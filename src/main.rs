@@ -385,6 +385,24 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Marketing/site asset generator: capture a window and export every
+        // matte style as a PNG into a directory.
+        Some("--assets") => {
+            let needle = args.get(1).context("--assets <title substr> <outdir>")?;
+            let outdir = std::path::PathBuf::from(args.get(2).context("--assets <title substr> <outdir>")?);
+            std::fs::create_dir_all(&outdir)?;
+            let hwnd = window::find_by_title(needle)
+                .with_context(|| format!("no visible window matching {needle:?}"))?;
+            let raw = capture::capture_window(hwnd).context("capture failed")?;
+            for s in style::variants(&raw) {
+                let img = compose::export(&raw, &s, 0.10, None, 2);
+                let p = outdir.join(format!("matte-{}.png", s.name.to_lowercase()));
+                img.save(&p)?;
+                eprintln!("{} {}x{}", p.display(), img.width(), img.height());
+            }
+            raw.save(outdir.join("raw.png"))?;
+            Ok(())
+        }
         // Record the primary monitor region for N seconds (testing).
         Some("--record-test") => {
             let secs: u64 = args.get(1).map(|s| s.parse().unwrap_or(4)).unwrap_or(4);
