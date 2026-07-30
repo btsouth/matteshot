@@ -200,6 +200,14 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         None,
     );
     let _ = DestroyMenu(menu);
+    // Documented TrackPopupMenu quirk: without this, the next click on the
+    // tray icon can be swallowed by leftover menu state.
+    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::WM_NULL,
+        WPARAM(0),
+        LPARAM(0),
+    );
 
     state.pending = match cmd.0 as usize {
         CMD_CAPTURE => Some(Action::Capture),

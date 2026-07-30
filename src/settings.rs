@@ -454,6 +454,11 @@ pub fn open() {
     unsafe {
         let existing = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
         if !existing.0.is_null() && IsWindow(existing).as_bool() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE,
+            };
+            let _ = SetWindowPos(existing, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            let _ = SetWindowPos(existing, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = SetForegroundWindow(existing);
             return;
         }
@@ -551,15 +556,32 @@ pub fn open() {
             false,
             windows::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW,
         );
+        // Center on the monitor the cursor is on (the user just clicked the
+        // tray there); a fixed 120,120 lands behind whatever is maximized.
+        let (ww, wh) = (outer.right - outer.left, outer.bottom - outer.top);
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+        let mon = windows::Win32::Graphics::Gdi::MonitorFromPoint(
+            pt,
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY,
+        );
+        let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
+            cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(mon, &mut mi);
+        let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - ww) / 2;
+        let y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - wh) / 2;
+
         let hwnd = match CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW,
             w!("matteshot_settings"),
             w!("Matteshot settings"),
             WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            120,
-            120,
-            outer.right - outer.left,
-            outer.bottom - outer.top,
+            x,
+            y,
+            ww,
+            wh,
             None,
             None,
             hinstance,
@@ -574,6 +596,15 @@ pub fn open() {
 
         crate::theme::apply_titlebar(hwnd, &crate::theme::current());
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
+        // After a tray menu closes our process has lost its foreground
+        // permission, so SetForegroundWindow alone silently fails and the new
+        // window is born BEHIND the active app. The topmost toggle forces
+        // z-order without needing activation rights.
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         let _ = SetForegroundWindow(hwnd);
     }
 }
