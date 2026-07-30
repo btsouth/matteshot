@@ -41,7 +41,7 @@ jobs:
           endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files: target\release\matteshot.exe
+          files: ${{ github.workspace }}\target\release\matteshot.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -57,7 +57,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $path = "installer\Output\MatteshotSetup-$version.exe"
           if (-not (Test-Path $path)) { Write-Error "installer not found at $path"; exit 1 }
-          "path=$path" >> $env:GITHUB_OUTPUT
+          # The signing action requires rooted paths.
+          "path=$((Resolve-Path $path).Path)" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Sign the installer with Trusted Signing
