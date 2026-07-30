@@ -106,6 +106,16 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     let styles = style::variants(&raw);
     let names: Vec<&'static str> = styles.iter().map(|s| s.name).collect();
 
+    // The preselected matte is exported and copied in the background the
+    // moment the picker opens: pressing PrtScn already means "I want this on
+    // my clipboard" — picking a number just switches which one.
+    struct AutoCopy {
+        canceled: bool,
+        path: Option<std::path::PathBuf>,
+    }
+    let auto = std::sync::Arc::new(std::sync::Mutex::new(AutoCopy { canceled: false, path: None }));
+    let preselect = cfg.last_style.min(styles.len().saturating_sub(1));
+
     let action = match pick_override {
         Some(i) => {
             if i >= styles.len() {
@@ -114,22 +124,55 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             PickAction::Choose(i)
         }
         None => {
+            {
+                let auto = auto.clone();
+                let raw = raw.clone();
+                let style = styles[preselect].clone();
+                let (scale, dir) = (cfg.export_scale, cfg.save_dir());
+                std::thread::spawn(move || {
+                    let styled = compose::export(&raw, &style, 0.10, None, scale);
+                    let mut st = auto.lock().unwrap();
+                    if st.canceled {
+                        return;
+                    }
+                    if let Ok(path) = output::save_png(&styled, style.name, &dir) {
+                        let _ = output::to_clipboard(&styled, Some(&path));
+                        eprintln!("auto-copy [{}]: {}", style.name, path.display());
+                        st.path = Some(path);
+                    }
+                });
+            }
             let previews = previews_for(&raw, &styles);
             picker::pick(&previews, &names, monitor, cfg.last_style)?
         }
+    };
+
+    // Helper: stop the auto-copy (if still running) and remove its file (if
+    // it already landed) — used when the user's explicit action supersedes it.
+    let cancel_auto = || {
+        let mut st = auto.lock().unwrap();
+        st.canceled = true;
+        st.path.take()
     };
 
     let (chosen, open_editor) = match action {
         PickAction::Choose(i) => (i, false),
         PickAction::Edit(i) => (i, true),
         PickAction::Cancel => {
-            eprintln!("cancelled");
+            // Esc keeps the auto-copy: the no-touch flow — PrtScn, select,
+            // Esc, paste.
+            eprintln!("cancelled (auto-copy stands)");
             return Ok(());
         }
         PickAction::Pin => {
             return pin::show(raw, monitor);
         }
         PickAction::CopyText => {
+            // The user wants text, not the image — retire the auto-copy so a
+            // late-finishing export can't clobber the OCR text on the clipboard.
+            if let Some(p) = cancel_auto() {
+                let _ = std::fs::remove_file(p);
+            }
             return ocr::copy_text(&raw);
         }
         PickAction::Tweak(i) => {
@@ -156,7 +199,11 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             };
         }
         PickAction::Reshoot(sel, mon) => {
-            // PrtScn mid-pick: the user re-snipped; replace the pending shot.
+            // PrtScn mid-pick: the user re-snipped; replace the pending shot
+            // (and its auto-copy — the new capture makes its own).
+            if let Some(p) = cancel_auto() {
+                let _ = std::fs::remove_file(p);
+            }
             eprintln!("reshoot: replacing the pending capture");
             return match sel {
                 overlay::Selection::Window(hwnd) => shoot(Source::Window(hwnd), mon, None),
@@ -179,9 +226,30 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         }
     };
 
+    // If they confirmed the preselected matte and the auto-copy already
+    // landed, the work is done — don't export the same thing twice.
+    let auto_path = cancel_auto();
+    if chosen == preselect {
+        if let Some(path) = &auto_path {
+            cfg.last_style = chosen;
+            cfg.save();
+            if open_editor {
+                output::open_in_editor(path);
+            }
+            eprintln!("done [{}] (auto-copy reused): {}", styles[chosen].name, path.display());
+            return Ok(());
+        }
+    }
+
     let styled = compose::export(&raw, &styles[chosen], 0.10, None, cfg.export_scale);
     let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir())?;
     output::to_clipboard(&styled, Some(&path)).context("clipboard failed")?;
+    // A different pick supersedes the auto-copied file.
+    if let Some(old) = auto_path {
+        if old != path {
+            let _ = std::fs::remove_file(old);
+        }
+    }
     cfg.last_style = chosen;
     cfg.save();
     if open_editor {

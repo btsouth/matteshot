@@ -341,7 +341,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     let mut aborted = false;
     // Learned on the first successful step, then held steady.
     let mut chrome: Option<(u32, u32)> = None;
-    /// Apps scroll a consistent amount per notch; that's a strong prior.
+    // Apps scroll a consistent amount per notch; that's a strong prior.
     let mut last_shift: Option<u32> = None;
 
     while steps < MAX_STEPS && canvas.height() < MAX_HEIGHT {

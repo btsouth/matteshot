@@ -200,7 +200,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.faint);
     let mut hint = wide(
-        "click or 1\u{2013}7 copy   \u{00b7}   T tweak   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   E edit   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
+        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   E edit   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
     );
     let mut hint_rect = RECT {
         left: 0,
