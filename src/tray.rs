@@ -75,9 +75,25 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// A 32x32 icon drawn at runtime: rounded gradient square with a lens dot.
-/// Also used as the window icon for taskbar-visible windows.
+/// The embedded app icon (assets\matteshot.ico via build.rs), falling back to
+/// the runtime-drawn one if the resource is somehow missing. Also used as the
+/// window icon for taskbar-visible windows.
 pub(crate) unsafe fn app_icon() -> HICON {
+    use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED};
+    if let Ok(hinstance) = GetModuleHandleW(None) {
+        if let Ok(h) = LoadImageW(
+            hinstance,
+            windows::core::PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE | LR_SHARED,
+        ) {
+            if !h.is_invalid() {
+                return HICON(h.0);
+            }
+        }
+    }
     make_icon()
 }
 

@@ -2,7 +2,7 @@
 ; Build: ISCC.exe installer\matteshot.iss   (from the repo root)
 
 #ifndef AppVersion
-  #define AppVersion "0.9.0"
+  #define AppVersion "0.9.1"
 #endif
 
 [Setup]
@@ -23,6 +23,8 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
 UninstallDisplayName=Matteshot
+SetupIconFile=..\assets\matteshot.ico
+UninstallDisplayIcon={app}\matteshot.exe
 
 [Files]
 Source: "..\target\release\matteshot.exe"; DestDir: "{app}"; Flags: ignoreversion

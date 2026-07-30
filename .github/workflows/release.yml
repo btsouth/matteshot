@@ -89,3 +89,19 @@ jobs:
             --title "Matteshot $version" `
             --notes "Signed Windows installer." `
             --verify-tag
+
+      # Public download: the repo is private, so release assets aren't public.
+      # Inert until the CLOUDFLARE_R2_API_TOKEN secret exists on the release
+      # environment.
+      - name: Publish the installer to Cloudflare R2
+        if: ${{ secrets.CLOUDFLARE_R2_API_TOKEN != '' }}
+        shell: pwsh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npm install -g wrangler
+          $v = '${{ steps.installer.outputs.version }}'
+          $p = '${{ steps.installer.outputs.path }}'
+          wrangler r2 object put "matteshot-downloads/MatteshotSetup-$v.exe" --file $p --content-type application/octet-stream --remote
+          wrangler r2 object put "matteshot-downloads/MatteshotSetup.exe" --file $p --content-type application/octet-stream --remote

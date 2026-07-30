@@ -4,6 +4,7 @@ mod annotate;
 mod capture;
 mod compose;
 mod config;
+mod icon;
 mod ocr;
 mod pin;
 mod audio;
@@ -452,6 +453,12 @@ fn main() -> Result<()> {
                 eprintln!("bench: raw capture saved to {}", p.display());
             }
             Ok(())
+        }
+        // Regenerate the app icon (assets\matteshot.ico) with the product's
+        // own compositing pipeline.
+        Some("--icon") => {
+            let outdir = std::path::PathBuf::from(args.get(1).map(String::as_str).unwrap_or("assets"));
+            icon::generate(&outdir)
         }
         // Marketing/site asset generator: capture a window and export every
         // matte style as a PNG into a directory.
