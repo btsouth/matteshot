@@ -44,9 +44,9 @@ Read `README.md` for the full feature map and architecture — it is accurate.
    and the stable `MatteshotSetup.exe`.
 5. Update `public/version.json` in the site repo, deploy, purge zone cache.
 
-**In flight right now:** v0.9.1 (first release with the real app icon) was
-tagged and CI was green-building when this doc was written. If its release
-exists and is signed, do step 4 + 5 for it.
+**v0.9.1 is fully shipped**: signed (verified `Valid`, CN=Brandon South),
+uploaded to R2 (versioned + stable), version.json bumped to 0.9.1, zone cache
+purged. Nothing in flight.
 
 ## The app icon / brand
 
@@ -94,9 +94,7 @@ must SetWindowPos topmost→notopmost to surface); AdjustWindowRectEx always.
 1. **Brandon**: add secret `CLOUDFLARE_R2_API_TOKEN` to matteshot repo →
    Settings → Environments → release (same value as cubby-clipboard's). Then
    releases self-publish to R2.
-2. **Verify v0.9.1** shipped signed; upload to R2 (versioned + stable) and bump
-   `version.json` to 0.9.1.
-3. **In-app update check**: on startup (and daily), fetch
+2. **In-app update check**: on startup (and daily), fetch
    `https://matteshot.app/version.json`, compare to `env!("CARGO_PKG_VERSION")`,
    tray balloon + menu item when newer. Keep it silent on failure. No auto-download.
 4. **winget manifest**: unblocked (signed installer at stable public URL).
