@@ -1,7 +1,9 @@
 ; Matteshot installer — per-user (no UAC), tray app.
 ; Build: ISCC.exe installer\matteshot.iss   (from the repo root)
 
-#define AppVersion "0.9.0"
+#ifndef AppVersion
+  #define AppVersion "0.9.0"
+#endif
 
 [Setup]
 AppId={{8B1F3C52-9D14-4A6E-B7E0-52A32C1D9F41}
