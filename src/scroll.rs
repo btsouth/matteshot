@@ -30,8 +30,11 @@ pub enum Target {
     Region(RECT, HMONITOR),
 }
 
-const MAX_STEPS: usize = 60;
-const MAX_HEIGHT: u32 = 24_000;
+// Generous ceilings — these are runaway guards, not working limits. Long
+// articles routinely need hundreds of steps (a 60-step cap once truncated a
+// Wikipedia article at 3/4).
+const MAX_STEPS: usize = 400;
+const MAX_HEIGHT: u32 = 40_000;
 /// Wheel notches per step — small enough that frames always overlap.
 const NOTCHES: i32 = 3;
 
