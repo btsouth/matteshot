@@ -1,0 +1,322 @@
+//! System tray presence: runtime-generated icon, left-click captures,
+//! right-click menu. The tray window shares the main thread's message loop;
+//! menu picks surface as `Action`s the main loop polls after dispatch.
+
+use anyhow::Result;
+use windows::core::w;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, GetCursorPos, GetWindowLongPtrW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA, HICON,
+    ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD,
+    WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+};
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+use winreg::RegKey;
+
+const WM_TRAYICON: u32 = 0x8001; // WM_APP + 1
+const CMD_CAPTURE: usize = 101;
+const CMD_CAPTURE_ACTIVE: usize = 102;
+const CMD_OPEN_FOLDER: usize = 103;
+const CMD_AUTOSTART: usize = 104;
+const CMD_PRTSCN: usize = 105;
+const CMD_QUIT: usize = 106;
+const CMD_SETTINGS: usize = 107;
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "Matteshot";
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Action {
+    Capture,
+    CaptureActive,
+    OpenFolder,
+    Settings,
+    ToggleAutostart,
+    TogglePrtscn,
+    Quit,
+}
+
+struct TrayState {
+    pending: Option<Action>,
+}
+
+pub struct Tray {
+    pub hwnd: HWND,
+    state: Box<TrayState>,
+    _icon: HICON,
+}
+
+pub fn autostart_enabled() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(RUN_KEY, KEY_READ)
+        .and_then(|k| k.get_value::<String, _>(RUN_VALUE))
+        .is_ok()
+}
+
+pub fn set_autostart(enabled: bool) -> Result<()> {
+    let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
+    if enabled {
+        let exe = std::env::current_exe()?;
+        key.set_value(RUN_VALUE, &format!("\"{}\"", exe.display()))?;
+    } else {
+        let _ = key.delete_value(RUN_VALUE);
+    }
+    Ok(())
+}
+
+/// A 32x32 icon drawn at runtime: rounded gradient square with a lens dot.
+/// Also used as the window icon for taskbar-visible windows.
+pub(crate) unsafe fn app_icon() -> HICON {
+    make_icon()
+}
+
+unsafe fn make_icon() -> HICON {
+    const S: i32 = 32;
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: S,
+            biHeight: -S,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let screen = GetDC(None);
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let color = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+        .expect("icon dib");
+    ReleaseDC(None, screen);
+    let px = std::slice::from_raw_parts_mut(bits as *mut u8, (S * S * 4) as usize);
+
+    for y in 0..S {
+        for x in 0..S {
+            // Rounded-square coverage.
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let r = 8.0f32;
+            let (cx, cy) = (16.0, 16.0);
+            let (qx, qy) = ((fx - cx).abs() - (14.0 - r), (fy - cy).abs() - (14.0 - r));
+            let dist = if qx > 0.0 && qy > 0.0 {
+                (qx * qx + qy * qy).sqrt() - r
+            } else {
+                qx.max(qy) - r
+            };
+            let cov = (0.5 - dist).clamp(0.0, 1.0);
+
+            // Diagonal indigo -> teal gradient.
+            let t = (fx + fy) / 64.0;
+            let (mut rr, mut gg, mut bb) = (
+                0.36 + (0.13 - 0.36) * t,
+                0.32 + (0.72 - 0.32) * t,
+                0.92 + (0.78 - 0.92) * t,
+            );
+
+            // Lens dot.
+            let d = ((fx - 16.0).powi(2) + (fy - 16.0).powi(2)).sqrt();
+            let ring = ((0.5 - (d - 6.0).abs() + 1.4).clamp(0.0, 1.0)) * 0.9;
+            rr += (1.0 - rr) * ring;
+            gg += (1.0 - gg) * ring;
+            bb += (1.0 - bb) * ring;
+
+            let a = cov;
+            let i = ((y * S + x) * 4) as usize;
+            // Premultiplied BGRA.
+            px[i] = (bb * a * 255.0) as u8;
+            px[i + 1] = (gg * a * 255.0) as u8;
+            px[i + 2] = (rr * a * 255.0) as u8;
+            px[i + 3] = (a * 255.0) as u8;
+        }
+    }
+
+    let mask = CreateBitmap(S, S, 1, 1, None);
+    let icon_info = ICONINFO {
+        fIcon: true.into(),
+        hbmColor: color,
+        hbmMask: mask,
+        ..Default::default()
+    };
+    let icon = CreateIconIndirect(&icon_info).expect("icon");
+    let _ = DeleteObject(color);
+    let _ = DeleteObject(mask);
+    icon
+}
+
+unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
+    let menu = CreatePopupMenu().expect("menu");
+    let check = |on: bool| if on { MF_CHECKED } else { Default::default() };
+    let _ = AppendMenuW(menu, MF_STRING, CMD_CAPTURE, w!("Capture\tPrtScn"));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        CMD_CAPTURE_ACTIVE,
+        w!("Capture active window\tCtrl+Alt+S"),
+    );
+    let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_FOLDER, w!("Open captures folder"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+    let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Settings\u{2026}"));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING | check(autostart_enabled()),
+        CMD_AUTOSTART,
+        w!("Start with Windows"),
+    );
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        CMD_PRTSCN,
+        if !crate::prtscn::snipping_owns_prtscn() {
+            w!("Give PrtScn back to Snipping Tool")
+        } else {
+            w!("Take over PrtScn")
+        },
+    );
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+    let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit Matteshot"));
+
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    // Required so the menu dismisses when clicking elsewhere.
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_BOTTOMALIGN,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+
+    state.pending = match cmd.0 as usize {
+        CMD_CAPTURE => Some(Action::Capture),
+        CMD_CAPTURE_ACTIVE => Some(Action::CaptureActive),
+        CMD_OPEN_FOLDER => Some(Action::OpenFolder),
+        CMD_SETTINGS => Some(Action::Settings),
+        CMD_AUTOSTART => Some(Action::ToggleAutostart),
+        CMD_PRTSCN => Some(Action::TogglePrtscn),
+        CMD_QUIT => Some(Action::Quit),
+        _ => None,
+    };
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_TRAYICON => {
+            let state = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState).as_mut();
+            if let Some(state) = state {
+                match lparam.0 as u32 {
+                    WM_LBUTTONUP => state.pending = Some(Action::Capture),
+                    WM_RBUTTONUP => show_menu(hwnd, state),
+                    _ => {}
+                }
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+impl Tray {
+    pub fn create() -> Result<Tray> {
+        unsafe {
+            let hinstance = GetModuleHandleW(None)?;
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinstance.into(),
+                lpszClassName: w!("matteshot_tray"),
+                ..Default::default()
+            };
+            RegisterClassW(&class);
+
+            let mut state = Box::new(TrayState { pending: None });
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("matteshot_tray"),
+                w!("Matteshot"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                hinstance,
+                Some(&mut *state as *mut TrayState as *const _),
+            )?;
+
+            let icon = make_icon();
+            let mut data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+                uCallbackMessage: WM_TRAYICON,
+                hIcon: icon,
+                ..Default::default()
+            };
+            let tip: Vec<u16> = "Matteshot \u{2014} PrtScn to capture".encode_utf16().collect();
+            data.szTip[..tip.len()].copy_from_slice(&tip);
+            let _ = Shell_NotifyIconW(NIM_ADD, &data);
+
+            Ok(Tray { hwnd, state, _icon: icon })
+        }
+    }
+
+    /// One-shot balloon notification (first run).
+    pub fn notify(&self, title: &str, text: &str) {
+        unsafe {
+            let mut data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: self.hwnd,
+                uID: 1,
+                uFlags: NIF_INFO,
+                ..Default::default()
+            };
+            let t: Vec<u16> = title.encode_utf16().collect();
+            let x: Vec<u16> = text.encode_utf16().collect();
+            data.szInfoTitle[..t.len().min(63)].copy_from_slice(&t[..t.len().min(63)]);
+            data.szInfo[..x.len().min(255)].copy_from_slice(&x[..x.len().min(255)]);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+    }
+
+    /// Poll and clear the pending menu action.
+    pub fn take_action(&mut self) -> Option<Action> {
+        self.state.pending.take()
+    }
+
+    pub fn remove(&self) {
+        unsafe {
+            let data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: self.hwnd,
+                uID: 1,
+                ..Default::default()
+            };
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        }
+    }
+
+    pub fn quit() {
+        unsafe { PostQuitMessage(0) };
+    }
+}
