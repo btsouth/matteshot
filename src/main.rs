@@ -29,6 +29,7 @@ mod tray;
 mod tweak;
 mod update;
 mod video_edit;
+mod welcome;
 mod window;
 
 use anyhow::{bail, Context, Result};
@@ -92,6 +93,7 @@ fn request_graceful_shutdown() -> Result<()> {
     close_all("matteshot_recdone", "the video editor")?;
     close_all("matteshot_settings", "settings")?;
     close_all("matteshot_activation", "activation")?;
+    close_all("matteshot_welcome", "welcome")?;
     close_all("matteshot_pin", "a pinned capture")?;
     close_all("matteshot_tray", "Matteshot")?;
     Ok(())
@@ -483,14 +485,19 @@ fn run_app() -> Result<()> {
     );
     diagnostics::log("resident ready");
 
-    // First run: a single balloon so the user knows where the app lives.
+    // First run: show the core loop before the app disappears into the tray.
+    // This is non-modal, so PrtScn and tray commands remain live.
     let cfg = Config::load();
     if !cfg.onboarded && initial_license.can_capture() {
-        tray.notify(
-            "Matteshot is ready",
-            "Press PrtScn to capture. Right-click the tray icon for settings.",
-        );
-        Config::update(|cfg| cfg.onboarded = true);
+        if let Err(error) = welcome::open_first_run() {
+            diagnostics::log("welcome window failed");
+            eprintln!("welcome: {error:#}");
+            tray.notify(
+                "Matteshot is ready",
+                "Press PrtScn to capture. Right-click the tray icon for settings.",
+            );
+            Config::update(|cfg| cfg.onboarded = true);
+        }
     }
     update::start(tray.hwnd);
     license::start_background_refresh();
@@ -519,6 +526,23 @@ fn run_app() -> Result<()> {
                 }
             }
             DispatchMessageW(&msg);
+
+            if let Some(action) = welcome::take_action() {
+                let result = match action {
+                    welcome::Action::Capture => {
+                        if ensure_capture_allowed(&mut hotkeys_active)? {
+                            shoot_overlay()
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    welcome::Action::Settings => settings::open(),
+                };
+                if let Err(error) = result {
+                    eprintln!("welcome action: {error:#}");
+                    error_box(&format!("{error:#}"));
+                }
+            }
 
             // A timer message reaches this loop every 250 ms. If Windows or
             // another exiting instance briefly owned PrtScn during startup,
@@ -1120,6 +1144,18 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Open the first-run surface without changing the user's real config.
+        Some("--welcome") => {
+            welcome::open_preview()?;
+            let mut msg = MSG::default();
+            unsafe {
+                while welcome::is_open() && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            Ok(())
+        }
         Some("--spike-dpi") => {
             require_capture_license()?;
             let needle = args.get(1).context("--spike-dpi needs a window title substring")?;
@@ -1179,7 +1215,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --welcome | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
         None => run_app(),
     };

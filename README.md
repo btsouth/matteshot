@@ -58,6 +58,8 @@ Save folder + video folder (`IFileDialog` pickers, open buttons), export quality
 
 Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. **Copy diagnostics** in the tray produces a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path.
 
+On first run, a compact native welcome surface explains the PrtScn-to-paste loop, the no-card 14-day trial, and opens the real capture flow in one click. It follows Windows light and dark app mode, stays non-modal so capture hotkeys remain responsive, and never appears again after it has been shown.
+
 ## CLI / test rig
 
 ```
@@ -72,6 +74,7 @@ matteshot --trim-test <mp4> <a> <b> [1-7] # trim/export probe; optional matte
 matteshot --video-edit-test <mp4> # matte + text/arrow/box/blur export probe
 matteshot --playback-test <mp4> # paced 3s editor preview decode, no UI/clipboard
 matteshot --review-test <mp4> # open the video editor around an existing file
+matteshot --welcome          # preview first-run onboarding without changing config
 matteshot --ocr <substr>     # capture a window and print its OCR text
 matteshot --update-test      # probe version.json; never downloads
 matteshot --settings         # open the settings window directly
