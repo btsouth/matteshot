@@ -15,15 +15,18 @@ use windows::Win32::Graphics::Gdi::{
     HFONT, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_ESCAPE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCAPTION,
-    IDC_ARROW, MSG, WDA_EXCLUDEFROMCAPTURE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    IDC_ARROW, MSG, WDA_EXCLUDEFROMCAPTURE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST,
+    WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
 use crate::record::{Progress, Target};
@@ -101,6 +104,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_ERASEBKGND => LRESULT(1),
+        // The recorder controls must never steal focus from a game or other
+        // hardware-rendered target.
+        WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE
         // Draggable by its body, but not by the Stop button.
         WM_NCHITTEST => {
             let res = DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -162,8 +168,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_HOTKEY => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, 1);
+            let _ = UnregisterHotKey(hwnd, 1);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -235,7 +246,7 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
         let y = mi.rcWork.bottom - ch - 24;
 
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("matteshot_recui"),
             w!("Recording"),
             WS_POPUP | WS_VISIBLE,
@@ -250,7 +261,19 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
         )?;
         // Never let the controls appear in their own recording.
         let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-        let _ = SetForegroundWindow(hwnd);
+        // Esc remains available even though the pill deliberately never
+        // activates. The registration exists only for this recording.
+        let _ = RegisterHotKey(
+            hwnd,
+            1,
+            HOT_KEY_MODIFIERS(0x4000), // MOD_NOREPEAT
+            VK_ESCAPE.0 as u32,
+        );
+        // The freeze-frame overlay was foreground while the user chose the
+        // target. Hand focus back to the selected window before it renders.
+        if let Target::Window(h) = target {
+            let _ = SetForegroundWindow(HWND(h as *mut _));
+        }
         SetTimer(hwnd, 1, 250, None);
 
         let mut msg = MSG::default();

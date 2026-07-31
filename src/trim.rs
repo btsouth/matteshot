@@ -6,6 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
+use rayon::prelude::*;
 use windows::core::{HSTRING, PROPVARIANT};
 use windows::Win32::Media::MediaFoundation::{
     IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio,
@@ -228,6 +229,20 @@ fn rgba_to_bgra(image: &RgbaImage, w: u32, h: u32) -> Vec<u8> {
     bgra
 }
 
+fn bgra_to_rgba_into(bytes: &[u8], image: &mut RgbaImage) {
+    image
+        .as_mut()
+        .par_chunks_mut(4)
+        .zip(bytes.par_chunks(4))
+        .for_each(|(dst, src)| {
+            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+        });
+}
+
+fn rgba_to_bgra_in_place(image: &mut RgbaImage) {
+    image.as_mut().par_chunks_mut(4).for_each(|pixel| pixel.swap(0, 2));
+}
+
 /// Re-encode [start, end), optionally framing every video frame with one
 /// deterministic matte. Audio timing and bytes follow the trim path unchanged.
 pub fn cut_with_matte(
@@ -247,6 +262,18 @@ pub fn cut_with_edit(
     end: i64,
     matte: Option<&crate::style::Style>,
     annotations: &[crate::video_edit::Item],
+) -> Result<()> {
+    cut_with_edit_progress(src, dst, start, end, matte, annotations, |_| {})
+}
+
+pub fn cut_with_edit_progress(
+    src: &Path,
+    dst: &Path,
+    start: i64,
+    end: i64,
+    matte: Option<&crate::style::Style>,
+    annotations: &[crate::video_edit::Item],
+    mut progress: impl FnMut(u32),
 ) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
     let (reader, w, h, stride) = open_reader(src, true)?;
@@ -274,8 +301,9 @@ pub fn cut_with_edit(
         .as_ref()
         .map(|base| (even(base.width()), even(base.height())))
         .unwrap_or_else(|| (even(w), even(h)));
-    let (writer, vstream, astream) =
-        unsafe { crate::record::make_sink(dst, ow, oh, audio_fmt.as_ref())? };
+    let (writer, vstream, astream) = unsafe {
+        crate::record::make_sink_for_content(dst, ow, oh, even(w), even(h), audio_fmt.as_ref())?
+    };
 
     unsafe {
         let pv = PROPVARIANT::from(start.max(0));
@@ -283,6 +311,16 @@ pub fn cut_with_edit(
     }
 
     let row = (ow * 4) as usize;
+    let source_row = (w * 4) as usize;
+    let mut raw = vec![0u8; source_row * h as usize];
+    let mut plain_out = vec![0u8; row * oh as usize];
+    let mut composed_frame = if let Some(base) = &matte_base {
+        Some(base.clone())
+    } else if !annotations.is_empty() {
+        Some(RgbaImage::new(ow, oh))
+    } else {
+        None
+    };
     loop {
         unsafe {
             let mut stream = 0u32;
@@ -329,8 +367,6 @@ pub fn cut_with_edit(
                 let mut ptr = std::ptr::null_mut();
                 buf.Lock(&mut ptr, None, None)?;
                 let abs_stride = stride.unsigned_abs() as usize;
-                let source_row = (w * 4) as usize;
-                let mut raw = vec![0u8; source_row * h as usize];
                 for y in 0..h as usize {
                     let src_row = if stride < 0 { h as usize - 1 - y } else { y };
                     std::ptr::copy_nonoverlapping(
@@ -341,26 +377,28 @@ pub fn cut_with_edit(
                 }
                 buf.Unlock()?;
 
-                let out = if matte_base.is_none() && annotations.is_empty() {
-                    let mut cropped = vec![0u8; row * oh as usize];
+                let out = if let Some(composed) = composed_frame.as_mut() {
+                    if let Some(base) = &matte_base {
+                        composed.as_mut().copy_from_slice(base.as_raw());
+                        crate::compose::blend_bgra_content(
+                            composed,
+                            &raw,
+                            w as usize,
+                            h as usize,
+                            &matte_opts,
+                        );
+                    } else {
+                        bgra_to_rgba_into(&raw, composed);
+                    }
+                    crate::video_edit::render(composed, annotations, ts, None);
+                    rgba_to_bgra_in_place(composed);
+                    composed.as_raw()
+                } else {
                     for y in 0..oh.min(h) as usize {
-                        cropped[y * row..(y + 1) * row]
+                        plain_out[y * row..(y + 1) * row]
                             .copy_from_slice(&raw[y * source_row..y * source_row + row]);
                     }
-                    cropped
-                } else {
-                    let content = bgra_to_rgba(&raw, w, h);
-                    let mut composed = if let Some(base) = &matte_base {
-                        let mut framed = base.clone();
-                        crate::compose::blend_content(&mut framed, &content, &matte_opts);
-                        framed
-                    } else if content.width() == ow && content.height() == oh {
-                        content
-                    } else {
-                        image::imageops::crop_imm(&content, 0, 0, ow, oh).to_image()
-                    };
-                    crate::video_edit::render(&mut composed, annotations, ts, None);
-                    rgba_to_bgra(&composed, ow, oh)
+                    plain_out.as_slice()
                 };
 
                 use windows::Win32::Media::MediaFoundation::{
@@ -377,6 +415,8 @@ pub fn cut_with_edit(
                 s.SetSampleTime(rel)?;
                 s.SetSampleDuration(sample.GetSampleDuration().unwrap_or(333_333))?;
                 writer.WriteSample(vstream, &s)?;
+                let span = (end - start).max(1);
+                progress(((rel * 100 / span).clamp(0, 99)) as u32);
             } else if let Some(astream) = astream {
                 let buf = sample.ConvertToContiguousBuffer()?;
                 let mut ptr = std::ptr::null_mut();
@@ -403,6 +443,7 @@ pub fn cut_with_edit(
         }
     }
     unsafe { writer.Finalize().context("finalize trim")? };
+    progress(100);
     Ok(())
 }
 

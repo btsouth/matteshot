@@ -74,13 +74,28 @@ pub unsafe fn make_sink(
     h: u32,
     audio: Option<&crate::audio::Format>,
 ) -> Result<(IMFSinkWriter, u32, Option<u32>)> {
+    make_sink_for_content(path, w, h, w, h, audio)
+}
+
+/// Create an H.264 sink whose bitrate follows the moving content rather than
+/// static matte padding. A framed export has more output pixels, but the added
+/// background is cheap to encode and should not inflate file size linearly.
+pub unsafe fn make_sink_for_content(
+    path: &std::path::Path,
+    w: u32,
+    h: u32,
+    content_w: u32,
+    content_h: u32,
+    audio: Option<&crate::audio::Format>,
+) -> Result<(IMFSinkWriter, u32, Option<u32>)> {
     let writer: IMFSinkWriter =
         MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, None)
             .context("create sink writer")?;
 
-    // Output: H.264. ~0.15 bits per pixel per frame is a good screen-content
-    // bitrate — text stays legible without absurd file sizes.
-    let bitrate = ((w * h) as f32 * FPS as f32 * 0.15) as u32;
+    // Output: H.264. 0.12 bits per moving-content pixel per frame preserves
+    // crisp UI and fast motion without treating static matte padding as if it
+    // were another full frame of changing content.
+    let bitrate = ((content_w * content_h) as f32 * FPS as f32 * 0.12) as u32;
     let out = MFCreateMediaType()?;
     out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
@@ -484,6 +499,16 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         started: std::time::Instant::now(),
         error: Mutex::new(None),
     });
+
+    // The freeze-frame selector owned foreground while the target was
+    // chosen. Restore the selected window before the capture worker starts;
+    // hardware-rendered apps may pause or tear down their visible swap chain
+    // as soon as they lose activation.
+    if let Target::Window(h) = target {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(HWND(h as *mut _));
+        }
+    }
 
     let worker = {
         let progress = progress.clone();

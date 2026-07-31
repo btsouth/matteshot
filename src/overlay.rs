@@ -28,9 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, LoadCursorW, PostQuitMessage,
     RegisterClassW, SetForegroundWindow,
     SetCursor, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, IDC_ARROW, IDC_CROSS, MSG, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    GWL_EXSTYLE, GWLP_USERDATA, IDC_ARROW, IDC_CROSS, MSG, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 const WHITE: COLORREF = COLORREF(0x00FFFFFF);
@@ -586,6 +586,15 @@ unsafe extern "system" fn enum_proc(
     let state = &mut *(lparam.0 as *mut EnumState);
 
     if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return true.into();
+    }
+    // Click-through overlay windows are not real capture targets. Treating
+    // their DWM bounds as ordinary windows can select a transparent GPU
+    // helper surface instead of the app beneath it (MuMuPlayer's Qt
+    // ToolSaveBits window is one example), producing a black recording with
+    // only the hardware cursor visible.
+    let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    if exstyle & WS_EX_TRANSPARENT.0 != 0 {
         return true.into();
     }
     let mut pid = 0u32;

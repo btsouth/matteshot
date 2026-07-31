@@ -1,6 +1,7 @@
 //! Compositing: rounded corners, soft shadow, padding, styled backdrop.
 
 use image::{Rgba, RgbaImage};
+use rayon::prelude::*;
 
 use crate::style::{Backdrop, Rgb, Style};
 
@@ -249,18 +250,100 @@ pub fn blend_content(canvas: &mut RgbaImage, window: &RgbaImage, opts: &ComposeO
     let Layout { pad_x, pad_y, .. } = layout(w, h, opts);
     let corner = (max_dim * 0.012).clamp(10.0 * metric_scale, 28.0 * metric_scale).max(2.0);
 
-    for y in 0..h {
-        for x in 0..w {
-            let src = window.get_pixel(x as u32, y as u32);
-            let cov =
-                rounded_rect_coverage(x as f32 + 0.5, y as f32 + 0.5, w as f32, h as f32, corner);
-            let a = cov * (src[3] as f32 / 255.0);
-            if a > 0.0 {
-                let dst = canvas.get_pixel_mut((x + pad_x) as u32, (y + pad_y) as u32);
-                for c in 0..3 {
-                    dst[c] = (src[c] as f32 * a + dst[c] as f32 * (1.0 - a)) as u8;
+    let canvas_w = canvas.width() as usize;
+    let src = window.as_raw();
+    canvas
+        .as_mut()
+        .par_chunks_mut(canvas_w * 4)
+        .skip(pad_y)
+        .take(h)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let src_row = &src[y * w * 4..(y + 1) * w * 4];
+            let dst_row = &mut row[pad_x * 4..(pad_x + w) * 4];
+            for x in 0..w {
+                let s = &src_row[x * 4..x * 4 + 4];
+                let d = &mut dst_row[x * 4..x * 4 + 4];
+                let corner_pixel = (x < corner as usize || x + corner as usize >= w)
+                    && (y < corner as usize || y + corner as usize >= h);
+                if s[3] == 255 && !corner_pixel {
+                    d[..3].copy_from_slice(&s[..3]);
+                    continue;
+                }
+                let cov = if corner_pixel {
+                    rounded_rect_coverage(
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        w as f32,
+                        h as f32,
+                        corner,
+                    )
+                } else {
+                    1.0
+                };
+                let a = cov * (s[3] as f32 / 255.0);
+                if a > 0.0 {
+                    for c in 0..3 {
+                        d[c] = (s[c] as f32 * a + d[c] as f32 * (1.0 - a)) as u8;
+                    }
                 }
             }
-        }
-    }
+        });
+}
+
+/// Blend a tightly packed BGRA frame directly into an RGBA matte. Video
+/// export uses this to avoid allocating and channel-swapping a second
+/// full-resolution image for every decoded frame.
+pub fn blend_bgra_content(
+    canvas: &mut RgbaImage,
+    bgra: &[u8],
+    w: usize,
+    h: usize,
+    opts: &ComposeOpts,
+) {
+    debug_assert!(bgra.len() >= w * h * 4);
+    let metric_scale = opts.metric_scale;
+    let max_dim = w.max(h) as f32;
+    let Layout { pad_x, pad_y, .. } = layout(w, h, opts);
+    let corner = (max_dim * 0.012).clamp(10.0 * metric_scale, 28.0 * metric_scale).max(2.0);
+    let canvas_w = canvas.width() as usize;
+    canvas
+        .as_mut()
+        .par_chunks_mut(canvas_w * 4)
+        .skip(pad_y)
+        .take(h)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let src_row = &bgra[y * w * 4..(y + 1) * w * 4];
+            let dst_row = &mut row[pad_x * 4..(pad_x + w) * 4];
+            for x in 0..w {
+                let s = &src_row[x * 4..x * 4 + 4];
+                let d = &mut dst_row[x * 4..x * 4 + 4];
+                let corner_pixel = (x < corner as usize || x + corner as usize >= w)
+                    && (y < corner as usize || y + corner as usize >= h);
+                if s[3] == 255 && !corner_pixel {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    continue;
+                }
+                let cov = if corner_pixel {
+                    rounded_rect_coverage(
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        w as f32,
+                        h as f32,
+                        corner,
+                    )
+                } else {
+                    1.0
+                };
+                let a = cov * (s[3] as f32 / 255.0);
+                if a > 0.0 {
+                    d[0] = (s[2] as f32 * a + d[0] as f32 * (1.0 - a)) as u8;
+                    d[1] = (s[1] as f32 * a + d[1] as f32 * (1.0 - a)) as u8;
+                    d[2] = (s[0] as f32 * a + d[2] as f32 * (1.0 - a)) as u8;
+                }
+            }
+        });
 }

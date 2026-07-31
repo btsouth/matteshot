@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
     HDC, HFONT, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -20,11 +21,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
-    LoadCursorW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, CREATESTRUCTW, CS_DBLCLKS,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW,
-    WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
+    LoadCursorW, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
+    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU,
+    WS_VISIBLE,
 };
+
+const WM_EXPORT_PROGRESS: u32 = WM_APP + 20;
+const WM_EXPORT_DONE: u32 = WM_APP + 21;
+
+struct ExportDone {
+    path: PathBuf,
+    result: std::result::Result<(), String>,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
@@ -122,6 +132,7 @@ struct State {
     undo_control: RECT,
     delete_control: RECT,
     status: Option<String>,
+    exporting: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -1297,7 +1308,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         );
     }
 
-    for (i, (r, _, label)) in state.controls.iter().enumerate() {
+    for (i, (r, act, label)) in state.controls.iter().enumerate() {
         let hot = i as i32 == state.hover;
         let primary = i == 0;
         let fill = CreateSolidBrush(if primary {
@@ -1340,7 +1351,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 state.theme.muted
             },
         );
-        let mut l = wide(label);
+        let shown = if *act == Act::SaveTrim && state.exporting {
+            "Exporting"
+        } else {
+            label
+        };
+        let mut l = wide(shown);
         let mut lr = *r;
         DrawTextW(hdc, &mut l, &mut lr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
@@ -1354,6 +1370,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_EXPORT_PROGRESS => {
+            if let Some(state) = state_of(hwnd) {
+                if state.exporting {
+                    state.status = Some(format!("exporting full resolution · {}%", wparam.0));
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_EXPORT_DONE => {
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
+            let done = Box::from_raw(lparam.0 as *mut ExportDone);
+            if let Some(state) = state_of(hwnd) {
+                state.exporting = false;
+                match &done.result {
+                    Ok(()) => {
+                        let _ = crate::output::file_to_clipboard(&done.path);
+                        state.status = Some(format!(
+                            "saved {} · copied",
+                            done.path.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    }
+                    Err(error) => state.status = Some(format!("export failed: {error}")),
+                }
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         WM_PAINT => {
             if let Some(state) = state_of(hwnd) {
                 let mut ps = PAINTSTRUCT::default();
@@ -1738,6 +1784,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = crate::output::file_to_clipboard(&state.mp4);
                         }
                         Act::Delete => {
+                            if state.exporting {
+                                state.status =
+                                    Some("finish the current export before deleting".into());
+                                let _ = InvalidateRect(hwnd, None, false);
+                                return LRESULT(0);
+                            }
                             let _ = std::fs::remove_file(&state.mp4);
                             if let Some(g) = &state.gif {
                                 let _ = std::fs::remove_file(g);
@@ -1745,6 +1797,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = DestroyWindow(hwnd);
                         }
                         Act::SaveTrim => {
+                            if state.exporting {
+                                return LRESULT(0);
+                            }
                             let style = state.styles[state.matte_index].clone();
                             let has_matte = !crate::compose::is_plain(&style);
                             let has_trim = state.trim_start > 0 || state.trim_end < state.duration;
@@ -1781,31 +1836,66 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 String::new()
                             };
                             state.status = Some(format!(
-                                "exporting {}{}{} \u{2026}",
+                                "exporting {}{}{} \u{00b7} 0%",
                                 style.name,
                                 if has_trim { " + trim" } else { "" },
                                 annotation_label
                             ));
+                            state.exporting = true;
                             let _ = InvalidateRect(hwnd, None, false);
                             let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
-                            match crate::trim::cut_with_edit(
-                                &state.mp4,
-                                &dst,
-                                state.trim_start,
-                                state.trim_end,
-                                Some(&style),
-                                &state.annotations,
-                            ) {
-                                Ok(()) => {
-                                    let _ = crate::output::file_to_clipboard(&dst);
-                                    state.status = Some(format!(
-                                        "saved {} \u{00b7} copied",
-                                        dst.file_name().unwrap_or_default().to_string_lossy()
-                                    ));
+                            let src = state.mp4.clone();
+                            let start = state.trim_start;
+                            let end = state.trim_end;
+                            let annotations = state.annotations.clone();
+                            let hwnd_raw = hwnd.0 as isize;
+                            std::thread::spawn(move || {
+                                let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+                                let _ = std::fs::remove_file(&dst);
+                                let mut last_progress = u32::MAX;
+                                let result = crate::trim::cut_with_edit_progress(
+                                    &src,
+                                    &dst,
+                                    start,
+                                    end,
+                                    Some(&style),
+                                    &annotations,
+                                    |percent| {
+                                        if percent != last_progress {
+                                            last_progress = percent;
+                                            unsafe {
+                                                let _ = PostMessageW(
+                                                    HWND(hwnd_raw as *mut _),
+                                                    WM_EXPORT_PROGRESS,
+                                                    WPARAM(percent as usize),
+                                                    LPARAM(0),
+                                                );
+                                            }
+                                        }
+                                    },
+                                )
+                                .map_err(|error| format!("{error:#}"));
+                                if result.is_err() {
+                                    let _ = std::fs::remove_file(&dst);
                                 }
-                                Err(e) => state.status = Some(format!("export failed: {e}")),
-                            }
-                            let _ = InvalidateRect(hwnd, None, false);
+                                if com.is_ok() {
+                                    unsafe { CoUninitialize() };
+                                }
+                                let done = Box::new(ExportDone { path: dst, result });
+                                let done_ptr = Box::into_raw(done);
+                                unsafe {
+                                    if PostMessageW(
+                                        HWND(hwnd_raw as *mut _),
+                                        WM_EXPORT_DONE,
+                                        WPARAM(0),
+                                        LPARAM(done_ptr as isize),
+                                    )
+                                    .is_err()
+                                    {
+                                        drop(Box::from_raw(done_ptr));
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -2072,6 +2162,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         undo_control: initial.undo_control,
         delete_control: initial.delete_control,
         status: None,
+        exporting: false,
     }));
 
     unsafe {
