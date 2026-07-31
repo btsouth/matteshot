@@ -155,8 +155,10 @@ fn pixelate(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), block: u32) {
                     n += 1;
                 }
             }
-            if n > 0 {
-                let avg = Rgba([(r / n) as u8, (g / n) as u8, (b_ / n) as u8, 255]);
+            if let (Some(r), Some(g), Some(b)) =
+                (r.checked_div(n), g.checked_div(n), b_.checked_div(n))
+            {
+                let avg = Rgba([r as u8, g as u8, b as u8, 255]);
                 for y in by..bh {
                     for x in bx..bw {
                         img.put_pixel(x as u32, y as u32, avg);

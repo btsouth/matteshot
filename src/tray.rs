@@ -91,6 +91,7 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 /// The embedded app icon (assets\matteshot.ico via build.rs), falling back to
 /// the runtime-drawn one if the resource is somehow missing. Also used as the
 /// window icon for taskbar-visible windows.
+#[allow(clippy::manual_dangling_ptr)] // Win32 MAKEINTRESOURCE: resource ID encoded as a pointer.
 pub(crate) unsafe fn app_icon() -> HICON {
     use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED};
     if let Ok(hinstance) = GetModuleHandleW(None) {

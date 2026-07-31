@@ -153,7 +153,14 @@ unsafe fn draw_checkbox(hdc: HDC, r: RECT, label: &str, state: &State, checked: 
         draw_text_in(hdc, state.font_small, state.theme.accent_text, box_r, "\u{2713}", 1 /*DT_CENTER*/);
     }
     let label_r = RECT { left: box_r.right + s(state, 10), ..r };
-    draw_text_in(hdc, state.font, if hot { state.theme.text } else { state.theme.text }, label_r, label, 0);
+    draw_text_in(
+        hdc,
+        state.font,
+        if hot { state.theme.accent } else { state.theme.text },
+        label_r,
+        label,
+        0,
+    );
 }
 
 unsafe fn paint(hdc: HDC, state: &State) {
@@ -480,24 +487,25 @@ pub fn open() -> Result<()> {
 
         // Static layout.
         let m = sc(24);
-        let mut controls = Vec::new();
         // Save folder row buttons (right-aligned).
-        controls.push((
-            RECT { left: cw - m - sc(140), top: sc(42), right: cw - m - sc(64), bottom: sc(72) },
-            Ctrl::ChangeDir,
-        ));
-        controls.push((
-            RECT { left: cw - m - sc(56), top: sc(42), right: cw - m, bottom: sc(72) },
-            Ctrl::OpenDir,
-        ));
-        controls.push((
-            RECT { left: cw - m - sc(140), top: sc(106), right: cw - m - sc(64), bottom: sc(136) },
-            Ctrl::ChangeVideoDir,
-        ));
-        controls.push((
-            RECT { left: cw - m - sc(56), top: sc(106), right: cw - m, bottom: sc(136) },
-            Ctrl::OpenVideoDir,
-        ));
+        let mut controls = vec![
+            (
+                RECT { left: cw - m - sc(140), top: sc(42), right: cw - m - sc(64), bottom: sc(72) },
+                Ctrl::ChangeDir,
+            ),
+            (
+                RECT { left: cw - m - sc(56), top: sc(42), right: cw - m, bottom: sc(72) },
+                Ctrl::OpenDir,
+            ),
+            (
+                RECT { left: cw - m - sc(140), top: sc(106), right: cw - m - sc(64), bottom: sc(136) },
+                Ctrl::ChangeVideoDir,
+            ),
+            (
+                RECT { left: cw - m - sc(56), top: sc(106), right: cw - m, bottom: sc(136) },
+                Ctrl::OpenVideoDir,
+            ),
+        ];
         // Export scale segmented.
         for (i, n) in [1u32, 2, 3].iter().enumerate() {
             let x = m + i as i32 * sc(62);

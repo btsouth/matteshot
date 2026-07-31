@@ -117,10 +117,8 @@ pub fn file_to_clipboard(path: &Path) -> Result<()> {
     drop.extend_from_slice(&[0, 0, 0, 0]);
     unsafe {
         OpenClipboard(HWND::default()).context("open clipboard")?;
-        let result = (|| -> Result<()> {
-            let _ = EmptyClipboard();
-            put_bytes(CF_HDROP, &drop)
-        })();
+        let _ = EmptyClipboard();
+        let result = put_bytes(CF_HDROP, &drop);
         let _ = CloseClipboard();
         result
     }
@@ -136,10 +134,8 @@ pub fn text_to_clipboard(text: &str) -> Result<()> {
     wide.extend_from_slice(&[0, 0]);
     unsafe {
         OpenClipboard(HWND::default()).context("open clipboard")?;
-        let result = (|| -> Result<()> {
-            let _ = EmptyClipboard();
-            put_bytes(CF_UNICODETEXT, &wide)
-        })();
+        let _ = EmptyClipboard();
+        let result = put_bytes(CF_UNICODETEXT, &wide);
         let _ = CloseClipboard();
         result
     }

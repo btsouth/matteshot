@@ -68,6 +68,7 @@ unsafe fn state(hwnd: HWND) -> Option<&'static mut UiState> {
     (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut UiState).as_mut()
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn child(
     class: PCWSTR,
     text: &str,

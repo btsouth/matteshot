@@ -88,8 +88,12 @@ impl Resampler {
 
 /// Encoder-friendly rate/channels for a device format.
 pub fn encode_format(dev: &Format) -> Format {
-    let rate = if dev.rate % 44100 == 0 && dev.rate % 48000 != 0 { 44100 } else { 48000 };
-    Format { rate, channels: dev.channels.min(2).max(1) }
+    let rate = if dev.rate.is_multiple_of(44100) && !dev.rate.is_multiple_of(48000) {
+        44100
+    } else {
+        48000
+    };
+    Format { rate, channels: dev.channels.clamp(1, 2) }
 }
 
 /// Open the device on the calling thread just long enough to learn the mix

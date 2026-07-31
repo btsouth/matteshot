@@ -178,13 +178,15 @@ unsafe fn write_pcm(
 }
 
 /// The capture + encode loop. Runs on a worker thread until `stop` is set.
+type GifFrames = Vec<(Vec<u8>, u32, u32)>;
+
 fn capture_loop(
     target: Target,
     path: std::path::PathBuf,
     want_gif: bool,
     audio_source: Option<crate::audio::Source>,
     progress: Arc<Progress>,
-) -> Result<Option<Vec<(Vec<u8>, u32, u32)>>> {
+) -> Result<Option<GifFrames>> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")? };
 
     // Audio: probe the device format first (the sink needs it up front),
@@ -415,7 +417,7 @@ fn capture_loop(
             }
         }
 
-        if want_gif && n % GIF_EVERY == 0 && gif_frames.len() < GIF_MAX_FRAMES {
+        if want_gif && n.is_multiple_of(GIF_EVERY) && gif_frames.len() < GIF_MAX_FRAMES {
             let scale = (GIF_MAX_WIDTH as f32 / out_w as f32).min(1.0);
             let (gw, gh) = (
                 ((out_w as f32 * scale) as u32).max(2) & !1,
