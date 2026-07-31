@@ -62,12 +62,15 @@ matteshot --take-printscreen # unbind PrtScn from Snipping Tool
 matteshot --restore-printscreen
 matteshot --bench <substr>   # timed capture of a window, raw PNG to %TEMP%
 matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCROLL_DEBUG=1 for per-step diagnostics)
-matteshot --record-test <t>  # short recording smoke test
+matteshot --record-test [s]  # short recording smoke test, optionally auto-stop after s seconds
 matteshot --trim-test <mp4>  # probe + cut smoke test
-matteshot --ocr <png>        # OCR a file
+matteshot --ocr <substr>     # capture a window and print its OCR text
 matteshot --update-test      # probe version.json; never downloads
-matteshot --settings / --tweak <png>   # open UI surfaces directly
+matteshot --settings         # open the settings window directly
+matteshot --once --tweak     # capture the foreground window and open the tweak editor
 ```
+
+Capture-producing diagnostic commands honor the same trial and license gate as the resident app.
 
 Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `Videos\Matteshot` (note: often OneDrive-redirected).
 
@@ -98,8 +101,9 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 ## Ship status
 
 - [x] Feature-complete core: capture, mattes, picker, tweak editor, annotations, OCR, pin, recording + audio + trim, scrolling capture, themes, settings, multi-monitor
-- [ ] Installer (Inno Setup) + code signing (Azure Trusted Signing)
+- [x] Inno Setup installer + Azure Trusted Signing release pipeline
 - [ ] winget manifest
 - [x] Update check
-- [ ] Stripe checkout + license keys
-- [ ] matteshot.app site + assets
+- [x] 14-day trial + Lemon Squeezy license activation
+- [ ] Lemon Squeezy merchant approval + live checkout
+- [x] matteshot.app site + assets

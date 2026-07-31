@@ -71,6 +71,16 @@ fn error_box(text: &str) {
     }
 }
 
+fn require_capture_license() -> Result<()> {
+    if license::status().can_capture() {
+        Ok(())
+    } else {
+        bail!(
+            "Your 14-day trial has ended. Open Matteshot and enter a license key from the tray menu."
+        )
+    }
+}
+
 fn previews_for(raw: &RgbaImage, styles: &[style::Style]) -> Vec<RgbaImage> {
     let (w, h) = (raw.width(), raw.height());
     let scale = (PREVIEW_MAX as f32 / w.max(h) as f32).min(1.0);
@@ -110,6 +120,10 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             img
         }
     };
+    // A successful window or region capture starts the trial regardless of
+    // which picker action follows. This includes the zero-touch auto-copy
+    // path, Esc (where auto-copy stands), OCR, pinning, and the tweak editor.
+    license::record_successful_capture();
     let styles = style::variants(&raw);
     let names: Vec<&'static str> = styles.iter().map(|s| s.name).collect();
 
@@ -269,7 +283,6 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         styled.height(),
         path.display()
     );
-    license::record_successful_capture();
     Ok(())
 }
 
@@ -518,6 +531,7 @@ fn main() -> Result<()> {
         // (or the current foreground window) and exit. `--pick N` skips the
         // picker UI. `--overlay` runs the freeze-frame overlay instead.
         Some("--once") => {
+            require_capture_license()?;
             let mut hwnd = window::foreground();
             let mut pick_override = None;
             let mut use_overlay = false;
@@ -548,6 +562,7 @@ fn main() -> Result<()> {
             } else if use_tweak {
                 let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
                 let raw = capture::capture_window(hwnd).context("capture failed")?;
+                license::record_successful_capture();
                 let styles = style::variants(&raw);
                 tweak::run(raw, styles, 0, mon).map(|_| ())
             } else {
@@ -557,6 +572,7 @@ fn main() -> Result<()> {
         }
         // Warm-path capture benchmark: same window three times in-process.
         Some("--bench") => {
+            require_capture_license()?;
             let needle = args.get(1).context("--bench needs a window title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
@@ -568,6 +584,7 @@ fn main() -> Result<()> {
                 last = Some(img);
             }
             if let Some(img) = last {
+                license::record_successful_capture();
                 let p = std::env::temp_dir().join("matteshot-bench.png");
                 img.save(&p)?;
                 eprintln!("bench: raw capture saved to {}", p.display());
@@ -583,12 +600,14 @@ fn main() -> Result<()> {
         // Marketing/site asset generator: capture a window and export every
         // matte style as a PNG into a directory.
         Some("--assets") => {
+            require_capture_license()?;
             let needle = args.get(1).context("--assets <title substr> <outdir>")?;
             let outdir = std::path::PathBuf::from(args.get(2).context("--assets <title substr> <outdir>")?);
             std::fs::create_dir_all(&outdir)?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let raw = capture::capture_window(hwnd).context("capture failed")?;
+            license::record_successful_capture();
             for s in style::variants(&raw) {
                 let img = compose::export(&raw, &s, 0.10, None, 2);
                 let p = outdir.join(format!("matte-{}.png", s.name.to_lowercase()));
@@ -600,6 +619,7 @@ fn main() -> Result<()> {
         }
         // Record the primary monitor region for N seconds (testing).
         Some("--record-test") => {
+            require_capture_license()?;
             let secs: u64 = args.get(1).map(|s| s.parse().unwrap_or(4)).unwrap_or(4);
             let mon = unsafe {
                 windows::Win32::Graphics::Gdi::MonitorFromPoint(
@@ -632,6 +652,7 @@ fn main() -> Result<()> {
                 }
             });
             record::session(record::Target::region(rect, mon), true)?;
+            license::record_successful_capture();
             // Keep pumping briefly so the review window can be inspected.
             let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut msg = MSG::default();
@@ -657,10 +678,12 @@ fn main() -> Result<()> {
         }
         // Scroll-capture a window by title, save raw (testing).
         Some("--scroll-test") => {
+            require_capture_license()?;
             let needle = args.get(1).context("--scroll-test <title>")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let img = scroll::capture(scroll::Target::centered_window(hwnd))?;
+            license::record_successful_capture();
             let p = std::env::temp_dir().join("matteshot-scroll.png");
             img.save(&p)?;
             eprintln!("saved {}x{} -> {}", img.width(), img.height(), p.display());
@@ -684,10 +707,12 @@ fn main() -> Result<()> {
         }
         // OCR probe: recognize and print (no clipboard) — testing.
         Some("--ocr") => {
+            require_capture_license()?;
             let needle = args.get(1).context("--ocr needs a title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let img = capture::capture_window(hwnd)?;
+            license::record_successful_capture();
             let text = ocr::recognize(&img)?;
             eprintln!("--- {} chars ---", text.len());
             for line in text.lines().take(12) {
@@ -697,10 +722,12 @@ fn main() -> Result<()> {
         }
         // Render sample annotations onto a capture and save raw (testing).
         Some("--annotate-demo") => {
+            require_capture_license()?;
             let needle = args.get(1).context("--annotate-demo needs a title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let mut img = capture::capture_window(hwnd)?;
+            license::record_successful_capture();
             let (w, h) = (img.width() as f32, img.height() as f32);
             let anns = vec![
                 annotate::Annotation {
@@ -789,10 +816,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("--spike-dpi") => {
+            require_capture_license()?;
             let needle = args.get(1).context("--spike-dpi needs a window title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
-            spike::run(hwnd, needle)
+            spike::run(hwnd, needle)?;
+            license::record_successful_capture();
+            Ok(())
         }
         Some("--take-printscreen") => {
             if prtscn::set_snipping_binding(false).is_ok() {
