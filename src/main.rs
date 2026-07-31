@@ -830,8 +830,20 @@ fn main() -> Result<()> {
             eprintln!("{}", license::status().tray_label());
             Ok(())
         }
+        // Support-safe activation path: the key is read from redirected stdin
+        // so it never appears in process arguments or diagnostic output.
+        Some("--activate-stdin") => {
+            use std::io::Read;
+            let mut key = String::new();
+            std::io::stdin()
+                .read_to_string(&mut key)
+                .context("read license key from stdin")?;
+            let activated = license::activate(&key)?;
+            eprintln!("{}", activated.tray_label());
+            Ok(())
+        }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-6>] [--overlay] | --license | --license-status | --take-printscreen | --restore-printscreen]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-6>] [--overlay] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen]"
         ),
         None => run_app(),
     };
