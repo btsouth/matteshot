@@ -86,6 +86,7 @@ struct State {
     sel: usize,
     pad_factor: f32,
     aspect_idx: usize,
+    export_scale: u32,
     /// Per-capture override for the finished image's longest edge.
     output_max_edge: u32,
     // Cached preview composite as BGRA.
@@ -287,13 +288,12 @@ fn rebuild_preview(state: &mut State) {
 
 /// Full-quality result with the current tweaks and annotations applied.
 fn final_image(state: &State) -> RgbaImage {
-    let cfg = Config::load();
     let raw = &state.raw;
     let plain = compose::is_plain(&state.styles[state.sel]);
     let scale = if plain || raw.width().max(raw.height()) >= 1600 {
         1
     } else {
-        cfg.export_scale.clamp(1, 4)
+        state.export_scale.clamp(1, 4)
     };
     let mut content = if scale > 1 {
         image::imageops::resize(
@@ -317,6 +317,29 @@ fn final_image(state: &State) -> RgbaImage {
         compose::compose_with(&content, &state.styles[state.sel], &opts)
     };
     output::resize_to_max_edge(&finished, state.output_max_edge)
+}
+
+/// Exact Copy/Save dimensions without rendering the full-size image.
+fn final_dimensions(state: &State) -> (u32, u32) {
+    let (mut width, mut height) = state.raw.dimensions();
+    if !compose::is_plain(&state.styles[state.sel]) {
+        let scale = if width.max(height) >= 1600 {
+            1
+        } else {
+            state.export_scale.clamp(1, 4)
+        };
+        width *= scale;
+        height *= scale;
+        let opts = ComposeOpts {
+            metric_scale: scale as f32,
+            pad_factor: state.pad_factor,
+            aspect: ASPECTS[state.aspect_idx].1,
+        };
+        let layout = compose::layout(width as usize, height as usize, &opts);
+        width += (layout.pad_x * 2) as u32;
+        height += (layout.pad_y * 2) as u32;
+    }
+    output::resized_dimensions(width, height, state.output_max_edge)
 }
 
 unsafe fn chip(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot: bool) {
@@ -504,7 +527,21 @@ unsafe fn paint(hdc: HDC, state: &State) {
         label(hdc, state, r.left, r.top - lh, "ANNOTATE  (drag on the preview)");
     }
     if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::OutputSize(_))) {
-        label(hdc, state, r.left, r.top - lh, "OUTPUT SIZE");
+        label(
+            hdc,
+            state,
+            r.left,
+            r.top - lh * 2,
+            "RESIZE IMAGE  ·  THIS SCREENSHOT ONLY",
+        );
+        let (width, height) = final_dimensions(state);
+        label(
+            hdc,
+            state,
+            r.left,
+            r.top - lh,
+            &format!("Final size: {width} × {height} px"),
+        );
     }
 
     // Controls.
@@ -1561,6 +1598,7 @@ pub fn run(
         sel: initial,
         pad_factor: compose::DEFAULT_PAD_FACTOR,
         aspect_idx: 0,
+        export_scale: cfg.export_scale,
         output_max_edge: cfg.output_max_edge,
         preview: Vec::new(),
         preview_w: 1,
