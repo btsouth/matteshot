@@ -4,6 +4,7 @@ mod annotate;
 mod capture;
 mod compose;
 mod config;
+mod diagnostics;
 mod icon;
 mod license;
 mod license_ui;
@@ -14,6 +15,7 @@ mod recdone;
 mod record;
 mod recui;
 mod scroll;
+mod state_lock;
 mod trim;
 mod output;
 mod overlay;
@@ -32,7 +34,7 @@ mod window;
 use anyhow::{bail, Context, Result};
 use image::RgbaImage;
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::HiDpi::{
@@ -42,8 +44,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MessageBoxW, IDYES, MB_ICONERROR, MB_ICONWARNING, MB_OK,
-    MB_YESNO, MSG, WM_HOTKEY,
+    DispatchMessageW, GetMessageW, IsWindow, MessageBoxW, PostMessageW, IDYES,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, WM_CLOSE, WM_HOTKEY,
 };
 
 use crate::config::Config;
@@ -55,6 +57,45 @@ const VK_S: u32 = 0x53;
 
 /// Max dimension of the downscaled capture used for picker previews.
 const PREVIEW_MAX: u32 = 480;
+
+/// Ask every Matteshot surface to close on its own UI thread, then stop the
+/// resident. The installer uses this instead of taskkill so recordings and
+/// exports get their normal cancellation/finalization path.
+fn request_graceful_shutdown() -> Result<()> {
+    fn close_all(class_name: &str, label: &str) -> Result<()> {
+        loop {
+            let hwnd = match crate::window::find_by_class(class_name) {
+                Some(hwnd) => hwnd,
+                None => return Ok(()),
+            };
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))
+                    .with_context(|| format!("ask {label} to close"))?;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while unsafe { IsWindow(hwnd) }.as_bool() {
+                if std::time::Instant::now() >= deadline {
+                    bail!("{label} is still busy; finish or cancel the current operation and try again");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    // Stop producers first. A recorder can open the editor while it finishes,
+    // so the editor is deliberately closed after the capture surfaces.
+    close_all("matteshot_recui", "the recorder")?;
+    close_all("matteshot_scrollpill", "scroll capture")?;
+    close_all("matteshot_overlay", "the capture overlay")?;
+    close_all("matteshot_picker", "the picker")?;
+    close_all("matteshot_tweak", "the image editor")?;
+    close_all("matteshot_recdone", "the video editor")?;
+    close_all("matteshot_settings", "settings")?;
+    close_all("matteshot_activation", "activation")?;
+    close_all("matteshot_pin", "a pinned capture")?;
+    close_all("matteshot_tray", "Matteshot")?;
+    Ok(())
+}
 
 enum Source {
     Window(HWND),
@@ -110,7 +151,7 @@ fn previews_for(raw: &RgbaImage, styles: &[style::Style]) -> Vec<RgbaImage> {
 
 fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Result<()> {
     // Loaded fresh each capture so settings changes apply immediately.
-    let mut cfg = Config::load();
+    let cfg = Config::load();
     let raw = match source {
         Source::Window(hwnd) => {
             eprintln!("capturing: {}", window::title_of(hwnd));
@@ -152,15 +193,28 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 let style = styles[preselect].clone();
                 let (scale, dir) = (cfg.export_scale, cfg.save_dir());
                 std::thread::spawn(move || {
-                    let styled = compose::export(&raw, &style, 0.10, None, scale);
+                    let styled = compose::export(
+                        &raw,
+                        &style,
+                        compose::DEFAULT_PAD_FACTOR,
+                        None,
+                        scale,
+                    );
                     let mut st = auto.lock().unwrap();
                     if st.canceled {
                         return;
                     }
                     if let Ok(path) = output::save_png(&styled, style.name, &dir) {
-                        let _ = output::to_clipboard(&styled, Some(&path));
-                        eprintln!("auto-copy [{}]: {}", style.name, path.display());
-                        st.path = Some(path);
+                        match output::to_clipboard(&styled, Some(&path)) {
+                            Ok(()) => {
+                                eprintln!("auto-copy [{}]: {}", style.name, path.display());
+                                st.path = Some(path);
+                            }
+                            Err(error) => {
+                                eprintln!("auto-copy failed [{}]: {error:#}", style.name);
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
                     }
                 });
             }
@@ -198,6 +252,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             return ocr::copy_text(&raw);
         }
         PickAction::Tweak(i) => {
+            // The tweak editor owns every later Copy action. Synchronize with
+            // the background auto-copy before opening it so a slow clipboard
+            // write cannot overwrite the user's edited result afterward.
+            if let Some(p) = cancel_auto() {
+                let _ = std::fs::remove_file(p);
+            }
             return match tweak::run(raw, styles, i, monitor)? {
                 Some((overlay::Selection::Window(h), mon)) => shoot(Source::Window(h), mon, None),
                 Some((overlay::Selection::Region(img), mon)) => {
@@ -253,8 +313,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     let auto_path = cancel_auto();
     if chosen == preselect {
         if let Some(path) = &auto_path {
-            cfg.last_style = chosen;
-            cfg.save();
+            Config::update(|cfg| cfg.last_style = chosen);
             if open_editor {
                 output::open_in_editor(path);
             }
@@ -263,7 +322,13 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         }
     }
 
-    let styled = compose::export(&raw, &styles[chosen], 0.10, None, cfg.export_scale);
+    let styled = compose::export(
+        &raw,
+        &styles[chosen],
+        compose::DEFAULT_PAD_FACTOR,
+        None,
+        cfg.export_scale,
+    );
     let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir())?;
     output::to_clipboard(&styled, Some(&path)).context("clipboard failed")?;
     // A different pick supersedes the auto-copied file.
@@ -272,8 +337,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             let _ = std::fs::remove_file(old);
         }
     }
-    cfg.last_style = chosen;
-    cfg.save();
+    Config::update(|cfg| cfg.last_style = chosen);
     if open_editor {
         output::open_in_editor(&path);
     }
@@ -339,6 +403,9 @@ fn enable_capture_hotkeys() -> Result<bool> {
         RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_S)
             .context("Ctrl+Alt+S is already taken by another app")?;
     }
+    if !prtscn::preferred() {
+        return Ok(false);
+    }
     Ok(matches!(
         prtscn::acquire(HOTKEY_ID_PRTSCN, true),
         prtscn::Acquire::Taken | prtscn::Acquire::TakenAfterToggle
@@ -371,6 +438,7 @@ fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
     if license_ui::open()? {
         let _ = enable_capture_hotkeys()?;
         *hotkeys_active = true;
+        settings::refresh();
         Ok(true)
     } else {
         Ok(false)
@@ -378,7 +446,27 @@ fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
 }
 
 fn run_app() -> Result<()> {
+    let Some(_resident_guard) =
+        state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?
+    else {
+        // A shortcut or autostart race should never create a second tray app
+        // that competes for PrtScn. Make an intentional second launch useful
+        // by opening Settings on the established resident.
+        for _ in 0..20 {
+            if tray::request_existing_settings() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        diagnostics::log("duplicate launch routed to resident");
+        return Ok(());
+    };
+    let cleaned = output::cleanup_stale_video_partials(&Config::load().video_dir());
+    if cleaned > 0 {
+        diagnostics::log(&format!("recovered stale partials count={cleaned}"));
+    }
     capture::warmup();
+    prtscn::set_preferred(Config::load().capture_prtscn);
     let initial_license = license::status();
     let mut hotkeys_active = initial_license.can_capture();
     let prtscn_ours = if hotkeys_active {
@@ -393,16 +481,16 @@ fn run_app() -> Result<()> {
         "matteshot: ready — PrtScn {} | Ctrl+Alt+S = active window",
         if prtscn_ours { "= capture overlay" } else { "not held (see tray menu)" }
     );
+    diagnostics::log("resident ready");
 
     // First run: a single balloon so the user knows where the app lives.
-    let mut cfg = Config::load();
+    let cfg = Config::load();
     if !cfg.onboarded && initial_license.can_capture() {
         tray.notify(
             "Matteshot is ready",
             "Press PrtScn to capture. Right-click the tray icon for settings.",
         );
-        cfg.onboarded = true;
-        cfg.save();
+        Config::update(|cfg| cfg.onboarded = true);
     }
     update::start(tray.hwnd);
     license::start_background_refresh();
@@ -432,6 +520,18 @@ fn run_app() -> Result<()> {
             }
             DispatchMessageW(&msg);
 
+            // A timer message reaches this loop every 250 ms. If Windows or
+            // another exiting instance briefly owned PrtScn during startup,
+            // recover automatically instead of believing a failed one-shot
+            // registration succeeded forever.
+            if hotkeys_active
+                && prtscn::preferred()
+                && !prtscn::owns_key()
+                && prtscn::take(HOTKEY_ID_PRTSCN)
+            {
+                settings::refresh();
+            }
+
             if let Some(action) = tray.take_action() {
                 let result = match action {
                     tray::Action::Capture => {
@@ -460,7 +560,10 @@ fn run_app() -> Result<()> {
                     }
                     tray::Action::TogglePrtscn => {
                         if license::status().can_capture() {
-                            if prtscn::snipping_owns_prtscn() {
+                            let enabled = !prtscn::preferred();
+                            prtscn::set_preferred(enabled);
+                            Config::update(|cfg| cfg.capture_prtscn = enabled);
+                            if enabled {
                                 let _ = prtscn::take(HOTKEY_ID_PRTSCN);
                             } else {
                                 prtscn::release(HOTKEY_ID_PRTSCN);
@@ -483,6 +586,7 @@ fn run_app() -> Result<()> {
                             let _ = enable_capture_hotkeys()?;
                             hotkeys_active = true;
                         }
+                        settings::refresh();
                         Ok(())
                     }
                     tray::Action::Deactivate => {
@@ -494,6 +598,7 @@ fn run_app() -> Result<()> {
                         );
                         if answer == IDYES {
                             license::deactivate()?;
+                            settings::refresh();
                             if !license::status().can_capture() {
                                 disable_capture_hotkeys(true);
                                 hotkeys_active = false;
@@ -501,7 +606,13 @@ fn run_app() -> Result<()> {
                         }
                         Ok(())
                     }
+                    tray::Action::Diagnostics => {
+                        diagnostics::copy_report()?;
+                        tray.notify("Matteshot diagnostics", "Copied a privacy-safe support report.");
+                        Ok(())
+                    }
                     tray::Action::Quit => {
+                        diagnostics::log("resident quit requested");
                         tray.remove();
                         tray::Tray::quit();
                         Ok(())
@@ -525,6 +636,7 @@ fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     theme::enable_dark_menus();
+    diagnostics::init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -610,7 +722,7 @@ fn main() -> Result<()> {
             let raw = capture::capture_window(hwnd).context("capture failed")?;
             license::record_successful_capture();
             for s in style::variants(&raw) {
-                let img = compose::export(&raw, &s, 0.10, None, 2);
+                let img = compose::export(&raw, &s, compose::DEFAULT_PAD_FACTOR, None, 2);
                 let p = outdir.join(format!("matte-{}.png", s.name.to_lowercase()));
                 img.save(&p)?;
                 eprintln!("{} {}x{}", p.display(), img.width(), img.height());
@@ -637,12 +749,8 @@ fn main() -> Result<()> {
             // Auto-stop: close the pill from a timer thread.
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(secs));
-                unsafe {
-                    let h = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-                        w!("matteshot_recui"),
-                        None,
-                    );
-                    if let Ok(h) = h {
+                if let Some(h) = crate::window::find_by_class("matteshot_recui") {
+                    unsafe {
                         let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                             h,
                             windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
@@ -673,6 +781,56 @@ fn main() -> Result<()> {
                         DispatchMessageW(&msg);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            Ok(())
+        }
+        // Hands-off window-recording probe. The recording path is real; only
+        // the stop action is timed so resize and editor behavior can be tested
+        // without synthesizing Matteshot's global shortcuts.
+        Some("--record-window-test") => {
+            require_capture_license()?;
+            let needle = args
+                .get(1)
+                .context("--record-window-test <title> [seconds]")?;
+            let secs: u64 = args.get(2).and_then(|value| value.parse().ok()).unwrap_or(6);
+            let hwnd = window::find_by_title(needle)
+                .with_context(|| format!("no visible window matching {needle:?}"))?;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                if let Some(controls) = crate::window::find_by_class("matteshot_recui") {
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            controls,
+                            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                            windows::Win32::Foundation::WPARAM(0),
+                            windows::Win32::Foundation::LPARAM(0),
+                        );
+                    }
+                }
+            });
+            record::session(record::Target::window(hwnd), false)?;
+            license::record_successful_capture();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
+            let mut msg = MSG::default();
+            unsafe {
+                while std::time::Instant::now() < deadline
+                    && window::find_by_class("matteshot_recdone").is_some()
+                {
+                    while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                        &mut msg,
+                        None,
+                        0,
+                        0,
+                        windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                    )
+                    .as_bool()
+                    {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
                 }
             }
             Ok(())
@@ -784,8 +942,21 @@ fn main() -> Result<()> {
                 },
             ];
             let dst = src.with_extension("edit.mp4");
-            trim::cut_with_edit(&src, &dst, 0, duration, Some(&style), &items)?;
-            eprintln!("video editor export -> {}", dst.display());
+            let opts = compose::ComposeOpts {
+                metric_scale: 1.0,
+                pad_factor: 0.14,
+                aspect: Some(1.0),
+            };
+            trim::cut_with_edit_progress(
+                &src,
+                &dst,
+                0,
+                duration,
+                Some((&style, &opts)),
+                &items,
+                |_| {},
+            )?;
+            eprintln!("video editor export (1:1, 14% padding) -> {}", dst.display());
             Ok(())
         }
         // Paced editor-playback probe. Decodes three seconds at preview size,
@@ -942,7 +1113,7 @@ fn main() -> Result<()> {
             settings::open()?;
             let mut msg = MSG::default();
             unsafe {
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                while settings::is_open() && GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
@@ -969,6 +1140,7 @@ fn main() -> Result<()> {
             eprintln!("PrtScn re-bound to Snipping Tool.");
             Ok(())
         }
+        Some("--quit") => request_graceful_shutdown(),
         // Live update endpoint probe (testing; never downloads anything).
         Some("--update-test") => {
             match update::check_once()? {
@@ -1007,7 +1179,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --review-test <mp4> | --video-edit-test <mp4> | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
         None => run_app(),
     };

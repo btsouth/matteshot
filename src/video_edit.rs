@@ -1,4 +1,4 @@
-//! Time-ranged video annotations stored in normalized output coordinates.
+//! Time-ranged video annotations stored in normalized content coordinates.
 //! The same model drives the editor preview and full-resolution MP4 export.
 
 use image::RgbaImage;
@@ -57,27 +57,41 @@ fn annotation(item: &Item, w: u32, h: u32) -> crate::annotate::Annotation {
     }
 }
 
-pub fn render(image: &mut RgbaImage, items: &[Item], time: i64, skip: Option<usize>) {
+/// Render annotations relative to the recorded content, even when the output
+/// canvas has extra matte padding or a forced aspect ratio.
+pub fn render_at(
+    image: &mut RgbaImage,
+    items: &[Item],
+    time: i64,
+    skip: Option<usize>,
+    content_size: (u32, u32),
+    offset: (f32, f32),
+) {
     let visible: Vec<_> = items
         .iter()
         .enumerate()
         .filter(|(index, item)| Some(*index) != skip && item.active_at(time))
-        .map(|(_, item)| annotation(item, image.width(), image.height()))
+        .map(|(_, item)| annotation(item, content_size.0, content_size.1))
         .collect();
     if visible.is_empty() {
         return;
     }
-    let scale = (image.width().min(image.height()) as f32 / 720.0).clamp(0.45, 4.0);
-    crate::annotate::render(image, &visible, scale, (0.0, 0.0), None);
+    let scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
+    crate::annotate::render(image, &visible, scale, offset, None);
 }
 
-pub fn render_one(image: &mut RgbaImage, item: &Item) {
-    let scale = (image.width().min(image.height()) as f32 / 720.0).clamp(0.45, 4.0);
+pub fn render_one_at(
+    image: &mut RgbaImage,
+    item: &Item,
+    content_size: (u32, u32),
+    offset: (f32, f32),
+) {
+    let scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
     crate::annotate::render(
         image,
-        &[annotation(item, image.width(), image.height())],
+        &[annotation(item, content_size.0, content_size.1)],
         scale,
-        (0.0, 0.0),
+        offset,
         None,
     );
 }
@@ -167,7 +181,8 @@ pub fn translate(item: &mut Item, dx: f32, dy: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounds, hit, translate, Item, Shape};
+    use super::{bounds, hit, render_at, translate, Item, Shape};
+    use image::{Rgba, RgbaImage};
 
     fn arrow() -> Item {
         Item {
@@ -201,5 +216,31 @@ mod tests {
         for (actual, expected) in [x0, y0, x1, y1].into_iter().zip([0.6, 0.6, 1.0, 1.0]) {
             assert!((actual - expected).abs() < 0.00001);
         }
+    }
+
+    #[test]
+    fn matte_layout_keeps_annotations_in_content_coordinates() {
+        let item = Item {
+            shape: Shape::Arrow {
+                from: (0.1, 0.5),
+                to: (0.9, 0.5),
+            },
+            start: 0,
+            end: 20,
+            color: 0,
+            size: 1.0,
+        };
+        let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
+        render_at(&mut image, &[item], 10, None, (100, 100), (50.0, 50.0));
+
+        assert!(image
+            .enumerate_pixels()
+            .any(|(x, y, pixel)| {
+                (50..150).contains(&x) && (50..150).contains(&y) && pixel[0] > 0
+            }));
+        assert!(image
+            .enumerate_pixels()
+            .filter(|(x, y, _)| *x < 45 || *x >= 155 || *y < 45 || *y >= 155)
+            .all(|(_, _, pixel)| pixel[0] == 0));
     }
 }

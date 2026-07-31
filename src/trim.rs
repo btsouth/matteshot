@@ -268,6 +268,26 @@ pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
     })
 }
 
+/// A finalized MP4 is trusted only after Media Foundation can read its
+/// duration and decode video from it. File existence or a successful
+/// SinkWriter::Finalize alone does not prove the container is usable.
+pub fn validate_video(path: &Path) -> Result<()> {
+    let bytes = std::fs::metadata(path)
+        .with_context(|| format!("read video metadata for {}", path.display()))?
+        .len();
+    if bytes < 512 {
+        anyhow::bail!("video is unexpectedly small ({bytes} bytes)");
+    }
+    let probe = probe(path, 96, 48).context("decode finalized video")?;
+    if probe.duration_100ns <= 0 {
+        anyhow::bail!("video has no playable duration");
+    }
+    if probe.thumbs.is_empty() {
+        anyhow::bail!("video has no decodable frames");
+    }
+    Ok(())
+}
+
 /// Resolve real stream indices — assuming video is 0 silently corrupts the
 /// output (audio bytes encoded as frames).
 fn stream_indices(reader: &IMFSourceReader) -> (u32, Option<u32>) {
@@ -343,7 +363,16 @@ pub fn cut_with_edit(
     matte: Option<&crate::style::Style>,
     annotations: &[crate::video_edit::Item],
 ) -> Result<()> {
-    cut_with_edit_progress(src, dst, start, end, matte, annotations, |_| {})
+    let compose_opts = crate::compose::ComposeOpts::default();
+    cut_with_edit_progress(
+        src,
+        dst,
+        start,
+        end,
+        matte.map(|style| (style, &compose_opts)),
+        annotations,
+        |_| {},
+    )
 }
 
 pub fn cut_with_edit_progress(
@@ -351,8 +380,35 @@ pub fn cut_with_edit_progress(
     dst: &Path,
     start: i64,
     end: i64,
-    matte: Option<&crate::style::Style>,
+    matte: Option<(&crate::style::Style, &crate::compose::ComposeOpts)>,
     annotations: &[crate::video_edit::Item],
+    progress: impl FnMut(u32),
+) -> Result<()> {
+    let cancel = AtomicBool::new(false);
+    cut_with_edit_progress_cancel(
+        src,
+        dst,
+        start,
+        end,
+        matte,
+        annotations,
+        &cancel,
+        progress,
+    )
+}
+
+// The cancel-aware form deliberately mirrors the established export API and
+// adds one synchronization primitive; grouping these strongly typed inputs
+// into a bag would make call sites less explicit.
+#[allow(clippy::too_many_arguments)]
+pub fn cut_with_edit_progress_cancel(
+    src: &Path,
+    dst: &Path,
+    start: i64,
+    end: i64,
+    matte: Option<(&crate::style::Style, &crate::compose::ComposeOpts)>,
+    annotations: &[crate::video_edit::Item],
+    cancel: &AtomicBool,
     mut progress: impl FnMut(u32),
 ) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
@@ -373,10 +429,18 @@ pub fn cut_with_edit_progress(
     };
 
     let even = |v: u32| (v.max(2)) & !1;
-    let matte = matte.filter(|style| !crate::compose::is_plain(style));
-    let matte_opts = crate::compose::ComposeOpts::default();
+    let (matte, matte_opts) = match matte {
+        Some((style, opts)) if !crate::compose::is_plain(style) => (Some(style), *opts),
+        _ => (None, crate::compose::ComposeOpts::default()),
+    };
     let matte_base =
         matte.map(|style| crate::compose::compose_base(w as usize, h as usize, style, &matte_opts));
+    let annotation_offset = if matte_base.is_some() {
+        let layout = crate::compose::layout(w as usize, h as usize, &matte_opts);
+        (layout.pad_x as f32, layout.pad_y as f32)
+    } else {
+        (0.0, 0.0)
+    };
     let (ow, oh) = matte_base
         .as_ref()
         .map(|base| (even(base.width()), even(base.height())))
@@ -402,6 +466,9 @@ pub fn cut_with_edit_progress(
         None
     };
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("export cancelled");
+        }
         unsafe {
             let mut stream = 0u32;
             let mut flags = 0u32;
@@ -470,7 +537,14 @@ pub fn cut_with_edit_progress(
                     } else {
                         bgra_to_rgba_into(&raw, composed);
                     }
-                    crate::video_edit::render(composed, annotations, ts, None);
+                    crate::video_edit::render_at(
+                        composed,
+                        annotations,
+                        ts,
+                        None,
+                        (w, h),
+                        annotation_offset,
+                    );
                     rgba_to_bgra_in_place(composed);
                     composed.as_raw()
                 } else {
@@ -522,6 +596,9 @@ pub fn cut_with_edit_progress(
             }
         }
     }
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!("export cancelled");
+    }
     unsafe { writer.Finalize().context("finalize trim")? };
     progress(100);
     Ok(())
@@ -529,7 +606,7 @@ pub fn cut_with_edit_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::{bgra_to_rgba, rgba_to_bgra};
+    use super::{bgra_to_rgba, rgba_to_bgra, validate_video};
 
     #[test]
     fn video_pixel_channel_conversion_round_trips() {
@@ -537,5 +614,16 @@ mod tests {
         let rgba = bgra_to_rgba(&bgra, 2, 1);
         assert_eq!(rgba.as_raw(), &[1, 2, 3, 255, 10, 20, 30, 128]);
         assert_eq!(rgba_to_bgra(&rgba, 2, 1), bgra);
+    }
+
+    #[test]
+    fn video_validation_rejects_truncated_output() {
+        let path = std::env::temp_dir().join(format!(
+            "matteshot-invalid-video-{}.mp4",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not an mp4").unwrap();
+        assert!(validate_video(&path).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

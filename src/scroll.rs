@@ -51,6 +51,22 @@ impl Target {
 // Wikipedia article at 3/4).
 const MAX_STEPS: usize = 400;
 const MAX_HEIGHT: u32 = 40_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SafetyLimit {
+    Steps,
+    Height,
+}
+
+fn safety_limit(steps: usize, height: u32) -> Option<SafetyLimit> {
+    if steps >= MAX_STEPS {
+        Some(SafetyLimit::Steps)
+    } else if height >= MAX_HEIGHT {
+        Some(SafetyLimit::Height)
+    } else {
+        None
+    }
+}
 /// Wheel notches per step — small enough that frames always overlap.
 const NOTCHES: i32 = 3;
 
@@ -100,6 +116,7 @@ unsafe extern "system" fn pill_proc(
 unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
     let theme = crate::theme::current();
     let (w, h) = (240, 40);
+    let hinstance = GetModuleHandleW(None)?;
     let mut pill = Box::new(Pill {
         text: "Scrolling capture\u{2026}".encode_utf16().collect(),
         theme,
@@ -122,7 +139,6 @@ unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
         w,
         h,
     });
-    let hinstance = GetModuleHandleW(None)?;
     let class = WNDCLASSW {
         lpfnWndProc: Some(pill_proc),
         hInstance: hinstance.into(),
@@ -137,7 +153,7 @@ unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
     let _ = GetMonitorInfoW(anchor, &mut mi);
     let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
     let y = mi.rcWork.top + 40;
-    let hwnd = CreateWindowExW(
+    let hwnd = match CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         w!("matteshot_scrollpill"),
         w!("Matteshot"),
@@ -150,7 +166,13 @@ unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
         None,
         hinstance,
         Some(&mut *pill as *mut Pill as *const _),
-    )?;
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            let _ = DeleteObject(pill.font);
+            return Err(error.into());
+        }
+    };
     // Keep our own progress out of the captured frames.
     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(
         hwnd,
@@ -343,23 +365,40 @@ fn frame_after_wheel(
     point: POINT,
     view_top: u32,
     view_bottom: u32,
-) -> Option<RgbaImage> {
+) -> Result<RgbaImage> {
     send_wheel_at(point);
     std::thread::sleep(std::time::Duration::from_millis(110));
     pump();
-    let mut next = grab(target).ok()?;
+    let mut next = grab(target).context("capture scrolled frame")?;
     let settle_by = std::time::Instant::now() + std::time::Duration::from_millis(700);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(70));
         pump();
-        let Ok(again) = grab(target) else { break };
+        let again = grab(target).context("capture settling frame")?;
         let moving = viewport_diff(&next, &again, view_top, view_bottom);
         next = again;
         if moving < 1.0 || std::time::Instant::now() > settle_by {
             break;
         }
     }
-    Some(next)
+    Ok(next)
+}
+
+struct CaptureCleanup {
+    saved: POINT,
+    pill: Option<(HWND, HFONT)>,
+}
+
+impl Drop for CaptureCleanup {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some((pill, font)) = self.pill.take() {
+                let _ = DestroyWindow(pill);
+                let _ = DeleteObject(font);
+            }
+            let _ = SetCursorPos(self.saved.x, self.saved.y);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -510,6 +549,13 @@ fn measure_shift(
 
 /// Scroll-capture `target` into one tall image.
 pub fn capture(target: Target) -> Result<RgbaImage> {
+    if let Target::Region(rect, monitor, _) = target {
+        if !crate::window::monitor_contains_rect(monitor, rect) {
+            bail!(
+                "Scrolling capture regions must stay on one monitor. Select the scrollable area on a single display."
+            );
+        }
+    }
     let anchor = match target {
         Target::Window(h, _) => unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY) },
         Target::Region(_, m, _) => m,
@@ -535,9 +581,11 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         // Let the target process the move before the first wheel event.
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
+    let mut cleanup = CaptureCleanup { saved, pill: None };
     eprintln!("scroll: wheel anchor {},{}", hover.x, hover.y);
 
     let (pill, mut pill_state) = unsafe { show_pill(anchor)? };
+    cleanup.pill = Some((pill, pill_state.font));
     pump();
 
     let first = grab(target).context("first frame")?;
@@ -552,7 +600,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     let mut prev = first.clone();
     let mut last_observed = first.clone();
     let mut steps = 0usize;
-    let mut aborted = false;
+    let mut failure: Option<anyhow::Error> = None;
     // Learned on the first successful step, then held steady.
     let mut chrome: Option<(u32, u32)> = None;
     let scrollbar_width = transient_scrollbar_width(target);
@@ -562,15 +610,25 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
 
     while steps < MAX_STEPS && canvas.height() < MAX_HEIGHT {
         if esc_pressed() {
-            aborted = true;
+            failure = Some(anyhow::anyhow!("scrolling capture cancelled"));
             break;
         }
         // The viewport we know so far (whole frame until chrome is learned).
         let (vt, vb) = chrome.map(|(t, b)| (t, fh - b)).unwrap_or((0, fh));
 
-        let Some(mut next) = frame_after_wheel(target, hover, vt, vb) else {
-            break;
+        let mut next = match frame_after_wheel(target, hover, vt, vb) {
+            Ok(frame) => frame,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
         };
+        if next.dimensions() != (fw, fh) {
+            failure = Some(anyhow::anyhow!(
+                "the scrolling target changed size during capture"
+            ));
+            break;
+        }
 
         // Did anything move at all? This is the honest bottom-of-page test —
         // and it also catches apps that ignore the wheel entirely.
@@ -583,8 +641,14 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
                     next = retry;
                     movement = motion(&prev, &next, fh, vt, vb);
                 }
-                Err(_) => break,
+                Err(error) => {
+                    failure = Some(error.context("recapture scrolling target"));
+                    break;
+                }
             }
+        }
+        if failure.is_some() {
+            break;
         }
         last_observed = next.clone();
 
@@ -610,6 +674,11 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
                 })
                 .filter(|p| *p != hover)
             else {
+                if movement.idle >= 2.5 {
+                    failure = Some(anyhow::anyhow!(
+                        "content moved but Matteshot could not stitch it reliably"
+                    ));
+                }
                 break;
             };
             let recovery_base = next;
@@ -617,12 +686,21 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
                 "scroll: anchor blocked; retrying at {},{}",
                 fallback.x, fallback.y
             );
-            let Some(retry) = frame_after_wheel(target, fallback, vt, vb) else {
-                break;
+            let retry = match frame_after_wheel(target, fallback, vt, vb) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             };
             last_observed = retry.clone();
             let recovered = motion(&recovery_base, &retry, fh, vt, vb);
             if !stitchable(recovered, last_shift) {
+                if recovered.idle >= 2.5 {
+                    failure = Some(anyhow::anyhow!(
+                        "content moved but Matteshot could not stitch it reliably"
+                    ));
+                }
                 break;
             }
             hover = fallback;
@@ -675,6 +753,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         let tail_top = tail_bottom.saturating_sub(shift).max(view_top);
         let tail_h = tail_bottom - tail_top;
         if tail_h == 0 {
+            failure = Some(anyhow::anyhow!("scrolling capture found no new rows to append"));
             break;
         }
         let mut grown = RgbaImage::new(fw, canvas.height() + tail_h);
@@ -715,21 +794,29 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         }
     }
 
+    if failure.is_none() {
+        failure = match safety_limit(steps, canvas.height()) {
+            Some(SafetyLimit::Steps) => Some(anyhow::anyhow!(
+                "scrolling capture reached its {MAX_STEPS}-step safety limit before the page ended"
+            )),
+            Some(SafetyLimit::Height) => Some(anyhow::anyhow!(
+                "scrolling capture reached its {MAX_HEIGHT}-pixel safety limit before the page ended"
+            )),
+            None => None,
+        };
+    }
+
     if scrollbar_track_colors.is_some() {
         let view_top = chrome.map(|(top, _)| top).unwrap_or(0);
         paint_final_scrollbar(&mut canvas, &last_observed, scrollbar_width, view_top);
         eprintln!("scroll: kept browser scrollbar at start and finish");
     }
 
-    unsafe {
-        let _ = DestroyWindow(pill);
-        let _ = SetCursorPos(saved.x, saved.y);
-        let _ = DeleteObject(pill_state.font);
-    }
+    drop(cleanup);
     pump();
 
-    if aborted && canvas.height() <= fh {
-        bail!("cancelled");
+    if let Some(error) = failure {
+        return Err(error);
     }
     eprintln!(
         "scroll capture: {} steps, {}x{}",
@@ -743,6 +830,13 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_safety_limited_captures_are_detected() {
+        assert_eq!(safety_limit(MAX_STEPS, 1000), Some(SafetyLimit::Steps));
+        assert_eq!(safety_limit(2, MAX_HEIGHT), Some(SafetyLimit::Height));
+        assert_eq!(safety_limit(2, 1000), None);
+    }
 
     #[test]
     fn scroll_anchor_stays_at_the_users_point() {

@@ -855,11 +855,10 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         }
         Ctl::Copy => {
             let img = final_image(state);
-            let mut cfg = Config::load();
+            let cfg = Config::load();
             let path = output::save_png(&img, state.styles[state.sel].name, &cfg.save_dir());
             let _ = output::to_clipboard(&img, path.as_deref().ok());
-            cfg.last_style = state.sel;
-            cfg.save();
+            Config::update(|cfg| cfg.last_style = state.sel);
             state.done = true;
             let _ = DestroyWindow(hwnd);
         }
@@ -1493,7 +1492,7 @@ pub fn run(
         preview_metric,
         styles,
         sel: initial,
-        pad_factor: 0.10,
+        pad_factor: compose::DEFAULT_PAD_FACTOR,
         aspect_idx: 0,
         preview: Vec::new(),
         preview_w: 1,

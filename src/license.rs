@@ -13,7 +13,6 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
@@ -21,9 +20,6 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
     WINHTTP_QUERY_STATUS_CODE,
-};
-use windows::Win32::Storage::FileSystem::{
-    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::RegKey;
@@ -39,6 +35,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const REGISTRY_KEY: &str = r"Software\Southbound Software\Matteshot";
 const REGISTRY_TRIAL_START: &str = "TrialStartedAt";
 const REGISTRY_LAST_SEEN: &str = "TrialLastSeenAt";
+const LICENSE_MUTEX: &str = "Local\\Matteshot.License.State";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -169,27 +166,15 @@ fn save_state(state: &State) -> Result<()> {
         std::fs::create_dir_all(parent).context("create Matteshot data directory")?;
     }
     let body = serde_json::to_vec_pretty(state).context("serialize license state")?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, body).context("write license state")?;
-    let temporary_wide: Vec<u16> = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let path_wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(temporary_wide.as_ptr()),
-            PCWSTR(path_wide.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-        .context("replace license state")?;
-    }
-    Ok(())
+    crate::state_lock::atomic_write(&path, &body).context("replace license state")
+}
+
+fn same_activation(state: &State, expected: &StoredLicense) -> bool {
+    state
+        .license
+        .as_ref()
+        .map(|stored| stored.refresh_token.as_str())
+        == Some(expected.refresh_token.as_str())
 }
 
 /// Once this PC has held a paid activation it cannot fall back into an unused
@@ -256,6 +241,7 @@ fn trial_status_at(started: Option<i64>, last_seen: Option<i64>, now: i64) -> St
 }
 
 pub fn status() -> Status {
+    let _guard = crate::state_lock::lock(LICENSE_MUTEX).ok();
     let mut state = load_state();
     let device = device_id();
     if let Some(stored) = state.license.as_ref() {
@@ -286,6 +272,7 @@ pub fn record_successful_capture() {
     if matches!(status(), Status::Licensed { .. }) {
         return;
     }
+    let _guard = crate::state_lock::lock(LICENSE_MUTEX).ok();
     let mut state = load_state();
     let now = Utc::now().timestamp();
     let started =
@@ -329,6 +316,7 @@ pub fn activate(license_key: &str) -> Result<Status> {
         refresh_token: response.refresh_token,
     };
     let certificate = verify(&stored, &device).context("verify activation certificate")?;
+    let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
     let mut state = load_state();
     close_trial_after_activation(&mut state, Utc::now().timestamp());
     state.license = Some(stored);
@@ -340,19 +328,24 @@ pub fn activate(license_key: &str) -> Result<Status> {
 }
 
 pub fn refresh_once() -> Result<Status> {
-    let mut state = load_state();
-    let stored = state
-        .license
-        .clone()
-        .context("Matteshot is not activated")?;
+    let stored = {
+        let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
+        load_state()
+            .license
+            .context("Matteshot is not activated")?
+    };
     let request = SessionRequest {
         refresh_token: stored.refresh_token.clone(),
         device_id: device_id(),
     };
     let (status_code, response) = post_json(LICENSE_PATH_REFRESH, &serde_json::to_vec(&request)?)?;
     if status_code == 403 {
-        state.license = None;
-        save_state(&state)?;
+        let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
+        let mut state = load_state();
+        if same_activation(&state, &stored) {
+            state.license = None;
+            save_state(&state)?;
+        }
         bail!(
             "{}",
             response_error(&response, "This activation is no longer valid.")
@@ -373,6 +366,11 @@ pub fn refresh_once() -> Result<Status> {
         refresh_token: response.refresh_token,
     };
     let certificate = verify(&replacement, &device_id())?;
+    let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
+    let mut state = load_state();
+    if !same_activation(&state, &stored) {
+        bail!("activation changed while it was being refreshed");
+    }
     state.license = Some(replacement);
     save_state(&state)?;
     Ok(Status::Licensed {
@@ -391,13 +389,14 @@ pub fn start_background_refresh() {
 }
 
 pub fn deactivate() -> Result<()> {
-    let mut state = load_state();
-    let stored = state
-        .license
-        .clone()
-        .context("Matteshot is not activated")?;
+    let stored = {
+        let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
+        load_state()
+            .license
+            .context("Matteshot is not activated")?
+    };
     let request = SessionRequest {
-        refresh_token: stored.refresh_token,
+        refresh_token: stored.refresh_token.clone(),
         device_id: device_id(),
     };
     let (status_code, response) =
@@ -408,8 +407,13 @@ pub fn deactivate() -> Result<()> {
             response_error(&response, "The activation could not be released.")
         );
     }
-    state.license = None;
-    save_state(&state)
+    let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
+    let mut state = load_state();
+    if same_activation(&state, &stored) {
+        state.license = None;
+        save_state(&state)?;
+    }
+    Ok(())
 }
 
 fn verify(stored: &StoredLicense, expected_device: &str) -> Result<Certificate> {
@@ -570,6 +574,23 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(token: &str) -> StoredLicense {
+        StoredLicense {
+            certificate: "certificate".into(),
+            signature: "signature".into(),
+            refresh_token: token.into(),
+        }
+    }
+
+    #[test]
+    fn refresh_results_cannot_replace_a_newer_activation() {
+        let mut state = State { license: Some(stored("new")), ..Default::default() };
+        assert!(!same_activation(&state, &stored("old")));
+        assert!(same_activation(&state, &stored("new")));
+        state.license = None;
+        assert!(!same_activation(&state, &stored("new")));
+    }
 
     #[test]
     fn trial_does_not_begin_until_first_capture() {

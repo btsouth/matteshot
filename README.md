@@ -22,12 +22,14 @@ Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips in
 
 ## Recording
 
-**● Record** (V) in the overlay, then the same gesture — click a window or drag a region. A floating pill shows elapsed time with Stop (Esc also stops); it excludes itself from the video via `WDA_EXCLUDEFROMCAPTURE`.
+**● Record** (V) in the overlay, then the same gesture — click a window or drag a region. A floating pill shows elapsed time with Stop (`Ctrl+Shift+R` also stops); it excludes itself from the video via `WDA_EXCLUDEFROMCAPTURE`.
 
 - H.264 MP4 via Media Foundation, ~30fps, bitrate scaled to pixel count, saved to the videos folder, file on clipboard.
+- Window recording keeps a stable canvas if the target is resized, ignores duplicate high-refresh frames, and fails clearly instead of saving an all-black capture when a hardware surface never produces an initial frame.
 - **Audio**: Off / System (WASAPI loopback) / Mic in settings. Float PCM → resampled to an AAC-legal rate (192 kHz interfaces are common; AAC takes only 44.1/48 kHz) → stereo downmix → AAC muxed into the same MP4.
 - Optional share-sized **GIF** alongside (settings toggle).
-- **On stop**, a focused video editor opens with a large frame preview, native Play/Pause, Spacebar control, synchronized playhead, the same seven matte choices as screenshots, keyboard seeking, and two trim handles. Playback keeps running through matte changes and resumes after timeline or trim seeks. A compact **+ Add** drawer places time-ranged text, arrows, boxes, and pixelate-redaction; every tool returns to Select after placement, annotations stay freely movable, and their timeline clips can be moved or resized. **Export edit** renders the matte and annotations at full resolution through a responsive background re-encode with progress and audio preserved. The untouched original stays put. Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
+- **On stop**, a focused video editor opens at 85% of the active monitor with a large frame preview, native Play/Pause, Spacebar control, synchronized playhead, the same seven matte choices as screenshots, adjustable padding, Auto / 1:1 / 4:3 / 16:9 / Social aspect presets, keyboard seeking, and two trim handles. Playback keeps running through visual changes and resumes after timeline or trim seeks; its bounded preview decoder, cached matte, and coalesced frame delivery keep background switches responsive. A compact **+ Add** drawer places time-ranged text, arrows, boxes, and pixelate-redaction; every tool returns to Select after placement, annotations stay attached to the recorded content across matte and aspect changes, remain freely movable, and their timeline clips can be moved or resized. **Export edit** renders the chosen layout and annotations at full resolution through a responsive background re-encode with progress and audio preserved. Export is cancelable, finalizes through a same-folder temporary file, never overwrites an earlier edit, and keeps the untouched original in place. Closing during export offers a safe cancel-and-cleanup path. Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
+- Recordings and edited exports remain private `.partial` files until they finalize and pass a real Media Foundation decode check. A crash cannot surface a truncated MP4 as finished work; stale partials are removed on the next clean start.
 
 ## Scrolling capture
 
@@ -54,6 +56,8 @@ Dark + light themes follow the system setting (`AppsUseLightTheme`), live-switch
 
 Save folder + video folder (`IFileDialog` pickers, open buttons), export quality 1x/2x/3x, start with Windows, PrtScn capture toggle, GIF toggle, recording audio Off/System/Mic. First run shows a tray balloon.
 
+Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. **Copy diagnostics** in the tray produces a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path.
+
 ## CLI / test rig
 
 ```
@@ -63,6 +67,7 @@ matteshot --restore-printscreen
 matteshot --bench <substr>   # timed capture of a window, raw PNG to %TEMP%
 matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCROLL_DEBUG=1 for per-step diagnostics)
 matteshot --record-test [s]  # short recording smoke test, optionally auto-stop after s seconds
+matteshot --record-window-test <title> [s] # real named-window recording with timed stop
 matteshot --trim-test <mp4> <a> <b> [1-7] # trim/export probe; optional matte
 matteshot --video-edit-test <mp4> # matte + text/arrow/box/blur export probe
 matteshot --playback-test <mp4> # paced 3s editor preview decode, no UI/clipboard
@@ -102,7 +107,7 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 ## Windows landmines (hard-won)
 
 - **DPI**: `PerMonitorV2` at startup or captures come out soft on mixed-DPI setups.
-- **PrtScn**: Win11 routes it to Snipping Tool. On 23H2/24H2 that's `PrintScreenKeyForSnippingEnabled` (HKCU\Control Panel\Keyboard, missing = enabled) — Matteshot flips it with consent, live. **On Insider 26220+ the value is ignored**: routing consumes the key ahead of hotkey dispatch even when `RegisterHotKey(VK_SNAPSHOT)` succeeds; the real toggle is Settings > Bluetooth & devices > Keyboard, with an untraceable backing store. Matteshot detects and guides. Fallback if it regresses: WH_KEYBOARD_LL hook.
+- **PrtScn**: Win11 routes it to Snipping Tool. On 23H2/24H2 that's `PrintScreenKeyForSnippingEnabled` (HKCU\Control Panel\Keyboard, missing = enabled), but Insider 26220+ can ignore that value and consume the key even after `RegisterHotKey(VK_SNAPSHOT)` reports success. The resident therefore owns PrtScn with a `WH_KEYBOARD_LL` hook and posts the same `WM_HOTKEY` used by every nested picker/editor loop. The hook is removed on toggle, license expiry, or process exit, so Snipping Tool immediately gets the key back. Registry routing remains only as a compatibility fallback.
 - **Synthetic PrtScn is untestable** while Snipping routing is on — injected VK_SNAPSHOT never reaches hotkey dispatch.
 - **WGC corner alpha varies by build** — Matteshot applies its own SDF corner mask unconditionally.
 - **`FindWindowW` doesn't match** Matteshot's toolwindow popups even though `EnumWindows` sees them — don't use it in tests.

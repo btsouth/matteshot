@@ -7,15 +7,23 @@
 //! owns the key, ask the user (one MessageBox) and flip the setting the same
 //! way the Settings app does, then retry.
 
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::thread::JoinHandle;
+
 use anyhow::{Context, Result};
 use windows::core::w;
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, HOT_KEY_MODIFIERS, VK_SNAPSHOT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, SendMessageTimeoutW, HWND_BROADCAST, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND,
-    MB_TOPMOST, MB_YESNO, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    CallNextHookEx, GetMessageW, MessageBoxW, PeekMessageW, PostMessageW, PostThreadMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HWND_BROADCAST, IDYES, KBDLLHOOKSTRUCT,
+    MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
@@ -23,6 +31,28 @@ use winreg::RegKey;
 const MOD_NOREPEAT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x4000);
 const KEYBOARD_KEY: &str = r"Control Panel\Keyboard";
 const VALUE: &str = "PrintScreenKeyForSnippingEnabled";
+
+// RegisterHotKey is not enough on newer Windows Insider builds: it can report
+// success while the shell consumes PrtScn before WM_HOTKEY is delivered. A
+// low-level hook is the primary owner and posts the same WM_HOTKEY message the
+// rest of Matteshot already understands. The hook disappears automatically if
+// the resident exits, so Windows immediately gets the key back after a crash.
+static HOOK: AtomicIsize = AtomicIsize::new(0);
+static TARGET_THREAD: AtomicU32 = AtomicU32::new(0);
+static TARGET_ID: AtomicU32 = AtomicU32::new(0);
+static KEY_DOWN: AtomicBool = AtomicBool::new(false);
+static FALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+static PREFERRED: AtomicBool = AtomicBool::new(true);
+
+struct HookRuntime {
+    thread_id: u32,
+    thread: JoinHandle<()>,
+}
+
+fn hook_runtime() -> &'static Mutex<Option<HookRuntime>> {
+    static RUNTIME: OnceLock<Mutex<Option<HookRuntime>>> = OnceLock::new();
+    RUNTIME.get_or_init(|| Mutex::new(None))
+}
 
 pub enum Acquire {
     /// PrtScn is ours.
@@ -35,6 +65,115 @@ pub enum Acquire {
     ShellStillOwns,
     /// Something else (another screenshot tool?) holds PrtScn.
     OtherOwner,
+}
+
+pub fn set_preferred(enabled: bool) {
+    PREFERRED.store(enabled, Ordering::SeqCst);
+}
+
+pub fn preferred() -> bool {
+    PREFERRED.load(Ordering::SeqCst)
+}
+
+pub fn owns_key() -> bool {
+    HOOK.load(Ordering::SeqCst) != 0 || FALLBACK_REGISTERED.load(Ordering::SeqCst)
+}
+
+unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let key = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        if key.vkCode == VK_SNAPSHOT.0 as u32 {
+            match wparam.0 as u32 {
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    if !KEY_DOWN.swap(true, Ordering::SeqCst) {
+                        let posted = PostThreadMessageW(
+                            TARGET_THREAD.load(Ordering::SeqCst),
+                            windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY,
+                            WPARAM(TARGET_ID.load(Ordering::SeqCst) as usize),
+                            LPARAM(0),
+                        )
+                        .is_ok();
+                        if !posted {
+                            KEY_DOWN.store(false, Ordering::SeqCst);
+                            return CallNextHookEx(None, code, wparam, lparam);
+                        }
+                    }
+                    return LRESULT(1);
+                }
+                WM_KEYUP | WM_SYSKEYUP => {
+                    KEY_DOWN.store(false, Ordering::SeqCst);
+                    return LRESULT(1);
+                }
+                _ => {}
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+fn install_hook(id: i32) -> bool {
+    let Ok(mut runtime) = hook_runtime().lock() else {
+        return false;
+    };
+    if runtime.is_some() {
+        return true;
+    }
+    unsafe {
+        // PostThreadMessage requires the target thread to already own a queue.
+        let mut message = MSG::default();
+        let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+        let target_thread = GetCurrentThreadId();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let mut message = MSG::default();
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            let thread_id = GetCurrentThreadId();
+            TARGET_THREAD.store(target_thread, Ordering::SeqCst);
+            TARGET_ID.store(id as u32, Ordering::SeqCst);
+            let module = GetModuleHandleW(None)
+                .map(|module| HINSTANCE(module.0))
+                .unwrap_or_default();
+            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0)
+            else {
+                let _ = ready_tx.send(None);
+                return;
+            };
+            HOOK.store(hook.0 as isize, Ordering::SeqCst);
+            let _ = ready_tx.send(Some(thread_id));
+            while GetMessageW(&mut message, None, 0, 0).as_bool() {}
+            let _ = UnhookWindowsHookEx(hook);
+            HOOK.store(0, Ordering::SeqCst);
+            KEY_DOWN.store(false, Ordering::SeqCst);
+        });
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Some(thread_id)) => {
+                *runtime = Some(HookRuntime { thread_id, thread });
+                true
+            }
+            _ => {
+                let _ = thread.join();
+                false
+            }
+        }
+    }
+}
+
+fn uninstall_hook() {
+    if let Ok(mut runtime) = hook_runtime().lock() {
+        if let Some(runtime) = runtime.take() {
+            unsafe {
+                let _ = PostThreadMessageW(
+                    runtime.thread_id,
+                    WM_QUIT,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            let _ = runtime.thread.join();
+        }
+    }
+    HOOK.store(0, Ordering::SeqCst);
+    KEY_DOWN.store(false, Ordering::SeqCst);
 }
 
 /// Missing value defaults to enabled on current Win11 builds.
@@ -56,23 +195,23 @@ pub fn set_snipping_binding(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Nudge the shell the same way the Settings app does.
+/// Nudge the shell without ever waiting on a slow desktop process.
 fn broadcast_setting_change() {
     unsafe {
-        let _ = SendMessageTimeoutW(
+        let _ = PostMessageW(
             HWND_BROADCAST,
             WM_SETTINGCHANGE,
             WPARAM(0),
             LPARAM(w!("Control Panel\\Keyboard").0 as isize),
-            SMTO_ABORTIFHUNG,
-            200,
-            None,
         );
     }
 }
 
 fn try_register(id: i32) -> bool {
-    unsafe { RegisterHotKey(None, id, MOD_NOREPEAT, VK_SNAPSHOT.0 as u32).is_ok() }
+    let registered =
+        unsafe { RegisterHotKey(None, id, MOD_NOREPEAT, VK_SNAPSHOT.0 as u32).is_ok() };
+    FALLBACK_REGISTERED.store(registered, Ordering::SeqCst);
+    registered
 }
 
 fn prompt_takeover() -> bool {
@@ -88,27 +227,32 @@ fn prompt_takeover() -> bool {
 
 /// Explicit takeover (tray menu / CLI): flip the binding and grab the key.
 pub fn take(id: i32) -> bool {
-    let _ = set_snipping_binding(false);
-    for _ in 0..20 {
-        if try_register(id) {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    if install_hook(id) {
+        return true;
     }
-    false
+    // Compatibility fallback for systems that reject the low-level hook.
+    // This is intentionally one-shot; the resident heartbeat retries without
+    // freezing Settings for two seconds.
+    let _ = set_snipping_binding(false);
+    try_register(id)
 }
 
 /// Explicit release: let go of the key and restore the Snipping binding.
 pub fn release(id: i32) {
+    uninstall_hook();
     unsafe {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey(None, id);
     }
+    FALLBACK_REGISTERED.store(false, Ordering::SeqCst);
     let _ = set_snipping_binding(true);
 }
 
 /// Try to own PrtScn under the given hotkey id. `interactive` controls
 /// whether we may show the takeover prompt.
 pub fn acquire(id: i32, interactive: bool) -> Acquire {
+    if install_hook(id) {
+        return Acquire::Taken;
+    }
     if try_register(id) {
         return Acquire::Taken;
     }

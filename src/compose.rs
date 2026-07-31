@@ -5,6 +5,10 @@ use rayon::prelude::*;
 
 use crate::style::{Backdrop, Rgb, Style};
 
+/// Product default for automatic matte framing. Editors may override it
+/// within their 4–18% range, while hand-tuned assets can opt out entirely.
+pub const DEFAULT_PAD_FACTOR: f32 = 0.08;
+
 /// Antialiased coverage for a rounded-rect mask at pixel (x, y).
 fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
     // Signed distance to a rounded rectangle centered in [0,w]x[0,h].
@@ -98,7 +102,7 @@ pub struct ComposeOpts {
 
 impl Default for ComposeOpts {
     fn default() -> Self {
-        ComposeOpts { metric_scale: 1.0, pad_factor: 0.10, aspect: None }
+        ComposeOpts { metric_scale: 1.0, pad_factor: DEFAULT_PAD_FACTOR, aspect: None }
     }
 }
 
@@ -346,4 +350,62 @@ pub fn blend_bgra_content(
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compose_with, ComposeOpts};
+    use crate::style::{Backdrop, Rgb, Style};
+    use image::{Rgba, RgbaImage};
+
+    fn style() -> Style {
+        Style {
+            name: "Test",
+            backdrop: Backdrop::Linear {
+                c1: Rgb(0.2, 0.3, 0.6),
+                c2: Rgb(0.4, 0.2, 0.5),
+            },
+        }
+    }
+
+    #[test]
+    fn forced_aspect_extends_the_matte_without_distorting_content() {
+        let raw = RgbaImage::from_pixel(400, 225, Rgba([24, 32, 48, 255]));
+        let output = compose_with(
+            &raw,
+            &style(),
+            &ComposeOpts {
+                aspect: Some(1.0),
+                ..Default::default()
+            },
+        );
+        assert!((output.width() as i64 - output.height() as i64).abs() <= 1);
+        assert!(output.width() > raw.width());
+    }
+
+    #[test]
+    fn padding_control_changes_canvas_size_monotonically() {
+        let raw = RgbaImage::from_pixel(800, 450, Rgba([24, 32, 48, 255]));
+        let tight = compose_with(
+            &raw,
+            &style(),
+            &ComposeOpts {
+                pad_factor: 0.04,
+                ..Default::default()
+            },
+        );
+        let roomy = compose_with(
+            &raw,
+            &style(),
+            &ComposeOpts {
+                pad_factor: 0.18,
+                ..Default::default()
+            },
+        );
+        let default = compose_with(&raw, &style(), &ComposeOpts::default());
+        assert!(default.width() > tight.width());
+        assert!(default.width() < roomy.width());
+        assert!(roomy.width() > tight.width());
+        assert!(roomy.height() > tight.height());
+    }
 }
