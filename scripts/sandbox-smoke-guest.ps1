@@ -152,10 +152,23 @@ try {
     }
 
     Write-Step "Activating the test license"
-    $activationOutput = Get-Content -Raw $licenseKey |
-        & $app --activate-stdin 2>&1
-    $activationExitCode = $LASTEXITCODE
-    $activationStatus = ($activationOutput | Out-String).Trim()
+    $activationInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $activationInfo.FileName = $app
+    $activationInfo.Arguments = "--activate-stdin"
+    $activationInfo.UseShellExecute = $false
+    $activationInfo.CreateNoWindow = $true
+    $activationInfo.RedirectStandardInput = $true
+    $activationInfo.RedirectStandardOutput = $true
+    $activationInfo.RedirectStandardError = $true
+    $activationProcess = New-Object System.Diagnostics.Process
+    $activationProcess.StartInfo = $activationInfo
+    $activationProcess.Start() | Out-Null
+    $activationProcess.StandardInput.Write((Get-Content -Raw $licenseKey))
+    $activationProcess.StandardInput.Close()
+    $activationStatus = $activationProcess.StandardError.ReadToEnd().Trim()
+    $activationProcess.StandardOutput.ReadToEnd() | Out-Null
+    $activationProcess.WaitForExit()
+    $activationExitCode = $activationProcess.ExitCode
     if ($activationExitCode -ne 0) {
         throw "license-activate failed with exit code ${activationExitCode}: $activationStatus"
     }
