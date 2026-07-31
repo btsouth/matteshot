@@ -123,23 +123,21 @@ try {
         throw "Unexpected initial license state: $initialStatus"
     }
 
-    Write-Step "Launching a fresh Notepad file for isolated capture"
-    $notepadFile = Join-Path $env:TEMP "Matteshot-Smoke.txt"
-    "Matteshot clean-machine capture test" | Set-Content -Encoding UTF8 $notepadFile
-    Start-Process "notepad.exe" -ArgumentList "`"$notepadFile`"" | Out-Null
-    $notepad = $null
+    Write-Step "Launching an isolated test window for capture"
+    Start-Process "cmd.exe" -ArgumentList "/k title Matteshot-Smoke" | Out-Null
+    $captureWindow = $null
     $deadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 250
-        $notepad = Get-Process -ErrorAction SilentlyContinue |
+        $captureWindow = Get-Process -ErrorAction SilentlyContinue |
             Where-Object { $_.MainWindowTitle -like "*Matteshot-Smoke*" } |
             Select-Object -First 1
-    } while (-not $notepad -and (Get-Date) -lt $deadline)
-    if (-not $notepad) {
-        throw "The fresh Notepad file did not expose a window."
+    } while (-not $captureWindow -and (Get-Date) -lt $deadline)
+    if (-not $captureWindow) {
+        throw "The isolated test window was not exposed."
     }
 
-    Write-Step "Capturing the fresh Notepad file without host clipboard access"
+    Write-Step "Capturing the isolated test window without host clipboard access"
     Invoke-Matteshot @("--bench", "Matteshot-Smoke") "capture" | Out-Null
     $capture = Join-Path $env:TEMP "matteshot-bench.png"
     if (-not (Test-Path $capture) -or (Get-Item $capture).Length -eq 0) {
