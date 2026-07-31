@@ -914,6 +914,7 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 3,
                     size: 1.35,
+                    caption_style: video_edit::CaptionStyle::Box,
                 },
                 video_edit::Item {
                     shape: video_edit::Shape::Arrow {
@@ -924,6 +925,7 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 0,
                     size: 1.0,
+                    caption_style: video_edit::CaptionStyle::Shadow,
                 },
                 video_edit::Item {
                     shape: video_edit::Shape::Rect {
@@ -934,6 +936,7 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 2,
                     size: 1.0,
+                    caption_style: video_edit::CaptionStyle::Shadow,
                 },
                 video_edit::Item {
                     shape: video_edit::Shape::Blur {
@@ -944,6 +947,7 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 0,
                     size: 1.0,
+                    caption_style: video_edit::CaptionStyle::Shadow,
                 },
             ];
             let dst = src.with_extension("edit.mp4");

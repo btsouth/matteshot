@@ -94,15 +94,19 @@ enum Tool {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum TimingChoice {
+    WholeVideo,
+    ThreeSeconds,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Drag {
     Trim(Handle),
     Playhead,
     Padding,
+    CaptionSize,
     Draw { index: usize, start: (f32, f32) },
     Move { index: usize, last: (f32, f32) },
-    ClipStart(usize),
-    ClipEnd(usize),
-    ClipMove { index: usize, last_time: i64 },
 }
 
 struct TextEntry {
@@ -120,6 +124,9 @@ struct WindowLayout {
     tool_controls: Vec<(RECT, Tool, &'static str)>,
     color_controls: Vec<(RECT, usize)>,
     size_controls: Vec<(RECT, usize)>,
+    caption_size_slider: RECT,
+    caption_style_controls: Vec<(RECT, crate::video_edit::CaptionStyle)>,
+    timing_controls: Vec<(RECT, TimingChoice)>,
     undo_control: RECT,
     delete_control: RECT,
     preview: RECT,
@@ -166,11 +173,16 @@ struct State {
     tool: Option<Tool>,
     color_idx: usize,
     size_idx: usize,
+    caption_size: f32,
+    caption_style: crate::video_edit::CaptionStyle,
     text_entry: Option<TextEntry>,
     add_control: RECT,
     tool_controls: Vec<(RECT, Tool, &'static str)>,
     color_controls: Vec<(RECT, usize)>,
     size_controls: Vec<(RECT, usize)>,
+    caption_size_slider: RECT,
+    caption_style_controls: Vec<(RECT, crate::video_edit::CaptionStyle)>,
+    timing_controls: Vec<(RECT, TimingChoice)>,
     undo_control: RECT,
     delete_control: RECT,
     status: Option<String>,
@@ -246,11 +258,12 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
     let m = sc(24);
     let timeline_h = (ch / 6).clamp(sc(88), sc(126));
+    let strip_bottom = ch - sc(112);
     let strip = RECT {
         left: m,
-        top: ch - sc(140) - timeline_h,
+        top: strip_bottom - timeline_h,
         right: cw - m,
-        bottom: ch - sc(140),
+        bottom: strip_bottom,
     };
     let preview = RECT {
         left: m,
@@ -383,6 +396,52 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
             index,
         ));
     }
+    let caption_size_slider = RECT {
+        left: panel_left + sc(58),
+        top: panel_top + sc(88),
+        right: panel_left + sc(190),
+        bottom: panel_top + sc(114),
+    };
+    let caption_style_controls = vec![
+        (
+            RECT {
+                left: panel_left + sc(206),
+                top: panel_top + sc(88),
+                right: panel_left + sc(278),
+                bottom: panel_top + sc(114),
+            },
+            crate::video_edit::CaptionStyle::Shadow,
+        ),
+        (
+            RECT {
+                left: panel_left + sc(286),
+                top: panel_top + sc(88),
+                right: panel_left + sc(372),
+                bottom: panel_top + sc(114),
+            },
+            crate::video_edit::CaptionStyle::Box,
+        ),
+    ];
+    let timing_controls = vec![
+        (
+            RECT {
+                left: panel_left + sc(90),
+                top: panel_top + sc(124),
+                right: panel_left + sc(214),
+                bottom: panel_top + sc(152),
+            },
+            TimingChoice::WholeVideo,
+        ),
+        (
+            RECT {
+                left: panel_left + sc(222),
+                top: panel_top + sc(124),
+                right: panel_left + sc(372),
+                bottom: panel_top + sc(152),
+            },
+            TimingChoice::ThreeSeconds,
+        ),
+    ];
     let undo_control = RECT {
         left: panel_left + sc(254),
         top: panel_top + sc(50),
@@ -404,6 +463,9 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         tool_controls,
         color_controls,
         size_controls,
+        caption_size_slider,
+        caption_style_controls,
+        timing_controls,
         undo_control,
         delete_control,
         preview,
@@ -544,7 +606,8 @@ fn recompose_preview(state: &mut State) {
             start,
             end,
             color: state.color_idx,
-            size: current_size(state),
+            size: state.caption_size,
+            caption_style: state.caption_style,
         };
         crate::video_edit::render_one_at(&mut image, &draft, content_size, content_offset);
     }
@@ -685,17 +748,93 @@ fn current_size(state: &State) -> f32 {
 }
 
 fn default_range(state: &State) -> (i64, i64) {
-    const DEFAULT: i64 = 30_000_000;
-    const MINIMUM: i64 = 5_000_000;
-    if state.duration <= 0 {
-        return (0, DEFAULT);
+    (0, state.duration.max(1))
+}
+
+fn caption_controls_active(state: &State) -> bool {
+    state.text_entry.is_some()
+        || state.tool == Some(Tool::Text)
+        || state
+            .selected
+            .and_then(|index| state.annotations.get(index))
+            .is_some_and(|item| matches!(item.shape, crate::video_edit::Shape::Text { .. }))
+}
+
+fn selected_timing(state: &State) -> TimingChoice {
+    state
+        .selected
+        .and_then(|index| state.annotations.get(index))
+        .map(|item| {
+            if item.start <= 0 && item.end >= state.duration {
+                TimingChoice::WholeVideo
+            } else {
+                TimingChoice::ThreeSeconds
+            }
+        })
+        .unwrap_or(TimingChoice::WholeVideo)
+}
+
+fn apply_timing(state: &mut State, choice: TimingChoice) {
+    let Some(index) = state
+        .selected
+        .filter(|index| *index < state.annotations.len())
+    else {
+        return;
+    };
+    push_undo(state);
+    let (start, end) = match choice {
+        TimingChoice::WholeVideo => default_range(state),
+        TimingChoice::ThreeSeconds => {
+            let duration = state.duration.max(1);
+            let start = state.playhead.clamp(0, duration);
+            let end = (start + 30_000_000).min(duration);
+            if end > start {
+                (start, end)
+            } else {
+                ((duration - 30_000_000).max(0), duration)
+            }
+        }
+    };
+    state.annotations[index].start = start;
+    state.annotations[index].end = end;
+    recompose_preview(state);
+}
+
+fn update_caption_size(state: &mut State, x: i32) {
+    const MIN: f32 = 0.7;
+    const MAX: f32 = 3.4;
+    let slider = state.caption_size_slider;
+    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32)
+        .clamp(0.0, 1.0);
+    state.caption_size = MIN + t * (MAX - MIN);
+    if let Some(index) = state
+        .selected
+        .filter(|index| *index < state.annotations.len())
+    {
+        if matches!(state.annotations[index].shape, crate::video_edit::Shape::Text { .. }) {
+            state.annotations[index].size = state.caption_size;
+        }
     }
-    let mut start = state.playhead.clamp(0, state.duration);
-    let end = (start + DEFAULT).min(state.duration);
-    if end - start < MINIMUM {
-        start = (end - DEFAULT).max(0);
+    recompose_preview(state);
+}
+
+fn sync_selected_controls(state: &mut State, index: usize) {
+    let Some(item) = state.annotations.get(index) else {
+        return;
+    };
+    state.color_idx = item.color;
+    if matches!(item.shape, crate::video_edit::Shape::Text { .. }) {
+        state.caption_size = item.size;
+        state.caption_style = item.caption_style;
+    } else {
+        state.size_idx = if item.size < 0.91 {
+            0
+        } else if item.size > 1.17 {
+            2
+        } else {
+            1
+        };
     }
-    (start, end.max(start + MINIMUM).min(state.duration))
 }
 
 fn push_undo(state: &mut State) {
@@ -723,51 +862,6 @@ fn delete_selected(state: &mut State) {
         state.annotations.remove(index);
         state.selected = None;
         recompose_preview(state);
-    }
-}
-
-fn annotation_name(item: &crate::video_edit::Item) -> &'static str {
-    match &item.shape {
-        crate::video_edit::Shape::Text { .. } => "Text",
-        crate::video_edit::Shape::Arrow { .. } => "Arrow",
-        crate::video_edit::Shape::Rect { .. } => "Box",
-        crate::video_edit::Shape::Blur { .. } => "Blur",
-    }
-}
-
-fn annotation_lane(state: &State) -> RECT {
-    RECT {
-        left: state.strip.left,
-        top: state.strip.bottom + s(state, 34),
-        right: state.strip.right,
-        bottom: state.strip.bottom + s(state, 56),
-    }
-}
-
-fn time_to_x(state: &State, time: i64) -> i32 {
-    if state.duration <= 0 {
-        return state.strip.left;
-    }
-    state.strip.left
-        + ((time.clamp(0, state.duration) as f64 / state.duration as f64)
-            * (state.strip.right - state.strip.left) as f64) as i32
-}
-
-fn x_to_time(state: &State, x: i32) -> i64 {
-    let span = (state.strip.right - state.strip.left).max(1) as f64;
-    ((((x - state.strip.left) as f64 / span) * state.duration as f64) as i64)
-        .clamp(0, state.duration)
-}
-
-fn item_clip_rect(state: &State, index: usize, item: &crate::video_edit::Item) -> RECT {
-    let lane = annotation_lane(state);
-    let row_h = ((lane.bottom - lane.top) / 2).max(1);
-    let row = (index % 2) as i32;
-    RECT {
-        left: time_to_x(state, item.start),
-        top: lane.top + row * row_h,
-        right: time_to_x(state, item.end).max(time_to_x(state, item.start) + s(state, 12)),
-        bottom: lane.top + (row + 1) * row_h - 1,
     }
 }
 
@@ -839,19 +933,33 @@ fn contains(rect: RECT, x: i32, y: i32) -> bool {
 }
 
 fn tool_panel(state: &State) -> RECT {
+    let top = state
+        .tool_controls
+        .first()
+        .map(|(rect, ..)| rect.top - s(state, 10))
+        .unwrap_or(state.add_control.bottom);
+    let mut bottom = state.delete_control.bottom + s(state, 10);
+    if caption_controls_active(state) {
+        bottom = bottom.max(state.caption_size_slider.bottom + s(state, 10));
+    }
+    if state.selected.is_some() {
+        bottom = bottom.max(
+            state
+                .timing_controls
+                .last()
+                .map(|(rect, _)| rect.bottom + s(state, 10))
+                .unwrap_or(bottom),
+        );
+    }
     RECT {
         left: state
             .tool_controls
             .first()
             .map(|(rect, ..)| rect.left - s(state, 10))
             .unwrap_or(state.add_control.left),
-        top: state
-            .tool_controls
-            .first()
-            .map(|(rect, ..)| rect.top - s(state, 10))
-            .unwrap_or(state.add_control.bottom),
+        top,
         right: state.delete_control.right + s(state, 10),
-        bottom: state.delete_control.bottom + s(state, 10),
+        bottom,
     }
 }
 
@@ -894,7 +1002,8 @@ fn commit_text(state: &mut State) {
         start,
         end,
         color: state.color_idx,
-        size: current_size(state),
+        size: state.caption_size,
+        caption_style: state.caption_style,
     };
     if let Some(index) = entry
         .editing
@@ -1196,22 +1305,104 @@ unsafe fn paint(hdc: HDC, state: &State) {
             let _ = DeleteObject(fill);
             let _ = DeleteObject(pen);
         }
-        for (rect, index) in &state.size_controls {
-            paint_chip(
+        if caption_controls_active(state) {
+            SelectObject(hdc, state.font_small);
+            SetTextColor(hdc, state.theme.muted);
+            let mut size_label = wide(&format!("Size {}", (state.caption_size * 24.0).round() as i32));
+            let mut size_rect = RECT {
+                left: tool_panel(state).left + s(state, 12),
+                top: state.caption_size_slider.top,
+                right: state.caption_size_slider.left - s(state, 6),
+                bottom: state.caption_size_slider.bottom,
+            };
+            DrawTextW(hdc, &mut size_label, &mut size_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            let slider = state.caption_size_slider;
+            let cy = (slider.top + slider.bottom) / 2;
+            let track = CreateSolidBrush(state.theme.track);
+            FillRect(
                 hdc,
-                *rect,
-                ["S", "M", "L"][*index],
-                state.size_idx == *index,
-                state,
+                &RECT {
+                    left: slider.left,
+                    top: cy - s(state, 2),
+                    right: slider.right,
+                    bottom: cy + s(state, 2),
+                },
+                track,
             );
+            let _ = DeleteObject(track);
+            let t = ((state.caption_size - 0.7) / (3.4 - 0.7)).clamp(0.0, 1.0);
+            let thumb_x = slider.left + ((slider.right - slider.left) as f32 * t) as i32;
+            let fill = CreateSolidBrush(state.theme.accent);
+            FillRect(
+                hdc,
+                &RECT {
+                    left: slider.left,
+                    top: cy - s(state, 2),
+                    right: thumb_x,
+                    bottom: cy + s(state, 2),
+                },
+                fill,
+            );
+            let old = SelectObject(hdc, fill);
+            let r = s(state, 6);
+            let _ = RoundRect(hdc, thumb_x - r, cy - r, thumb_x + r, cy + r, r * 2, r * 2);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(fill);
+            for (rect, style) in &state.caption_style_controls {
+                paint_chip(
+                    hdc,
+                    *rect,
+                    match style {
+                        crate::video_edit::CaptionStyle::Shadow => "Shadow",
+                        crate::video_edit::CaptionStyle::Box => "Caption box",
+                    },
+                    state.caption_style == *style,
+                    state,
+                );
+            }
+        } else {
+            for (rect, index) in &state.size_controls {
+                paint_chip(
+                    hdc,
+                    *rect,
+                    ["S", "M", "L"][*index],
+                    state.size_idx == *index,
+                    state,
+                );
+            }
         }
         paint_chip(hdc, state.undo_control, "Undo", false, state);
         paint_chip(hdc, state.delete_control, "Delete", false, state);
+        if state.selected.is_some() {
+            SelectObject(hdc, state.font_small);
+            SetTextColor(hdc, state.theme.muted);
+            let mut timing_label = wide("Timing");
+            let mut timing_rect = RECT {
+                left: tool_panel(state).left + s(state, 12),
+                top: state.timing_controls[0].0.top,
+                right: state.timing_controls[0].0.left - s(state, 6),
+                bottom: state.timing_controls[0].0.bottom,
+            };
+            DrawTextW(hdc, &mut timing_label, &mut timing_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            let active_timing = selected_timing(state);
+            for (rect, choice) in &state.timing_controls {
+                paint_chip(
+                    hdc,
+                    *rect,
+                    match choice {
+                        TimingChoice::WholeVideo => "Whole video",
+                        TimingChoice::ThreeSeconds => "3 sec here",
+                    },
+                    active_timing == *choice,
+                    state,
+                );
+            }
+        }
     }
 
     if state.text_entry.is_some() || state.tool.is_some() || state.selected.is_some() {
         let hint = if state.text_entry.is_some() {
-            "Type caption   \u{00b7}   Enter place   \u{00b7}   Esc cancel"
+            "Type caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel"
         } else if let Some(tool) = state.tool {
             match tool {
                 Tool::Text => "Click the preview to place a caption",
@@ -1220,7 +1411,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 Tool::Blur => "Drag over anything sensitive to blur it",
             }
         } else {
-            "Selected   \u{00b7}   drag to move   \u{00b7}   Delete removes"
+            "Selected   \u{00b7}   drag to move   \u{00b7}   + Add for style and timing"
         };
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, state.theme.text);
@@ -1596,80 +1787,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
         };
         DrawTextW(hdc, &mut l, &mut lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-        if !state.annotations.is_empty() {
-            let lane = annotation_lane(state);
-            let lane_fill = CreateSolidBrush(state.theme.chip);
-            FillRect(hdc, &lane, lane_fill);
-            let _ = DeleteObject(lane_fill);
-            for (index, item) in state.annotations.iter().enumerate() {
-                let rect = item_clip_rect(state, index, item);
-                let selected = state.selected == Some(index);
-                let [r, g, b] =
-                    crate::annotate::COLORS[item.color.min(crate::annotate::COLORS.len() - 1)];
-                let color = windows::Win32::Foundation::COLORREF(
-                    r as u32 | ((g as u32) << 8) | ((b as u32) << 16),
-                );
-                let fill = CreateSolidBrush(if selected {
-                    state.theme.accent
-                } else {
-                    state.theme.bg
-                });
-                let pen = CreatePen(PS_SOLID, if selected { 2 } else { 1 }, color);
-                let old_brush = SelectObject(hdc, fill);
-                let old_pen = SelectObject(hdc, pen);
-                let _ = RoundRect(
-                    hdc,
-                    rect.left,
-                    rect.top,
-                    rect.right,
-                    rect.bottom,
-                    s(state, 5),
-                    s(state, 5),
-                );
-                SelectObject(hdc, old_brush);
-                SelectObject(hdc, old_pen);
-                let _ = DeleteObject(fill);
-                let _ = DeleteObject(pen);
-
-                SetTextColor(
-                    hdc,
-                    if selected {
-                        state.theme.accent_text
-                    } else {
-                        state.theme.muted
-                    },
-                );
-                let mut clip_label = wide(annotation_name(item));
-                let mut clip_label_rect = RECT {
-                    left: rect.left + s(state, 4),
-                    top: rect.top,
-                    right: rect.right - s(state, 4),
-                    bottom: rect.bottom,
-                };
-                DrawTextW(
-                    hdc,
-                    &mut clip_label,
-                    &mut clip_label_rect,
-                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-                );
-                if selected {
-                    let handles = CreateSolidBrush(state.theme.text);
-                    for edge in [rect.left, rect.right] {
-                        FillRect(
-                            hdc,
-                            &RECT {
-                                left: edge - s(state, 2),
-                                top: rect.top + s(state, 1),
-                                right: edge + s(state, 2),
-                                bottom: rect.bottom - s(state, 1),
-                            },
-                            handles,
-                        );
-                    }
-                    let _ = DeleteObject(handles);
-                }
-            }
-        }
     }
 
     if let Some(msg) = &state.status {
@@ -1905,6 +2022,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         Drag::Playhead => set_playhead(state, x),
                         Drag::Padding => update_padding(state, x),
+                        Drag::CaptionSize => update_caption_size(state, x),
                         Drag::Draw { index, start } => {
                             if let Some(point) = screen_to_preview(state, x, y) {
                                 if let Some(item) = state.annotations.get_mut(index) {
@@ -1940,41 +2058,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 recompose_preview(state);
                             }
                         }
-                        Drag::ClipStart(index) => {
-                            let end = state.annotations.get(index).map(|item| item.end);
-                            let time = x_to_time(state, x);
-                            if let (Some(end), Some(item)) = (end, state.annotations.get_mut(index))
-                            {
-                                item.start = time.min(end - 5_000_000).max(0);
-                            }
-                            recompose_preview(state);
-                        }
-                        Drag::ClipEnd(index) => {
-                            let start = state.annotations.get(index).map(|item| item.start);
-                            let time = x_to_time(state, x);
-                            let duration = state.duration;
-                            if let (Some(start), Some(item)) =
-                                (start, state.annotations.get_mut(index))
-                            {
-                                item.end = time.max(start + 5_000_000).min(duration);
-                            }
-                            recompose_preview(state);
-                        }
-                        Drag::ClipMove { index, last_time } => {
-                            let now = x_to_time(state, x);
-                            if let Some(item) = state.annotations.get_mut(index) {
-                                let length = item.end - item.start;
-                                let start = (item.start + now - last_time)
-                                    .clamp(0, state.duration - length);
-                                item.start = start;
-                                item.end = start + length;
-                            }
-                            state.dragging = Some(Drag::ClipMove {
-                                index,
-                                last_time: now,
-                            });
-                            recompose_preview(state);
-                        }
                     }
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
@@ -1998,6 +2081,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                // Clicking anywhere accepts the current caption, returns to
+                // Select, and then continues handling that same click. Enter
+                // remains a convenient shortcut, never a requirement.
+                if state.text_entry.is_some() {
+                    commit_text(state);
+                }
                 if contains(state.padding_slider, x, y) {
                     state.dragging = Some(Drag::Padding);
                     update_padding(state, x);
@@ -2027,6 +2116,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.tool = Some(tool);
                         state.selected = None;
                         state.text_entry = None;
+                        if tool == Tool::Text {
+                            state.color_idx = 3;
+                            state.caption_style = crate::video_edit::CaptionStyle::Box;
+                        }
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
@@ -2049,24 +2142,73 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
-                    if let Some((_, index)) = state
-                        .size_controls
-                        .iter()
-                        .find(|(rect, _)| contains(*rect, x, y))
-                        .copied()
+                    if caption_controls_active(state)
+                        && contains(state.caption_size_slider, x, y)
                     {
                         stop_playback(state);
-                        state.size_idx = index;
-                        if let Some(selected) = state
-                            .selected
-                            .filter(|index| *index < state.annotations.len())
-                        {
+                        if state.selected.is_some() {
                             push_undo(state);
-                            state.annotations[selected].size = current_size(state);
-                            recompose_preview(state);
                         }
+                        state.dragging = Some(Drag::CaptionSize);
+                        update_caption_size(state, x);
+                        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
+                    }
+                    if caption_controls_active(state) {
+                        if let Some((_, style)) = state
+                            .caption_style_controls
+                            .iter()
+                            .find(|(rect, _)| contains(*rect, x, y))
+                            .copied()
+                        {
+                            stop_playback(state);
+                            state.caption_style = style;
+                            if let Some(selected) = state
+                                .selected
+                                .filter(|index| *index < state.annotations.len())
+                            {
+                                push_undo(state);
+                                state.annotations[selected].caption_style = style;
+                            }
+                            recompose_preview(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                    }
+                    if state.selected.is_some() {
+                        if let Some((_, choice)) = state
+                            .timing_controls
+                            .iter()
+                            .find(|(rect, _)| contains(*rect, x, y))
+                            .copied()
+                        {
+                            stop_playback(state);
+                            apply_timing(state, choice);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                    }
+                    if !caption_controls_active(state) {
+                        if let Some((_, index)) = state
+                            .size_controls
+                            .iter()
+                            .find(|(rect, _)| contains(*rect, x, y))
+                            .copied()
+                        {
+                            stop_playback(state);
+                            state.size_idx = index;
+                            if let Some(selected) = state
+                                .selected
+                                .filter(|index| *index < state.annotations.len())
+                            {
+                                push_undo(state);
+                                state.annotations[selected].size = current_size(state);
+                                recompose_preview(state);
+                            }
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
                     }
                     if contains(state.undo_control, x, y) {
                         stop_playback(state);
@@ -2081,40 +2223,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return LRESULT(0);
                     }
                     if contains(tool_panel(state), x, y) {
-                        return LRESULT(0);
-                    }
-                }
-
-                if contains(annotation_lane(state), x, y) {
-                    if let Some(index) = state
-                        .annotations
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find(|(index, item)| contains(item_clip_rect(state, *index, item), x, y))
-                        .map(|(index, _)| index)
-                    {
-                        stop_playback(state);
-                        let rect = item_clip_rect(state, index, &state.annotations[index]);
-                        state.selected = Some(index);
-                        state.playhead = state.annotations[index]
-                            .start
-                            .clamp(state.trim_start, state.trim_end);
-                        push_undo(state);
-                        let grab = s(state, 7);
-                        state.dragging = Some(if (x - rect.left).abs() <= grab {
-                            Drag::ClipStart(index)
-                        } else if (x - rect.right).abs() <= grab {
-                            Drag::ClipEnd(index)
-                        } else {
-                            Drag::ClipMove {
-                                index,
-                                last_time: x_to_time(state, x),
-                            }
-                        });
-                        refresh_preview(state);
-                        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
-                        let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
                 }
@@ -2141,6 +2249,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 end,
                                 color: state.color_idx,
                                 size: current_size(state),
+                                caption_style: crate::video_edit::CaptionStyle::Shadow,
                             });
                             let index = state.annotations.len() - 1;
                             state.selected = Some(index);
@@ -2159,6 +2268,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(index) = hit_annotation(state, point) {
                         push_undo(state);
                         state.selected = Some(index);
+                        sync_selected_controls(state, index);
                         state.dragging = Some(Drag::Move { index, last: point });
                         windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                     } else {
@@ -2468,6 +2578,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDBLCLK => {
             if let Some(state) = state_of(hwnd) {
+                state.dragging = None;
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -2480,13 +2592,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let pos = *pos;
                             let text = text.clone();
                             state.color_idx = state.annotations[index].color;
-                            state.size_idx = if state.annotations[index].size < 0.91 {
-                                0
-                            } else if state.annotations[index].size > 1.17 {
-                                2
-                            } else {
-                                1
-                            };
+                            state.caption_size = state.annotations[index].size;
+                            state.caption_style = state.annotations[index].caption_style;
                             state.selected = Some(index);
                             state.text_entry = Some(TextEntry {
                                 pos,
@@ -2625,6 +2732,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.tool_controls = next.tool_controls;
                     state.color_controls = next.color_controls;
                     state.size_controls = next.size_controls;
+                    state.caption_size_slider = next.caption_size_slider;
+                    state.caption_style_controls = next.caption_style_controls;
+                    state.timing_controls = next.timing_controls;
                     state.undo_control = next.undo_control;
                     state.delete_control = next.delete_control;
                     state.preview_rect = next.preview;
@@ -2832,11 +2942,16 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         tool: None,
         color_idx: 0,
         size_idx: 1,
+        caption_size: 1.75,
+        caption_style: crate::video_edit::CaptionStyle::Box,
         text_entry: None,
         add_control: initial.add_control,
         tool_controls: initial.tool_controls,
         color_controls: initial.color_controls,
         size_controls: initial.size_controls,
+        caption_size_slider: initial.caption_size_slider,
+        caption_style_controls: initial.caption_style_controls,
+        timing_controls: initial.timing_controls,
         undo_control: initial.undo_control,
         delete_control: initial.delete_control,
         status: None,

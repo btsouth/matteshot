@@ -3,6 +3,12 @@
 
 use image::RgbaImage;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptionStyle {
+    Shadow,
+    Box,
+}
+
 #[derive(Clone, Debug)]
 pub enum Shape {
     Arrow { from: (f32, f32), to: (f32, f32) },
@@ -18,6 +24,7 @@ pub struct Item {
     pub end: i64,
     pub color: usize,
     pub size: f32,
+    pub caption_style: CaptionStyle,
 }
 
 impl Item {
@@ -67,17 +74,11 @@ pub fn render_at(
     content_size: (u32, u32),
     offset: (f32, f32),
 ) {
-    let visible: Vec<_> = items
-        .iter()
-        .enumerate()
-        .filter(|(index, item)| Some(*index) != skip && item.active_at(time))
-        .map(|(_, item)| annotation(item, content_size.0, content_size.1))
-        .collect();
-    if visible.is_empty() {
-        return;
+    for (index, item) in items.iter().enumerate() {
+        if Some(index) != skip && item.active_at(time) {
+            render_one_at(image, item, content_size, offset);
+        }
     }
-    let metric_scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
-    crate::annotate::render_with_metric(image, &visible, 1.0, metric_scale, offset, None);
 }
 
 pub fn render_one_at(
@@ -87,6 +88,21 @@ pub fn render_one_at(
     offset: (f32, f32),
 ) {
     let metric_scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
+    if let Shape::Text { pos, text } = &item.shape {
+        crate::annotate::render_caption(
+            image,
+            point(*pos, content_size.0 as f32, content_size.1 as f32),
+            text,
+            crate::annotate::CaptionOptions {
+                color_index: item.color,
+                size: item.size,
+                metric_scale,
+                offset,
+                boxed: item.caption_style == CaptionStyle::Box,
+            },
+        );
+        return;
+    }
     crate::annotate::render_with_metric(
         image,
         &[annotation(item, content_size.0, content_size.1)],
@@ -111,11 +127,16 @@ pub fn bounds(item: &Item) -> (f32, f32, f32, f32) {
         Shape::Text { pos, text } => {
             let width = (text.chars().count() as f32 * 0.018 * item.size).clamp(0.06, 0.72);
             let height = 0.055 * item.size;
+            let pad = if item.caption_style == CaptionStyle::Box {
+                0.014 * item.size
+            } else {
+                0.006 * item.size
+            };
             (
-                pos.0,
-                pos.1,
-                (pos.0 + width).min(1.0),
-                (pos.1 + height).min(1.0),
+                (pos.0 - pad).max(0.0),
+                (pos.1 - pad).max(0.0),
+                (pos.0 + width + pad).min(1.0),
+                (pos.1 + height + pad).min(1.0),
             )
         }
     }
@@ -182,7 +203,7 @@ pub fn translate(item: &mut Item, dx: f32, dy: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounds, hit, render_at, translate, Item, Shape};
+    use super::{bounds, hit, render_at, translate, CaptionStyle, Item, Shape};
     use image::{Rgba, RgbaImage};
 
     fn arrow() -> Item {
@@ -195,6 +216,7 @@ mod tests {
             end: 20,
             color: 0,
             size: 1.0,
+            caption_style: CaptionStyle::Shadow,
         }
     }
 
@@ -230,6 +252,7 @@ mod tests {
             end: 20,
             color: 0,
             size: 1.0,
+            caption_style: CaptionStyle::Shadow,
         };
         let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
         render_at(&mut image, &[item], 10, None, (100, 100), (50.0, 50.0));
@@ -256,6 +279,7 @@ mod tests {
             end: 20,
             color: 0,
             size: 1.0,
+            caption_style: CaptionStyle::Shadow,
         };
         let mut image = RgbaImage::from_pixel(1200, 600, Rgba([0, 0, 0, 255]));
         render_at(
@@ -276,5 +300,58 @@ mod tests {
             .enumerate_pixels()
             .filter(|(x, _, _)| (490..545).contains(x))
             .all(|(_, _, pixel)| pixel[0] == 0));
+    }
+
+    #[test]
+    fn caption_box_adds_legible_background_outside_the_glyphs() {
+        let mut boxed = RgbaImage::from_pixel(400, 200, Rgba([230, 230, 230, 255]));
+        let mut shadow = boxed.clone();
+        let item = Item {
+            shape: Shape::Text {
+                pos: (0.25, 0.25),
+                text: "Caption".into(),
+            },
+            start: 0,
+            end: 20,
+            color: 3,
+            size: 2.0,
+            caption_style: CaptionStyle::Box,
+        };
+        render_at(
+            &mut boxed,
+            std::slice::from_ref(&item),
+            10,
+            None,
+            (400, 200),
+            (0.0, 0.0),
+        );
+        let mut shadow_item = item;
+        shadow_item.caption_style = CaptionStyle::Shadow;
+        render_at(&mut shadow, &[shadow_item], 10, None, (400, 200), (0.0, 0.0));
+
+        // The box extends left of the text origin; shadow-only text does not.
+        assert!(boxed.get_pixel(94, 52)[0] < shadow.get_pixel(94, 52)[0]);
+    }
+
+    #[test]
+    fn caption_can_be_moved_repeatedly_without_losing_its_position() {
+        let mut item = Item {
+            shape: Shape::Text {
+                pos: (0.2, 0.2),
+                text: "Move me".into(),
+            },
+            start: 0,
+            end: 20,
+            color: 3,
+            size: 1.75,
+            caption_style: CaptionStyle::Box,
+        };
+        translate(&mut item, 0.15, 0.1);
+        translate(&mut item, 0.1, 0.2);
+        let Shape::Text { pos, .. } = item.shape else {
+            panic!("caption changed shape");
+        };
+        assert!((pos.0 - 0.45).abs() < 0.0001);
+        assert!((pos.1 - 0.5).abs() < 0.0001);
     }
 }

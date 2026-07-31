@@ -251,6 +251,98 @@ pub fn render(
     render_with_metric(img, anns, scale, scale, offset, caret);
 }
 
+fn rounded_plate(
+    img: &mut RgbaImage,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    radius: f32,
+) {
+    let width = (right - left).max(1) as f32;
+    let height = (bottom - top).max(1) as f32;
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(1.0);
+    for y in top..bottom {
+        for x in left..right {
+            let px = x as f32 + 0.5 - left as f32;
+            let py = y as f32 + 0.5 - top as f32;
+            let qx = (px - width / 2.0).abs() - (width / 2.0 - radius);
+            let qy = (py - height / 2.0).abs() - (height / 2.0 - radius);
+            let distance = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt()
+                + qx.max(qy).min(0.0)
+                - radius;
+            let coverage = (0.5 - distance).clamp(0.0, 1.0);
+            blend(img, x, y, [12, 14, 20], coverage * 0.82);
+        }
+    }
+}
+
+/// Draw a video caption at an already-expanded destination-pixel position.
+/// `boxed` adds a translucent rounded plate for busy footage; shadow mode is
+/// deliberately stronger than screenshot text so captions remain readable.
+pub struct CaptionOptions {
+    pub color_index: usize,
+    pub size: f32,
+    pub metric_scale: f32,
+    pub offset: (f32, f32),
+    pub boxed: bool,
+}
+
+pub fn render_caption(
+    img: &mut RgbaImage,
+    pos: (f32, f32),
+    text: &str,
+    options: CaptionOptions,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let px_h = (24.0 * options.metric_scale * options.size).max(12.0) as i32;
+    let Some((alpha, tw, th)) = raster_text(text, px_h) else {
+        return;
+    };
+    let color = COLORS[options.color_index.min(COLORS.len() - 1)];
+    let ox = (pos.0 + options.offset.0) as i32;
+    let oy = (pos.1 + options.offset.1) as i32;
+    if options.boxed {
+        let pad_x = (px_h as f32 * 0.42).round() as i32;
+        let pad_y = (px_h as f32 * 0.24).round() as i32;
+        rounded_plate(
+            img,
+            ox - pad_x,
+            oy - pad_y,
+            ox + tw + pad_x,
+            oy + th + pad_y,
+            px_h as f32 * 0.34,
+        );
+    }
+    let shadow = (options.metric_scale * options.size * 2.0)
+        .round()
+        .clamp(1.0, 5.0) as i32;
+    for y in 0..th {
+        for x in 0..tw {
+            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
+            if a > 0.0 {
+                for (nx, ny) in [
+                    (-shadow, 0),
+                    (shadow, 0),
+                    (0, -shadow),
+                    (0, shadow),
+                    (shadow, shadow),
+                ] {
+                    blend(img, ox + x + nx, oy + y + ny, [8, 9, 13], a * 0.72);
+                }
+            }
+        }
+    }
+    for y in 0..th {
+        for x in 0..tw {
+            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
+            blend(img, ox + x, oy + y, color, a);
+        }
+    }
+}
+
 /// Render when coordinates are already in destination pixels but strokes and
 /// text still need to scale for preview/output resolution. Video annotations
 /// use this because their normalized coordinates are expanded before render.
