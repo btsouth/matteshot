@@ -26,6 +26,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Validate release version sources
+        shell: pwsh
+        run: |
+          $cargo = Get-Content -Raw Cargo.toml
+          $version = [regex]::Match(
+            $cargo,
+            '(?ms)^\[package\]\s*.*?^version\s*=\s*"([^"]+)"'
+          ).Groups[1].Value
+          .\scripts\validate-release-version.ps1 -Tag "v$version"
+
       - name: Test
         run: cargo test --all-targets --all-features
 

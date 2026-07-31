@@ -72,6 +72,15 @@ matteshot --once --tweak     # capture the foreground window and open the tweak 
 
 Capture-producing diagnostic commands honor the same trial and license gate as the resident app.
 
+Release acceptance runs in Windows Sandbox with clipboard redirection disabled:
+
+```powershell
+.\scripts\run-sandbox-smoke.ps1 `
+  -InstallerPath <signed-installer> `
+  -LicenseKeyPath <test-key-file> `
+  -WorkDirectory <temporary-directory>
+```
+
 Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `Videos\Matteshot` (note: often OneDrive-redirected).
 
 ## Architecture
