@@ -43,9 +43,10 @@ pub enum Selection {
     /// Record instead of capture — carries virtual-screen geometry.
     RecordWindow(HWND),
     RecordRegion(RECT, HMONITOR),
-    /// Scroll-capture a window or region.
-    ScrollWindow(HWND),
-    ScrollRegion(RECT, HMONITOR),
+    /// Scroll-capture a window or region. The point is the user's intended
+    /// wheel target in virtual-screen coordinates.
+    ScrollWindow(HWND, POINT),
+    ScrollRegion(RECT, HMONITOR, POINT),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -459,7 +460,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     MONITOR_DEFAULTTONEAREST,
                                 );
                                 let sel = if state.scrolling {
-                                    Selection::ScrollRegion(v, mon)
+                                    Selection::ScrollRegion(
+                                        v,
+                                        mon,
+                                        POINT {
+                                            x: start.x + state.origin.x,
+                                            y: start.y + state.origin.y,
+                                        },
+                                    )
                                 } else {
                                     Selection::RecordRegion(v, mon)
                                 };
@@ -486,8 +494,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if state.recording || state.scrolling {
                                 let r = state.windows[i].rect;
                                 let scrolling = state.scrolling;
+                                let anchor = POINT {
+                                    x: pt.x + state.origin.x,
+                                    y: pt.y + state.origin.y,
+                                };
                                 let sel = match state.windows[i].hwnd {
-                                    Some(t) if scrolling => Selection::ScrollWindow(t),
+                                    Some(t) if scrolling => Selection::ScrollWindow(t, anchor),
                                     Some(t) => Selection::RecordWindow(t),
                                     None => {
                                         let v = RECT {
@@ -501,7 +513,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                             MONITOR_DEFAULTTONEAREST,
                                         );
                                         if scrolling {
-                                            Selection::ScrollRegion(v, mon)
+                                            Selection::ScrollRegion(v, mon, anchor)
                                         } else {
                                             Selection::RecordRegion(v, mon)
                                         }

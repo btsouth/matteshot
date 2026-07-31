@@ -25,9 +25,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// What to scroll-capture.
 #[derive(Clone, Copy)]
 pub enum Target {
-    Window(HWND),
+    Window(HWND, POINT),
     /// Virtual-screen rect on a monitor.
-    Region(RECT, HMONITOR),
+    Region(RECT, HMONITOR, POINT),
+}
+
+impl Target {
+    /// Test-only/title-driven captures have no overlay click, so preserve the
+    /// old centered behavior for that path.
+    pub fn centered_window(hwnd: HWND) -> Self {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r);
+        }
+        Self::Window(
+            hwnd,
+            POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 },
+        )
+    }
 }
 
 // Generous ceilings — these are runaway guards, not working limits. Long
@@ -158,8 +173,8 @@ fn esc_pressed() -> bool {
 
 fn grab(target: Target) -> Result<RgbaImage> {
     match target {
-        Target::Window(h) => crate::capture::capture_window(h),
-        Target::Region(r, mon) => {
+        Target::Window(h, _) => crate::capture::capture_window(h),
+        Target::Region(r, mon, _) => {
             let full = crate::capture::capture_monitor(mon)?;
             let mut mi = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -182,6 +197,20 @@ fn grab(target: Target) -> Result<RgbaImage> {
             )
             .to_image())
         }
+    }
+}
+
+fn clamp_anchor(anchor: POINT, rect: RECT) -> POINT {
+    // Keep the point just inside the target. A drag starts on the selected
+    // region's edge, and exact border coordinates can route the wheel to an
+    // adjacent control in some apps.
+    let left = rect.left.min(rect.right - 1);
+    let right = (rect.right - 1).max(left);
+    let top = rect.top.min(rect.bottom - 1);
+    let bottom = (rect.bottom - 1).max(top);
+    POINT {
+        x: anchor.x.clamp(left, right),
+        y: anchor.y.clamp(top, bottom),
     }
 }
 
@@ -301,20 +330,21 @@ fn measure_shift(
 /// Scroll-capture `target` into one tall image.
 pub fn capture(target: Target) -> Result<RgbaImage> {
     let anchor = match target {
-        Target::Window(h) => unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY) },
-        Target::Region(_, m) => m,
+        Target::Window(h, _) => unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY) },
+        Target::Region(_, m, _) => m,
     };
 
-    // Put the cursor over the target so the wheel reaches the right control.
+    // Put the cursor exactly where the user chose so wheel routing follows
+    // their intent: page body scrolls the page; a nested pane scrolls itself.
     let hover = match target {
-        Target::Window(h) => {
+        Target::Window(h, point) => {
             let mut r = RECT::default();
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(h, &mut r);
             }
-            POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }
+            clamp_anchor(point, r)
         }
-        Target::Region(r, _) => POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 },
+        Target::Region(r, _, point) => clamp_anchor(point, r),
     };
     let mut saved = POINT::default();
     unsafe {
@@ -323,6 +353,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         // Let the target process the move before the first wheel event.
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
+    eprintln!("scroll: wheel anchor {},{}", hover.x, hover.y);
 
     let (pill, mut pill_state) = unsafe { show_pill(anchor)? };
     pump();
@@ -351,6 +382,9 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         }
         // Scroll down.
         unsafe {
+            // Some apps move the pointer as controls disappear during a
+            // scroll. Reassert the chosen target before every wheel event.
+            let _ = SetCursorPos(hover.x, hover.y);
             let input = INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
@@ -505,4 +539,22 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         canvas.height()
     );
     Ok(canvas)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_anchor_stays_at_the_users_point() {
+        let rect = RECT { left: 100, top: 200, right: 500, bottom: 700 };
+        assert_eq!(clamp_anchor(POINT { x: 240, y: 360 }, rect), POINT { x: 240, y: 360 });
+    }
+
+    #[test]
+    fn scroll_anchor_is_kept_inside_the_capture_target() {
+        let rect = RECT { left: 100, top: 200, right: 500, bottom: 700 };
+        assert_eq!(clamp_anchor(POINT { x: 900, y: 900 }, rect), POINT { x: 499, y: 699 });
+        assert_eq!(clamp_anchor(POINT { x: 20, y: 40 }, rect), POINT { x: 100, y: 200 });
+    }
 }

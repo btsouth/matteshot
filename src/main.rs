@@ -189,12 +189,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 Some((overlay::Selection::RecordRegion(r, m), _)) => {
                     record::session(record::Target::region(r, m), cfg.record_gif)
                 }
-                Some((overlay::Selection::ScrollWindow(h), mon)) => {
-                    let img = scroll::capture(scroll::Target::Window(h))?;
+                Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
+                    let img = scroll::capture(scroll::Target::Window(h, anchor))?;
                     shoot(Source::Image(img), mon, None)
                 }
-                Some((overlay::Selection::ScrollRegion(r, m), mon)) => {
-                    let img = scroll::capture(scroll::Target::Region(r, m))?;
+                Some((overlay::Selection::ScrollRegion(r, m, anchor), mon)) => {
+                    let img = scroll::capture(scroll::Target::Region(r, m, anchor))?;
                     shoot(Source::Image(img), mon, None)
                 }
                 None => Ok(()),
@@ -216,12 +216,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 overlay::Selection::RecordRegion(r, m) => {
                     record::session(record::Target::region(r, m), cfg.record_gif)
                 }
-                overlay::Selection::ScrollWindow(h) => {
-                    let img = scroll::capture(scroll::Target::Window(h))?;
+                overlay::Selection::ScrollWindow(h, anchor) => {
+                    let img = scroll::capture(scroll::Target::Window(h, anchor))?;
                     shoot(Source::Image(img), mon, None)
                 }
-                overlay::Selection::ScrollRegion(r, m) => {
-                    let img = scroll::capture(scroll::Target::Region(r, m))?;
+                overlay::Selection::ScrollRegion(r, m, anchor) => {
+                    let img = scroll::capture(scroll::Target::Region(r, m, anchor))?;
                     shoot(Source::Image(img), mon, None)
                 }
             };
@@ -278,12 +278,12 @@ fn shoot_overlay() -> Result<()> {
         Some((overlay::Selection::RecordRegion(r, mon), _)) => {
             record::session(record::Target::region(r, mon), Config::load().record_gif)
         }
-        Some((overlay::Selection::ScrollWindow(h), mon)) => {
-            let img = scroll::capture(scroll::Target::Window(h))?;
+        Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
+            let img = scroll::capture(scroll::Target::Window(h, anchor))?;
             shoot(Source::Image(img), mon, None)
         }
-        Some((overlay::Selection::ScrollRegion(r, m), mon)) => {
-            let img = scroll::capture(scroll::Target::Region(r, m))?;
+        Some((overlay::Selection::ScrollRegion(r, m, anchor), mon)) => {
+            let img = scroll::capture(scroll::Target::Region(r, m, anchor))?;
             shoot(Source::Image(img), mon, None)
         }
         None => {
@@ -552,7 +552,7 @@ fn main() -> Result<()> {
             let needle = args.get(1).context("--scroll-test <title>")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
-            let img = scroll::capture(scroll::Target::Window(hwnd))?;
+            let img = scroll::capture(scroll::Target::centered_window(hwnd))?;
             let p = std::env::temp_dir().join("matteshot-scroll.png");
             img.save(&p)?;
             eprintln!("saved {}x{} -> {}", img.width(), img.height(), p.display());
