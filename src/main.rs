@@ -788,6 +788,35 @@ fn main() -> Result<()> {
             eprintln!("video editor export -> {}", dst.display());
             Ok(())
         }
+        // Paced editor-playback probe. Decodes three seconds at preview size,
+        // never opens a window, writes a file, or touches the clipboard.
+        Some("--playback-test") => {
+            let src =
+                std::path::PathBuf::from(args.get(1).context("--playback-test <mp4>")?);
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let started = std::time::Instant::now();
+            let mut frames = 0u32;
+            let mut last = 0i64;
+            trim::playback_frames(
+                &src,
+                0,
+                30_000_000,
+                960,
+                540,
+                &cancel,
+                |frame| {
+                    frames += 1;
+                    last = frame.timestamp;
+                    true
+                },
+            )?;
+            eprintln!(
+                "playback: {frames} frames through {:.2}s in {:.2}s",
+                last as f64 / 10_000_000.0,
+                started.elapsed().as_secs_f64()
+            );
+            Ok(())
+        }
         // Open the focused recording editor around an existing MP4. This is
         // visual-only: it does not capture or touch the clipboard.
         Some("--review-test") => {

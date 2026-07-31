@@ -27,7 +27,7 @@ Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips in
 - H.264 MP4 via Media Foundation, ~30fps, bitrate scaled to pixel count, saved to the videos folder, file on clipboard.
 - **Audio**: Off / System (WASAPI loopback) / Mic in settings. Float PCM → resampled to an AAC-legal rate (192 kHz interfaces are common; AAC takes only 44.1/48 kHz) → stereo downmix → AAC muxed into the same MP4.
 - Optional share-sized **GIF** alongside (settings toggle).
-- **On stop**, a focused video editor opens with a large frame preview, the same seven matte choices as screenshots, a draggable playhead, keyboard scrubbing, and two trim handles. A compact **+ Add** drawer places time-ranged text, arrows, boxes, and pixelate-redaction; every tool returns to Select after placement, annotations stay freely movable, and their timeline clips can be moved or resized. **Export edit** renders the matte and annotations at full resolution through a frame-accurate re-encode with audio preserved. The untouched original stays put. Play original / Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
+- **On stop**, a focused video editor opens with a large frame preview, native Play/Pause, Spacebar control, synchronized playhead, the same seven matte choices as screenshots, keyboard seeking, and two trim handles. Playback keeps running through matte changes and resumes after timeline or trim seeks. A compact **+ Add** drawer places time-ranged text, arrows, boxes, and pixelate-redaction; every tool returns to Select after placement, annotations stay freely movable, and their timeline clips can be moved or resized. **Export edit** renders the matte and annotations at full resolution through a responsive background re-encode with progress and audio preserved. The untouched original stays put. Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
 
 ## Scrolling capture
 
@@ -65,6 +65,7 @@ matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCR
 matteshot --record-test [s]  # short recording smoke test, optionally auto-stop after s seconds
 matteshot --trim-test <mp4> <a> <b> [1-7] # trim/export probe; optional matte
 matteshot --video-edit-test <mp4> # matte + text/arrow/box/blur export probe
+matteshot --playback-test <mp4> # paced 3s editor preview decode, no UI/clipboard
 matteshot --review-test <mp4> # open the video editor around an existing file
 matteshot --ocr <substr>     # capture a window and print its OCR text
 matteshot --update-test      # probe version.json; never downloads

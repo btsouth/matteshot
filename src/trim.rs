@@ -3,6 +3,7 @@
 //! same sink pipeline the recorder uses).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
@@ -20,6 +21,14 @@ pub struct Probe {
     pub duration_100ns: i64,
     /// BGRA thumbnails: (pixels, w, h).
     pub thumbs: Vec<(Vec<u8>, u32, u32)>,
+}
+
+pub struct PlaybackFrame {
+    /// Tightly packed BGRA pixels sized for the editor preview.
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub timestamp: i64,
 }
 
 fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u32, i32)> {
@@ -141,6 +150,77 @@ pub fn preview_frame(
     let scaled = image::imageops::thumbnail(&rgba, max_w.max(2), max_h.max(2));
     let (sw, sh) = scaled.dimensions();
     Ok((rgba_to_bgra(&scaled, sw, sh), sw, sh))
+}
+
+/// Sequential, wall-clock-paced preview decode for the in-app video editor.
+/// Frames are decoded on a worker thread; late frames are dropped so the UI
+/// follows media time instead of accumulating an ever-growing message queue.
+pub fn playback_frames(
+    path: &Path,
+    start: i64,
+    end: i64,
+    max_w: u32,
+    max_h: u32,
+    cancel: &AtomicBool,
+    mut deliver: impl FnMut(PlaybackFrame) -> bool,
+) -> Result<()> {
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
+    let (reader, w, h, stride) = open_reader(path, false)?;
+    unsafe {
+        let position = PROPVARIANT::from(start.max(0));
+        reader
+            .SetCurrentPosition(&windows::core::GUID::zeroed(), &position)
+            .context("seek playback preview")?;
+    }
+
+    let wall_start = std::time::Instant::now();
+    while !cancel.load(Ordering::Relaxed) {
+        let Some((bgra, timestamp)) = read_video_frame(&reader, w, h, stride)? else {
+            break;
+        };
+        if timestamp < start {
+            continue;
+        }
+        if timestamp >= end {
+            break;
+        }
+
+        let media_elapsed = std::time::Duration::from_nanos(
+            timestamp.saturating_sub(start).max(0) as u64 * 100,
+        );
+        let due = wall_start + media_elapsed;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= due {
+                break;
+            }
+            std::thread::sleep((due - now).min(std::time::Duration::from_millis(5)));
+        }
+
+        // When decode falls behind, keep consuming until media time catches
+        // up. Posting every late frame would make Pause feel delayed.
+        if std::time::Instant::now().saturating_duration_since(due)
+            > std::time::Duration::from_millis(90)
+        {
+            continue;
+        }
+
+        let rgba = bgra_to_rgba(&bgra, w, h);
+        let scaled = image::imageops::thumbnail(&rgba, max_w.max(2), max_h.max(2));
+        let (width, height) = scaled.dimensions();
+        if !deliver(PlaybackFrame {
+            bytes: rgba_to_bgra(&scaled, width, height),
+            width,
+            height,
+            timestamp,
+        }) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Duration + filmstrip thumbnails sized to tile `strip_w` x `strip_h` at

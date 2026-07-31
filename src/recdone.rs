@@ -2,6 +2,8 @@
 //! export actions. Non-modal on the main loop.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use image::RgbaImage;
@@ -17,7 +19,7 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
+    GetKeyState, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
@@ -30,10 +32,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const WM_EXPORT_PROGRESS: u32 = WM_APP + 20;
 const WM_EXPORT_DONE: u32 = WM_APP + 21;
+const WM_PLAYBACK_FRAME: u32 = WM_APP + 22;
+const WM_PLAYBACK_DONE: u32 = WM_APP + 23;
 
 struct ExportDone {
     path: PathBuf,
     result: std::result::Result<(), String>,
+}
+
+#[derive(Default)]
+struct PlaybackMailbox {
+    frame: Option<(u64, crate::trim::PlaybackFrame)>,
+    done: Option<(u64, std::result::Result<(), String>, bool)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -133,6 +143,11 @@ struct State {
     delete_control: RECT,
     status: Option<String>,
     exporting: bool,
+    playing: bool,
+    playback_generation: u64,
+    playback_cancel: Option<Arc<AtomicBool>>,
+    playback_mailbox: Arc<Mutex<PlaybackMailbox>>,
+    resume_after_drag: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -204,7 +219,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     let by = ch - sc(52);
     let labels: [(Act, &'static str, i32); 5] = [
         (Act::SaveTrim, "Export edit", 108),
-        (Act::Play, "Play original", 112),
+        (Act::Play, "Play", 82),
         (Act::Reveal, "Show in folder", 126),
         (Act::Copy, "Copy", 72),
         (Act::Delete, "Delete", 80),
@@ -406,6 +421,90 @@ fn refresh_preview_exact(state: &mut State) {
             recompose_preview(state);
         }
         Err(_) => refresh_preview(state),
+    }
+}
+
+fn stop_playback(state: &mut State) {
+    if let Some(cancel) = state.playback_cancel.take() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    state.playing = false;
+    state.playback_generation = state.playback_generation.wrapping_add(1);
+}
+
+fn start_playback(hwnd: HWND, state: &mut State) {
+    if state.duration <= 0 || state.trim_end <= state.trim_start {
+        return;
+    }
+    stop_playback(state);
+    if state.playhead < state.trim_start || state.playhead >= state.trim_end - 100_000 {
+        state.playhead = state.trim_start;
+    }
+
+    let generation = state.playback_generation;
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.playback_cancel = Some(cancel.clone());
+    state.playing = true;
+    state.status = None;
+
+    let source = state.mp4.clone();
+    let start = state.playhead;
+    let end = state.trim_end;
+    let max_w = (state.preview_rect.right - state.preview_rect.left).max(2) as u32;
+    let max_h = (state.preview_rect.bottom - state.preview_rect.top).max(2) as u32;
+    let mailbox = state.playback_mailbox.clone();
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let result = crate::trim::playback_frames(
+            &source,
+            start,
+            end,
+            max_w,
+            max_h,
+            &cancel,
+            |frame| {
+                mailbox.lock().unwrap().frame = Some((generation, frame));
+                unsafe {
+                    PostMessageW(
+                        HWND(hwnd_raw as *mut _),
+                        WM_PLAYBACK_FRAME,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                    .is_ok()
+                }
+            },
+        )
+        .map_err(|error| format!("{error:#}"));
+        let cancelled = cancel.load(Ordering::Relaxed);
+        mailbox.lock().unwrap().done = Some((generation, result, cancelled));
+        unsafe {
+            let _ = PostMessageW(
+                HWND(hwnd_raw as *mut _),
+                WM_PLAYBACK_DONE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        if com.is_ok() {
+            unsafe { CoUninitialize() };
+        }
+    });
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+fn toggle_playback(hwnd: HWND, state: &mut State) {
+    if state.playing {
+        stop_playback(state);
+        state.status = Some("paused".into());
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    } else {
+        start_playback(hwnd, state);
     }
 }
 
@@ -1353,6 +1452,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
         );
         let shown = if *act == Act::SaveTrim && state.exporting {
             "Exporting"
+        } else if *act == Act::Play && state.playing {
+            "Pause"
         } else {
             label
         };
@@ -1397,6 +1498,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     Err(error) => state.status = Some(format!("export failed: {error}")),
                 }
                 let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_PLAYBACK_FRAME => {
+            if let Some(state) = state_of(hwnd) {
+                let next = state.playback_mailbox.lock().unwrap().frame.take();
+                if let Some((generation, frame)) = next {
+                    if state.playing && generation == state.playback_generation {
+                        state.playhead = frame.timestamp.clamp(state.trim_start, state.trim_end);
+                        state.preview_raw = Some((frame.bytes, frame.width, frame.height));
+                        recompose_preview(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_PLAYBACK_DONE => {
+            if let Some(state) = state_of(hwnd) {
+                let done = state.playback_mailbox.lock().unwrap().done.take();
+                if let Some((generation, result, cancelled)) = done {
+                    if generation == state.playback_generation {
+                        state.playing = false;
+                        state.playback_cancel = None;
+                        if !cancelled {
+                            match result {
+                                Ok(()) => {
+                                    state.playhead = state.trim_end;
+                                    refresh_preview_exact(state);
+                                    state.status = None;
+                                }
+                                Err(error) => {
+                                    state.status = Some(format!("playback failed: {error}"));
+                                }
+                            }
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -1540,6 +1680,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
                 if contains(state.add_control, x, y) {
+                    stop_playback(state);
                     state.tools_open = !state.tools_open;
                     if !state.tools_open {
                         state.tool = None;
@@ -1556,6 +1697,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .find(|(rect, ..)| contains(*rect, x, y))
                         .copied()
                     {
+                        stop_playback(state);
                         state.tool = Some(tool);
                         state.selected = None;
                         state.text_entry = None;
@@ -1568,6 +1710,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .find(|(rect, _)| contains(*rect, x, y))
                         .copied()
                     {
+                        stop_playback(state);
                         state.color_idx = index;
                         if let Some(selected) = state
                             .selected
@@ -1586,6 +1729,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .find(|(rect, _)| contains(*rect, x, y))
                         .copied()
                     {
+                        stop_playback(state);
                         state.size_idx = index;
                         if let Some(selected) = state
                             .selected
@@ -1599,11 +1743,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return LRESULT(0);
                     }
                     if contains(state.undo_control, x, y) {
+                        stop_playback(state);
                         undo(state);
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
                     if contains(state.delete_control, x, y) {
+                        stop_playback(state);
                         delete_selected(state);
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
@@ -1614,14 +1760,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
 
                 if contains(annotation_lane(state), x, y) {
-                    if let Some((index, item)) = state
+                    if let Some(index) = state
                         .annotations
                         .iter()
                         .enumerate()
                         .rev()
                         .find(|(index, item)| contains(item_clip_rect(state, *index, item), x, y))
+                        .map(|(index, _)| index)
                     {
-                        let rect = item_clip_rect(state, index, item);
+                        stop_playback(state);
+                        let rect = item_clip_rect(state, index, &state.annotations[index]);
                         state.selected = Some(index);
                         state.playhead = state.annotations[index]
                             .start
@@ -1646,6 +1794,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
 
                 if let Some(point) = screen_to_preview(state, x, y) {
+                    stop_playback(state);
                     if let Some(tool) = state.tool {
                         if tool == Tool::Text {
                             state.text_entry = Some(TextEntry {
@@ -1700,6 +1849,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     && x >= strip.left - 8
                     && x <= strip.right + 8
                 {
+                    state.resume_after_drag = state.playing;
+                    if state.playing {
+                        stop_playback(state);
+                    }
                     let to_x = |t: i64| {
                         strip.left
                             + ((t as f64 / state.duration as f64)
@@ -1741,6 +1894,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                     if matches!(drag, Drag::Trim(_) | Drag::Playhead) {
                         refresh_preview_exact(state);
+                        if state.resume_after_drag {
+                            state.resume_after_drag = false;
+                            start_playback(hwnd, state);
+                        }
                     } else {
                         if let Drag::Draw { index, .. } = drag {
                             if let Some(item) = state.annotations.get(index) {
@@ -1778,7 +1935,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .position(|(r, ..)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
                 {
                     match state.controls[i].1 {
-                        Act::Play => crate::output::open_in_editor(&state.mp4),
+                        Act::Play => toggle_playback(hwnd, state),
                         Act::Reveal => crate::output::reveal_in_explorer(&state.mp4),
                         Act::Copy => {
                             let _ = crate::output::file_to_clipboard(&state.mp4);
@@ -1790,6 +1947,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let _ = InvalidateRect(hwnd, None, false);
                                 return LRESULT(0);
                             }
+                            stop_playback(state);
                             let _ = std::fs::remove_file(&state.mp4);
                             if let Some(g) = &state.gif {
                                 let _ = std::fs::remove_file(g);
@@ -1800,6 +1958,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if state.exporting {
                                 return LRESULT(0);
                             }
+                            stop_playback(state);
                             let style = state.styles[state.matte_index].clone();
                             let has_matte = !crate::compose::is_plain(&style);
                             let has_trim = state.trim_start > 0 || state.trim_end < state.duration;
@@ -1968,7 +2127,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 match wparam.0 as u16 {
                     key if key == VK_ESCAPE.0 => {
-                        if state.text_entry.is_some() {
+                        if state.playing {
+                            stop_playback(state);
+                            state.status = Some("paused".into());
+                            let _ = InvalidateRect(hwnd, None, false);
+                        } else if state.text_entry.is_some() {
                             state.text_entry = None;
                             recompose_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
@@ -1983,30 +2146,53 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = DestroyWindow(hwnd);
                         }
                     }
+                    key if key == VK_SPACE.0 => {
+                        if state.text_entry.is_none() {
+                            toggle_playback(hwnd, state);
+                        }
+                    }
                     key if key == VK_DELETE.0 => {
+                        stop_playback(state);
                         delete_selected(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     0x5A if GetKeyState(VK_CONTROL.0 as i32) < 0 => {
+                        stop_playback(state);
                         undo(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     key if key == VK_LEFT.0 => {
-                        state.playhead = (state.playhead - 5_000_000).max(0);
+                        let resume = state.playing;
+                        stop_playback(state);
+                        state.playhead = (state.playhead - 5_000_000).max(state.trim_start);
                         refresh_preview_exact(state);
+                        if resume {
+                            start_playback(hwnd, state);
+                        }
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     key if key == VK_RIGHT.0 => {
-                        state.playhead = (state.playhead + 5_000_000).min(state.duration);
+                        let resume = state.playing;
+                        stop_playback(state);
+                        state.playhead = (state.playhead + 5_000_000).min(state.trim_end);
                         refresh_preview_exact(state);
+                        if resume && state.playhead < state.trim_end {
+                            start_playback(hwnd, state);
+                        }
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     key if key == VK_HOME.0 => {
+                        let resume = state.playing;
+                        stop_playback(state);
                         state.playhead = state.trim_start;
                         refresh_preview_exact(state);
+                        if resume {
+                            start_playback(hwnd, state);
+                        }
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     key if key == VK_END.0 => {
+                        stop_playback(state);
                         state.playhead = state.trim_end;
                         refresh_preview_exact(state);
                         let _ = InvalidateRect(hwnd, None, false);
@@ -2051,6 +2237,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_CLOSE => {
+            if let Some(state) = state_of(hwnd) {
+                stop_playback(state);
+            }
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -2058,6 +2247,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
+                if let Some(cancel) = &state.playback_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 let _ = DeleteObject(state.font);
                 let _ = DeleteObject(state.font_small);
                 let _ = DeleteObject(state.font_big);
@@ -2163,6 +2355,11 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         delete_control: initial.delete_control,
         status: None,
         exporting: false,
+        playing: false,
+        playback_generation: 0,
+        playback_cancel: None,
+        playback_mailbox: Arc::new(Mutex::new(PlaybackMailbox::default())),
+        resume_after_drag: false,
     }));
 
     unsafe {
