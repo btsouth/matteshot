@@ -522,6 +522,7 @@ fn run_app() -> Result<()> {
                     error_box(&format!("Capture failed: {e:#}"));
                 }
             }
+            let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
             DispatchMessageW(&msg);
 
             // A timer message reaches this loop every 250 ms. If Windows or

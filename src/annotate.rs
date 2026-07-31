@@ -248,17 +248,38 @@ pub fn render(
     offset: (f32, f32),
     caret: Option<usize>,
 ) {
+    render_with_metric(img, anns, scale, scale, offset, caret);
+}
+
+/// Render when coordinates are already in destination pixels but strokes and
+/// text still need to scale for preview/output resolution. Video annotations
+/// use this because their normalized coordinates are expanded before render.
+pub fn render_with_metric(
+    img: &mut RgbaImage,
+    anns: &[Annotation],
+    coordinate_scale: f32,
+    metric_scale: f32,
+    offset: (f32, f32),
+    caret: Option<usize>,
+) {
     for (i, ann) in anns.iter().enumerate() {
-        let stroke = (5.0 * scale * ann.size).max(2.0);
+        let stroke = (5.0 * metric_scale * ann.size).max(2.0);
         let color = COLORS[ann.color.min(COLORS.len() - 1)];
-        let s = |p: (f32, f32)| (p.0 * scale + offset.0, p.1 * scale + offset.1);
+        let s = |p: (f32, f32)| {
+            (
+                p.0 * coordinate_scale + offset.0,
+                p.1 * coordinate_scale + offset.1,
+            )
+        };
         match &ann.shape {
             Shape::Arrow { from, to } => {
                 let (f, t) = (s(*from), s(*to));
                 let (dx, dy) = (t.0 - f.0, t.1 - f.1);
                 let len = (dx * dx + dy * dy).sqrt().max(1e-3);
                 let (ux, uy) = (dx / len, dy / len);
-                let head = (stroke * 3.4).min(len * 0.5).max(14.0 * scale * ann.size);
+                let head = (stroke * 3.4)
+                    .min(len * 0.5)
+                    .max(14.0 * metric_scale * ann.size);
                 // Shorten the shaft so it doesn't poke out of the head.
                 let shaft_end = (t.0 - ux * head * 0.7, t.1 - uy * head * 0.7);
                 line(img, f, shaft_end, stroke, color);
@@ -312,7 +333,7 @@ pub fn render(
             }
             Shape::Counter { pos, n } => {
                 let c = s(*pos);
-                let r = (14.0 * scale * ann.size).max(9.0);
+                let r = (14.0 * metric_scale * ann.size).max(9.0);
                 // Filled badge with AA edge.
                 let (min_x, max_x) = ((c.0 - r - 1.0) as i32, (c.0 + r + 1.0) as i32);
                 let (min_y, max_y) = ((c.1 - r - 1.0) as i32, (c.1 + r + 1.0) as i32);
@@ -340,7 +361,7 @@ pub fn render(
                 }
             }
             Shape::Blur { a, b } => {
-                pixelate(img, s(*a), s(*b), (14.0 * scale) as u32);
+                pixelate(img, s(*a), s(*b), (14.0 * metric_scale) as u32);
             }
             Shape::Text { pos, text } => {
                 let shown = if caret == Some(i) {
@@ -350,7 +371,7 @@ pub fn render(
                 } else {
                     text.clone()
                 };
-                let px_h = (21.0 * scale * ann.size).max(12.0) as i32;
+                let px_h = (21.0 * metric_scale * ann.size).max(12.0) as i32;
                 if let Some((alpha, tw, th)) = raster_text(&shown, px_h) {
                     let p = s(*pos);
                     let (ox, oy) = (p.0 as i32, p.1 as i32);

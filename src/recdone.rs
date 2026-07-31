@@ -461,18 +461,6 @@ fn matte_thumbs(
         .collect()
 }
 
-fn matte_frame(
-    raw: &(Vec<u8>, u32, u32),
-    style: &crate::style::Style,
-    opts: &crate::compose::ComposeOpts,
-) -> (Vec<u8>, u32, u32) {
-    if crate::compose::is_plain(style) {
-        return raw.clone();
-    }
-    let image = thumb_image(&raw.0, raw.1, raw.2);
-    image_thumb(&crate::compose::compose_with(&image, style, opts))
-}
-
 fn set_playhead(state: &mut State, x: i32) {
     let span = (state.strip.right - state.strip.left).max(1) as f64;
     state.playhead = ((((x - state.strip.left) as f64 / span) * state.duration as f64) as i64)
@@ -2802,11 +2790,10 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
     )
     .ok()
     .or_else(|| raw_thumbs.first().cloned());
-    let preview = preview_raw
-        .as_ref()
-        .map(|frame| matte_frame(frame, &styles[matte_index], &opts));
-
-    let state = Box::into_raw(Box::new(State {
+    // Build the opening still through the same cached composition path used
+    // by playback frames. Two subtly different paths made the first frame
+    // change shape as soon as Play delivered its first decoded frame.
+    let mut state = Box::new(State {
         mp4,
         gif,
         summary,
@@ -2823,7 +2810,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         raw_thumbs,
         thumbs,
         preview_raw,
-        preview,
+        preview: None,
         preview_base_cache: None,
         preview_rect: initial.preview,
         strip: initial.strip,
@@ -2863,7 +2850,9 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         playback_cancel: None,
         playback_mailbox: Arc::new(Mutex::new(PlaybackMailbox::default())),
         resume_after_drag: false,
-    }));
+    });
+    recompose_preview(&mut state);
+    let state = Box::into_raw(state);
 
     unsafe {
         let hinstance = GetModuleHandleW(None)?;

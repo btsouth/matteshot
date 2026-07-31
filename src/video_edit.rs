@@ -76,8 +76,8 @@ pub fn render_at(
     if visible.is_empty() {
         return;
     }
-    let scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
-    crate::annotate::render(image, &visible, scale, offset, None);
+    let metric_scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
+    crate::annotate::render_with_metric(image, &visible, 1.0, metric_scale, offset, None);
 }
 
 pub fn render_one_at(
@@ -86,11 +86,12 @@ pub fn render_one_at(
     content_size: (u32, u32),
     offset: (f32, f32),
 ) {
-    let scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
-    crate::annotate::render(
+    let metric_scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
+    crate::annotate::render_with_metric(
         image,
         &[annotation(item, content_size.0, content_size.1)],
-        scale,
+        1.0,
+        metric_scale,
         offset,
         None,
     );
@@ -241,6 +242,39 @@ mod tests {
         assert!(image
             .enumerate_pixels()
             .filter(|(x, y, _)| *x < 45 || *x >= 155 || *y < 45 || *y >= 155)
+            .all(|(_, _, pixel)| pixel[0] == 0));
+    }
+
+    #[test]
+    fn preview_metric_scaling_does_not_move_annotations() {
+        let item = Item {
+            shape: Shape::Rect {
+                a: (0.75, 0.4),
+                b: (0.85, 0.6),
+            },
+            start: 0,
+            end: 20,
+            color: 0,
+            size: 1.0,
+        };
+        let mut image = RgbaImage::from_pixel(1200, 600, Rgba([0, 0, 0, 255]));
+        render_at(
+            &mut image,
+            &[item],
+            10,
+            None,
+            (1000, 400),
+            (100.0, 100.0),
+        );
+
+        // The rectangle starts at x=100 + 75% of 1000 = 850. Stroke-size
+        // scaling must not scale that already-expanded pixel coordinate.
+        assert!(image.enumerate_pixels().any(|(x, y, pixel)| {
+            (840..960).contains(&x) && (250..275).contains(&y) && pixel[0] > 100
+        }));
+        assert!(image
+            .enumerate_pixels()
+            .filter(|(x, _, _)| (490..545).contains(x))
             .all(|(_, _, pixel)| pixel[0] == 0));
     }
 }
