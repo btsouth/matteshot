@@ -124,13 +124,16 @@ try {
     }
 
     Write-Step "Launching Calculator for isolated capture"
-    $calculator = Start-Process "calc.exe" -PassThru
+    Start-Process "calc.exe" | Out-Null
+    $calculator = $null
     $deadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 250
-        $calculator.Refresh()
-    } while (-not $calculator.MainWindowTitle -and (Get-Date) -lt $deadline)
-    if (-not $calculator.MainWindowTitle) {
+        $calculator = Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowTitle -like "*Calculator*" } |
+            Select-Object -First 1
+    } while (-not $calculator -and (Get-Date) -lt $deadline)
+    if (-not $calculator) {
         throw "Calculator did not expose a window."
     }
 
