@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use image::RgbaImage;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -38,6 +39,12 @@ enum Handle {
     End,
 }
 
+struct WindowLayout {
+    controls: Vec<(RECT, Act, &'static str)>,
+    matte_controls: Vec<(RECT, usize)>,
+    strip: RECT,
+}
+
 struct State {
     mp4: PathBuf,
     gif: Option<PathBuf>,
@@ -53,11 +60,15 @@ struct State {
     height: i32,
     // Trim state.
     duration: i64,
+    raw_thumbs: Vec<(Vec<u8>, u32, u32)>,
     thumbs: Vec<(Vec<u8>, u32, u32)>,
     strip: RECT,
     trim_start: i64,
     trim_end: i64,
     dragging: Option<Handle>,
+    styles: Vec<crate::style::Style>,
+    matte_index: usize,
+    matte_controls: Vec<(RECT, usize)>,
     status: Option<String>,
 }
 
@@ -90,20 +101,44 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 }
 
 /// Layout for a client size. Rerun on resize.
-fn layout(scale: f32, cw: i32, ch: i32) -> (Vec<(RECT, Act, &'static str)>, RECT) {
+fn layout(
+    scale: f32,
+    cw: i32,
+    ch: i32,
+    style_count: usize,
+) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
     let m = sc(24);
     let strip = RECT {
         left: m,
-        top: sc(112),
+        top: sc(136),
         right: cw - m,
         bottom: ch - sc(104),
     };
+    let mut matte_controls = Vec::new();
+    if style_count > 0 {
+        let start = m + sc(52);
+        let gap = sc(7);
+        let available = (cw - m - start - gap * (style_count as i32 - 1)).max(style_count as i32);
+        let chip_w = available / style_count as i32;
+        for i in 0..style_count {
+            let left = start + i as i32 * (chip_w + gap);
+            matte_controls.push((
+                RECT {
+                    left,
+                    top: sc(96),
+                    right: left + chip_w,
+                    bottom: sc(124),
+                },
+                i,
+            ));
+        }
+    }
     let mut controls = Vec::new();
     let by = ch - sc(52);
     let labels: [(Act, &'static str, i32); 5] = [
-        (Act::Play, "Play", 74),
-        (Act::SaveTrim, "Save trim", 104),
+        (Act::SaveTrim, "Export edit", 108),
+        (Act::Play, "Play original", 112),
         (Act::Reveal, "Show in folder", 126),
         (Act::Copy, "Copy", 72),
         (Act::Delete, "Delete", 80),
@@ -117,7 +152,38 @@ fn layout(scale: f32, cw: i32, ch: i32) -> (Vec<(RECT, Act, &'static str)>, RECT
         ));
         x += sc(w) + sc(9);
     }
-    (controls, strip)
+    WindowLayout { controls, matte_controls, strip }
+}
+
+fn thumb_image(bytes: &[u8], w: u32, h: u32) -> RgbaImage {
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for pixel in bytes.chunks_exact(4) {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    RgbaImage::from_raw(w, h, rgba).expect("filmstrip frame has exact dimensions")
+}
+
+fn image_thumb(image: &RgbaImage) -> (Vec<u8>, u32, u32) {
+    let mut bgra = Vec::with_capacity((image.width() * image.height() * 4) as usize);
+    for pixel in image.pixels() {
+        bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    (bgra, image.width(), image.height())
+}
+
+fn matte_thumbs(
+    raw: &[(Vec<u8>, u32, u32)],
+    style: &crate::style::Style,
+) -> Vec<(Vec<u8>, u32, u32)> {
+    if crate::compose::is_plain(style) {
+        return raw.to_vec();
+    }
+    raw.iter()
+        .map(|(bytes, w, h)| {
+            let image = thumb_image(bytes, *w, *h);
+            image_thumb(&crate::compose::compose_scaled(&image, style, 1.0))
+        })
+        .collect()
 }
 
 /// Move a trim handle to window x, keeping at least ~0.3s between them.
@@ -162,6 +228,60 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let mut rc3 =
         RECT { left: m, top: s(state, 66), right: state.width - m, bottom: s(state, 88) };
     DrawTextW(hdc, &mut p, &mut rc3, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(hdc, state.font_small);
+    SetTextColor(hdc, state.theme.muted);
+    let mut matte_label = wide("Matte");
+    let mut matte_label_rect = RECT {
+        left: m,
+        top: s(state, 96),
+        right: m + s(state, 48),
+        bottom: s(state, 124),
+    };
+    DrawTextW(
+        hdc,
+        &mut matte_label,
+        &mut matte_label_rect,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+    );
+
+    for (rect, index) in &state.matte_controls {
+        let selected = *index == state.matte_index;
+        let fill = CreateSolidBrush(if selected { state.theme.accent } else { state.theme.chip });
+        let pen = CreatePen(
+            PS_SOLID,
+            1,
+            if selected { state.theme.accent } else { state.theme.chip_line },
+        );
+        let old_brush = SelectObject(hdc, fill);
+        let old_pen = SelectObject(hdc, pen);
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            s(state, 9),
+            s(state, 9),
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(fill);
+        let _ = DeleteObject(pen);
+
+        SetTextColor(
+            hdc,
+            if selected { state.theme.accent_text } else { state.theme.muted },
+        );
+        let mut name = wide(state.styles[*index].name);
+        let mut label_rect = *rect;
+        DrawTextW(
+            hdc,
+            &mut name,
+            &mut label_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
 
     // Filmstrip + trim handles.
     if !state.thumbs.is_empty() && state.duration > 0 {
@@ -449,6 +569,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                     return LRESULT(0);
                 }
+                if let Some((_, index)) = state
+                    .matte_controls
+                    .iter()
+                    .find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+                    .copied()
+                {
+                    if index != state.matte_index {
+                        let style = state.styles[index].clone();
+                        state.thumbs = matte_thumbs(&state.raw_thumbs, &style);
+                        state.matte_index = index;
+                        state.status = None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(i) = state
                     .controls
                     .iter()
@@ -468,22 +603,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = DestroyWindow(hwnd);
                         }
                         Act::SaveTrim => {
+                            let style = state.styles[state.matte_index].clone();
+                            let has_matte = !crate::compose::is_plain(&style);
+                            let has_trim =
+                                state.trim_start > 0 || state.trim_end < state.duration;
+                            let style_slug = style.name.to_ascii_lowercase();
+                            let suffix = match (has_matte, has_trim) {
+                                (true, true) => format!("{style_slug}-trim"),
+                                (true, false) => style_slug,
+                                (false, true) => "trim".into(),
+                                (false, false) => "copy".into(),
+                            };
                             let dst = state.mp4.with_file_name(format!(
-                                "{}-trim.mp4",
+                                "{}-{suffix}.mp4",
                                 state
                                     .mp4
                                     .file_stem()
                                     .map(|s| s.to_string_lossy().to_string())
                                     .unwrap_or_default()
                             ));
-                            state.status = Some("trimming\u{2026}".into());
+                            state.status = Some(format!(
+                                "exporting {}{} \u{2026}",
+                                style.name,
+                                if has_trim { " + trim" } else { "" }
+                            ));
                             let _ = InvalidateRect(hwnd, None, false);
                             let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
-                            match crate::trim::cut(
+                            match crate::trim::cut_with_matte(
                                 &state.mp4,
                                 &dst,
                                 state.trim_start,
                                 state.trim_end,
+                                Some(&style),
                             ) {
                                 Ok(()) => {
                                     let _ = crate::output::file_to_clipboard(&dst);
@@ -492,7 +643,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                         dst.file_name().unwrap_or_default().to_string_lossy()
                                     ));
                                 }
-                                Err(e) => state.status = Some(format!("trim failed: {e}")),
+                                Err(e) => state.status = Some(format!("export failed: {e}")),
                             }
                             let _ = InvalidateRect(hwnd, None, false);
                         }
@@ -513,9 +664,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if w > 0 && h > 0 {
                     state.width = w;
                     state.height = h;
-                    let (controls, strip) = layout(state.scale, w, h);
-                    state.controls = controls;
-                    state.strip = strip;
+                    let next = layout(state.scale, w, h, state.styles.len());
+                    state.controls = next.controls;
+                    state.matte_controls = next.matte_controls;
+                    state.strip = next.strip;
                     let _ = InvalidateRect(hwnd, None, true);
                 }
             }
@@ -556,12 +708,22 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
 
     // Filmstrip: best-effort, never blocks showing the window.
     let (probe_w, probe_h) = {
-        let (_, s) = layout(scale, cw, ch);
-        ((s.right - s.left) as u32, (s.bottom - s.top) as u32)
+        let initial = layout(scale, cw, ch, 7);
+        (
+            (initial.strip.right - initial.strip.left) as u32,
+            (initial.strip.bottom - initial.strip.top) as u32,
+        )
     };
     let probe = crate::trim::probe(&mp4, probe_w, probe_h).ok();
     let duration = probe.as_ref().map(|p| p.duration_100ns).unwrap_or(0);
-    let thumbs = probe.map(|p| p.thumbs).unwrap_or_default();
+    let raw_thumbs = probe.map(|p| p.thumbs).unwrap_or_default();
+    let style_source = raw_thumbs
+        .first()
+        .map(|(bytes, w, h)| thumb_image(bytes, *w, *h))
+        .unwrap_or_else(|| RgbaImage::from_pixel(1, 1, image::Rgba([42, 46, 58, 255])));
+    let styles = crate::style::variants(&style_source);
+    let matte_index = 0;
+    let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index]);
 
     let size_mb = std::fs::metadata(&mp4).map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0);
     let mut summary = format!(
@@ -575,13 +737,13 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         summary.push_str("   \u{00b7}   + GIF");
     }
 
-    let (controls, strip) = layout(scale, cw, ch);
+    let initial = layout(scale, cw, ch, styles.len());
 
     let state = Box::into_raw(Box::new(State {
         mp4,
         gif,
         summary,
-        controls,
+        controls: initial.controls,
         hover: -1,
         theme: crate::theme::current(),
         font: unsafe { make_font(-sc(14), 400) },
@@ -591,11 +753,15 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         width: cw,
         height: ch,
         duration,
+        raw_thumbs,
         thumbs,
-        strip,
+        strip: initial.strip,
         trim_start: 0,
         trim_end: duration,
         dragging: None,
+        styles,
+        matte_index,
+        matte_controls: initial.matte_controls,
         status: None,
     }));
 

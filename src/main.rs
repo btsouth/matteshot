@@ -689,9 +689,12 @@ fn main() -> Result<()> {
             eprintln!("saved {}x{} -> {}", img.width(), img.height(), p.display());
             Ok(())
         }
-        // Trim probe: cut [start,end] seconds from an mp4 (testing).
+        // Video export probe: cut [start,end] seconds and optionally apply
+        // one of the 1-based matte choices.
         Some("--trim-test") => {
-            let src = std::path::PathBuf::from(args.get(1).context("--trim-test <file> <a> <b>")?);
+            let src = std::path::PathBuf::from(
+                args.get(1).context("--trim-test <file> <a> <b> [1-7]")?,
+            );
             let a: f64 = args.get(2).map(|s| s.parse().unwrap_or(1.0)).unwrap_or(1.0);
             let b: f64 = args.get(3).map(|s| s.parse().unwrap_or(3.0)).unwrap_or(3.0);
             let probe = trim::probe(&src, 6, 54)?;
@@ -700,9 +703,28 @@ fn main() -> Result<()> {
                 probe.duration_100ns as f64 / 1e7,
                 probe.thumbs.len()
             );
-            let dst = src.with_extension("trim.mp4");
-            trim::cut(&src, &dst, (a * 1e7) as i64, (b * 1e7) as i64)?;
-            eprintln!("trimmed -> {}", dst.display());
+            let selected = if let Some(value) = args.get(4) {
+                let index = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|index| (1..=7).contains(index))
+                    .context("matte must be 1-7")?
+                    - 1;
+                let (bytes, w, h) = probe.thumbs.first().context("video has no preview frame")?;
+                let frame = trim::bgra_to_rgba(bytes, *w, *h);
+                crate::style::variants(&frame).get(index).cloned()
+            } else {
+                None
+            };
+            let dst = src.with_extension(if selected.is_some() { "matte.mp4" } else { "trim.mp4" });
+            trim::cut_with_matte(
+                &src,
+                &dst,
+                (a * 1e7) as i64,
+                (b * 1e7) as i64,
+                selected.as_ref(),
+            )?;
+            eprintln!("exported -> {}", dst.display());
             Ok(())
         }
         // OCR probe: recognize and print (no clipboard) — testing.

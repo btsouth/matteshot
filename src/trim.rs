@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use image::RgbaImage;
 use windows::core::{HSTRING, PROPVARIANT};
 use windows::Win32::Media::MediaFoundation::{
     IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL, MFStartup, MFMediaType_Audio, MFMediaType_Video, MFVideoFormat_RGB32,
@@ -175,8 +176,34 @@ fn stream_indices(reader: &IMFSourceReader) -> (u32, Option<u32>) {
     (video, audio)
 }
 
-/// Cut [start, end) into `dst`, re-encoding video (frame-accurate) and audio.
-pub fn cut(src: &Path, dst: &Path, start: i64, end: i64) -> Result<()> {
+pub(crate) fn bgra_to_rgba(bytes: &[u8], w: u32, h: u32) -> RgbaImage {
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for pixel in bytes.chunks_exact(4) {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    RgbaImage::from_raw(w, h, rgba).expect("BGRA frame has exact dimensions")
+}
+
+fn rgba_to_bgra(image: &RgbaImage, w: u32, h: u32) -> Vec<u8> {
+    let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h.min(image.height()) {
+        for x in 0..w.min(image.width()) {
+            let pixel = image.get_pixel(x, y);
+            bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+    }
+    bgra
+}
+
+/// Re-encode [start, end), optionally framing every video frame with one
+/// deterministic matte. Audio timing and bytes follow the trim path unchanged.
+pub fn cut_with_matte(
+    src: &Path,
+    dst: &Path,
+    start: i64,
+    end: i64,
+    matte: Option<&crate::style::Style>,
+) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
     let (reader, w, h, stride) = open_reader(src, true)?;
     let (video_idx, audio_idx) = stream_indices(&reader);
@@ -195,7 +222,15 @@ pub fn cut(src: &Path, dst: &Path, start: i64, end: i64) -> Result<()> {
     };
 
     let even = |v: u32| (v.max(2)) & !1;
-    let (ow, oh) = (even(w), even(h));
+    let matte = matte.filter(|style| !crate::compose::is_plain(style));
+    let matte_opts = crate::compose::ComposeOpts::default();
+    let matte_base = matte.map(|style| {
+        crate::compose::compose_base(w as usize, h as usize, style, &matte_opts)
+    });
+    let (ow, oh) = matte_base
+        .as_ref()
+        .map(|base| (even(base.width()), even(base.height())))
+        .unwrap_or_else(|| (even(w), even(h)));
     let (writer, vstream, astream) =
         unsafe { crate::record::make_sink(dst, ow, oh, audio_fmt.as_ref())? };
 
@@ -251,16 +286,31 @@ pub fn cut(src: &Path, dst: &Path, start: i64, end: i64) -> Result<()> {
                 let mut ptr = std::ptr::null_mut();
                 buf.Lock(&mut ptr, None, None)?;
                 let abs_stride = stride.unsigned_abs() as usize;
-                let mut out = vec![0u8; row * oh as usize];
-                for y in 0..oh.min(h) as usize {
+                let source_row = (w * 4) as usize;
+                let mut raw = vec![0u8; source_row * h as usize];
+                for y in 0..h as usize {
                     let src_row = if stride < 0 { h as usize - 1 - y } else { y };
                     std::ptr::copy_nonoverlapping(
                         (ptr as *const u8).add(src_row * abs_stride),
-                        out.as_mut_ptr().add(y * row),
-                        row.min((w * 4) as usize),
+                        raw.as_mut_ptr().add(y * source_row),
+                        source_row,
                     );
                 }
                 buf.Unlock()?;
+
+                let out = if let Some(base) = &matte_base {
+                    let content = bgra_to_rgba(&raw, w, h);
+                    let mut composed = base.clone();
+                    crate::compose::blend_content(&mut composed, &content, &matte_opts);
+                    rgba_to_bgra(&composed, ow, oh)
+                } else {
+                    let mut cropped = vec![0u8; row * oh as usize];
+                    for y in 0..oh.min(h) as usize {
+                        cropped[y * row..(y + 1) * row]
+                            .copy_from_slice(&raw[y * source_row..y * source_row + row]);
+                    }
+                    cropped
+                };
 
                 use windows::Win32::Media::MediaFoundation::{
                     MFCreateMemoryBuffer, MFCreateSample,
@@ -303,4 +353,17 @@ pub fn cut(src: &Path, dst: &Path, start: i64, end: i64) -> Result<()> {
     }
     unsafe { writer.Finalize().context("finalize trim")? };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bgra_to_rgba, rgba_to_bgra};
+
+    #[test]
+    fn video_pixel_channel_conversion_round_trips() {
+        let bgra = vec![3, 2, 1, 255, 30, 20, 10, 128];
+        let rgba = bgra_to_rgba(&bgra, 2, 1);
+        assert_eq!(rgba.as_raw(), &[1, 2, 3, 255, 10, 20, 30, 128]);
+        assert_eq!(rgba_to_bgra(&rgba, 2, 1), bgra);
+    }
 }
