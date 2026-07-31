@@ -1,0 +1,112 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Build and sign private candidate
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read package version
+        id: package
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object name -eq 'matteshot' | Select-Object -First 1
+          if (-not $package) {
+            Write-Error 'Matteshot package metadata was not found.'
+            exit 1
+          }
+          "version=$($package.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Sign in to Azure with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign the app binary with Trusted Signing
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ github.workspace }}\target\release\matteshot.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Build installer
+        id: installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $version = '${{ steps.package.outputs.version }}'
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\matteshot.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $path = "installer\Output\MatteshotSetup-$version.exe"
+          if (-not (Test-Path $path)) {
+            Write-Error "Installer not found at $path."
+            exit 1
+          }
+          "path=$((Resolve-Path $path).Path)" >> $env:GITHUB_OUTPUT
+
+      - name: Sign installer with Trusted Signing
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ steps.installer.outputs.path }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signatures and checksum
+        id: verify
+        shell: pwsh
+        run: |
+          $app = Get-AuthenticodeSignature '${{ github.workspace }}\target\release\matteshot.exe'
+          $installer = Get-AuthenticodeSignature '${{ steps.installer.outputs.path }}'
+          if ($app.Status -ne 'Valid') {
+            Write-Error "App signature is $($app.Status)."
+            exit 1
+          }
+          if ($installer.Status -ne 'Valid') {
+            Write-Error "Installer signature is $($installer.Status)."
+            exit 1
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 '${{ steps.installer.outputs.path }}').Hash.ToLowerInvariant()
+          $checksum = Join-Path $env:RUNNER_TEMP 'MatteshotSetup.exe.sha256'
+          "$hash  MatteshotSetup-${{ steps.package.outputs.version }}.exe" |
+            Set-Content -Encoding ascii -NoNewline $checksum
+          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+
+      - name: Upload private signed candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: Matteshot-${{ steps.package.outputs.version }}-signed-candidate
+          path: |
+            ${{ steps.installer.outputs.path }}
+            ${{ steps.verify.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 14
