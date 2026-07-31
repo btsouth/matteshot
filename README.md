@@ -27,7 +27,7 @@ Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips in
 - H.264 MP4 via Media Foundation, ~30fps, bitrate scaled to pixel count, saved to the videos folder, file on clipboard.
 - **Audio**: Off / System (WASAPI loopback) / Mic in settings. Float PCM → resampled to an AAC-legal rate (192 kHz interfaces are common; AAC takes only 44.1/48 kHz) → stereo downmix → AAC muxed into the same MP4.
 - Optional share-sized **GIF** alongside (settings toggle).
-- **On stop**, a focused video editor opens with a large frame preview, the same seven matte choices as screenshots, a draggable playhead, keyboard scrubbing, and two trim handles. **Export edit** creates a new framed and/or trimmed MP4 through a frame-accurate re-encode with audio preserved. The untouched original stays put. Play original / Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
+- **On stop**, a focused video editor opens with a large frame preview, the same seven matte choices as screenshots, a draggable playhead, keyboard scrubbing, and two trim handles. A compact **+ Add** drawer places time-ranged text, arrows, boxes, and pixelate-redaction; every tool returns to Select after placement, annotations stay freely movable, and their timeline clips can be moved or resized. **Export edit** renders the matte and annotations at full resolution through a frame-accurate re-encode with audio preserved. The untouched original stays put. Play original / Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
 
 ## Scrolling capture
 
@@ -64,6 +64,7 @@ matteshot --bench <substr>   # timed capture of a window, raw PNG to %TEMP%
 matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCROLL_DEBUG=1 for per-step diagnostics)
 matteshot --record-test [s]  # short recording smoke test, optionally auto-stop after s seconds
 matteshot --trim-test <mp4> <a> <b> [1-7] # trim/export probe; optional matte
+matteshot --video-edit-test <mp4> # matte + text/arrow/box/blur export probe
 matteshot --review-test <mp4> # open the video editor around an existing file
 matteshot --ocr <substr>     # capture a window and print its OCR text
 matteshot --update-test      # probe version.json; never downloads
@@ -92,7 +93,7 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 - `overlay.rs` — multi-monitor freeze-frame selector: combined virtual-screen image, dim/bright DIB layers, z-order hit-testing on `DWMWA_EXTENDED_FRAME_BOUNDS`, toolbar with record/scroll arming.
 - `style.rs` / `compose.rs` — hue-histogram matte families; pure-Rust compositing (gradient, blurred shadow, SDF corner mask, proportional padding, aspect extension). Export short-circuits the None matte and skips upscales ≥1600px.
 - `picker.rs` — contact strip; `tweak.rs` — the editor; `annotate.rs` — shape model + capsule-band AA rasterizer + GDI text with halo.
-- `record.rs` — MF sink writer (H.264+AAC), WGC frame loop, audio-cursor muxing with silence fill; `audio.rs` — WASAPI loopback/mic + stateful linear resampler; `recui.rs` — stop pill; `recdone.rs` — matte-aware review/trim window; `trim.rs` — source reader (`ENABLE_ADVANCED_VIDEO_PROCESSING`, streams resolved via `GetNativeMediaType`, never assume stream 0) → frame-accurate cut and matte export.
+- `record.rs` — MF sink writer (H.264+AAC), WGC frame loop, audio-cursor muxing with silence fill; `audio.rs` — WASAPI loopback/mic + stateful linear resampler; `recui.rs` — stop pill; `recdone.rs` — matte-aware video editor; `video_edit.rs` — normalized time-ranged annotation model shared by preview and export; `trim.rs` — source reader (`ENABLE_ADVANCED_VIDEO_PROCESSING`, streams resolved via `GetNativeMediaType`, never assume stream 0) → frame-accurate edit export.
 - `scroll.rs` — scrolling capture (see above).
 - `theme.rs` — theme plumbing; `settings.rs` — settings window; `pin.rs` — floating pinned captures; `ocr.rs` — Windows.Media.Ocr; `prtscn.rs` — PrtScn acquisition; `tray.rs` — tray icon/menu; `output.rs` — clipboard (manual CF_DIB + PNG + CF_HDROP), save, reveal.
 - `update.rs` — silent WinHTTP version check on startup and daily; newer versions surface through a tray balloon and download menu item.

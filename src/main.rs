@@ -26,6 +26,7 @@ mod theme;
 mod tray;
 mod tweak;
 mod update;
+mod video_edit;
 mod window;
 
 use anyhow::{bail, Context, Result};
@@ -727,6 +728,66 @@ fn main() -> Result<()> {
             eprintln!("exported -> {}", dst.display());
             Ok(())
         }
+        // Full video editor export probe. Uses a deterministic matte and one
+        // sample of every annotation type without touching the clipboard.
+        Some("--video-edit-test") => {
+            let src =
+                std::path::PathBuf::from(args.get(1).context("--video-edit-test <mp4>")?);
+            let probe = trim::probe(&src, 8, 72)?;
+            let duration = probe.duration_100ns.max(5_000_000);
+            let (bytes, w, h) = probe.thumbs.first().context("video has no preview frame")?;
+            let frame = trim::bgra_to_rgba(bytes, *w, *h);
+            let style = crate::style::variants(&frame)
+                .into_iter()
+                .next()
+                .context("no matte styles")?;
+            let items = vec![
+                video_edit::Item {
+                    shape: video_edit::Shape::Text {
+                        pos: (0.08, 0.08),
+                        text: "Matteshot video edit".into(),
+                    },
+                    start: 0,
+                    end: duration,
+                    color: 3,
+                    size: 1.35,
+                },
+                video_edit::Item {
+                    shape: video_edit::Shape::Arrow {
+                        from: (0.14, 0.72),
+                        to: (0.38, 0.50),
+                    },
+                    start: 0,
+                    end: duration,
+                    color: 0,
+                    size: 1.0,
+                },
+                video_edit::Item {
+                    shape: video_edit::Shape::Rect {
+                        a: (0.54, 0.22),
+                        b: (0.82, 0.52),
+                    },
+                    start: 0,
+                    end: duration,
+                    color: 2,
+                    size: 1.0,
+                },
+                video_edit::Item {
+                    shape: video_edit::Shape::Blur {
+                        a: (0.58, 0.68),
+                        b: (0.84, 0.82),
+                    },
+                    start: 0,
+                    end: duration,
+                    color: 0,
+                    size: 1.0,
+                },
+            ];
+            let dst = src.with_extension("edit.mp4");
+            trim::cut_with_edit(&src, &dst, 0, duration, Some(&style), &items)?;
+            eprintln!("video editor export -> {}", dst.display());
+            Ok(())
+        }
         // Open the focused recording editor around an existing MP4. This is
         // visual-only: it does not capture or touch the clipboard.
         Some("--review-test") => {
@@ -917,7 +978,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-6>] [--overlay] | --review-test <mp4> | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --review-test <mp4> | --video-edit-test <mp4> | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen]"
         ),
         None => run_app(),
     };

@@ -9,21 +9,21 @@ use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, FF_DONTCARE, HDC, HFONT, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
+    HDC, HFONT, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
+    GetKeyState, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, LoadCursorW,
-    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, AdjustWindowRectEx, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION,
-    WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
+    LoadCursorW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, CREATESTRUCTW, CS_DBLCLKS,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW,
+    WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -42,14 +42,39 @@ enum Handle {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Text,
+    Arrow,
+    Rect,
+    Blur,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Drag {
     Trim(Handle),
     Playhead,
+    Draw { index: usize, start: (f32, f32) },
+    Move { index: usize, last: (f32, f32) },
+    ClipStart(usize),
+    ClipEnd(usize),
+    ClipMove { index: usize, last_time: i64 },
+}
+
+struct TextEntry {
+    pos: (f32, f32),
+    text: String,
+    editing: Option<usize>,
 }
 
 struct WindowLayout {
     controls: Vec<(RECT, Act, &'static str)>,
     matte_controls: Vec<(RECT, usize)>,
+    add_control: RECT,
+    tool_controls: Vec<(RECT, Tool, &'static str)>,
+    color_controls: Vec<(RECT, usize)>,
+    size_controls: Vec<(RECT, usize)>,
+    undo_control: RECT,
+    delete_control: RECT,
     preview: RECT,
     strip: RECT,
 }
@@ -82,6 +107,20 @@ struct State {
     styles: Vec<crate::style::Style>,
     matte_index: usize,
     matte_controls: Vec<(RECT, usize)>,
+    annotations: Vec<crate::video_edit::Item>,
+    undo: Vec<Vec<crate::video_edit::Item>>,
+    selected: Option<usize>,
+    tools_open: bool,
+    tool: Option<Tool>,
+    color_idx: usize,
+    size_idx: usize,
+    text_entry: Option<TextEntry>,
+    add_control: RECT,
+    tool_controls: Vec<(RECT, Tool, &'static str)>,
+    color_controls: Vec<(RECT, usize)>,
+    size_controls: Vec<(RECT, usize)>,
+    undo_control: RECT,
+    delete_control: RECT,
     status: Option<String>,
 }
 
@@ -114,12 +153,7 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 }
 
 /// Layout for a client size. Rerun on resize.
-fn layout(
-    scale: f32,
-    cw: i32,
-    ch: i32,
-    style_count: usize,
-) -> WindowLayout {
+fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
     let m = sc(24);
     let timeline_h = (ch / 6).clamp(sc(88), sc(126));
@@ -167,13 +201,98 @@ fn layout(
     let mut x = m;
     for (act, label, w) in labels {
         controls.push((
-            RECT { left: x, top: by, right: x + sc(w), bottom: by + sc(34) },
+            RECT {
+                left: x,
+                top: by,
+                right: x + sc(w),
+                bottom: by + sc(34),
+            },
             act,
             label,
         ));
         x += sc(w) + sc(9);
     }
-    WindowLayout { controls, matte_controls, preview, strip }
+
+    let add_control = RECT {
+        left: preview.right - sc(88),
+        top: preview.top + sc(12),
+        right: preview.right - sc(12),
+        bottom: preview.top + sc(42),
+    };
+    let panel_left = preview.right - sc(382);
+    let panel_top = add_control.bottom + sc(8);
+    let mut tool_controls = Vec::new();
+    for (index, (tool, label)) in [
+        (Tool::Text, "Text"),
+        (Tool::Arrow, "Arrow"),
+        (Tool::Rect, "Box"),
+        (Tool::Blur, "Blur"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let left = panel_left + sc(10) + index as i32 * sc(76);
+        tool_controls.push((
+            RECT {
+                left,
+                top: panel_top + sc(10),
+                right: left + sc(68),
+                bottom: panel_top + sc(38),
+            },
+            tool,
+            label,
+        ));
+    }
+    let mut color_controls = Vec::new();
+    for index in 0..crate::annotate::COLORS.len() {
+        let left = panel_left + sc(12) + index as i32 * sc(30);
+        color_controls.push((
+            RECT {
+                left,
+                top: panel_top + sc(52),
+                right: left + sc(22),
+                bottom: panel_top + sc(74),
+            },
+            index,
+        ));
+    }
+    let mut size_controls = Vec::new();
+    for index in 0..3 {
+        let left = panel_left + sc(146) + index as i32 * sc(34);
+        size_controls.push((
+            RECT {
+                left,
+                top: panel_top + sc(50),
+                right: left + sc(28),
+                bottom: panel_top + sc(76),
+            },
+            index,
+        ));
+    }
+    let undo_control = RECT {
+        left: panel_left + sc(254),
+        top: panel_top + sc(50),
+        right: panel_left + sc(308),
+        bottom: panel_top + sc(76),
+    };
+    let delete_control = RECT {
+        left: panel_left + sc(314),
+        top: panel_top + sc(50),
+        right: panel_left + sc(372),
+        bottom: panel_top + sc(76),
+    };
+    WindowLayout {
+        controls,
+        matte_controls,
+        add_control,
+        tool_controls,
+        color_controls,
+        size_controls,
+        undo_control,
+        delete_control,
+        preview,
+        strip,
+    }
 }
 
 fn thumb_image(bytes: &[u8], w: u32, h: u32) -> RgbaImage {
@@ -207,10 +326,7 @@ fn matte_thumbs(
         .collect()
 }
 
-fn matte_frame(
-    raw: &(Vec<u8>, u32, u32),
-    style: &crate::style::Style,
-) -> (Vec<u8>, u32, u32) {
+fn matte_frame(raw: &(Vec<u8>, u32, u32), style: &crate::style::Style) -> (Vec<u8>, u32, u32) {
     if crate::compose::is_plain(style) {
         return raw.clone();
     }
@@ -243,17 +359,36 @@ fn refresh_preview(state: &mut State) {
 }
 
 fn recompose_preview(state: &mut State) {
-    state.preview = state
-        .preview_raw
-        .as_ref()
-        .map(|frame| matte_frame(frame, &state.styles[state.matte_index]));
+    state.preview = state.preview_raw.as_ref().map(|frame| {
+        let raw = thumb_image(&frame.0, frame.1, frame.2);
+        let mut image = if crate::compose::is_plain(&state.styles[state.matte_index]) {
+            raw
+        } else {
+            crate::compose::compose_scaled(&raw, &state.styles[state.matte_index], 1.0)
+        };
+        let skip = state.text_entry.as_ref().and_then(|entry| entry.editing);
+        crate::video_edit::render(&mut image, &state.annotations, state.playhead, skip);
+        if let Some(entry) = &state.text_entry {
+            let (start, end) = default_range(state);
+            let draft = crate::video_edit::Item {
+                shape: crate::video_edit::Shape::Text {
+                    pos: entry.pos,
+                    text: format!("{}|", entry.text),
+                },
+                start,
+                end,
+                color: state.color_idx,
+                size: current_size(state),
+            };
+            crate::video_edit::render_one(&mut image, &draft);
+        }
+        image_thumb(&image)
+    });
 }
 
 fn refresh_preview_exact(state: &mut State) {
-    let max_w = (state.preview_rect.right - state.preview_rect.left)
-        .max(2) as u32;
-    let max_h = (state.preview_rect.bottom - state.preview_rect.top)
-        .max(2) as u32;
+    let max_w = (state.preview_rect.right - state.preview_rect.left).max(2) as u32;
+    let max_h = (state.preview_rect.bottom - state.preview_rect.top).max(2) as u32;
     match crate::trim::preview_frame(&state.mp4, state.playhead, max_w, max_h) {
         Ok(frame) => {
             state.preview_raw = Some(frame);
@@ -261,6 +396,219 @@ fn refresh_preview_exact(state: &mut State) {
         }
         Err(_) => refresh_preview(state),
     }
+}
+
+fn current_size(state: &State) -> f32 {
+    [0.82, 1.0, 1.35][state.size_idx.min(2)]
+}
+
+fn default_range(state: &State) -> (i64, i64) {
+    const DEFAULT: i64 = 30_000_000;
+    const MINIMUM: i64 = 5_000_000;
+    if state.duration <= 0 {
+        return (0, DEFAULT);
+    }
+    let mut start = state.playhead.clamp(0, state.duration);
+    let end = (start + DEFAULT).min(state.duration);
+    if end - start < MINIMUM {
+        start = (end - DEFAULT).max(0);
+    }
+    (start, end.max(start + MINIMUM).min(state.duration))
+}
+
+fn push_undo(state: &mut State) {
+    state.undo.push(state.annotations.clone());
+    if state.undo.len() > 40 {
+        state.undo.remove(0);
+    }
+}
+
+fn undo(state: &mut State) {
+    if let Some(previous) = state.undo.pop() {
+        state.annotations = previous;
+        state.selected = None;
+        state.text_entry = None;
+        recompose_preview(state);
+    }
+}
+
+fn delete_selected(state: &mut State) {
+    if let Some(index) = state
+        .selected
+        .filter(|index| *index < state.annotations.len())
+    {
+        push_undo(state);
+        state.annotations.remove(index);
+        state.selected = None;
+        recompose_preview(state);
+    }
+}
+
+fn annotation_name(item: &crate::video_edit::Item) -> &'static str {
+    match &item.shape {
+        crate::video_edit::Shape::Text { .. } => "Text",
+        crate::video_edit::Shape::Arrow { .. } => "Arrow",
+        crate::video_edit::Shape::Rect { .. } => "Box",
+        crate::video_edit::Shape::Blur { .. } => "Blur",
+    }
+}
+
+fn annotation_lane(state: &State) -> RECT {
+    RECT {
+        left: state.strip.left,
+        top: state.strip.bottom + s(state, 34),
+        right: state.strip.right,
+        bottom: state.strip.bottom + s(state, 56),
+    }
+}
+
+fn time_to_x(state: &State, time: i64) -> i32 {
+    if state.duration <= 0 {
+        return state.strip.left;
+    }
+    state.strip.left
+        + ((time.clamp(0, state.duration) as f64 / state.duration as f64)
+            * (state.strip.right - state.strip.left) as f64) as i32
+}
+
+fn x_to_time(state: &State, x: i32) -> i64 {
+    let span = (state.strip.right - state.strip.left).max(1) as f64;
+    ((((x - state.strip.left) as f64 / span) * state.duration as f64) as i64)
+        .clamp(0, state.duration)
+}
+
+fn item_clip_rect(state: &State, index: usize, item: &crate::video_edit::Item) -> RECT {
+    let lane = annotation_lane(state);
+    let row_h = ((lane.bottom - lane.top) / 2).max(1);
+    let row = (index % 2) as i32;
+    RECT {
+        left: time_to_x(state, item.start),
+        top: lane.top + row * row_h,
+        right: time_to_x(state, item.end).max(time_to_x(state, item.start) + s(state, 12)),
+        bottom: lane.top + (row + 1) * row_h - 1,
+    }
+}
+
+fn preview_image_rect(state: &State, frame: &(Vec<u8>, u32, u32)) -> RECT {
+    let inset = s(state, 12);
+    let available_w = (state.preview_rect.right - state.preview_rect.left - inset * 2).max(1);
+    let available_h = (state.preview_rect.bottom - state.preview_rect.top - inset * 2).max(1);
+    let scale = (available_w as f32 / frame.1 as f32).min(available_h as f32 / frame.2 as f32);
+    let width = (frame.1 as f32 * scale).round().max(1.0) as i32;
+    let height = (frame.2 as f32 * scale).round().max(1.0) as i32;
+    RECT {
+        left: state.preview_rect.left
+            + (state.preview_rect.right - state.preview_rect.left - width) / 2,
+        top: state.preview_rect.top
+            + (state.preview_rect.bottom - state.preview_rect.top - height) / 2,
+        right: state.preview_rect.left
+            + (state.preview_rect.right - state.preview_rect.left - width) / 2
+            + width,
+        bottom: state.preview_rect.top
+            + (state.preview_rect.bottom - state.preview_rect.top - height) / 2
+            + height,
+    }
+}
+
+fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
+    let frame = state.preview.as_ref()?;
+    let rect = preview_image_rect(state, frame);
+    if x < rect.left || x > rect.right || y < rect.top || y > rect.bottom {
+        return None;
+    }
+    Some((
+        ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0),
+        ((y - rect.top) as f32 / (rect.bottom - rect.top).max(1) as f32).clamp(0.0, 1.0),
+    ))
+}
+
+fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
+    state
+        .annotations
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, item)| {
+            item.active_at(state.playhead) && crate::video_edit::hit(item, point, 0.018)
+        })
+        .map(|(index, _)| index)
+}
+
+fn contains(rect: RECT, x: i32, y: i32) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+fn tool_panel(state: &State) -> RECT {
+    RECT {
+        left: state
+            .tool_controls
+            .first()
+            .map(|(rect, ..)| rect.left - s(state, 10))
+            .unwrap_or(state.add_control.left),
+        top: state
+            .tool_controls
+            .first()
+            .map(|(rect, ..)| rect.top - s(state, 10))
+            .unwrap_or(state.add_control.bottom),
+        right: state.delete_control.right + s(state, 10),
+        bottom: state.delete_control.bottom + s(state, 10),
+    }
+}
+
+fn shape_for_tool(tool: Tool, start: (f32, f32)) -> crate::video_edit::Shape {
+    match tool {
+        Tool::Arrow => crate::video_edit::Shape::Arrow {
+            from: start,
+            to: start,
+        },
+        Tool::Rect => crate::video_edit::Shape::Rect { a: start, b: start },
+        Tool::Blur => crate::video_edit::Shape::Blur { a: start, b: start },
+        Tool::Text => unreachable!("text uses direct entry"),
+    }
+}
+
+fn commit_text(state: &mut State) {
+    let Some(entry) = state.text_entry.take() else {
+        return;
+    };
+    let text = entry.text.trim().to_string();
+    if text.is_empty() {
+        recompose_preview(state);
+        return;
+    }
+    push_undo(state);
+    let (start, end) = entry
+        .editing
+        .and_then(|index| {
+            state
+                .annotations
+                .get(index)
+                .map(|item| (item.start, item.end))
+        })
+        .unwrap_or_else(|| default_range(state));
+    let item = crate::video_edit::Item {
+        shape: crate::video_edit::Shape::Text {
+            pos: entry.pos,
+            text,
+        },
+        start,
+        end,
+        color: state.color_idx,
+        size: current_size(state),
+    };
+    if let Some(index) = entry
+        .editing
+        .filter(|index| *index < state.annotations.len())
+    {
+        state.annotations[index] = item;
+        state.selected = Some(index);
+    } else {
+        state.annotations.push(item);
+        state.selected = Some(state.annotations.len() - 1);
+    }
+    state.tool = None;
+    state.tools_open = false;
+    recompose_preview(state);
 }
 
 /// Move a trim handle to window x, keeping at least ~0.3s between them.
@@ -280,12 +628,7 @@ fn s(state: &State, v: i32) -> i32 {
     (v as f32 * state.scale) as i32
 }
 
-unsafe fn paint_bgra_fit(
-    hdc: HDC,
-    rect: RECT,
-    frame: &(Vec<u8>, u32, u32),
-    state: &State,
-) {
+unsafe fn paint_bgra_fit(hdc: HDC, rect: RECT, frame: &(Vec<u8>, u32, u32), state: &State) {
     let panel = CreateSolidBrush(state.theme.chip);
     let panel_pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
     let old_brush = SelectObject(hdc, panel);
@@ -307,8 +650,7 @@ unsafe fn paint_bgra_fit(
     let inset = s(state, 12);
     let available_w = (rect.right - rect.left - inset * 2).max(1);
     let available_h = (rect.bottom - rect.top - inset * 2).max(1);
-    let scale = (available_w as f32 / frame.1 as f32)
-        .min(available_h as f32 / frame.2 as f32);
+    let scale = (available_w as f32 / frame.1 as f32).min(available_h as f32 / frame.2 as f32);
     let draw_w = (frame.1 as f32 * scale).round().max(1.0) as i32;
     let draw_h = (frame.2 as f32 * scale).round().max(1.0) as i32;
     let left = rect.left + (rect.right - rect.left - draw_w) / 2;
@@ -325,10 +667,7 @@ unsafe fn paint_bgra_fit(
         },
         ..Default::default()
     };
-    windows::Win32::Graphics::Gdi::SetStretchBltMode(
-        hdc,
-        windows::Win32::Graphics::Gdi::HALFTONE,
-    );
+    windows::Win32::Graphics::Gdi::SetStretchBltMode(hdc, windows::Win32::Graphics::Gdi::HALFTONE);
     windows::Win32::Graphics::Gdi::StretchDIBits(
         hdc,
         left,
@@ -346,9 +685,67 @@ unsafe fn paint_bgra_fit(
     );
 }
 
+unsafe fn paint_chip(hdc: HDC, rect: RECT, label: &str, selected: bool, state: &State) {
+    let fill = CreateSolidBrush(if selected {
+        state.theme.accent
+    } else {
+        state.theme.chip
+    });
+    let pen = CreatePen(
+        PS_SOLID,
+        1,
+        if selected {
+            state.theme.accent
+        } else {
+            state.theme.chip_line
+        },
+    );
+    let old_brush = SelectObject(hdc, fill);
+    let old_pen = SelectObject(hdc, pen);
+    let _ = RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        s(state, 9),
+        s(state, 9),
+    );
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(fill);
+    let _ = DeleteObject(pen);
+    SelectObject(hdc, state.font_small);
+    SetTextColor(
+        hdc,
+        if selected {
+            state.theme.accent_text
+        } else {
+            state.theme.muted
+        },
+    );
+    let mut text = wide(label);
+    let mut label_rect = rect;
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut label_rect,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+    );
+}
+
 unsafe fn paint(hdc: HDC, state: &State) {
     let bg = CreateSolidBrush(state.theme.bg);
-    FillRect(hdc, &RECT { left: 0, top: 0, right: state.width, bottom: state.height }, bg);
+    FillRect(
+        hdc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: state.width,
+            bottom: state.height,
+        },
+        bg,
+    );
     let _ = DeleteObject(bg);
     SetBkMode(hdc, TRANSPARENT);
 
@@ -356,24 +753,189 @@ unsafe fn paint(hdc: HDC, state: &State) {
     SelectObject(hdc, state.font_big);
     SetTextColor(hdc, state.theme.text);
     let mut t = wide("Recording editor");
-    let mut rc = RECT { left: m, top: s(state, 14), right: state.width - m, bottom: s(state, 42) };
+    let mut rc = RECT {
+        left: m,
+        top: s(state, 14),
+        right: state.width - m,
+        bottom: s(state, 42),
+    };
     DrawTextW(hdc, &mut t, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.muted);
     let mut sum = wide(&state.summary);
-    let mut rc2 =
-        RECT { left: m, top: s(state, 44), right: state.width - m, bottom: s(state, 66) };
-    DrawTextW(hdc, &mut sum, &mut rc2, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    let mut rc2 = RECT {
+        left: m,
+        top: s(state, 44),
+        right: state.width - m,
+        bottom: s(state, 66),
+    };
+    DrawTextW(
+        hdc,
+        &mut sum,
+        &mut rc2,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+    );
 
     SetTextColor(hdc, state.theme.faint);
     let mut p = wide(&state.mp4.display().to_string());
-    let mut rc3 =
-        RECT { left: m, top: s(state, 66), right: state.width - m, bottom: s(state, 88) };
-    DrawTextW(hdc, &mut p, &mut rc3, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
+    let mut rc3 = RECT {
+        left: m,
+        top: s(state, 66),
+        right: state.width - m,
+        bottom: s(state, 88),
+    };
+    DrawTextW(
+        hdc,
+        &mut p,
+        &mut rc3,
+        DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER,
+    );
 
     if let Some(frame) = &state.preview {
         paint_bgra_fit(hdc, state.preview_rect, frame, state);
+
+        if let Some(index) = state
+            .selected
+            .filter(|index| *index < state.annotations.len())
+        {
+            let item = &state.annotations[index];
+            if item.active_at(state.playhead) {
+                let image_rect = preview_image_rect(state, frame);
+                let (x0, y0, x1, y1) = crate::video_edit::bounds(item);
+                let map_x = |x: f32| {
+                    image_rect.left
+                        + (x.clamp(0.0, 1.0) * (image_rect.right - image_rect.left) as f32) as i32
+                };
+                let map_y = |y: f32| {
+                    image_rect.top
+                        + (y.clamp(0.0, 1.0) * (image_rect.bottom - image_rect.top) as f32) as i32
+                };
+                let pen = CreatePen(windows::Win32::Graphics::Gdi::PS_DOT, 1, state.theme.accent);
+                let old_pen = SelectObject(hdc, pen);
+                let old_brush = SelectObject(
+                    hdc,
+                    windows::Win32::Graphics::Gdi::GetStockObject(
+                        windows::Win32::Graphics::Gdi::HOLLOW_BRUSH,
+                    ),
+                );
+                let pad = s(state, 5);
+                let _ = windows::Win32::Graphics::Gdi::Rectangle(
+                    hdc,
+                    map_x(x0) - pad,
+                    map_y(y0) - pad,
+                    map_x(x1) + pad,
+                    map_y(y1) + pad,
+                );
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(pen);
+            }
+        }
+    }
+
+    paint_chip(
+        hdc,
+        state.add_control,
+        if state.tools_open { "Done" } else { "+ Add" },
+        state.tools_open,
+        state,
+    );
+    if state.tools_open {
+        let panel = tool_panel(state);
+        let fill = CreateSolidBrush(state.theme.bg);
+        let pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
+        let old_brush = SelectObject(hdc, fill);
+        let old_pen = SelectObject(hdc, pen);
+        let _ = RoundRect(
+            hdc,
+            panel.left,
+            panel.top,
+            panel.right,
+            panel.bottom,
+            s(state, 12),
+            s(state, 12),
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(fill);
+        let _ = DeleteObject(pen);
+
+        for (rect, tool, label) in &state.tool_controls {
+            paint_chip(hdc, *rect, label, state.tool == Some(*tool), state);
+        }
+        for (rect, index) in &state.color_controls {
+            let [r, g, b] = crate::annotate::COLORS[*index];
+            let color = windows::Win32::Foundation::COLORREF(
+                r as u32 | ((g as u32) << 8) | ((b as u32) << 16),
+            );
+            let fill = CreateSolidBrush(color);
+            let pen = CreatePen(
+                PS_SOLID,
+                if state.color_idx == *index { 3 } else { 1 },
+                if state.color_idx == *index {
+                    state.theme.text
+                } else {
+                    state.theme.chip_line
+                },
+            );
+            let old_brush = SelectObject(hdc, fill);
+            let old_pen = SelectObject(hdc, pen);
+            let _ = RoundRect(
+                hdc,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                s(state, 8),
+                s(state, 8),
+            );
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(fill);
+            let _ = DeleteObject(pen);
+        }
+        for (rect, index) in &state.size_controls {
+            paint_chip(
+                hdc,
+                *rect,
+                ["S", "M", "L"][*index],
+                state.size_idx == *index,
+                state,
+            );
+        }
+        paint_chip(hdc, state.undo_control, "Undo", false, state);
+        paint_chip(hdc, state.delete_control, "Delete", false, state);
+    }
+
+    if state.text_entry.is_some() || state.tool.is_some() || state.selected.is_some() {
+        let hint = if state.text_entry.is_some() {
+            "Type caption   \u{00b7}   Enter place   \u{00b7}   Esc cancel"
+        } else if let Some(tool) = state.tool {
+            match tool {
+                Tool::Text => "Click the preview to place a caption",
+                Tool::Arrow => "Drag on the preview to draw an arrow",
+                Tool::Rect => "Drag on the preview to draw a box",
+                Tool::Blur => "Drag over anything sensitive to blur it",
+            }
+        } else {
+            "Selected   \u{00b7}   drag to move   \u{00b7}   Delete removes"
+        };
+        SelectObject(hdc, state.font_small);
+        SetTextColor(hdc, state.theme.text);
+        let mut text = wide(hint);
+        let mut rect = RECT {
+            left: state.preview_rect.left + s(state, 16),
+            top: state.preview_rect.bottom - s(state, 34),
+            right: state.preview_rect.right - s(state, 16),
+            bottom: state.preview_rect.bottom - s(state, 12),
+        };
+        DrawTextW(
+            hdc,
+            &mut text,
+            &mut rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
     }
 
     SelectObject(hdc, state.font_small);
@@ -399,11 +961,19 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
     for (rect, index) in &state.matte_controls {
         let selected = *index == state.matte_index;
-        let fill = CreateSolidBrush(if selected { state.theme.accent } else { state.theme.chip });
+        let fill = CreateSolidBrush(if selected {
+            state.theme.accent
+        } else {
+            state.theme.chip
+        });
         let pen = CreatePen(
             PS_SOLID,
             1,
-            if selected { state.theme.accent } else { state.theme.chip_line },
+            if selected {
+                state.theme.accent
+            } else {
+                state.theme.chip_line
+            },
         );
         let old_brush = SelectObject(hdc, fill);
         let old_pen = SelectObject(hdc, pen);
@@ -423,7 +993,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
         SetTextColor(
             hdc,
-            if selected { state.theme.accent_text } else { state.theme.muted },
+            if selected {
+                state.theme.accent_text
+            } else {
+                state.theme.muted
+            },
         );
         let mut name = wide(state.styles[*index].name);
         let mut label_rect = *rect;
@@ -508,8 +1082,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
         // Dim the trimmed-away ends with a 50% wash so frames stay visible.
         let shade = CreateSolidBrush(state.theme.bg);
         for r in [
-            RECT { left: strip.left, top: strip.top, right: sx, bottom: strip.bottom },
-            RECT { left: ex, top: strip.top, right: strip.right, bottom: strip.bottom },
+            RECT {
+                left: strip.left,
+                top: strip.top,
+                right: sx,
+                bottom: strip.bottom,
+            },
+            RECT {
+                left: ex,
+                top: strip.top,
+                right: strip.right,
+                bottom: strip.bottom,
+            },
         ] {
             if r.right > r.left {
                 let bf = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
@@ -521,7 +1105,16 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 let mem = windows::Win32::Graphics::Gdi::CreateCompatibleDC(hdc);
                 let bmp = windows::Win32::Graphics::Gdi::CreateCompatibleBitmap(hdc, 1, 1);
                 let old = SelectObject(mem, bmp);
-                FillRect(mem, &RECT { left: 0, top: 0, right: 1, bottom: 1 }, shade);
+                FillRect(
+                    mem,
+                    &RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: 1,
+                    },
+                    shade,
+                );
                 let _ = windows::Win32::Graphics::Gdi::AlphaBlend(
                     hdc,
                     r.left,
@@ -609,6 +1202,81 @@ unsafe fn paint(hdc: HDC, state: &State) {
             bottom: strip.bottom + s(state, 28),
         };
         DrawTextW(hdc, &mut l, &mut lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        if !state.annotations.is_empty() {
+            let lane = annotation_lane(state);
+            let lane_fill = CreateSolidBrush(state.theme.chip);
+            FillRect(hdc, &lane, lane_fill);
+            let _ = DeleteObject(lane_fill);
+            for (index, item) in state.annotations.iter().enumerate() {
+                let rect = item_clip_rect(state, index, item);
+                let selected = state.selected == Some(index);
+                let [r, g, b] =
+                    crate::annotate::COLORS[item.color.min(crate::annotate::COLORS.len() - 1)];
+                let color = windows::Win32::Foundation::COLORREF(
+                    r as u32 | ((g as u32) << 8) | ((b as u32) << 16),
+                );
+                let fill = CreateSolidBrush(if selected {
+                    state.theme.accent
+                } else {
+                    state.theme.bg
+                });
+                let pen = CreatePen(PS_SOLID, if selected { 2 } else { 1 }, color);
+                let old_brush = SelectObject(hdc, fill);
+                let old_pen = SelectObject(hdc, pen);
+                let _ = RoundRect(
+                    hdc,
+                    rect.left,
+                    rect.top,
+                    rect.right,
+                    rect.bottom,
+                    s(state, 5),
+                    s(state, 5),
+                );
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(fill);
+                let _ = DeleteObject(pen);
+
+                SetTextColor(
+                    hdc,
+                    if selected {
+                        state.theme.accent_text
+                    } else {
+                        state.theme.muted
+                    },
+                );
+                let mut clip_label = wide(annotation_name(item));
+                let mut clip_label_rect = RECT {
+                    left: rect.left + s(state, 4),
+                    top: rect.top,
+                    right: rect.right - s(state, 4),
+                    bottom: rect.bottom,
+                };
+                DrawTextW(
+                    hdc,
+                    &mut clip_label,
+                    &mut clip_label_rect,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                );
+                if selected {
+                    let handles = CreateSolidBrush(state.theme.text);
+                    for edge in [rect.left, rect.right] {
+                        FillRect(
+                            hdc,
+                            &RECT {
+                                left: edge - s(state, 2),
+                                top: rect.top + s(state, 1),
+                                right: edge + s(state, 2),
+                                bottom: rect.bottom - s(state, 1),
+                            },
+                            handles,
+                        );
+                    }
+                    let _ = DeleteObject(handles);
+                }
+            }
+        }
     }
 
     if let Some(msg) = &state.status {
@@ -616,26 +1284,47 @@ unsafe fn paint(hdc: HDC, state: &State) {
         SetTextColor(hdc, state.theme.accent);
         let mut t = wide(msg);
         let mut r = RECT {
-            left: s(state, 24),
-            top: state.height - s(state, 86),
+            left: state.width / 2,
+            top: s(state, 44),
             right: state.width - s(state, 24),
-            bottom: state.height - s(state, 62),
+            bottom: s(state, 66),
         };
-        DrawTextW(hdc, &mut t, &mut r, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        DrawTextW(
+            hdc,
+            &mut t,
+            &mut r,
+            DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_RIGHT,
+        );
     }
 
     for (i, (r, _, label)) in state.controls.iter().enumerate() {
         let hot = i as i32 == state.hover;
         let primary = i == 0;
-        let fill = CreateSolidBrush(if primary { state.theme.accent } else { state.theme.chip });
+        let fill = CreateSolidBrush(if primary {
+            state.theme.accent
+        } else {
+            state.theme.chip
+        });
         let pen = CreatePen(
             PS_SOLID,
             1,
-            if primary { state.theme.accent } else { state.theme.chip_line },
+            if primary {
+                state.theme.accent
+            } else {
+                state.theme.chip_line
+            },
         );
         let ob = SelectObject(hdc, fill);
         let op = SelectObject(hdc, pen);
-        let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, s(state, 10), s(state, 10));
+        let _ = RoundRect(
+            hdc,
+            r.left,
+            r.top,
+            r.right,
+            r.bottom,
+            s(state, 10),
+            s(state, 10),
+        );
         SelectObject(hdc, ob);
         SelectObject(hdc, op);
         let _ = DeleteObject(fill);
@@ -707,11 +1396,80 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     match drag {
                         Drag::Trim(handle) => {
                             set_handle(state, handle, x);
-                            state.playhead =
-                                state.playhead.clamp(state.trim_start, state.trim_end);
+                            state.playhead = state.playhead.clamp(state.trim_start, state.trim_end);
                             refresh_preview(state);
                         }
                         Drag::Playhead => set_playhead(state, x),
+                        Drag::Draw { index, start } => {
+                            if let Some(point) = screen_to_preview(state, x, y) {
+                                if let Some(item) = state.annotations.get_mut(index) {
+                                    item.shape = match item.shape {
+                                        crate::video_edit::Shape::Arrow { .. } => {
+                                            crate::video_edit::Shape::Arrow {
+                                                from: start,
+                                                to: point,
+                                            }
+                                        }
+                                        crate::video_edit::Shape::Rect { .. } => {
+                                            crate::video_edit::Shape::Rect { a: start, b: point }
+                                        }
+                                        crate::video_edit::Shape::Blur { .. } => {
+                                            crate::video_edit::Shape::Blur { a: start, b: point }
+                                        }
+                                        crate::video_edit::Shape::Text { .. } => item.shape.clone(),
+                                    };
+                                }
+                                recompose_preview(state);
+                            }
+                        }
+                        Drag::Move { index, last } => {
+                            if let Some(point) = screen_to_preview(state, x, y) {
+                                if let Some(item) = state.annotations.get_mut(index) {
+                                    crate::video_edit::translate(
+                                        item,
+                                        point.0 - last.0,
+                                        point.1 - last.1,
+                                    );
+                                }
+                                state.dragging = Some(Drag::Move { index, last: point });
+                                recompose_preview(state);
+                            }
+                        }
+                        Drag::ClipStart(index) => {
+                            let end = state.annotations.get(index).map(|item| item.end);
+                            let time = x_to_time(state, x);
+                            if let (Some(end), Some(item)) = (end, state.annotations.get_mut(index))
+                            {
+                                item.start = time.min(end - 5_000_000).max(0);
+                            }
+                            recompose_preview(state);
+                        }
+                        Drag::ClipEnd(index) => {
+                            let start = state.annotations.get(index).map(|item| item.start);
+                            let time = x_to_time(state, x);
+                            let duration = state.duration;
+                            if let (Some(start), Some(item)) =
+                                (start, state.annotations.get_mut(index))
+                            {
+                                item.end = time.max(start + 5_000_000).min(duration);
+                            }
+                            recompose_preview(state);
+                        }
+                        Drag::ClipMove { index, last_time } => {
+                            let now = x_to_time(state, x);
+                            if let Some(item) = state.annotations.get_mut(index) {
+                                let length = item.end - item.start;
+                                let start = (item.start + now - last_time)
+                                    .clamp(0, state.duration - length);
+                                item.start = start;
+                                item.end = start + length;
+                            }
+                            state.dragging = Some(Drag::ClipMove {
+                                index,
+                                last_time: now,
+                            });
+                            recompose_preview(state);
+                        }
                     }
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
@@ -735,6 +1493,160 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                if contains(state.add_control, x, y) {
+                    state.tools_open = !state.tools_open;
+                    if !state.tools_open {
+                        state.tool = None;
+                        state.text_entry = None;
+                        recompose_preview(state);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+                if state.tools_open {
+                    if let Some((_, tool, _)) = state
+                        .tool_controls
+                        .iter()
+                        .find(|(rect, ..)| contains(*rect, x, y))
+                        .copied()
+                    {
+                        state.tool = Some(tool);
+                        state.selected = None;
+                        state.text_entry = None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if let Some((_, index)) = state
+                        .color_controls
+                        .iter()
+                        .find(|(rect, _)| contains(*rect, x, y))
+                        .copied()
+                    {
+                        state.color_idx = index;
+                        if let Some(selected) = state
+                            .selected
+                            .filter(|index| *index < state.annotations.len())
+                        {
+                            push_undo(state);
+                            state.annotations[selected].color = index;
+                            recompose_preview(state);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if let Some((_, index)) = state
+                        .size_controls
+                        .iter()
+                        .find(|(rect, _)| contains(*rect, x, y))
+                        .copied()
+                    {
+                        state.size_idx = index;
+                        if let Some(selected) = state
+                            .selected
+                            .filter(|index| *index < state.annotations.len())
+                        {
+                            push_undo(state);
+                            state.annotations[selected].size = current_size(state);
+                            recompose_preview(state);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if contains(state.undo_control, x, y) {
+                        undo(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if contains(state.delete_control, x, y) {
+                        delete_selected(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if contains(tool_panel(state), x, y) {
+                        return LRESULT(0);
+                    }
+                }
+
+                if contains(annotation_lane(state), x, y) {
+                    if let Some((index, item)) = state
+                        .annotations
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(index, item)| contains(item_clip_rect(state, *index, item), x, y))
+                    {
+                        let rect = item_clip_rect(state, index, item);
+                        state.selected = Some(index);
+                        state.playhead = state.annotations[index]
+                            .start
+                            .clamp(state.trim_start, state.trim_end);
+                        push_undo(state);
+                        let grab = s(state, 7);
+                        state.dragging = Some(if (x - rect.left).abs() <= grab {
+                            Drag::ClipStart(index)
+                        } else if (x - rect.right).abs() <= grab {
+                            Drag::ClipEnd(index)
+                        } else {
+                            Drag::ClipMove {
+                                index,
+                                last_time: x_to_time(state, x),
+                            }
+                        });
+                        refresh_preview(state);
+                        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                }
+
+                if let Some(point) = screen_to_preview(state, x, y) {
+                    if let Some(tool) = state.tool {
+                        if tool == Tool::Text {
+                            state.text_entry = Some(TextEntry {
+                                pos: point,
+                                text: String::new(),
+                                editing: None,
+                            });
+                            state.tool = None;
+                            state.tools_open = false;
+                            state.selected = None;
+                            recompose_preview(state);
+                        } else {
+                            push_undo(state);
+                            let (start, end) = default_range(state);
+                            state.annotations.push(crate::video_edit::Item {
+                                shape: shape_for_tool(tool, point),
+                                start,
+                                end,
+                                color: state.color_idx,
+                                size: current_size(state),
+                            });
+                            let index = state.annotations.len() - 1;
+                            state.selected = Some(index);
+                            state.tool = None;
+                            state.tools_open = false;
+                            state.dragging = Some(Drag::Draw {
+                                index,
+                                start: point,
+                            });
+                            windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                            recompose_preview(state);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if let Some(index) = hit_annotation(state, point) {
+                        push_undo(state);
+                        state.selected = Some(index);
+                        state.dragging = Some(Drag::Move { index, last: point });
+                        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                    } else {
+                        state.selected = None;
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+
                 let strip = state.strip;
                 if state.duration > 0
                     && y >= strip.top - 6
@@ -745,7 +1657,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let to_x = |t: i64| {
                         strip.left
                             + ((t as f64 / state.duration as f64)
-                                * (strip.right - strip.left) as f64) as i32
+                                * (strip.right - strip.left) as f64)
+                                as i32
                     };
                     let (sx, ex) = (to_x(state.trim_start), to_x(state.trim_end));
                     let grab = s(state, 10);
@@ -760,11 +1673,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     match drag {
                         Drag::Trim(handle) => {
                             set_handle(state, handle, x);
-                            state.playhead =
-                                state.playhead.clamp(state.trim_start, state.trim_end);
+                            state.playhead = state.playhead.clamp(state.trim_start, state.trim_end);
                             refresh_preview(state);
                         }
                         Drag::Playhead => set_playhead(state, x),
+                        _ => {}
                     }
                     windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                     let _ = InvalidateRect(hwnd, None, false);
@@ -778,9 +1691,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if state.dragging.take().is_some() {
+                if let Some(drag) = state.dragging.take() {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-                    refresh_preview_exact(state);
+                    if matches!(drag, Drag::Trim(_) | Drag::Playhead) {
+                        refresh_preview_exact(state);
+                    } else {
+                        if let Drag::Draw { index, .. } = drag {
+                            if let Some(item) = state.annotations.get(index) {
+                                let (x0, y0, x1, y1) = crate::video_edit::bounds(item);
+                                if (x1 - x0).hypot(y1 - y0) < 0.008 {
+                                    state.annotations.remove(index);
+                                    state.selected = None;
+                                }
+                            }
+                        }
+                        recompose_preview(state);
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -821,15 +1747,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Act::SaveTrim => {
                             let style = state.styles[state.matte_index].clone();
                             let has_matte = !crate::compose::is_plain(&style);
-                            let has_trim =
-                                state.trim_start > 0 || state.trim_end < state.duration;
+                            let has_trim = state.trim_start > 0 || state.trim_end < state.duration;
                             let style_slug = style.name.to_ascii_lowercase();
-                            let suffix = match (has_matte, has_trim) {
+                            let has_annotations = !state.annotations.is_empty();
+                            let mut suffix = match (has_matte, has_trim) {
                                 (true, true) => format!("{style_slug}-trim"),
                                 (true, false) => style_slug,
                                 (false, true) => "trim".into(),
                                 (false, false) => "copy".into(),
                             };
+                            if has_annotations {
+                                suffix.push_str("-edit");
+                            }
                             let dst = state.mp4.with_file_name(format!(
                                 "{}-{suffix}.mp4",
                                 state
@@ -838,19 +1767,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     .map(|s| s.to_string_lossy().to_string())
                                     .unwrap_or_default()
                             ));
+                            let annotation_label = if has_annotations {
+                                format!(
+                                    " + {} annotation{}",
+                                    state.annotations.len(),
+                                    if state.annotations.len() == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                )
+                            } else {
+                                String::new()
+                            };
                             state.status = Some(format!(
-                                "exporting {}{} \u{2026}",
+                                "exporting {}{}{} \u{2026}",
                                 style.name,
-                                if has_trim { " + trim" } else { "" }
+                                if has_trim { " + trim" } else { "" },
+                                annotation_label
                             ));
                             let _ = InvalidateRect(hwnd, None, false);
                             let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
-                            match crate::trim::cut_with_matte(
+                            match crate::trim::cut_with_edit(
                                 &state.mp4,
                                 &dst,
                                 state.trim_start,
                                 state.trim_end,
                                 Some(&style),
+                                &state.annotations,
                             ) {
                                 Ok(()) => {
                                     let _ = crate::output::file_to_clipboard(&dst);
@@ -868,11 +1812,94 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_LBUTTONDBLCLK => {
+            if let Some(state) = state_of(hwnd) {
+                let (x, y) = (
+                    (lparam.0 & 0xFFFF) as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                if let Some(point) = screen_to_preview(state, x, y) {
+                    if let Some(index) = hit_annotation(state, point) {
+                        if let crate::video_edit::Shape::Text { pos, text } =
+                            &state.annotations[index].shape
+                        {
+                            let pos = *pos;
+                            let text = text.clone();
+                            state.color_idx = state.annotations[index].color;
+                            state.size_idx = if state.annotations[index].size < 0.91 {
+                                0
+                            } else if state.annotations[index].size > 1.17 {
+                                2
+                            } else {
+                                1
+                            };
+                            state.selected = Some(index);
+                            state.text_entry = Some(TextEntry {
+                                pos,
+                                text,
+                                editing: Some(index),
+                            });
+                            recompose_preview(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            if let Some(state) = state_of(hwnd) {
+                if state.text_entry.is_some() {
+                    let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
+                    match ch {
+                        '\r' => commit_text(state),
+                        '\u{8}' => {
+                            if let Some(entry) = &mut state.text_entry {
+                                entry.text.pop();
+                            }
+                            recompose_preview(state);
+                        }
+                        ch if !ch.is_control() => {
+                            if let Some(entry) = &mut state.text_entry {
+                                if entry.text.chars().count() < 160 {
+                                    entry.text.push(ch);
+                                }
+                            }
+                            recompose_preview(state);
+                        }
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
         WM_KEYDOWN => {
             if let Some(state) = state_of(hwnd) {
                 match wparam.0 as u16 {
                     key if key == VK_ESCAPE.0 => {
-                        let _ = DestroyWindow(hwnd);
+                        if state.text_entry.is_some() {
+                            state.text_entry = None;
+                            recompose_preview(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        } else if state.tool.is_some() || state.tools_open {
+                            state.tool = None;
+                            state.tools_open = false;
+                            let _ = InvalidateRect(hwnd, None, false);
+                        } else if state.selected.is_some() {
+                            state.selected = None;
+                            let _ = InvalidateRect(hwnd, None, false);
+                        } else {
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
+                    key if key == VK_DELETE.0 => {
+                        delete_selected(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    0x5A if GetKeyState(VK_CONTROL.0 as i32) < 0 => {
+                        undo(state);
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
                     key if key == VK_LEFT.0 => {
                         state.playhead = (state.playhead - 5_000_000).max(0);
@@ -901,13 +1928,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         windows::Win32::UI::WindowsAndMessaging::WM_SIZE => {
             if let Some(state) = state_of(hwnd) {
-                let (w, h) = ((lparam.0 & 0xFFFF) as i32, ((lparam.0 >> 16) & 0xFFFF) as i32);
+                let (w, h) = (
+                    (lparam.0 & 0xFFFF) as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i32,
+                );
                 if w > 0 && h > 0 {
                     state.width = w;
                     state.height = h;
                     let next = layout(state.scale, w, h, state.styles.len());
                     state.controls = next.controls;
                     state.matte_controls = next.matte_controls;
+                    state.add_control = next.add_control;
+                    state.tool_controls = next.tool_controls;
+                    state.color_controls = next.color_controls;
+                    state.size_controls = next.size_controls;
+                    state.undo_control = next.undo_control;
+                    state.delete_control = next.delete_control;
                     state.preview_rect = next.preview;
                     state.strip = next.strip;
                     let _ = InvalidateRect(hwnd, None, true);
@@ -967,7 +2003,9 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
     let matte_index = 0;
     let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index]);
 
-    let size_mb = std::fs::metadata(&mp4).map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0);
+    let size_mb = std::fs::metadata(&mp4)
+        .map(|m| m.len() as f64 / 1_048_576.0)
+        .unwrap_or(0.0);
     let mut summary = format!(
         "{:02}:{:02}   \u{00b7}   {} frames   \u{00b7}   {:.1} MB",
         secs / 60,
@@ -1019,13 +2057,27 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         styles,
         matte_index,
         matte_controls: initial.matte_controls,
+        annotations: Vec::new(),
+        undo: Vec::new(),
+        selected: None,
+        tools_open: false,
+        tool: None,
+        color_idx: 0,
+        size_idx: 1,
+        text_entry: None,
+        add_control: initial.add_control,
+        tool_controls: initial.tool_controls,
+        color_controls: initial.color_controls,
+        size_controls: initial.size_controls,
+        undo_control: initial.undo_control,
+        delete_control: initial.delete_control,
         status: None,
     }));
 
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -1040,7 +2092,12 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
             | WS_VISIBLE
             | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME
             | windows::Win32::UI::WindowsAndMessaging::WS_MAXIMIZEBOX;
-        let mut outer = RECT { left: 0, top: 0, right: cw, bottom: ch };
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: cw,
+            bottom: ch,
+        };
         let _ = AdjustWindowRectEx(&mut outer, style, false, WS_EX_APPWINDOW);
         match CreateWindowExW(
             WS_EX_APPWINDOW,

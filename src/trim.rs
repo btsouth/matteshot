@@ -8,11 +8,11 @@ use anyhow::{Context, Result};
 use image::RgbaImage;
 use windows::core::{HSTRING, PROPVARIANT};
 use windows::Win32::Media::MediaFoundation::{
-    IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL, MFStartup, MFMediaType_Audio, MFMediaType_Video, MFVideoFormat_RGB32,
-    MFSTARTUP_FULL, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
-    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
+    IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio,
+    MFMediaType_Video, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_FULL, MF_MT_AUDIO_NUM_CHANNELS,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+    MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
 };
 
 pub struct Probe {
@@ -49,11 +49,8 @@ fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u
             at.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
             at.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
             // Missing audio stream is fine.
-            let _ = reader.SetCurrentMediaType(
-                MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32,
-                None,
-                &at,
-            );
+            let _ =
+                reader.SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, None, &at);
         }
 
         let cur = reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)?;
@@ -161,11 +158,16 @@ pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
         let pos = duration * i as i64 / n_thumbs as i64;
         unsafe {
             let pv = PROPVARIANT::from(pos);
-            if reader.SetCurrentPosition(&windows::core::GUID::zeroed(), &pv).is_err() {
+            if reader
+                .SetCurrentPosition(&windows::core::GUID::zeroed(), &pv)
+                .is_err()
+            {
                 break;
             }
         }
-        let Some((bgra, _)) = read_video_frame(&reader, w, h, stride)? else { break };
+        let Some((bgra, _)) = read_video_frame(&reader, w, h, stride)? else {
+            break;
+        };
         // Nearest-neighbor downscale to the thumb size.
         let mut t = Vec::with_capacity((tw * thumb_h * 4) as usize);
         for y in 0..thumb_h {
@@ -179,7 +181,10 @@ pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
         }
         thumbs.push((t, tw, thumb_h));
     }
-    Ok(Probe { duration_100ns: duration, thumbs })
+    Ok(Probe {
+        duration_100ns: duration,
+        thumbs,
+    })
 }
 
 /// Resolve real stream indices — assuming video is 0 silently corrupts the
@@ -188,8 +193,12 @@ fn stream_indices(reader: &IMFSourceReader) -> (u32, Option<u32>) {
     let (mut video, mut audio) = (0u32, None);
     unsafe {
         for i in 0..8u32 {
-            let Ok(t) = reader.GetNativeMediaType(i, 0) else { continue };
-            let Ok(major) = t.GetGUID(&MF_MT_MAJOR_TYPE) else { continue };
+            let Ok(t) = reader.GetNativeMediaType(i, 0) else {
+                continue;
+            };
+            let Ok(major) = t.GetGUID(&MF_MT_MAJOR_TYPE) else {
+                continue;
+            };
             if major == MFMediaType_Video {
                 video = i;
             } else if major == MFMediaType_Audio && audio.is_none() {
@@ -228,6 +237,17 @@ pub fn cut_with_matte(
     end: i64,
     matte: Option<&crate::style::Style>,
 ) -> Result<()> {
+    cut_with_edit(src, dst, start, end, matte, &[])
+}
+
+pub fn cut_with_edit(
+    src: &Path,
+    dst: &Path,
+    start: i64,
+    end: i64,
+    matte: Option<&crate::style::Style>,
+    annotations: &[crate::video_edit::Item],
+) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
     let (reader, w, h, stride) = open_reader(src, true)?;
     let (video_idx, audio_idx) = stream_indices(&reader);
@@ -248,9 +268,8 @@ pub fn cut_with_matte(
     let even = |v: u32| (v.max(2)) & !1;
     let matte = matte.filter(|style| !crate::compose::is_plain(style));
     let matte_opts = crate::compose::ComposeOpts::default();
-    let matte_base = matte.map(|style| {
-        crate::compose::compose_base(w as usize, h as usize, style, &matte_opts)
-    });
+    let matte_base =
+        matte.map(|style| crate::compose::compose_base(w as usize, h as usize, style, &matte_opts));
     let (ow, oh) = matte_base
         .as_ref()
         .map(|base| (even(base.width()), even(base.height())))
@@ -322,18 +341,26 @@ pub fn cut_with_matte(
                 }
                 buf.Unlock()?;
 
-                let out = if let Some(base) = &matte_base {
-                    let content = bgra_to_rgba(&raw, w, h);
-                    let mut composed = base.clone();
-                    crate::compose::blend_content(&mut composed, &content, &matte_opts);
-                    rgba_to_bgra(&composed, ow, oh)
-                } else {
+                let out = if matte_base.is_none() && annotations.is_empty() {
                     let mut cropped = vec![0u8; row * oh as usize];
                     for y in 0..oh.min(h) as usize {
                         cropped[y * row..(y + 1) * row]
                             .copy_from_slice(&raw[y * source_row..y * source_row + row]);
                     }
                     cropped
+                } else {
+                    let content = bgra_to_rgba(&raw, w, h);
+                    let mut composed = if let Some(base) = &matte_base {
+                        let mut framed = base.clone();
+                        crate::compose::blend_content(&mut framed, &content, &matte_opts);
+                        framed
+                    } else if content.width() == ow && content.height() == oh {
+                        content
+                    } else {
+                        image::imageops::crop_imm(&content, 0, 0, ow, oh).to_image()
+                    };
+                    crate::video_edit::render(&mut composed, annotations, ts, None);
+                    rgba_to_bgra(&composed, ow, oh)
                 };
 
                 use windows::Win32::Media::MediaFoundation::{
