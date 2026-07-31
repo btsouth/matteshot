@@ -1113,7 +1113,7 @@ fn main() -> Result<()> {
             settings::open()?;
             let mut msg = MSG::default();
             unsafe {
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                while settings::is_open() && GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }

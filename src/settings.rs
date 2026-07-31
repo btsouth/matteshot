@@ -663,3 +663,15 @@ pub fn refresh() {
     }
 }
 
+/// Whether the settings surface still exists.
+///
+/// The resident shares its normal message loop with this non-modal window, but
+/// the standalone `--settings` diagnostic needs to know when the window was
+/// closed so it can end its own message loop and exit cleanly.
+pub fn is_open() -> bool {
+    unsafe {
+        let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
+        !hwnd.0.is_null() && IsWindow(hwnd).as_bool()
+    }
+}
+
