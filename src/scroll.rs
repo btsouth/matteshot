@@ -295,6 +295,29 @@ fn paint_scrollbar_track(image: &mut RgbaImage, track: &[Rgba<u8>]) {
     }
 }
 
+fn paint_final_scrollbar(
+    canvas: &mut RgbaImage,
+    frame: &RgbaImage,
+    width: u32,
+    view_top: u32,
+) {
+    let width = width.min(canvas.width()).min(frame.width());
+    let available = frame.height().saturating_sub(view_top);
+    let height = available.min(canvas.height());
+    if width == 0 || height == 0 {
+        return;
+    }
+    let canvas_x = canvas.width() - width;
+    let frame_x = frame.width() - width;
+    let canvas_y = canvas.height() - height;
+    let frame_y = frame.height() - height;
+    for y in 0..height {
+        for x in 0..width {
+            canvas.put_pixel(canvas_x + x, canvas_y + y, *frame.get_pixel(frame_x + x, frame_y + y));
+        }
+    }
+}
+
 fn send_wheel_at(point: POINT) {
     unsafe {
         let _ = SetCursorPos(point.x, point.y);
@@ -527,6 +550,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     }
     let mut canvas = first.clone();
     let mut prev = first.clone();
+    let mut last_observed = first.clone();
     let mut steps = 0usize;
     let mut aborted = false;
     // Learned on the first successful step, then held steady.
@@ -562,6 +586,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
                 Err(_) => break,
             }
         }
+        last_observed = next.clone();
 
         if std::env::var("MATTESHOT_SCROLL_DEBUG").is_ok() {
             eprintln!(
@@ -595,6 +620,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
             let Some(retry) = frame_after_wheel(target, fallback, vt, vb) else {
                 break;
             };
+            last_observed = retry.clone();
             let recovered = motion(&recovery_base, &retry, fh, vt, vb);
             if !stitchable(recovered, last_shift) {
                 break;
@@ -690,7 +716,9 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     }
 
     if scrollbar_track_colors.is_some() {
-        eprintln!("scroll: kept one browser scrollbar");
+        let view_top = chrome.map(|(top, _)| top).unwrap_or(0);
+        paint_final_scrollbar(&mut canvas, &last_observed, scrollbar_width, view_top);
+        eprintln!("scroll: kept browser scrollbar at start and finish");
     }
 
     unsafe {
@@ -765,5 +793,21 @@ mod tests {
         assert_eq!(*tail.get_pixel(5, 2), Rgba([80, 80, 80, 255]));
         assert_eq!(*tail.get_pixel(6, 2), Rgba([30, 30, 30, 255]));
         assert_eq!(*tail.get_pixel(7, 2), Rgba([30, 30, 30, 255]));
+    }
+
+    #[test]
+    fn final_scrollbar_is_restored_at_the_bottom() {
+        let mut canvas = RgbaImage::from_pixel(8, 16, Rgba([10, 10, 10, 255]));
+        let mut final_frame = RgbaImage::from_pixel(8, 8, Rgba([20, 20, 20, 255]));
+        for y in 0..8 {
+            final_frame.put_pixel(7, y, Rgba([100 + y as u8, 0, 0, 255]));
+        }
+        paint_final_scrollbar(&mut canvas, &final_frame, 1, 2);
+
+        assert_eq!(canvas.width(), 8);
+        assert_eq!(*canvas.get_pixel(7, 9), Rgba([10, 10, 10, 255]));
+        for y in 0..6 {
+            assert_eq!(*canvas.get_pixel(7, 10 + y), Rgba([102 + y as u8, 0, 0, 255]));
+        }
     }
 }
