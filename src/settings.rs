@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
+use anyhow::{Context, Result};
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -20,10 +21,10 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, LoadCursorW,
-    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, WM_CLOSE, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_SYSMENU,
-    WS_VISIBLE,
+    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_ERASEBKGND,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -450,17 +451,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 /// Open (or focus) the settings window. Non-modal; shares the main loop.
-pub fn open() {
+pub fn open() -> Result<()> {
     unsafe {
         let existing = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
         if !existing.0.is_null() && IsWindow(existing).as_bool() {
             use windows::Win32::UI::WindowsAndMessaging::{
                 SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE,
             };
+            let _ = ShowWindow(existing, SW_RESTORE);
             let _ = SetWindowPos(existing, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = SetWindowPos(existing, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = SetForegroundWindow(existing);
-            return;
+            eprintln!("settings: focused existing window");
+            return Ok(());
         }
 
         let scale = GetDpiForSystem() as f32 / 96.0;
@@ -532,10 +535,7 @@ pub fn open() {
             theme: crate::theme::current(),
         });
 
-        let hinstance = match GetModuleHandleW(None) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
+        let hinstance = GetModuleHandleW(None).context("get app module for settings")?;
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
@@ -588,14 +588,15 @@ pub fn open() {
             Some(leaked as *const _),
         ) {
             Ok(h) => h,
-            Err(_) => {
+            Err(error) => {
                 drop(Box::from_raw(leaked));
-                return;
+                return Err(error).context("create settings window");
             }
         };
 
         crate::theme::apply_titlebar(hwnd, &crate::theme::current());
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         // After a tray menu closes our process has lost its foreground
         // permission, so SetForegroundWindow alone silently fails and the new
         // window is born BEHIND the active app. The topmost toggle forces
@@ -606,6 +607,8 @@ pub fn open() {
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         let _ = SetForegroundWindow(hwnd);
+        eprintln!("settings: opened");
+        Ok(())
     }
 }
 

@@ -295,7 +295,11 @@ fn shoot_overlay() -> Result<()> {
 
 /// Ctrl+Alt+S flow: instant, zero-touch on the active window.
 fn shoot_active() -> Result<()> {
-    let fg = window::foreground();
+    let fg = window::external_foreground().context("No active app window to capture")?;
+    shoot_active_window(fg)
+}
+
+fn shoot_active_window(fg: HWND) -> Result<()> {
     let mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY) };
     shoot(Source::Window(fg), mon, None)
 }
@@ -349,15 +353,15 @@ fn run_app() -> Result<()> {
             if let Some(action) = tray.take_action() {
                 let result = match action {
                     tray::Action::Capture => shoot_overlay(),
-                    tray::Action::CaptureActive => shoot_active(),
+                    tray::Action::CaptureActive => tray
+                        .active_window()
+                        .context("No active app window to capture")
+                        .and_then(shoot_active_window),
                     tray::Action::OpenFolder => {
                         output::open_folder(&Config::load().save_dir());
                         Ok(())
                     }
-                    tray::Action::Settings => {
-                        settings::open();
-                        Ok(())
-                    }
+                    tray::Action::Settings => settings::open(),
                     tray::Action::ToggleAutostart => {
                         tray::set_autostart(!tray::autostart_enabled())
                     }
@@ -666,7 +670,7 @@ fn main() -> Result<()> {
         }
         // Open only the settings window (testing).
         Some("--settings") => {
-            settings::open();
+            settings::open()?;
             let mut msg = MSG::default();
             unsafe {
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {

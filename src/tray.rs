@@ -16,16 +16,18 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyMenu, GetCursorPos, GetWindowLongPtrW, PostQuitMessage, RegisterClassW,
-    SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA, HICON,
-    ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD,
-    WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    DestroyMenu, GetCursorPos, GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA,
+    HICON, ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_NONOTIFY,
+    TPM_RETURNCMD, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
 
 const WM_TRAYICON: u32 = 0x8001; // WM_APP + 1
 pub(crate) const WM_UPDATE_AVAILABLE: u32 = 0x8002; // WM_APP + 2
+const WM_TRAY_ACTION: u32 = 0x8003; // defer until the native popup is fully dismissed
 const CMD_CAPTURE: usize = 101;
 const CMD_CAPTURE_ACTIVE: usize = 102;
 const CMD_OPEN_FOLDER: usize = 103;
@@ -53,6 +55,7 @@ pub enum Action {
 struct TrayState {
     pending: Option<Action>,
     update: Option<crate::update::AvailableUpdate>,
+    active_window: Option<HWND>,
 }
 
 pub struct Tray {
@@ -175,6 +178,12 @@ unsafe fn make_icon() -> HICON {
 }
 
 unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
+    // Keep a real app foreground if one is still available. If clicking the
+    // tray already foregrounded the taskbar, retain the last timer snapshot.
+    if let Some(active) = crate::window::external_foreground() {
+        state.active_window = Some(active);
+    }
+
     let menu = CreatePopupMenu().expect("menu");
     let check = |on: bool| if on { MF_CHECKED } else { Default::default() };
     let _ = AppendMenuW(menu, MF_STRING, CMD_CAPTURE, w!("Capture\tPrtScn"));
@@ -226,6 +235,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         hwnd,
         None,
     );
+    eprintln!("tray: command {}", cmd.0);
     let _ = DestroyMenu(menu);
     // Documented TrackPopupMenu quirk: without this, the next click on the
     // tray icon can be swallowed by leftover menu state.
@@ -236,7 +246,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         LPARAM(0),
     );
 
-    state.pending = match cmd.0 as usize {
+    let action = match cmd.0 as usize {
         CMD_CAPTURE => Some(Action::Capture),
         CMD_CAPTURE_ACTIVE => Some(Action::CaptureActive),
         CMD_OPEN_FOLDER => Some(Action::OpenFolder),
@@ -247,6 +257,14 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         CMD_QUIT => Some(Action::Quit),
         _ => None,
     };
+    if let Some(action) = action {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            hwnd,
+            WM_TRAY_ACTION,
+            WPARAM(action as usize),
+            LPARAM(0),
+        );
+    }
 }
 
 unsafe fn notify(hwnd: HWND, title: &str, text: &str) {
@@ -301,6 +319,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_TRAY_ACTION => {
+            let state = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState).as_mut();
+            if let Some(state) = state {
+                state.pending = match wparam.0 {
+                    x if x == Action::Capture as usize => Some(Action::Capture),
+                    x if x == Action::CaptureActive as usize => Some(Action::CaptureActive),
+                    x if x == Action::OpenFolder as usize => Some(Action::OpenFolder),
+                    x if x == Action::Settings as usize => Some(Action::Settings),
+                    x if x == Action::ToggleAutostart as usize => Some(Action::ToggleAutostart),
+                    x if x == Action::TogglePrtscn as usize => Some(Action::TogglePrtscn),
+                    x if x == Action::OpenUpdate as usize => Some(Action::OpenUpdate),
+                    x if x == Action::Quit as usize => Some(Action::Quit),
+                    _ => None,
+                };
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let state = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState).as_mut();
+            if let (Some(state), Some(active)) = (state, crate::window::external_foreground()) {
+                state.active_window = Some(active);
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -320,6 +362,7 @@ impl Tray {
             let mut state = Box::new(TrayState {
                 pending: None,
                 update: None,
+                active_window: crate::window::external_foreground(),
             });
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
@@ -349,6 +392,7 @@ impl Tray {
             let tip: Vec<u16> = "Matteshot \u{2014} PrtScn to capture".encode_utf16().collect();
             data.szTip[..tip.len()].copy_from_slice(&tip);
             let _ = Shell_NotifyIconW(NIM_ADD, &data);
+            let _ = SetTimer(hwnd, 1, 250, None);
 
             Ok(Tray { hwnd, state, _icon: icon })
         }
@@ -365,6 +409,12 @@ impl Tray {
         self.state.update.as_ref().map(|u| u.download_url.clone())
     }
 
+    pub fn active_window(&self) -> Option<HWND> {
+        self.state
+            .active_window
+            .filter(|hwnd| crate::window::is_external(*hwnd))
+    }
+
     /// Poll and clear the pending menu action.
     pub fn take_action(&mut self) -> Option<Action> {
         self.state.pending.take()
@@ -372,6 +422,7 @@ impl Tray {
 
     pub fn remove(&self) {
         unsafe {
+            let _ = KillTimer(self.hwnd, 1);
             let data = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: self.hwnd,
