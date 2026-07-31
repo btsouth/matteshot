@@ -3,7 +3,7 @@
 //! main thread shows a floating stop pill that excludes itself from the
 //! recording (WDA_EXCLUDEFROMCAPTURE).
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -63,9 +63,51 @@ const GIF_EVERY: u32 = 3;
 const GIF_MAX_FRAMES: usize = 240;
 /// GIFs balloon fast (no interframe compression here) — keep them share-sized.
 const GIF_MAX_WIDTH: u32 = 480;
+static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
 
 fn even(v: i32) -> u32 {
     (v.max(2) as u32) & !1
+}
+
+fn encoder_slot(timestamp: i64, frame_interval: i64) -> i64 {
+    timestamp.max(0) / frame_interval.max(1)
+}
+
+fn nearly_blank_bgra(bytes: &[u8]) -> bool {
+    let mut sampled = 0usize;
+    let mut dark = 0usize;
+    for pixel in bytes.chunks_exact(4).step_by(16) {
+        sampled += 1;
+        if pixel[0] <= 4 && pixel[1] <= 4 && pixel[2] <= 4 {
+            dark += 1;
+        }
+    }
+    sampled > 0 && dark * 1000 >= sampled * 998
+}
+
+/// Keep the recording canvas stable when a window changes size. The current
+/// frame is aspect-fitted and centered instead of reading past rows or leaving
+/// unpredictable uninitialized bands in the encoded sample.
+fn letterbox_bgra(source: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let rgba = crate::trim::bgra_to_rgba(source, sw, sh);
+    let scale = (dw as f32 / sw.max(1) as f32).min(dh as f32 / sh.max(1) as f32);
+    let rw = ((sw as f32 * scale).round() as u32).clamp(1, dw);
+    let rh = ((sh as f32 * scale).round() as u32).clamp(1, dh);
+    let resized = image::imageops::resize(&rgba, rw, rh, image::imageops::FilterType::Triangle);
+    let ox = (dw - rw) / 2;
+    let oy = (dh - rh) / 2;
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    for pixel in out.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    for y in 0..rh {
+        for x in 0..rw {
+            let pixel = resized.get_pixel(x, y);
+            let at = (((oy + y) * dw + ox + x) * 4) as usize;
+            out[at..at + 4].copy_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+        }
+    }
+    out
 }
 
 pub unsafe fn make_sink(
@@ -223,6 +265,7 @@ fn capture_loop(
         unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
 
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+    let window_target = matches!(target, Target::Window(_));
     let (item, crop): (GraphicsCaptureItem, Option<RECT>) = match target {
         Target::Window(h) => (unsafe { interop.CreateForWindow(HWND(h as *mut _))? }, None),
         Target::Region(r, m) => {
@@ -303,73 +346,121 @@ fn capture_loop(
     let mut audio_cursor: i64 = 0;
 
     let mut gif_frames: Vec<(Vec<u8>, u32, u32)> = Vec::new();
-    let mut first_ts: Option<i64> = None;
-    let mut last_ts: i64 = 0;
+    let mut last_slot: Option<i64> = None;
+    let mut latest_buf: Option<Vec<u8>> = None;
+    let mut blank_frames = 0u32;
+    let mut awaiting_first_content = window_target;
     let frame_interval = 10_000_000i64 / FPS as i64;
+    let recording_clock = std::time::Instant::now();
     let mut staging: Option<ID3D11Texture2D> = None;
     let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
+    let row_bytes = (out_w * 4) as usize;
 
     while !progress.stop.load(Ordering::Relaxed) {
-        let frame = match pool.TryGetNextFrame() {
-            Ok(f) => f,
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(4));
-                continue;
-            }
-        };
-
-        let ts = frame.SystemRelativeTime()?.Duration;
-        let base = *first_ts.get_or_insert(ts);
-        let rel = (ts - base).max(0);
-        // Drop frames that would land on the same encoder slot.
-        if progress.frames.load(Ordering::Relaxed) > 0 && rel - last_ts < frame_interval / 2 {
+        // The encoder owns the media clock. WGC is change-driven for some
+        // windows and may supply only one frame while their content is static;
+        // duplicate the latest surface into each 30fps slot so real elapsed
+        // time and playback duration still match. High-refresh sources are
+        // naturally reduced to the same slot cadence.
+        let rel = (recording_clock.elapsed().as_nanos() / 100).min(i64::MAX as u128) as i64;
+        let slot = encoder_slot(rel, frame_interval);
+        if last_slot == Some(slot) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
         }
+        let sample_ts = slot * frame_interval;
+        let buf = if let Ok(frame) = pool.TryGetNextFrame() {
+            let surface = frame.Surface()?;
+            let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
+            let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { texture.GetDesc(&mut desc) };
 
-        let surface = frame.Surface()?;
-        let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
-        let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { texture.GetDesc(&mut desc) };
+            if staging.is_none()
+                || staging_desc.Width != desc.Width
+                || staging_desc.Height != desc.Height
+            {
+                staging_desc = D3D11_TEXTURE2D_DESC {
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                    ..desc
+                };
+                let mut tex = None;
+                unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut tex))? };
+                staging = tex;
+            }
+            let stage = staging.as_ref().unwrap();
+            unsafe { context.CopyResource(stage, &texture) };
 
-        if staging.is_none() || staging_desc.Width != desc.Width || staging_desc.Height != desc.Height
-        {
-            staging_desc = D3D11_TEXTURE2D_DESC {
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-                ..desc
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            unsafe { context.Map(stage, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+            let fresh = unsafe {
+                let src = mapped.pData as *const u8;
+                let result = if let Some(c) = crop {
+                    let src_x = c.left.max(0) as u32;
+                    let src_y = c.top.max(0) as u32;
+                    let mut cropped = vec![0u8; row_bytes * out_h as usize];
+                    for y in 0..out_h {
+                        let sy = (src_y + y).min(desc.Height.saturating_sub(1));
+                        let src_row =
+                            src.add(sy as usize * mapped.RowPitch as usize + src_x as usize * 4);
+                        std::ptr::copy_nonoverlapping(
+                            src_row,
+                            cropped.as_mut_ptr().add(y as usize * row_bytes),
+                            row_bytes.min((desc.Width.saturating_sub(src_x) * 4) as usize),
+                        );
+                    }
+                    cropped
+                } else if desc.Width < out_w
+                    || desc.Height < out_h
+                    || desc.Width.abs_diff(out_w) > 1
+                    || desc.Height.abs_diff(out_h) > 1
+                {
+                    let source_row = (desc.Width * 4) as usize;
+                    let mut source = vec![0u8; source_row * desc.Height as usize];
+                    for y in 0..desc.Height {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(y as usize * mapped.RowPitch as usize),
+                            source.as_mut_ptr().add(y as usize * source_row),
+                            source_row,
+                        );
+                    }
+                    letterbox_bgra(&source, desc.Width, desc.Height, out_w, out_h)
+                } else {
+                    let mut stable = vec![0u8; row_bytes * out_h as usize];
+                    for y in 0..out_h {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(y as usize * mapped.RowPitch as usize),
+                            stable.as_mut_ptr().add(y as usize * row_bytes),
+                            row_bytes,
+                        );
+                    }
+                    stable
+                };
+                context.Unmap(stage, 0);
+                result
             };
-            let mut tex = None;
-            unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut tex))? };
-            staging = tex;
-        }
-        let stage = staging.as_ref().unwrap();
-        unsafe { context.CopyResource(stage, &texture) };
-
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(stage, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
-
-        // Copy out the (possibly cropped) frame as tightly packed BGRA.
-        let (src_x, src_y) = match crop {
-            Some(c) => (c.left.max(0) as u32, c.top.max(0) as u32),
-            None => (0, 0),
+            latest_buf = Some(fresh.clone());
+            fresh
+        } else if let Some(latest) = &latest_buf {
+            latest.clone()
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
         };
-        let row_bytes = (out_w * 4) as usize;
-        let mut buf = vec![0u8; row_bytes * out_h as usize];
-        unsafe {
-            let src = mapped.pData as *const u8;
-            for y in 0..out_h {
-                let sy = (src_y + y).min(desc.Height.saturating_sub(1));
-                let src_row = src.add(sy as usize * mapped.RowPitch as usize + src_x as usize * 4);
-                std::ptr::copy_nonoverlapping(
-                    src_row,
-                    buf.as_mut_ptr().add(y as usize * row_bytes),
-                    row_bytes.min((desc.Width.saturating_sub(src_x) * 4) as usize),
+
+        if awaiting_first_content && nearly_blank_bgra(&buf) {
+            blank_frames += 1;
+            if blank_frames >= FPS * 3 {
+                bail!(
+                    "The selected window returned only blank frames for three seconds. Try recording a region of the monitor, or disable protected/hardware-overlay video in the target app."
                 );
             }
-            context.Unmap(stage, 0);
+        } else {
+            blank_frames = 0;
+            awaiting_first_content = false;
         }
 
         // Encode.
@@ -383,13 +474,13 @@ fn capture_loop(
 
             let sample = MFCreateSample()?;
             sample.AddBuffer(&media_buf)?;
-            sample.SetSampleTime(rel)?;
+            sample.SetSampleTime(sample_ts)?;
             sample.SetSampleDuration(frame_interval)?;
             writer.WriteSample(stream, &sample)?;
         }
 
         let n = progress.frames.fetch_add(1, Ordering::Relaxed);
-        last_ts = rel;
+        last_slot = Some(slot);
 
         // Mux pending audio, then top up with silence to the video clock.
         if let (Some(rx), Some(fmt), Some(astream)) =
@@ -416,7 +507,7 @@ fn capture_loop(
                         audio_cursor,
                     )?;
                 }
-                while audio_cursor < rel - 600_000 {
+                while audio_cursor < sample_ts - 600_000 {
                     // 20ms of silence.
                     let frames = fmt.rate as usize / 50;
                     let silence = vec![0f32; frames * fmt.channels as usize];
@@ -481,17 +572,37 @@ fn write_gif(frames: &[(Vec<u8>, u32, u32)], path: &std::path::Path) -> Result<(
 /// Record `target` until the user stops. Blocks on the caller's (main)
 /// thread running the stop-pill message loop; returns the saved paths.
 pub fn session(target: Target, want_gif: bool) -> Result<()> {
+    if let Target::Region(rect, monitor) = target {
+        let monitor = HMONITOR(monitor as *mut _);
+        if !crate::window::monitor_contains_rect(monitor, rect) {
+            bail!(
+                "Recording regions must stay on one monitor. Select a smaller region or record the full window."
+            );
+        }
+    }
     let cfg = crate::config::Config::load();
     let audio_source = match cfg.record_audio.as_str() {
         "system" => Some(crate::audio::Source::System),
         "mic" => Some(crate::audio::Source::Mic),
         _ => None,
     };
+    crate::diagnostics::log(&format!(
+        "recording start target={} audio={} gif={want_gif}",
+        if matches!(target, Target::Window(_)) {
+            "window"
+        } else {
+            "region"
+        },
+        cfg.record_audio
+    ));
     let dir = cfg.video_dir();
     std::fs::create_dir_all(&dir)?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
     let mp4 = dir.join(format!("matteshot-{stamp}.mp4"));
+    let record_id = NEXT_RECORD_ID.fetch_add(1, Ordering::Relaxed);
+    let partial_mp4 = crate::output::partial_video_path(&mp4, record_id);
     let gif = dir.join(format!("matteshot-{stamp}.gif"));
+    let _ = std::fs::remove_file(&partial_mp4);
 
     let progress = Arc::new(Progress {
         stop: AtomicBool::new(false),
@@ -512,10 +623,10 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
 
     let worker = {
         let progress = progress.clone();
-        let mp4 = mp4.clone();
+        let partial_mp4 = partial_mp4.clone();
         std::thread::spawn(move || match capture_loop(
             target,
-            mp4,
+            partial_mp4,
             want_gif,
             audio_source,
             progress.clone(),
@@ -529,13 +640,56 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         })
     };
 
-    // Stop pill owns the main thread until the user stops.
-    crate::recui::run(progress.clone(), target)?;
+    // Stop pill owns the main thread until the user stops. Always signal and
+    // join the capture worker even if creating or running the controls fails.
+    let ui_result = crate::recui::run(progress.clone(), target);
     progress.stop.store(true, Ordering::Relaxed);
-    let gif_frames = worker.join().map_err(|_| anyhow::anyhow!("recorder panicked"))?;
+    let worker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !worker.is_finished() {
+        if std::time::Instant::now() >= worker_deadline {
+            crate::diagnostics::log("recording finalize timeout");
+            bail!(
+                "The recorder did not finish within 60 seconds. The incomplete file was quarantined and will be removed after restart."
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let worker_result = worker.join();
+
+    if let Err(error) = ui_result {
+        crate::diagnostics::log("recording controls failed");
+        let _ = std::fs::remove_file(&partial_mp4);
+        let _ = std::fs::remove_file(&gif);
+        return Err(error).context("recording controls failed");
+    }
+    let gif_frames = match worker_result {
+        Ok(frames) => frames,
+        Err(_) => {
+            crate::diagnostics::log("recording worker panic");
+            let _ = std::fs::remove_file(&partial_mp4);
+            let _ = std::fs::remove_file(&gif);
+            bail!("recorder worker panicked");
+        }
+    };
 
     if let Some(err) = progress.error.lock().unwrap().clone() {
+        crate::diagnostics::log("recording capture failed");
+        let _ = std::fs::remove_file(&partial_mp4);
+        let _ = std::fs::remove_file(&gif);
         bail!(err);
+    }
+
+    if let Err(error) = crate::trim::validate_video(&partial_mp4) {
+        crate::diagnostics::log("recording validation failed");
+        let _ = std::fs::remove_file(&partial_mp4);
+        let _ = std::fs::remove_file(&gif);
+        return Err(error).context("recording failed its final integrity check");
+    }
+    if let Err(error) = std::fs::rename(&partial_mp4, &mp4) {
+        crate::diagnostics::log("recording publish failed");
+        let _ = std::fs::remove_file(&partial_mp4);
+        let _ = std::fs::remove_file(&gif);
+        return Err(error).context("publish finalized recording");
     }
 
     let mut gif_saved = None;
@@ -546,10 +700,47 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     }
     let frames = progress.frames.load(Ordering::Relaxed);
     let secs = progress.started.elapsed().as_secs();
+    crate::diagnostics::log(&format!("recording complete frames={frames} seconds={secs}"));
     eprintln!("recorded {frames} frames -> {}", mp4.display());
     // The file itself on the clipboard: paste straight into chat or a ticket.
     let _ = crate::output::file_to_clipboard(&mp4);
     // And a review window so stopping never feels like the recording vanished.
     let _ = crate::recdone::show(mp4, gif_saved, frames, secs);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn high_refresh_frames_share_one_thirty_fps_slot() {
+        let interval = 10_000_000 / 30;
+        assert_eq!(encoder_slot(0, interval), 0);
+        assert_eq!(encoder_slot(interval / 2, interval), 0);
+        assert_eq!(encoder_slot(interval + 1, interval), 1);
+    }
+
+    #[test]
+    fn resized_windows_are_letterboxed_without_distortion() {
+        let mut source = vec![0u8; 4 * 2 * 4];
+        for pixel in source.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 0, 255, 255]);
+        }
+        let output = letterbox_bgra(&source, 4, 2, 4, 4);
+        assert_eq!(&output[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&output[(4 * 4)..(4 * 4 + 4)], &[0, 0, 255, 255]);
+        assert_eq!(&output[(3 * 4 * 4)..(3 * 4 * 4 + 4)], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn blank_window_detection_ignores_normal_dark_content() {
+        let mut blank = vec![0u8; 32 * 4];
+        for pixel in blank.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        assert!(nearly_blank_bgra(&blank));
+        blank[0..4].copy_from_slice(&[80, 80, 80, 255]);
+        assert!(!nearly_blank_bgra(&blank));
+    }
 }

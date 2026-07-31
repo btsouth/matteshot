@@ -10,8 +10,8 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
     RoundRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT, PS_SOLID,
-    SRCCOPY, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT,
+    PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -49,6 +49,7 @@ enum Ctrl {
 
 struct State {
     cfg: Config,
+    license: crate::license::Status,
     font: HFONT,
     font_small: HFONT,
     controls: Vec<(RECT, Ctrl)>,
@@ -241,14 +242,38 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctrl::Autostart => {
                 draw_checkbox(hdc, *r, "Start with Windows", state, tray::autostart_enabled(), hot)
             }
-            Ctrl::Prtscn => draw_checkbox(
-                hdc,
-                *r,
-                "Capture the PrtScn key",
-                state,
-                !prtscn::snipping_owns_prtscn(),
-                hot,
-            ),
+            Ctrl::Prtscn => {
+                draw_checkbox(
+                    hdc,
+                    *r,
+                    "Capture the PrtScn key",
+                    state,
+                    state.cfg.capture_prtscn,
+                    hot,
+                );
+                let (label, color) = if !state.cfg.capture_prtscn {
+                    ("Off", state.theme.muted)
+                } else if !state.license.can_capture() {
+                    ("Activate to use", state.theme.muted)
+                } else if prtscn::owns_key() {
+                    ("Active", state.theme.accent)
+                } else {
+                    ("Reconnecting\u{2026}", state.theme.muted)
+                };
+                draw_text_in(
+                    hdc,
+                    state.font_small,
+                    color,
+                    RECT {
+                        left: r.right - s(state, 130),
+                        top: r.top,
+                        right: r.right,
+                        bottom: r.bottom,
+                    },
+                    label,
+                    DT_RIGHT.0,
+                );
+            }
             Ctrl::RecordGif => draw_checkbox(
                 hdc,
                 *r,
@@ -308,7 +333,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let footer_text = format!(
         "Matteshot {}   \u{00b7}   {}",
         env!("CARGO_PKG_VERSION"),
-        crate::license::status().tray_label()
+        state.license.tray_label()
     );
     draw_text_in(
         hdc,
@@ -337,39 +362,38 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
     match ctrl {
         Ctrl::ChangeDir => {
             if let Some(path) = pick_folder(hwnd) {
-                state.cfg.save_dir = Some(path.into());
-                state.cfg.save();
+                state.cfg = Config::update(|cfg| cfg.save_dir = Some(path.into()));
             }
         }
         Ctrl::OpenDir => crate::output::open_folder(&state.cfg.save_dir()),
         Ctrl::ChangeVideoDir => {
             if let Some(path) = pick_folder(hwnd) {
-                state.cfg.video_dir = Some(path.into());
-                state.cfg.save();
+                state.cfg = Config::update(|cfg| cfg.video_dir = Some(path.into()));
             }
         }
         Ctrl::OpenVideoDir => crate::output::open_folder(&state.cfg.video_dir()),
         Ctrl::Scale(n) => {
-            state.cfg.export_scale = n;
-            state.cfg.save();
+            state.cfg = Config::update(|cfg| cfg.export_scale = n);
         }
         Ctrl::Autostart => {
             let _ = tray::set_autostart(!tray::autostart_enabled());
         }
         Ctrl::Prtscn => {
-            if prtscn::snipping_owns_prtscn() {
+            let enabled = !state.cfg.capture_prtscn;
+            state.cfg = Config::update(|cfg| cfg.capture_prtscn = enabled);
+            prtscn::set_preferred(state.cfg.capture_prtscn);
+            if state.cfg.capture_prtscn {
                 let _ = prtscn::take(HOTKEY_ID_PRTSCN);
             } else {
                 prtscn::release(HOTKEY_ID_PRTSCN);
             }
         }
         Ctrl::RecordGif => {
-            state.cfg.record_gif = !state.cfg.record_gif;
-            state.cfg.save();
+            let enabled = !state.cfg.record_gif;
+            state.cfg = Config::update(|cfg| cfg.record_gif = enabled);
         }
         Ctrl::Audio(mode) => {
-            state.cfg.record_audio = mode.to_string();
-            state.cfg.save();
+            state.cfg = Config::update(|cfg| cfg.record_audio = mode.to_string());
         }
     }
     let _ = InvalidateRect(hwnd, None, false);
@@ -538,6 +562,7 @@ pub fn open() -> Result<()> {
 
         let state = Box::new(State {
             cfg: Config::load(),
+            license: crate::license::status(),
             font,
             font_small,
             controls,
@@ -622,6 +647,19 @@ pub fn open() -> Result<()> {
         let _ = SetForegroundWindow(hwnd);
         eprintln!("settings: opened");
         Ok(())
+    }
+}
+
+pub fn refresh() {
+    unsafe {
+        let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
+        if !hwnd.0.is_null() && IsWindow(hwnd).as_bool() {
+            if let Some(state) = state_of(hwnd) {
+                state.license = crate::license::status();
+                state.cfg = Config::load();
+            }
+            let _ = InvalidateRect(hwnd, None, false);
+        }
     }
 }
 

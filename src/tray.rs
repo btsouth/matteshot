@@ -19,8 +19,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, GetCursorPos, GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA,
     HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    TPM_NONOTIFY, TPM_RETURNCMD, WM_CLOSE, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER,
+    WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
@@ -39,6 +39,7 @@ const CMD_UPDATE: usize = 108;
 const CMD_BUY: usize = 109;
 const CMD_ACTIVATE: usize = 110;
 const CMD_DEACTIVATE: usize = 111;
+const CMD_DIAGNOSTICS: usize = 112;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Matteshot";
@@ -55,6 +56,7 @@ pub enum Action {
     Buy,
     Activate,
     Deactivate,
+    Diagnostics,
     Quit,
 }
 
@@ -257,12 +259,13 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         menu,
         capture_flags,
         CMD_PRTSCN,
-        if !crate::prtscn::snipping_owns_prtscn() {
+        if crate::prtscn::preferred() {
             w!("Give PrtScn back to Snipping Tool")
         } else {
             w!("Take over PrtScn")
         },
     );
+    let _ = AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS, w!("Copy diagnostics"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit Matteshot"));
 
@@ -301,6 +304,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         CMD_BUY => Some(Action::Buy),
         CMD_ACTIVATE => Some(Action::Activate),
         CMD_DEACTIVATE => Some(Action::Deactivate),
+        CMD_DIAGNOSTICS => Some(Action::Diagnostics),
         CMD_QUIT => Some(Action::Quit),
         _ => None,
     };
@@ -311,6 +315,21 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
             WPARAM(action as usize),
             LPARAM(0),
         );
+    }
+}
+
+pub fn request_existing_settings() -> bool {
+    let Some(hwnd) = crate::window::find_by_class("matteshot_tray") else {
+        return false;
+    };
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            hwnd,
+            WM_TRAY_ACTION,
+            WPARAM(Action::Settings as usize),
+            LPARAM(0),
+        )
+        .is_ok()
     }
 }
 
@@ -380,6 +399,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x if x == Action::Buy as usize => Some(Action::Buy),
                     x if x == Action::Activate as usize => Some(Action::Activate),
                     x if x == Action::Deactivate as usize => Some(Action::Deactivate),
+                    x if x == Action::Diagnostics as usize => Some(Action::Diagnostics),
                     x if x == Action::Quit as usize => Some(Action::Quit),
                     _ => None,
                 };
@@ -391,6 +411,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let (Some(state), Some(active)) = (state, crate::window::external_foreground()) {
                 state.active_window = Some(active);
             }
+            LRESULT(0)
+        }
+        // Used by the installer and uninstaller. This runs on the resident's
+        // own UI thread, allowing the message loop to unwind normally instead
+        // of terminating the process during an active file operation.
+        WM_CLOSE => {
+            PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

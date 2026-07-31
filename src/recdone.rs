@@ -2,18 +2,19 @@
 //! export actions. Non-modal on the main loop.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::RgbaImage;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
-    HDC, HFONT, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, RoundRect, SelectObject,
+    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -23,19 +24,32 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
-    LoadCursorW, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
-    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, WM_APP, WM_CHAR,
-    WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU,
-    WS_VISIBLE,
+    GetCursorPos, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow,
+    SetWindowLongPtrW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
+    IDYES, MB_ICONWARNING, MB_YESNO, WM_APP, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW,
+    WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
 };
 
 const WM_EXPORT_PROGRESS: u32 = WM_APP + 20;
 const WM_EXPORT_DONE: u32 = WM_APP + 21;
 const WM_PLAYBACK_FRAME: u32 = WM_APP + 22;
 const WM_PLAYBACK_DONE: u32 = WM_APP + 23;
+const WM_EXPORT_STALLED: u32 = WM_APP + 24;
+static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(1);
+
+const PAD_MIN: f32 = 0.04;
+const PAD_MAX: f32 = 0.18;
+const ASPECTS: [(&str, Option<f32>); 5] = [
+    ("Auto", None),
+    ("1:1", Some(1.0)),
+    ("4:3", Some(4.0 / 3.0)),
+    ("16:9", Some(16.0 / 9.0)),
+    ("Social", Some(1.91)),
+];
 
 struct ExportDone {
+    id: u64,
     path: PathBuf,
     result: std::result::Result<(), String>,
 }
@@ -43,7 +57,17 @@ struct ExportDone {
 #[derive(Default)]
 struct PlaybackMailbox {
     frame: Option<(u64, crate::trim::PlaybackFrame)>,
+    frame_posted: bool,
     done: Option<(u64, std::result::Result<(), String>, bool)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PreviewBaseKey {
+    width: u32,
+    height: u32,
+    matte: usize,
+    padding: u32,
+    aspect: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -73,6 +97,7 @@ enum Tool {
 enum Drag {
     Trim(Handle),
     Playhead,
+    Padding,
     Draw { index: usize, start: (f32, f32) },
     Move { index: usize, last: (f32, f32) },
     ClipStart(usize),
@@ -89,6 +114,8 @@ struct TextEntry {
 struct WindowLayout {
     controls: Vec<(RECT, Act, &'static str)>,
     matte_controls: Vec<(RECT, usize)>,
+    padding_slider: RECT,
+    aspect_controls: Vec<(RECT, usize)>,
     add_control: RECT,
     tool_controls: Vec<(RECT, Tool, &'static str)>,
     color_controls: Vec<(RECT, usize)>,
@@ -118,6 +145,7 @@ struct State {
     thumbs: Vec<(Vec<u8>, u32, u32)>,
     preview_raw: Option<(Vec<u8>, u32, u32)>,
     preview: Option<(Vec<u8>, u32, u32)>,
+    preview_base_cache: Option<(PreviewBaseKey, RgbaImage)>,
     preview_rect: RECT,
     strip: RECT,
     trim_start: i64,
@@ -127,6 +155,10 @@ struct State {
     styles: Vec<crate::style::Style>,
     matte_index: usize,
     matte_controls: Vec<(RECT, usize)>,
+    pad_factor: f32,
+    aspect_idx: usize,
+    padding_slider: RECT,
+    aspect_controls: Vec<(RECT, usize)>,
     annotations: Vec<crate::video_edit::Item>,
     undo: Vec<Vec<crate::video_edit::Item>>,
     selected: Option<usize>,
@@ -143,6 +175,10 @@ struct State {
     delete_control: RECT,
     status: Option<String>,
     exporting: bool,
+    export_id: Option<u64>,
+    export_cancel: Option<Arc<AtomicBool>>,
+    close_after_export: bool,
+    export_stalled: bool,
     playing: bool,
     playback_generation: u64,
     playback_cancel: Option<Arc<AtomicBool>>,
@@ -152,6 +188,33 @@ struct State {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+fn available_export_path(candidate: PathBuf) -> PathBuf {
+    if !candidate.exists() {
+        return candidate;
+    }
+    let parent = candidate.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let stem = candidate
+        .file_stem()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    let extension = candidate
+        .extension()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    for number in 2..10_000 {
+        let name = if extension.is_empty() {
+            format!("{stem}-{number}")
+        } else {
+            format!("{stem}-{number}.{extension}")
+        };
+        let path = parent.join(name);
+        if !path.exists() {
+            return path;
+        }
+    }
+    candidate
 }
 
 unsafe fn make_font(h: i32, weight: i32) -> HFONT {
@@ -193,7 +256,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         left: m,
         top: sc(96),
         right: cw - m,
-        bottom: strip.top - sc(72),
+        bottom: strip.top - sc(92),
     };
     let mut matte_controls = Vec::new();
     if style_count > 0 {
@@ -201,7 +264,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         let gap = sc(7);
         let available = (cw - m - start - gap * (style_count as i32 - 1)).max(style_count as i32);
         let chip_w = available / style_count as i32;
-        let chip_top = preview.bottom + sc(16);
+        let chip_top = preview.bottom + sc(8);
         for i in 0..style_count {
             let left = start + i as i32 * (chip_w + gap);
             matte_controls.push((
@@ -214,6 +277,31 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
                 i,
             ));
         }
+    }
+    let settings_top = preview.bottom + sc(40);
+    let padding_slider = RECT {
+        left: m + sc(68),
+        top: settings_top,
+        right: m + sc(258),
+        bottom: settings_top + sc(26),
+    };
+    let mut aspect_controls = Vec::new();
+    let aspect_start = m + sc(344);
+    let aspect_gap = sc(6);
+    let aspect_available =
+        (cw - m - aspect_start - aspect_gap * (ASPECTS.len() as i32 - 1)).max(1);
+    let aspect_width = (aspect_available / ASPECTS.len() as i32).max(sc(48));
+    for index in 0..ASPECTS.len() {
+        let left = aspect_start + index as i32 * (aspect_width + aspect_gap);
+        aspect_controls.push((
+            RECT {
+                left,
+                top: settings_top,
+                right: (left + aspect_width).min(cw - m),
+                bottom: settings_top + sc(26),
+            },
+            index,
+        ));
     }
     let mut controls = Vec::new();
     let by = ch - sc(52);
@@ -310,6 +398,8 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     WindowLayout {
         controls,
         matte_controls,
+        padding_slider,
+        aspect_controls,
         add_control,
         tool_controls,
         color_controls,
@@ -337,27 +427,50 @@ fn image_thumb(image: &RgbaImage) -> (Vec<u8>, u32, u32) {
     (bgra, image.width(), image.height())
 }
 
+fn compose_opts(pad_factor: f32, aspect_idx: usize) -> crate::compose::ComposeOpts {
+    crate::compose::ComposeOpts {
+        metric_scale: 1.0,
+        pad_factor,
+        aspect: ASPECTS[aspect_idx.min(ASPECTS.len() - 1)].1,
+    }
+}
+
+fn state_compose_opts(state: &State) -> crate::compose::ComposeOpts {
+    compose_opts(state.pad_factor, state.aspect_idx)
+}
+
 fn matte_thumbs(
     raw: &[(Vec<u8>, u32, u32)],
     style: &crate::style::Style,
+    opts: &crate::compose::ComposeOpts,
 ) -> Vec<(Vec<u8>, u32, u32)> {
     if crate::compose::is_plain(style) {
         return raw.to_vec();
     }
+    let mut bases = std::collections::HashMap::<(u32, u32), RgbaImage>::new();
     raw.iter()
         .map(|(bytes, w, h)| {
             let image = thumb_image(bytes, *w, *h);
-            image_thumb(&crate::compose::compose_scaled(&image, style, 1.0))
+            let base = bases
+                .entry((*w, *h))
+                .or_insert_with(|| crate::compose::compose_base(*w as usize, *h as usize, style, opts));
+            let mut composed = base.clone();
+            crate::compose::blend_content(&mut composed, &image, opts);
+            image_thumb(&composed)
         })
         .collect()
 }
 
-fn matte_frame(raw: &(Vec<u8>, u32, u32), style: &crate::style::Style) -> (Vec<u8>, u32, u32) {
+fn matte_frame(
+    raw: &(Vec<u8>, u32, u32),
+    style: &crate::style::Style,
+    opts: &crate::compose::ComposeOpts,
+) -> (Vec<u8>, u32, u32) {
     if crate::compose::is_plain(style) {
         return raw.clone();
     }
     let image = thumb_image(&raw.0, raw.1, raw.2);
-    image_thumb(&crate::compose::compose_scaled(&image, style, 1.0))
+    image_thumb(&crate::compose::compose_with(&image, style, opts))
 }
 
 fn set_playhead(state: &mut State, x: i32) {
@@ -385,31 +498,86 @@ fn refresh_preview(state: &mut State) {
 }
 
 fn recompose_preview(state: &mut State) {
-    state.preview = state.preview_raw.as_ref().map(|frame| {
-        let raw = thumb_image(&frame.0, frame.1, frame.2);
-        let mut image = if crate::compose::is_plain(&state.styles[state.matte_index]) {
-            raw
-        } else {
-            crate::compose::compose_scaled(&raw, &state.styles[state.matte_index], 1.0)
+    let opts = state_compose_opts(state);
+    let Some(frame) = state.preview_raw.as_ref() else {
+        state.preview = None;
+        return;
+    };
+    let raw = thumb_image(&frame.0, frame.1, frame.2);
+    let content_size = (raw.width(), raw.height());
+    let plain = crate::compose::is_plain(&state.styles[state.matte_index]);
+    let content_offset = if plain {
+        (0.0, 0.0)
+    } else {
+        let layout = crate::compose::layout(raw.width() as usize, raw.height() as usize, &opts);
+        (layout.pad_x as f32, layout.pad_y as f32)
+    };
+    let mut image = if plain {
+        raw
+    } else {
+        let key = PreviewBaseKey {
+            width: raw.width(),
+            height: raw.height(),
+            matte: state.matte_index,
+            padding: state.pad_factor.to_bits(),
+            aspect: state.aspect_idx,
         };
-        let skip = state.text_entry.as_ref().and_then(|entry| entry.editing);
-        crate::video_edit::render(&mut image, &state.annotations, state.playhead, skip);
-        if let Some(entry) = &state.text_entry {
-            let (start, end) = default_range(state);
-            let draft = crate::video_edit::Item {
-                shape: crate::video_edit::Shape::Text {
-                    pos: entry.pos,
-                    text: format!("{}|", entry.text),
-                },
-                start,
-                end,
-                color: state.color_idx,
-                size: current_size(state),
-            };
-            crate::video_edit::render_one(&mut image, &draft);
+        if state.preview_base_cache.as_ref().map(|(cached, _)| *cached) != Some(key) {
+            state.preview_base_cache = Some((
+                key,
+                crate::compose::compose_base(
+                    raw.width() as usize,
+                    raw.height() as usize,
+                    &state.styles[state.matte_index],
+                    &opts,
+                ),
+            ));
         }
-        image_thumb(&image)
-    });
+        let mut composed = state.preview_base_cache.as_ref().unwrap().1.clone();
+        crate::compose::blend_content(&mut composed, &raw, &opts);
+        composed
+    };
+    let skip = state.text_entry.as_ref().and_then(|entry| entry.editing);
+    crate::video_edit::render_at(
+        &mut image,
+        &state.annotations,
+        state.playhead,
+        skip,
+        content_size,
+        content_offset,
+    );
+    if let Some(entry) = &state.text_entry {
+        let (start, end) = default_range(state);
+        let draft = crate::video_edit::Item {
+            shape: crate::video_edit::Shape::Text {
+                pos: entry.pos,
+                text: format!("{}|", entry.text),
+            },
+            start,
+            end,
+            color: state.color_idx,
+            size: current_size(state),
+        };
+        crate::video_edit::render_one_at(&mut image, &draft, content_size, content_offset);
+    }
+    state.preview = Some(image_thumb(&image));
+}
+
+fn update_padding(state: &mut State, x: i32) {
+    let slider = state.padding_slider;
+    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32)
+        .clamp(0.0, 1.0);
+    state.pad_factor = PAD_MIN + t * (PAD_MAX - PAD_MIN);
+    recompose_preview(state);
+}
+
+fn refresh_matte_thumbs(state: &mut State) {
+    let opts = state_compose_opts(state);
+    state.thumbs = matte_thumbs(
+        &state.raw_thumbs,
+        &state.styles[state.matte_index],
+        &opts,
+    );
 }
 
 fn refresh_preview_exact(state: &mut State) {
@@ -450,8 +618,8 @@ fn start_playback(hwnd: HWND, state: &mut State) {
     let source = state.mp4.clone();
     let start = state.playhead;
     let end = state.trim_end;
-    let max_w = (state.preview_rect.right - state.preview_rect.left).max(2) as u32;
-    let max_h = (state.preview_rect.bottom - state.preview_rect.top).max(2) as u32;
+    let max_w = ((state.preview_rect.right - state.preview_rect.left).max(2) as u32).min(1440);
+    let max_h = ((state.preview_rect.bottom - state.preview_rect.top).max(2) as u32).min(900);
     let mailbox = state.playback_mailbox.clone();
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
@@ -464,8 +632,20 @@ fn start_playback(hwnd: HWND, state: &mut State) {
             max_h,
             &cancel,
             |frame| {
-                mailbox.lock().unwrap().frame = Some((generation, frame));
-                unsafe {
+                let should_post = {
+                    let mut mailbox = mailbox.lock().unwrap();
+                    mailbox.frame = Some((generation, frame));
+                    if mailbox.frame_posted {
+                        false
+                    } else {
+                        mailbox.frame_posted = true;
+                        true
+                    }
+                };
+                if !should_post {
+                    return true;
+                }
+                let posted = unsafe {
                     PostMessageW(
                         HWND(hwnd_raw as *mut _),
                         WM_PLAYBACK_FRAME,
@@ -473,7 +653,11 @@ fn start_playback(hwnd: HWND, state: &mut State) {
                         LPARAM(0),
                     )
                     .is_ok()
+                };
+                if !posted {
+                    mailbox.lock().unwrap().frame_posted = false;
                 }
+                posted
             },
         )
         .map_err(|error| format!("{error:#}"));
@@ -620,9 +804,27 @@ fn preview_image_rect(state: &State, frame: &(Vec<u8>, u32, u32)) -> RECT {
     }
 }
 
-fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
+fn preview_content_rect(state: &State) -> Option<RECT> {
     let frame = state.preview.as_ref()?;
-    let rect = preview_image_rect(state, frame);
+    let raw = state.preview_raw.as_ref()?;
+    let output = preview_image_rect(state, frame);
+    if crate::compose::is_plain(&state.styles[state.matte_index]) {
+        return Some(output);
+    }
+    let opts = state_compose_opts(state);
+    let layout = crate::compose::layout(raw.1 as usize, raw.2 as usize, &opts);
+    let scale = ((output.right - output.left) as f32 / frame.1.max(1) as f32)
+        .min((output.bottom - output.top) as f32 / frame.2.max(1) as f32);
+    Some(RECT {
+        left: output.left + (layout.pad_x as f32 * scale).round() as i32,
+        top: output.top + (layout.pad_y as f32 * scale).round() as i32,
+        right: output.left + ((layout.pad_x as u32 + raw.1) as f32 * scale).round() as i32,
+        bottom: output.top + ((layout.pad_y as u32 + raw.2) as f32 * scale).round() as i32,
+    })
+}
+
+fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
+    let rect = preview_content_rect(state)?;
     if x < rect.left || x > rect.right || y < rect.top || y > rect.bottom {
         return None;
     }
@@ -911,7 +1113,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
         {
             let item = &state.annotations[index];
             if item.active_at(state.playhead) {
-                let image_rect = preview_image_rect(state, frame);
+                let image_rect = preview_content_rect(state)
+                    .unwrap_or_else(|| preview_image_rect(state, frame));
                 let (x0, y0, x1, y1) = crate::video_edit::bounds(item);
                 let map_x = |x: f32| {
                     image_rect.left
@@ -1117,6 +1320,98 @@ unsafe fn paint(hdc: HDC, state: &State) {
             &mut label_rect,
             DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
+    }
+
+    let settings_top = state.padding_slider.top;
+    SetTextColor(hdc, state.theme.muted);
+    let mut padding_label = wide("Padding");
+    let mut padding_label_rect = RECT {
+        left: m,
+        top: settings_top,
+        right: state.padding_slider.left - s(state, 8),
+        bottom: state.padding_slider.bottom,
+    };
+    DrawTextW(
+        hdc,
+        &mut padding_label,
+        &mut padding_label_rect,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+    );
+
+    let plain = crate::compose::is_plain(&state.styles[state.matte_index]);
+    let slider = state.padding_slider;
+    let cy = (slider.top + slider.bottom) / 2;
+    let track_color = if plain {
+        state.theme.chip_line
+    } else {
+        state.theme.track
+    };
+    let track = CreateSolidBrush(track_color);
+    FillRect(
+        hdc,
+        &RECT {
+            left: slider.left,
+            top: cy - s(state, 2),
+            right: slider.right,
+            bottom: cy + s(state, 2),
+        },
+        track,
+    );
+    let _ = DeleteObject(track);
+    let pad_t = ((state.pad_factor - PAD_MIN) / (PAD_MAX - PAD_MIN)).clamp(0.0, 1.0);
+    let thumb_x = slider.left + ((slider.right - slider.left) as f32 * pad_t) as i32;
+    let active_color = if plain {
+        state.theme.faint
+    } else {
+        state.theme.accent
+    };
+    let filled = CreateSolidBrush(active_color);
+    FillRect(
+        hdc,
+        &RECT {
+            left: slider.left,
+            top: cy - s(state, 2),
+            right: thumb_x,
+            bottom: cy + s(state, 2),
+        },
+        filled,
+    );
+    let thumb_pen = CreatePen(PS_SOLID, 1, active_color);
+    let old_brush = SelectObject(hdc, filled);
+    let old_pen = SelectObject(hdc, thumb_pen);
+    let thumb_r = s(state, 7);
+    let _ = RoundRect(
+        hdc,
+        thumb_x - thumb_r,
+        cy - thumb_r,
+        thumb_x + thumb_r,
+        cy + thumb_r,
+        thumb_r * 2,
+        thumb_r * 2,
+    );
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(filled);
+    let _ = DeleteObject(thumb_pen);
+
+    if let Some((first, _)) = state.aspect_controls.first() {
+        SetTextColor(hdc, state.theme.muted);
+        let mut aspect_label = wide("Aspect");
+        let mut aspect_label_rect = RECT {
+            left: state.padding_slider.right + s(state, 18),
+            top: settings_top,
+            right: first.left - s(state, 8),
+            bottom: state.padding_slider.bottom,
+        };
+        DrawTextW(
+            hdc,
+            &mut aspect_label,
+            &mut aspect_label_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+        );
+    }
+    for (rect, index) in &state.aspect_controls {
+        paint_chip(hdc, *rect, ASPECTS[*index].0, state.aspect_idx == *index, state);
     }
 
     // Filmstrip + trim handles.
@@ -1451,7 +1746,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
             },
         );
         let shown = if *act == Act::SaveTrim && state.exporting {
-            "Exporting"
+            "Cancel export"
         } else if *act == Act::Play && state.playing {
             "Pause"
         } else {
@@ -1473,7 +1768,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => LRESULT(1),
         WM_EXPORT_PROGRESS => {
             if let Some(state) = state_of(hwnd) {
-                if state.exporting {
+                if state.exporting && state.export_id == Some(lparam.0 as u64) {
                     state.status = Some(format!("exporting full resolution · {}%", wparam.0));
                     let _ = InvalidateRect(hwnd, None, false);
                 }
@@ -1485,25 +1780,60 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             let done = Box::from_raw(lparam.0 as *mut ExportDone);
+            let mut close = false;
             if let Some(state) = state_of(hwnd) {
-                state.exporting = false;
-                match &done.result {
-                    Ok(()) => {
-                        let _ = crate::output::file_to_clipboard(&done.path);
-                        state.status = Some(format!(
-                            "saved {} · copied",
-                            done.path.file_name().unwrap_or_default().to_string_lossy()
-                        ));
+                if state.export_id == Some(done.id) {
+                    state.exporting = false;
+                    state.export_id = None;
+                    state.export_cancel = None;
+                    state.export_stalled = false;
+                    match &done.result {
+                        Ok(()) => {
+                            crate::diagnostics::log("video export complete");
+                            let _ = crate::output::file_to_clipboard(&done.path);
+                            state.status = Some(format!(
+                                "saved {} · copied",
+                                done.path.file_name().unwrap_or_default().to_string_lossy()
+                            ));
+                        }
+                        Err(error) if error == "export cancelled" => {
+                            crate::diagnostics::log("video export cancelled");
+                            state.status = Some("export cancelled · original kept".into());
+                        }
+                        Err(error) => {
+                            crate::diagnostics::log("video export failed");
+                            state.status = Some(format!("export failed: {error}"));
+                        }
                     }
-                    Err(error) => state.status = Some(format!("export failed: {error}")),
+                    close = state.close_after_export;
+                    state.close_after_export = false;
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
-                let _ = InvalidateRect(hwnd, None, false);
+            }
+            if close {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_EXPORT_STALLED => {
+            if let Some(state) = state_of(hwnd) {
+                if state.exporting && state.export_id == Some(lparam.0 as u64) {
+                    state.export_stalled = true;
+                    state.status = Some(
+                        "export stopped responding · cancelling safely · original kept".into(),
+                    );
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }
         WM_PLAYBACK_FRAME => {
             if let Some(state) = state_of(hwnd) {
-                let next = state.playback_mailbox.lock().unwrap().frame.take();
+                let next = {
+                    let mut mailbox = state.playback_mailbox.lock().unwrap();
+                    mailbox.frame_posted = false;
+                    mailbox.frame.take()
+                };
                 if let Some((generation, frame)) = next {
                     if state.playing && generation == state.playback_generation {
                         state.playhead = frame.timestamp.clamp(state.trim_start, state.trim_end);
@@ -1586,6 +1916,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             refresh_preview(state);
                         }
                         Drag::Playhead => set_playhead(state, x),
+                        Drag::Padding => update_padding(state, x),
                         Drag::Draw { index, start } => {
                             if let Some(point) = screen_to_preview(state, x, y) {
                                 if let Some(item) = state.annotations.get_mut(index) {
@@ -1679,6 +2010,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                if contains(state.padding_slider, x, y) {
+                    state.dragging = Some(Drag::Padding);
+                    update_padding(state, x);
+                    windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
                 if contains(state.add_control, x, y) {
                     stop_playback(state);
                     state.tools_open = !state.tools_open;
@@ -1899,6 +2237,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             start_playback(hwnd, state);
                         }
                     } else {
+                        if drag == Drag::Padding {
+                            refresh_matte_thumbs(state);
+                        }
                         if let Drag::Draw { index, .. } = drag {
                             if let Some(item) = state.annotations.get(index) {
                                 let (x0, y0, x1, y1) = crate::video_edit::bounds(item);
@@ -1920,9 +2261,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .copied()
                 {
                     if index != state.matte_index {
-                        let style = state.styles[index].clone();
-                        state.thumbs = matte_thumbs(&state.raw_thumbs, &style);
                         state.matte_index = index;
+                        refresh_matte_thumbs(state);
+                        recompose_preview(state);
+                        state.status = None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    return LRESULT(0);
+                }
+                if let Some((_, index)) = state
+                    .aspect_controls
+                    .iter()
+                    .find(|(r, _)| contains(*r, x, y))
+                    .copied()
+                {
+                    if index != state.aspect_idx {
+                        state.aspect_idx = index;
+                        refresh_matte_thumbs(state);
                         recompose_preview(state);
                         state.status = None;
                         let _ = InvalidateRect(hwnd, None, false);
@@ -1956,6 +2311,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         Act::SaveTrim => {
                             if state.exporting {
+                                if let Some(cancel) = &state.export_cancel {
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
+                                state.status = Some("cancelling export · original kept".into());
+                                crate::diagnostics::log("video export cancel requested");
+                                let _ = InvalidateRect(hwnd, None, false);
                                 return LRESULT(0);
                             }
                             stop_playback(state);
@@ -1973,14 +2334,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if has_annotations {
                                 suffix.push_str("-edit");
                             }
-                            let dst = state.mp4.with_file_name(format!(
+                            let dst = available_export_path(state.mp4.with_file_name(format!(
                                 "{}-{suffix}.mp4",
                                 state
                                     .mp4
                                     .file_stem()
                                     .map(|s| s.to_string_lossy().to_string())
                                     .unwrap_or_default()
-                            ));
+                            )));
                             let annotation_label = if has_annotations {
                                 format!(
                                     " + {} annotation{}",
@@ -2001,25 +2362,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 annotation_label
                             ));
                             state.exporting = true;
+                            crate::diagnostics::log("video export start");
+                            let export_id = NEXT_EXPORT_ID.fetch_add(1, Ordering::Relaxed);
+                            let export_cancel = Arc::new(AtomicBool::new(false));
+                            state.export_id = Some(export_id);
+                            state.export_cancel = Some(export_cancel.clone());
+                            state.close_after_export = false;
+                            state.export_stalled = false;
                             let _ = InvalidateRect(hwnd, None, false);
                             let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
                             let src = state.mp4.clone();
                             let start = state.trim_start;
                             let end = state.trim_end;
                             let annotations = state.annotations.clone();
+                            let compose_opts = state_compose_opts(state);
                             let hwnd_raw = hwnd.0 as isize;
+                            let activity = Arc::new(Mutex::new(std::time::Instant::now()));
+                            let finished = Arc::new(AtomicBool::new(false));
+                            {
+                                let activity = activity.clone();
+                                let finished = finished.clone();
+                                let cancel = export_cancel.clone();
+                                std::thread::spawn(move || loop {
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
+                                    if finished.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    if activity.lock().unwrap().elapsed()
+                                        >= std::time::Duration::from_secs(45)
+                                    {
+                                        cancel.store(true, Ordering::Relaxed);
+                                        crate::diagnostics::log("video export inactivity timeout");
+                                        unsafe {
+                                            let _ = PostMessageW(
+                                                HWND(hwnd_raw as *mut _),
+                                                WM_EXPORT_STALLED,
+                                                WPARAM(0),
+                                                LPARAM(export_id as isize),
+                                            );
+                                        }
+                                        break;
+                                    }
+                                });
+                            }
                             std::thread::spawn(move || {
                                 let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-                                let _ = std::fs::remove_file(&dst);
+                                let temporary = crate::output::partial_video_path(&dst, export_id);
+                                let _ = std::fs::remove_file(&temporary);
                                 let mut last_progress = u32::MAX;
-                                let result = crate::trim::cut_with_edit_progress(
+                                let result = crate::trim::cut_with_edit_progress_cancel(
                                     &src,
-                                    &dst,
+                                    &temporary,
                                     start,
                                     end,
-                                    Some(&style),
+                                    Some((&style, &compose_opts)),
                                     &annotations,
+                                    &export_cancel,
                                     |percent| {
+                                        *activity.lock().unwrap() = std::time::Instant::now();
                                         if percent != last_progress {
                                             last_progress = percent;
                                             unsafe {
@@ -2027,29 +2427,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                                     HWND(hwnd_raw as *mut _),
                                                     WM_EXPORT_PROGRESS,
                                                     WPARAM(percent as usize),
-                                                    LPARAM(0),
+                                                    LPARAM(export_id as isize),
                                                 );
                                             }
                                         }
                                     },
                                 )
-                                .map_err(|error| format!("{error:#}"));
+                                .map_err(|error| format!("{error:#}"))
+                                .and_then(|()| {
+                                    if export_cancel.load(Ordering::Relaxed) {
+                                        Err("export cancelled".into())
+                                    } else {
+                                        crate::trim::validate_video(&temporary)
+                                            .map_err(|error| format!("validate export: {error:#}"))?;
+                                        std::fs::rename(&temporary, &dst)
+                                            .map_err(|error| format!("finalize export: {error}"))
+                                    }
+                                });
                                 if result.is_err() {
-                                    let _ = std::fs::remove_file(&dst);
+                                    let _ = std::fs::remove_file(&temporary);
                                 }
                                 if com.is_ok() {
                                     unsafe { CoUninitialize() };
                                 }
-                                let done = Box::new(ExportDone { path: dst, result });
+                                finished.store(true, Ordering::Relaxed);
+                                let done = Box::new(ExportDone {
+                                    id: export_id,
+                                    path: dst,
+                                    result,
+                                });
                                 let done_ptr = Box::into_raw(done);
                                 unsafe {
-                                    if PostMessageW(
-                                        HWND(hwnd_raw as *mut _),
-                                        WM_EXPORT_DONE,
-                                        WPARAM(0),
-                                        LPARAM(done_ptr as isize),
-                                    )
-                                    .is_err()
+                                    let target = HWND(hwnd_raw as *mut _);
+                                    if !crate::window::has_class(target, "matteshot_recdone")
+                                        || PostMessageW(
+                                            target,
+                                            WM_EXPORT_DONE,
+                                            WPARAM(0),
+                                            LPARAM(done_ptr as isize),
+                                        )
+                                        .is_err()
                                     {
                                         drop(Box::from_raw(done_ptr));
                                     }
@@ -2214,6 +2631,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let next = layout(state.scale, w, h, state.styles.len());
                     state.controls = next.controls;
                     state.matte_controls = next.matte_controls;
+                    state.padding_slider = next.padding_slider;
+                    state.aspect_controls = next.aspect_controls;
                     state.add_control = next.add_control;
                     state.tool_controls = next.tool_controls;
                     state.color_controls = next.color_controls;
@@ -2238,6 +2657,51 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CLOSE => {
             if let Some(state) = state_of(hwnd) {
+                if state.exporting {
+                    if state.export_stalled {
+                        let answer = MessageBoxW(
+                            hwnd,
+                            w!("The export stopped responding and cancellation was requested.\n\nClose the editor now? Your original is safe, and the incomplete export will be removed after restart."),
+                            w!("Matteshot"),
+                            MB_YESNO | MB_ICONWARNING,
+                        );
+                        if answer == IDYES {
+                            if let Some(cancel) = &state.export_cancel {
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                            let _ = DestroyWindow(hwnd);
+                        }
+                        return LRESULT(0);
+                    }
+                    // MessageBox runs a nested message loop. The export can
+                    // finish while the confirmation is open, and
+                    // WM_EXPORT_DONE will then clear the active export before
+                    // MessageBox returns. Remember which export prompted the
+                    // dialog and re-check it afterwards so a late Yes closes
+                    // immediately instead of waiting forever for a second
+                    // completion message that will never arrive.
+                    let prompted_export = state.export_id;
+                    let answer = MessageBoxW(
+                        hwnd,
+                        w!("An export is still running.\n\nCancel it and close the editor after cleanup finishes?"),
+                        w!("Matteshot"),
+                        MB_YESNO | MB_ICONWARNING,
+                    );
+                    if answer == IDYES {
+                        if !state.exporting || state.export_id != prompted_export {
+                            stop_playback(state);
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        if let Some(cancel) = &state.export_cancel {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        state.close_after_export = true;
+                        state.status = Some("cancelling export · closing after cleanup".into());
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    return LRESULT(0);
+                }
                 stop_playback(state);
             }
             let _ = DestroyWindow(hwnd);
@@ -2247,6 +2711,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
+                if let Some(cancel) = &state.export_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 if let Some(cancel) = &state.playback_cancel {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -2262,9 +2729,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 /// Show the review window. Returns immediately; lives on the main loop.
 pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Result<()> {
+    if let Some(parent) = mp4.parent() {
+        crate::output::cleanup_stale_video_partials(parent);
+    }
     let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
     let sc = |v: i32| (v as f32 * scale) as i32;
-    let (cw, ch) = (sc(1040), sc(720));
+    let mut cursor = POINT::default();
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let _ = GetMonitorInfoW(monitor, &mut monitor_info);
+    }
+    let work_w = monitor_info.rcWork.right - monitor_info.rcWork.left;
+    let work_h = monitor_info.rcWork.bottom - monitor_info.rcWork.top;
+    let cw = ((work_w as f32 * 0.85) as i32)
+        .clamp(sc(760).min(work_w - sc(40)), work_w - sc(40));
+    let ch = ((work_h as f32 * 0.85) as i32)
+        .clamp(sc(560).min(work_h - sc(40)), work_h - sc(40));
+    let window_x = monitor_info.rcWork.left + (work_w - cw) / 2;
+    let window_y = monitor_info.rcWork.top + (work_h - ch) / 2;
 
     // Filmstrip: best-effort, never blocks showing the window.
     let (probe_w, probe_h) = {
@@ -2274,16 +2761,23 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
             (initial.strip.bottom - initial.strip.top) as u32,
         )
     };
-    let probe = crate::trim::probe(&mp4, probe_w, probe_h).ok();
-    let duration = probe.as_ref().map(|p| p.duration_100ns).unwrap_or(0);
-    let raw_thumbs = probe.map(|p| p.thumbs).unwrap_or_default();
+    let probe = crate::trim::probe(&mp4, probe_w, probe_h)
+        .context("open the finished recording in the editor")?;
+    if probe.duration_100ns <= 0 || probe.thumbs.is_empty() {
+        anyhow::bail!("the finished recording has no decodable video frames");
+    }
+    let duration = probe.duration_100ns;
+    let raw_thumbs = probe.thumbs;
     let style_source = raw_thumbs
         .first()
         .map(|(bytes, w, h)| thumb_image(bytes, *w, *h))
         .unwrap_or_else(|| RgbaImage::from_pixel(1, 1, image::Rgba([42, 46, 58, 255])));
     let styles = crate::style::variants(&style_source);
     let matte_index = 0;
-    let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index]);
+    let pad_factor = crate::compose::DEFAULT_PAD_FACTOR;
+    let aspect_idx = 0;
+    let opts = compose_opts(pad_factor, aspect_idx);
+    let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index], &opts);
 
     let size_mb = std::fs::metadata(&mp4)
         .map(|m| m.len() as f64 / 1_048_576.0)
@@ -2310,7 +2804,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
     .or_else(|| raw_thumbs.first().cloned());
     let preview = preview_raw
         .as_ref()
-        .map(|frame| matte_frame(frame, &styles[matte_index]));
+        .map(|frame| matte_frame(frame, &styles[matte_index], &opts));
 
     let state = Box::into_raw(Box::new(State {
         mp4,
@@ -2330,6 +2824,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         thumbs,
         preview_raw,
         preview,
+        preview_base_cache: None,
         preview_rect: initial.preview,
         strip: initial.strip,
         trim_start: 0,
@@ -2339,6 +2834,10 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         styles,
         matte_index,
         matte_controls: initial.matte_controls,
+        pad_factor,
+        aspect_idx,
+        padding_slider: initial.padding_slider,
+        aspect_controls: initial.aspect_controls,
         annotations: Vec::new(),
         undo: Vec::new(),
         selected: None,
@@ -2355,6 +2854,10 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         delete_control: initial.delete_control,
         status: None,
         exporting: false,
+        export_id: None,
+        export_cancel: None,
+        close_after_export: false,
+        export_stalled: false,
         playing: false,
         playback_generation: 0,
         playback_cancel: None,
@@ -2392,8 +2895,8 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
             w!("matteshot_recdone"),
             w!("Matteshot — video editor"),
             style,
-            160,
-            160,
+            window_x,
+            window_y,
             outer.right - outer.left,
             outer.bottom - outer.top,
             None,
@@ -2409,4 +2912,33 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{available_export_path, NEXT_EXPORT_ID};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn exports_never_overwrite_an_existing_edit() {
+        let id = NEXT_EXPORT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-export-path-test-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("recording-edit.mp4");
+        std::fs::File::create(&original).unwrap();
+
+        let available = available_export_path(original.clone());
+        assert_eq!(available, dir.join("recording-edit-2.mp4"));
+        assert_ne!(crate::output::partial_video_path(&available, id), available);
+        assert_eq!(
+            crate::output::partial_video_path(&available, id).parent(),
+            available.parent()
+        );
+
+        std::fs::remove_file(original).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_ESCAPE,
+    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -24,9 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCAPTION,
     IDC_ARROW, MSG, WDA_EXCLUDEFROMCAPTURE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST,
-    WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT,
+    WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use crate::record::{Progress, Target};
@@ -86,9 +86,9 @@ unsafe fn paint(hdc: HDC, state: &UiState) {
 
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.faint);
-    let mut h = wide("Esc");
+    let mut h = wide("Ctrl+Shift+R");
     let mut hr = RECT {
-        left: state.stop_rect.right + 6,
+        left: state.stop_rect.right + 10,
         top: 0,
         right: state.width - 8,
         bottom: state.height,
@@ -162,12 +162,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
-        WM_KEYDOWN => {
-            if wparam.0 as u16 == VK_ESCAPE.0 {
-                let _ = DestroyWindow(hwnd);
-            }
-            LRESULT(0)
-        }
         WM_HOTKEY => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -203,14 +197,14 @@ unsafe fn make_font(h: i32, weight: i32) -> HFONT {
 
 /// Show the pill and pump messages until the user stops.
 pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
-    let (cw, ch) = (196, 40);
+    let (cw, ch) = (260, 40);
     let theme = crate::theme::current();
     let mut state = Box::new(UiState {
         progress,
         theme,
         font: unsafe { make_font(-16, 600) },
         font_small: unsafe { make_font(-13, 400) },
-        stop_rect: RECT { left: 104, top: 7, right: 152, bottom: ch - 7 },
+        stop_rect: RECT { left: 108, top: 7, right: 166, bottom: ch - 7 },
         hover: false,
         width: cw,
         height: ch,
@@ -261,13 +255,13 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
         )?;
         // Never let the controls appear in their own recording.
         let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-        // Esc remains available even though the pill deliberately never
-        // activates. The registration exists only for this recording.
+        // A chord remains available even though the pill deliberately never
+        // activates, without stealing a normal application key from games.
         let _ = RegisterHotKey(
             hwnd,
             1,
-            HOT_KEY_MODIFIERS(0x4000), // MOD_NOREPEAT
-            VK_ESCAPE.0 as u32,
+            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+            0x52, // R
         );
         // The freeze-frame overlay was foreground while the user chose the
         // target. Hand focus back to the selected window before it renders.

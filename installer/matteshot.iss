@@ -42,16 +42,28 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\matteshot.exe"; Description: "Launch Matteshot"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Give PrtScn back to Snipping Tool and stop the resident app.
-Filename: "{app}\matteshot.exe"; Parameters: "--restore-printscreen"; Flags: runhidden; RunOnceId: "RestorePrtScn"
-Filename: "{cmd}"; Parameters: "/C taskkill /f /im matteshot.exe"; Flags: runhidden; RunOnceId: "KillApp"
+; Stop through Matteshot's own cleanup path, then restore the Windows binding.
+Filename: "{app}\matteshot.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "StopApp"
+Filename: "{app}\matteshot.exe"; Parameters: "--restore-printscreen"; Flags: runhidden waituntilterminated; RunOnceId: "RestorePrtScn"
 
 [Code]
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   R: Integer;
 begin
-  // Stop a running instance so the exe can be replaced.
-  Exec(ExpandConstant('{cmd}'), '/C taskkill /f /im matteshot.exe', '', SW_HIDE, ewWaitUntilTerminated, R);
+  // Never force-kill an active recording or export. Matteshot closes its UI
+  // surfaces, waits for their cleanup paths, then exits the resident loop.
+  if FileExists(ExpandConstant('{app}\matteshot.exe')) then begin
+    if not Exec(ExpandConstant('{app}\matteshot.exe'), '--quit', '', SW_HIDE,
+      ewWaitUntilTerminated, R) then begin
+      Result := 'Matteshot could not be closed. Close it from the tray and try again.';
+      exit;
+    end;
+    if R <> 0 then
+      // Older Matteshot builds do not know --quit. Ask Windows to close them
+      // without /f; CloseApplications remains the final file-lock safeguard.
+      Exec(ExpandConstant('{cmd}'), '/C taskkill /im matteshot.exe', '', SW_HIDE,
+        ewWaitUntilTerminated, R);
+  end;
   Result := '';
 end;
