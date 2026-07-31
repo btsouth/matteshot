@@ -27,7 +27,7 @@ Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips in
 - H.264 MP4 via Media Foundation, ~30fps, bitrate scaled to pixel count, saved to the videos folder, file on clipboard.
 - **Audio**: Off / System (WASAPI loopback) / Mic in settings. Float PCM → resampled to an AAC-legal rate (192 kHz interfaces are common; AAC takes only 44.1/48 kHz) → stereo downmix → AAC muxed into the same MP4.
 - Optional share-sized **GIF** alongside (settings toggle).
-- **On stop**, a review window: the same seven matte choices as screenshots update the filmstrip live, while two draggable handles set in/out. **Export edit** creates a new framed and/or trimmed MP4 through a frame-accurate re-encode with audio preserved. The untouched original stays put. Play original / Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
+- **On stop**, a focused video editor opens with a large frame preview, the same seven matte choices as screenshots, a draggable playhead, keyboard scrubbing, and two trim handles. **Export edit** creates a new framed and/or trimmed MP4 through a frame-accurate re-encode with audio preserved. The untouched original stays put. Play original / Show in folder / Copy / Delete included. Resizable, double-buffered, no flicker.
 
 ## Scrolling capture
 
@@ -64,6 +64,7 @@ matteshot --bench <substr>   # timed capture of a window, raw PNG to %TEMP%
 matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCROLL_DEBUG=1 for per-step diagnostics)
 matteshot --record-test [s]  # short recording smoke test, optionally auto-stop after s seconds
 matteshot --trim-test <mp4> <a> <b> [1-7] # trim/export probe; optional matte
+matteshot --review-test <mp4> # open the video editor around an existing file
 matteshot --ocr <substr>     # capture a window and print its OCR text
 matteshot --update-test      # probe version.json; never downloads
 matteshot --settings         # open the settings window directly

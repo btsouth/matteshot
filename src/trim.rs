@@ -121,6 +121,30 @@ fn read_video_frame(
     }
 }
 
+/// Decode one representative frame at `position` and downscale it for the
+/// editor preview. The export path always uses the original decoded pixels.
+pub fn preview_frame(
+    path: &Path,
+    position: i64,
+    max_w: u32,
+    max_h: u32,
+) -> Result<(Vec<u8>, u32, u32)> {
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
+    let (reader, w, h, stride) = open_reader(path, false)?;
+    unsafe {
+        let pv = PROPVARIANT::from(position.max(0));
+        reader
+            .SetCurrentPosition(&windows::core::GUID::zeroed(), &pv)
+            .context("seek preview frame")?;
+    }
+    let (bgra, _) = read_video_frame(&reader, w, h, stride)?
+        .context("video has no frame at the requested position")?;
+    let rgba = bgra_to_rgba(&bgra, w, h);
+    let scaled = image::imageops::thumbnail(&rgba, max_w.max(2), max_h.max(2));
+    let (sw, sh) = scaled.dimensions();
+    Ok((rgba_to_bgra(&scaled, sw, sh), sw, sh))
+}
+
 /// Duration + filmstrip thumbnails sized to tile `strip_w` x `strip_h` at
 /// the video's own aspect ratio (stretching frames to fixed cells makes the
 /// strip look wrong).

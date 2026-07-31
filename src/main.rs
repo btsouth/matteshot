@@ -727,6 +727,28 @@ fn main() -> Result<()> {
             eprintln!("exported -> {}", dst.display());
             Ok(())
         }
+        // Open the focused recording editor around an existing MP4. This is
+        // visual-only: it does not capture or touch the clipboard.
+        Some("--review-test") => {
+            let src =
+                std::path::PathBuf::from(args.get(1).context("--review-test <mp4>")?);
+            let probe = trim::probe(&src, 8, 72)?;
+            let duration = probe.duration_100ns.max(0);
+            recdone::show(
+                src,
+                None,
+                ((duration as f64 / 10_000_000.0) * 30.0).round() as u32,
+                (duration as u64 / 10_000_000).max(1),
+            )?;
+            let mut msg = MSG::default();
+            unsafe {
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            Ok(())
+        }
         // OCR probe: recognize and print (no clipboard) — testing.
         Some("--ocr") => {
             require_capture_license()?;
@@ -895,7 +917,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-6>] [--overlay] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-6>] [--overlay] | --review-test <mp4> | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen]"
         ),
         None => run_app(),
     };

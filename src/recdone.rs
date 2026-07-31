@@ -1,5 +1,5 @@
-//! Post-recording review: a small themed window confirming what was saved,
-//! with Play / Show in folder / Copy / Delete. Non-modal on the main loop.
+//! Focused post-recording editor: large matte preview, trim timeline, and
+//! export actions. Non-modal on the main loop.
 
 use std::path::PathBuf;
 
@@ -15,7 +15,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, LoadCursorW,
     RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, AdjustWindowRectEx, CREATESTRUCTW,
@@ -39,9 +41,16 @@ enum Handle {
     End,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    Trim(Handle),
+    Playhead,
+}
+
 struct WindowLayout {
     controls: Vec<(RECT, Act, &'static str)>,
     matte_controls: Vec<(RECT, usize)>,
+    preview: RECT,
     strip: RECT,
 }
 
@@ -62,10 +71,14 @@ struct State {
     duration: i64,
     raw_thumbs: Vec<(Vec<u8>, u32, u32)>,
     thumbs: Vec<(Vec<u8>, u32, u32)>,
+    preview_raw: Option<(Vec<u8>, u32, u32)>,
+    preview: Option<(Vec<u8>, u32, u32)>,
+    preview_rect: RECT,
     strip: RECT,
     trim_start: i64,
     trim_end: i64,
-    dragging: Option<Handle>,
+    playhead: i64,
+    dragging: Option<Drag>,
     styles: Vec<crate::style::Style>,
     matte_index: usize,
     matte_controls: Vec<(RECT, usize)>,
@@ -109,11 +122,18 @@ fn layout(
 ) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
     let m = sc(24);
+    let timeline_h = (ch / 6).clamp(sc(88), sc(126));
     let strip = RECT {
         left: m,
-        top: sc(136),
+        top: ch - sc(140) - timeline_h,
         right: cw - m,
-        bottom: ch - sc(104),
+        bottom: ch - sc(140),
+    };
+    let preview = RECT {
+        left: m,
+        top: sc(96),
+        right: cw - m,
+        bottom: strip.top - sc(72),
     };
     let mut matte_controls = Vec::new();
     if style_count > 0 {
@@ -121,14 +141,15 @@ fn layout(
         let gap = sc(7);
         let available = (cw - m - start - gap * (style_count as i32 - 1)).max(style_count as i32);
         let chip_w = available / style_count as i32;
+        let chip_top = preview.bottom + sc(16);
         for i in 0..style_count {
             let left = start + i as i32 * (chip_w + gap);
             matte_controls.push((
                 RECT {
                     left,
-                    top: sc(96),
+                    top: chip_top,
                     right: left + chip_w,
-                    bottom: sc(124),
+                    bottom: chip_top + sc(28),
                 },
                 i,
             ));
@@ -152,7 +173,7 @@ fn layout(
         ));
         x += sc(w) + sc(9);
     }
-    WindowLayout { controls, matte_controls, strip }
+    WindowLayout { controls, matte_controls, preview, strip }
 }
 
 fn thumb_image(bytes: &[u8], w: u32, h: u32) -> RgbaImage {
@@ -186,6 +207,62 @@ fn matte_thumbs(
         .collect()
 }
 
+fn matte_frame(
+    raw: &(Vec<u8>, u32, u32),
+    style: &crate::style::Style,
+) -> (Vec<u8>, u32, u32) {
+    if crate::compose::is_plain(style) {
+        return raw.clone();
+    }
+    let image = thumb_image(&raw.0, raw.1, raw.2);
+    image_thumb(&crate::compose::compose_scaled(&image, style, 1.0))
+}
+
+fn set_playhead(state: &mut State, x: i32) {
+    let span = (state.strip.right - state.strip.left).max(1) as f64;
+    state.playhead = ((((x - state.strip.left) as f64 / span) * state.duration as f64) as i64)
+        .clamp(0, state.duration);
+    refresh_preview(state);
+}
+
+fn refresh_preview(state: &mut State) {
+    if state.raw_thumbs.is_empty() {
+        state.preview_raw = None;
+        state.preview = None;
+        return;
+    }
+    let index = if state.duration > 0 {
+        ((state.playhead as f64 / state.duration as f64) * state.raw_thumbs.len() as f64)
+            .floor()
+            .min((state.raw_thumbs.len() - 1) as f64) as usize
+    } else {
+        0
+    };
+    state.preview_raw = Some(state.raw_thumbs[index].clone());
+    recompose_preview(state);
+}
+
+fn recompose_preview(state: &mut State) {
+    state.preview = state
+        .preview_raw
+        .as_ref()
+        .map(|frame| matte_frame(frame, &state.styles[state.matte_index]));
+}
+
+fn refresh_preview_exact(state: &mut State) {
+    let max_w = (state.preview_rect.right - state.preview_rect.left)
+        .max(2) as u32;
+    let max_h = (state.preview_rect.bottom - state.preview_rect.top)
+        .max(2) as u32;
+    match crate::trim::preview_frame(&state.mp4, state.playhead, max_w, max_h) {
+        Ok(frame) => {
+            state.preview_raw = Some(frame);
+            recompose_preview(state);
+        }
+        Err(_) => refresh_preview(state),
+    }
+}
+
 /// Move a trim handle to window x, keeping at least ~0.3s between them.
 fn set_handle(state: &mut State, h: Handle, x: i32) {
     let strip = state.strip;
@@ -203,6 +280,72 @@ fn s(state: &State, v: i32) -> i32 {
     (v as f32 * state.scale) as i32
 }
 
+unsafe fn paint_bgra_fit(
+    hdc: HDC,
+    rect: RECT,
+    frame: &(Vec<u8>, u32, u32),
+    state: &State,
+) {
+    let panel = CreateSolidBrush(state.theme.chip);
+    let panel_pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
+    let old_brush = SelectObject(hdc, panel);
+    let old_pen = SelectObject(hdc, panel_pen);
+    let _ = RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        s(state, 14),
+        s(state, 14),
+    );
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(panel);
+    let _ = DeleteObject(panel_pen);
+
+    let inset = s(state, 12);
+    let available_w = (rect.right - rect.left - inset * 2).max(1);
+    let available_h = (rect.bottom - rect.top - inset * 2).max(1);
+    let scale = (available_w as f32 / frame.1 as f32)
+        .min(available_h as f32 / frame.2 as f32);
+    let draw_w = (frame.1 as f32 * scale).round().max(1.0) as i32;
+    let draw_h = (frame.2 as f32 * scale).round().max(1.0) as i32;
+    let left = rect.left + (rect.right - rect.left - draw_w) / 2;
+    let top = rect.top + (rect.bottom - rect.top - draw_h) / 2;
+    let info = windows::Win32::Graphics::Gdi::BITMAPINFO {
+        bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+            biWidth: frame.1 as i32,
+            biHeight: -(frame.2 as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: windows::Win32::Graphics::Gdi::BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    windows::Win32::Graphics::Gdi::SetStretchBltMode(
+        hdc,
+        windows::Win32::Graphics::Gdi::HALFTONE,
+    );
+    windows::Win32::Graphics::Gdi::StretchDIBits(
+        hdc,
+        left,
+        top,
+        draw_w,
+        draw_h,
+        0,
+        0,
+        frame.1 as i32,
+        frame.2 as i32,
+        Some(frame.0.as_ptr() as *const _),
+        &info,
+        windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+        windows::Win32::Graphics::Gdi::SRCCOPY,
+    );
+}
+
 unsafe fn paint(hdc: HDC, state: &State) {
     let bg = CreateSolidBrush(state.theme.bg);
     FillRect(hdc, &RECT { left: 0, top: 0, right: state.width, bottom: state.height }, bg);
@@ -212,7 +355,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let m = s(state, 22);
     SelectObject(hdc, state.font_big);
     SetTextColor(hdc, state.theme.text);
-    let mut t = wide("Recording saved");
+    let mut t = wide("Recording editor");
     let mut rc = RECT { left: m, top: s(state, 14), right: state.width - m, bottom: s(state, 42) };
     DrawTextW(hdc, &mut t, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
@@ -229,14 +372,23 @@ unsafe fn paint(hdc: HDC, state: &State) {
         RECT { left: m, top: s(state, 66), right: state.width - m, bottom: s(state, 88) };
     DrawTextW(hdc, &mut p, &mut rc3, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
 
+    if let Some(frame) = &state.preview {
+        paint_bgra_fit(hdc, state.preview_rect, frame, state);
+    }
+
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.muted);
     let mut matte_label = wide("Matte");
+    let matte_top = state
+        .matte_controls
+        .first()
+        .map(|(rect, _)| rect.top)
+        .unwrap_or(state.preview_rect.bottom + s(state, 16));
     let mut matte_label_rect = RECT {
         left: m,
-        top: s(state, 96),
+        top: matte_top,
         right: m + s(state, 48),
-        bottom: s(state, 124),
+        bottom: matte_top + s(state, 28),
     };
     DrawTextW(
         hdc,
@@ -286,6 +438,21 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // Filmstrip + trim handles.
     if !state.thumbs.is_empty() && state.duration > 0 {
         let strip = state.strip;
+        SelectObject(hdc, state.font_small);
+        SetTextColor(hdc, state.theme.faint);
+        let mut timeline = wide("TIMELINE");
+        let mut timeline_rect = RECT {
+            left: strip.left,
+            top: strip.top - s(state, 24),
+            right: strip.right,
+            bottom: strip.top - s(state, 4),
+        };
+        DrawTextW(
+            hdc,
+            &mut timeline,
+            &mut timeline_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+        );
         let mut x = strip.left;
         for (bgra, tw, th) in &state.thumbs {
             if x >= strip.right {
@@ -392,15 +559,45 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
         let _ = DeleteObject(acc);
 
-        // Selected-range label.
-        let secs = |t: i64| (t / 10_000_000) as u64;
+        // Playhead sits above the trim range so scrubbing remains obvious.
+        let px = to_x(state.playhead);
+        let playhead = CreateSolidBrush(state.theme.text);
+        FillRect(
+            hdc,
+            &RECT {
+                left: px - 1,
+                top: strip.top - s(state, 7),
+                right: px + 1,
+                bottom: strip.bottom + s(state, 5),
+            },
+            playhead,
+        );
+        let old_brush = SelectObject(hdc, playhead);
+        let _ = RoundRect(
+            hdc,
+            px - s(state, 5),
+            strip.top - s(state, 11),
+            px + s(state, 5),
+            strip.top - s(state, 3),
+            s(state, 4),
+            s(state, 4),
+        );
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(playhead);
+
+        // Playhead + selected-range label.
+        let whole_secs = |t: i64| (t / 10_000_000) as u64;
+        let tenths = |t: i64| ((t.max(0) / 1_000_000) % 10) as u64;
         let label = format!(
-            "trim  {:02}:{:02} \u{2013} {:02}:{:02}   ({}s)",
-            secs(state.trim_start) / 60,
-            secs(state.trim_start) % 60,
-            secs(state.trim_end) / 60,
-            secs(state.trim_end) % 60,
-            secs(state.trim_end - state.trim_start).max(1)
+            "{:02}:{:02}.{}     Trim  {:02}:{:02} \u{2013} {:02}:{:02}     {}s selected",
+            whole_secs(state.playhead) / 60,
+            whole_secs(state.playhead) % 60,
+            tenths(state.playhead),
+            whole_secs(state.trim_start) / 60,
+            whole_secs(state.trim_start) % 60,
+            whole_secs(state.trim_end) / 60,
+            whole_secs(state.trim_end) % 60,
+            whole_secs(state.trim_end - state.trim_start).max(1)
         );
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, state.theme.muted);
@@ -506,16 +703,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if let Some(h) = state.dragging {
-                    set_handle(state, h, x);
-                    // Repaint just the strip + its label, not the window.
-                    let dirty = RECT {
-                        left: state.strip.left - s(state, 10),
-                        top: state.strip.top - s(state, 6),
-                        right: state.strip.right + s(state, 10),
-                        bottom: state.strip.bottom + s(state, 30),
-                    };
-                    let _ = InvalidateRect(hwnd, Some(&dirty), false);
+                if let Some(drag) = state.dragging {
+                    match drag {
+                        Drag::Trim(handle) => {
+                            set_handle(state, handle, x);
+                            state.playhead =
+                                state.playhead.clamp(state.trim_start, state.trim_end);
+                            refresh_preview(state);
+                        }
+                        Drag::Playhead => set_playhead(state, x),
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
                 let hover = state
@@ -550,9 +748,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 * (strip.right - strip.left) as f64) as i32
                     };
                     let (sx, ex) = (to_x(state.trim_start), to_x(state.trim_end));
-                    let h = if (x - sx).abs() <= (x - ex).abs() { Handle::Start } else { Handle::End };
-                    state.dragging = Some(h);
-                    set_handle(state, h, x);
+                    let grab = s(state, 10);
+                    let drag = if (x - sx).abs() <= grab {
+                        Drag::Trim(Handle::Start)
+                    } else if (x - ex).abs() <= grab {
+                        Drag::Trim(Handle::End)
+                    } else {
+                        Drag::Playhead
+                    };
+                    state.dragging = Some(drag);
+                    match drag {
+                        Drag::Trim(handle) => {
+                            set_handle(state, handle, x);
+                            state.playhead =
+                                state.playhead.clamp(state.trim_start, state.trim_end);
+                            refresh_preview(state);
+                        }
+                        Drag::Playhead => set_playhead(state, x),
+                    }
                     windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                     let _ = InvalidateRect(hwnd, None, false);
                 }
@@ -567,6 +780,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 if state.dragging.take().is_some() {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                    refresh_preview_exact(state);
+                    let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
                 if let Some((_, index)) = state
@@ -579,6 +794,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let style = state.styles[index].clone();
                         state.thumbs = matte_thumbs(&state.raw_thumbs, &style);
                         state.matte_index = index;
+                        recompose_preview(state);
                         state.status = None;
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -653,8 +869,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            if wparam.0 as u16 == VK_ESCAPE.0 {
-                let _ = DestroyWindow(hwnd);
+            if let Some(state) = state_of(hwnd) {
+                match wparam.0 as u16 {
+                    key if key == VK_ESCAPE.0 => {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    key if key == VK_LEFT.0 => {
+                        state.playhead = (state.playhead - 5_000_000).max(0);
+                        refresh_preview_exact(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    key if key == VK_RIGHT.0 => {
+                        state.playhead = (state.playhead + 5_000_000).min(state.duration);
+                        refresh_preview_exact(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    key if key == VK_HOME.0 => {
+                        state.playhead = state.trim_start;
+                        refresh_preview_exact(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    key if key == VK_END.0 => {
+                        state.playhead = state.trim_end;
+                        refresh_preview_exact(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    _ => {}
+                }
             }
             LRESULT(0)
         }
@@ -667,6 +908,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let next = layout(state.scale, w, h, state.styles.len());
                     state.controls = next.controls;
                     state.matte_controls = next.matte_controls;
+                    state.preview_rect = next.preview;
                     state.strip = next.strip;
                     let _ = InvalidateRect(hwnd, None, true);
                 }
@@ -677,8 +919,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let mmi = lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::MINMAXINFO;
             if !mmi.is_null() {
                 let s = GetDpiForSystem() as f32 / 96.0;
-                (*mmi).ptMinTrackSize.x = (640.0 * s) as i32;
-                (*mmi).ptMinTrackSize.y = (380.0 * s) as i32;
+                (*mmi).ptMinTrackSize.x = (760.0 * s) as i32;
+                (*mmi).ptMinTrackSize.y = (560.0 * s) as i32;
             }
             LRESULT(0)
         }
@@ -704,7 +946,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Result<()> {
     let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
     let sc = |v: i32| (v as f32 * scale) as i32;
-    let (cw, ch) = (sc(880), sc(470));
+    let (cw, ch) = (sc(1040), sc(720));
 
     // Filmstrip: best-effort, never blocks showing the window.
     let (probe_w, probe_h) = {
@@ -738,6 +980,17 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
     }
 
     let initial = layout(scale, cw, ch, styles.len());
+    let preview_raw = crate::trim::preview_frame(
+        &mp4,
+        0,
+        (initial.preview.right - initial.preview.left).max(2) as u32,
+        (initial.preview.bottom - initial.preview.top).max(2) as u32,
+    )
+    .ok()
+    .or_else(|| raw_thumbs.first().cloned());
+    let preview = preview_raw
+        .as_ref()
+        .map(|frame| matte_frame(frame, &styles[matte_index]));
 
     let state = Box::into_raw(Box::new(State {
         mp4,
@@ -755,9 +1008,13 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         duration,
         raw_thumbs,
         thumbs,
+        preview_raw,
+        preview,
+        preview_rect: initial.preview,
         strip: initial.strip,
         trim_start: 0,
         trim_end: duration,
+        playhead: 0,
         dragging: None,
         styles,
         matte_index,
@@ -788,7 +1045,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         match CreateWindowExW(
             WS_EX_APPWINDOW,
             w!("matteshot_recdone"),
-            w!("Matteshot — recording"),
+            w!("Matteshot — video editor"),
             style,
             160,
             160,
