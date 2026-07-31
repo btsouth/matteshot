@@ -17,9 +17,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetWindowLongPtrW, PeekMessageW, RegisterClassW, SetCursorPos, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, MSG, PM_REMOVE, WM_ERASEBKGND, WM_NCCREATE,
-    WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW, GetCursorPos,
+    GetWindowLongPtrW, PeekMessageW, RegisterClassW, SetCursorPos, SetWindowLongPtrW,
+    CREATESTRUCTW, GWLP_USERDATA, MSG, PM_REMOVE, WM_ERASEBKGND, WM_NCCREATE, WM_PAINT,
+    WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// What to scroll-capture.
@@ -214,6 +215,126 @@ fn clamp_anchor(anchor: POINT, rect: RECT) -> POINT {
     }
 }
 
+fn edge_anchor(rect: RECT, current: POINT) -> POINT {
+    let width = (rect.right - rect.left).max(1);
+    let inset = (width / 32).clamp(24, 64);
+    let right = POINT { x: rect.right - inset, y: current.y };
+    let left = POINT { x: rect.left + inset, y: current.y };
+    let candidate = if (current.x - right.x).abs() > (current.x - left.x).abs() {
+        right
+    } else {
+        left
+    };
+    clamp_anchor(candidate, rect)
+}
+
+fn recovery_anchor(target: Target, current: POINT) -> Option<POINT> {
+    let Target::Window(hwnd, _) = target else {
+        return None;
+    };
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect);
+    }
+    Some(edge_anchor(rect, current))
+}
+
+fn scrollbar_width_for_class(class: &str) -> u32 {
+    match class {
+        "Chrome_WidgetWin_1" | "MozillaWindowClass" => 16,
+        _ => 0,
+    }
+}
+
+fn transient_scrollbar_width(target: Target) -> u32 {
+    let Target::Window(hwnd, _) = target else {
+        return 0;
+    };
+    let mut class = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    // Browser scrollbars describe the temporary viewport, not the final
+    // stitched document. Keeping them repeats the moving thumb at every seam,
+    // so remove the narrow strip from full-page output.
+    scrollbar_width_for_class(&String::from_utf16_lossy(&class[..len]))
+}
+
+fn send_wheel_at(point: POINT) {
+    unsafe {
+        let _ = SetCursorPos(point.x, point.y);
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: (-120 * NOTCHES) as u32,
+                    dwFlags: MOUSEEVENTF_WHEEL,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn frame_after_wheel(
+    target: Target,
+    point: POINT,
+    view_top: u32,
+    view_bottom: u32,
+) -> Option<RgbaImage> {
+    send_wheel_at(point);
+    std::thread::sleep(std::time::Duration::from_millis(110));
+    pump();
+    let mut next = grab(target).ok()?;
+    let settle_by = std::time::Instant::now() + std::time::Duration::from_millis(700);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        pump();
+        let Ok(again) = grab(target) else { break };
+        let moving = viewport_diff(&next, &again, view_top, view_bottom);
+        next = again;
+        if moving < 1.0 || std::time::Instant::now() > settle_by {
+            break;
+        }
+    }
+    Some(next)
+}
+
+#[derive(Clone, Copy)]
+struct Motion {
+    idle: f32,
+    shift: u32,
+    score: f32,
+    ceiling: u32,
+}
+
+fn motion(
+    prev: &RgbaImage,
+    next: &RgbaImage,
+    frame_height: u32,
+    view_top: u32,
+    view_bottom: u32,
+) -> Motion {
+    let idle = viewport_diff(prev, next, view_top, view_bottom);
+    let (shift, score, ceiling) =
+        measure_shift(prev, next, frame_height / 2, view_top, view_bottom);
+    Motion { idle, shift, score, ceiling }
+}
+
+fn stitchable(m: Motion, last_shift: Option<u32>) -> bool {
+    let convincing = m.score < m.idle * 0.5;
+    let consistent = last_shift
+        .map(|p| m.score < 12.0 && m.shift.abs_diff(p) * 8 <= p)
+        .unwrap_or(false);
+    m.idle >= 2.5
+        && m.shift >= 4
+        && m.score <= 26.0
+        && m.shift < m.ceiling
+        && (convincing || consistent)
+}
+
 /// Mean per-channel difference of one row between two frames.
 fn row_diff(a: &RgbaImage, b: &RgbaImage, y: u32) -> f32 {
     let w = a.width();
@@ -336,7 +457,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
 
     // Put the cursor exactly where the user chose so wheel routing follows
     // their intent: page body scrolls the page; a nested pane scrolls itself.
-    let hover = match target {
+    let mut hover = match target {
         Target::Window(h, point) => {
             let mut r = RECT::default();
             unsafe {
@@ -346,6 +467,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         }
         Target::Region(r, _, point) => clamp_anchor(point, r),
     };
+    let chosen_anchor = hover;
     let mut saved = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut saved);
@@ -380,86 +502,82 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
             aborted = true;
             break;
         }
-        // Scroll down.
-        unsafe {
-            // Some apps move the pointer as controls disappear during a
-            // scroll. Reassert the chosen target before every wheel event.
-            let _ = SetCursorPos(hover.x, hover.y);
-            let input = INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx: 0,
-                        dy: 0,
-                        mouseData: (-120 * NOTCHES) as u32,
-                        dwFlags: MOUSEEVENTF_WHEEL,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            };
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-        }
         // The viewport we know so far (whole frame until chrome is learned).
         let (vt, vb) = chrome.map(|(t, b)| (t, fh - b)).unwrap_or((0, fh));
 
-        // Wait for the scroll to settle rather than guessing a delay: apps
-        // animate at wildly different speeds, so grab until two consecutive
-        // frames agree (or we run out of patience).
-        std::thread::sleep(std::time::Duration::from_millis(110));
-        pump();
-        let mut next = match grab(target) {
-            Ok(f) => f,
-            Err(_) => break,
+        let Some(mut next) = frame_after_wheel(target, hover, vt, vb) else {
+            break;
         };
-        let settle_by = std::time::Instant::now() + std::time::Duration::from_millis(700);
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(70));
-            pump();
-            let Ok(again) = grab(target) else { break };
-            let moving = viewport_diff(&next, &again, vt, vb);
-            next = again;
-            if moving < 1.0 || std::time::Instant::now() > settle_by {
-                break;
-            }
-        }
 
         // Did anything move at all? This is the honest bottom-of-page test —
         // and it also catches apps that ignore the wheel entirely.
-        let mut idle = viewport_diff(&prev, &next, vt, vb);
-        if idle < 2.5 {
+        let mut movement = motion(&prev, &next, fh, vt, vb);
+        if movement.idle < 2.5 {
             std::thread::sleep(std::time::Duration::from_millis(280));
             pump();
             match grab(target) {
                 Ok(retry) => {
-                    idle = viewport_diff(&prev, &retry, vt, vb);
                     next = retry;
+                    movement = motion(&prev, &next, fh, vt, vb);
                 }
                 Err(_) => break,
             }
-            if idle < 2.5 {
-                break; // genuinely at the bottom
-            }
         }
 
-        let (shift, score, ceiling) = measure_shift(&prev, &next, fh / 2, vt, vb);
         if std::env::var("MATTESHOT_SCROLL_DEBUG").is_ok() {
             eprintln!(
-                "step {steps}: shift={shift} score={score:.2} idle={idle:.2} view={vt}..{vb}"
+                "step {steps}: shift={} score={:.2} idle={:.2} view={vt}..{vb}",
+                movement.shift, movement.score, movement.idle
             );
         }
-        // Trust the match if it explains the frame far better than "no
-        // movement" does — or, when the page has animated content that keeps
-        // scores high (video, GIFs, spinners), if the shift agrees with the
-        // steady scroll rate we've already established.
-        let convincing = score < idle * 0.5;
-        let consistent = last_shift
-            .map(|p| score < 12.0 && shift.abs_diff(p) * 8 <= p)
-            .unwrap_or(false);
-        if shift < 4 || score > 26.0 || shift >= ceiling || !(convincing || consistent) {
-            break;
+
+        // A fixed screen point can eventually be covered by a nested scroller
+        // as the main page moves. Once global scrolling is established, a
+        // localized/idle step is retried near the far window edge, where the
+        // browser routes the wheel back to the main document.
+        if !stitchable(movement, last_shift) {
+            let Some(fallback) = last_shift
+                .and_then(|_| {
+                    if hover != chosen_anchor {
+                        Some(chosen_anchor)
+                    } else {
+                        recovery_anchor(target, hover)
+                    }
+                })
+                .filter(|p| *p != hover)
+            else {
+                break;
+            };
+            let recovery_base = next;
+            eprintln!(
+                "scroll: anchor blocked; retrying at {},{}",
+                fallback.x, fallback.y
+            );
+            let Some(retry) = frame_after_wheel(target, fallback, vt, vb) else {
+                break;
+            };
+            let recovered = motion(&recovery_base, &retry, fh, vt, vb);
+            if !stitchable(recovered, last_shift) {
+                break;
+            }
+            hover = fallback;
+            next = retry;
+            movement = recovered;
+            eprintln!("scroll: main page recovered");
         }
+        let shift = movement.shift;
+        let established_main_page = last_shift.is_none();
         last_shift = Some(shift);
+        if established_main_page {
+            // Once the first full-frame shift proves that the user intended
+            // the main document, move to a stable edge before embedded panes
+            // can slide under the original point. Region captures keep the
+            // exact chosen point because their crop defines the scroll pane.
+            if let Some(edge) = recovery_anchor(target, hover).filter(|p| *p != hover) {
+                hover = edge;
+                eprintln!("scroll: main page anchored at {},{}", hover.x, hover.y);
+            }
+        }
 
         // Only once we know the content really moved can static rows be
         // read as fixed chrome rather than "nothing happened yet".
@@ -522,6 +640,14 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         }
     }
 
+    let scrollbar = transient_scrollbar_width(target).min(canvas.width().saturating_sub(1));
+    if scrollbar > 0 {
+        canvas =
+            image::imageops::crop_imm(&canvas, 0, 0, canvas.width() - scrollbar, canvas.height())
+                .to_image();
+        eprintln!("scroll: removed {scrollbar}px browser scrollbar");
+    }
+
     unsafe {
         let _ = DestroyWindow(pill);
         let _ = SetCursorPos(saved.x, saved.y);
@@ -556,5 +682,19 @@ mod tests {
         let rect = RECT { left: 100, top: 200, right: 500, bottom: 700 };
         assert_eq!(clamp_anchor(POINT { x: 900, y: 900 }, rect), POINT { x: 499, y: 699 });
         assert_eq!(clamp_anchor(POINT { x: 20, y: 40 }, rect), POINT { x: 100, y: 200 });
+    }
+
+    #[test]
+    fn recovery_moves_to_the_far_window_edge() {
+        let rect = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        assert_eq!(edge_anchor(rect, POINT { x: 600, y: 700 }), POINT { x: 1860, y: 700 });
+        assert_eq!(edge_anchor(rect, POINT { x: 1500, y: 700 }), POINT { x: 60, y: 700 });
+    }
+
+    #[test]
+    fn browser_scrollbars_are_removed_from_stitched_output() {
+        assert_eq!(scrollbar_width_for_class("Chrome_WidgetWin_1"), 16);
+        assert_eq!(scrollbar_width_for_class("MozillaWindowClass"), 16);
+        assert_eq!(scrollbar_width_for_class("Notepad"), 0);
     }
 }

@@ -1221,10 +1221,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                     // Tool shortcuts (A/R/T/B) and colors (1-4).
-                    0x41 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(0)),
-                    0x52 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(1)),
-                    0x54 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(2)),
-                    0x42 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(3)),
+                    0x41 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(0)), // Arrow
+                    0x52 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(2)), // Rectangle
+                    0x54 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(5)), // Text
+                    0x42 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(6)), // Blur
                     v @ 0x31..=0x34 if state.editing.is_none() => {
                         activate(hwnd, state, Ctl::Color((v - 0x31) as usize))
                     }
