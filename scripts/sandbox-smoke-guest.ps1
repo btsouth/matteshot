@@ -43,6 +43,42 @@ function Invoke-Matteshot(
     return ""
 }
 
+function Remove-TestActivation {
+    $licenseStatePath = Join-Path $env:APPDATA "matteshot\license.json"
+    if (-not (Test-Path $licenseStatePath)) {
+        return $false
+    }
+
+    $licenseState = Get-Content -Raw $licenseStatePath | ConvertFrom-Json
+    if (-not $licenseState.license.refresh_token -or -not $licenseState.license.certificate) {
+        return $false
+    }
+
+    $certificateBody = $licenseState.license.certificate.Replace("-", "+").Replace("_", "/")
+    switch ($certificateBody.Length % 4) {
+        2 { $certificateBody += "==" }
+        3 { $certificateBody += "=" }
+    }
+    $certificateJson = [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String($certificateBody)
+    )
+    $certificate = $certificateJson | ConvertFrom-Json
+    $deactivationBody = @{
+        refresh_token = $licenseState.license.refresh_token
+        device_id = $certificate.device_id
+    } | ConvertTo-Json
+    $deactivation = Invoke-RestMethod `
+        -Method Post `
+        -Uri "https://license.matteshot.app/v1/license/deactivate" `
+        -ContentType "application/json" `
+        -Body $deactivationBody
+    if (-not $deactivation.deactivated) {
+        throw "License service did not release the sandbox activation."
+    }
+    Remove-Item $licenseStatePath -Force
+    return $true
+}
+
 $passed = $false
 $failure = $null
 try {
@@ -136,33 +172,9 @@ try {
     Stop-Process -Id $resident.Id -Force
 
     Write-Step "Releasing the sandbox activation"
-    $licenseStatePath = Join-Path $env:APPDATA "matteshot\license.json"
-    if (-not (Test-Path $licenseStatePath)) {
+    if (-not (Remove-TestActivation)) {
         throw "Activated license state was not stored."
     }
-    $licenseState = Get-Content -Raw $licenseStatePath | ConvertFrom-Json
-    $certificateBody = $licenseState.license.certificate.Replace("-", "+").Replace("_", "/")
-    switch ($certificateBody.Length % 4) {
-        2 { $certificateBody += "==" }
-        3 { $certificateBody += "=" }
-    }
-    $certificateJson = [Text.Encoding]::UTF8.GetString(
-        [Convert]::FromBase64String($certificateBody)
-    )
-    $certificate = $certificateJson | ConvertFrom-Json
-    $deactivationBody = @{
-        refresh_token = $licenseState.license.refresh_token
-        device_id = $certificate.device_id
-    } | ConvertTo-Json
-    $deactivation = Invoke-RestMethod `
-        -Method Post `
-        -Uri "https://license.matteshot.app/v1/license/deactivate" `
-        -ContentType "application/json" `
-        -Body $deactivationBody
-    if (-not $deactivation.deactivated) {
-        throw "License service did not release the sandbox activation."
-    }
-    Remove-Item $licenseStatePath -Force
     $deactivatedStatus = Invoke-Matteshot @("--license-status") "license-deactivated"
     if ($deactivatedStatus -notmatch "^Trial ended") {
         throw "Paid activation was not released cleanly."
@@ -203,6 +215,14 @@ catch {
 finally {
     Get-Process -Name "matteshot" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
+    try {
+        if (Remove-TestActivation) {
+            Write-Step "Released a remaining sandbox activation during cleanup"
+        }
+    }
+    catch {
+        Write-Step "Cleanup warning: sandbox activation could not be released"
+    }
     if ((Test-Path $app) -and (Test-Path $uninstaller)) {
         Start-Process `
             -FilePath $uninstaller `
