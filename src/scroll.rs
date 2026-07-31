@@ -3,7 +3,7 @@
 //! actually moved (never trusting the scroll amount we asked for).
 
 use anyhow::{bail, Context, Result};
-use image::RgbaImage;
+use image::{Rgba, RgbaImage};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -258,6 +258,43 @@ fn transient_scrollbar_width(target: Target) -> u32 {
     scrollbar_width_for_class(&String::from_utf16_lossy(&class[..len]))
 }
 
+fn scrollbar_track(
+    frame: &RgbaImage,
+    width: u32,
+    view_top: u32,
+    view_bottom: u32,
+) -> Vec<Rgba<u8>> {
+    let width = width.min(frame.width());
+    let top = view_top.min(frame.height().saturating_sub(1));
+    let bottom = view_bottom.clamp(top + 1, frame.height());
+    (frame.width() - width..frame.width())
+        .map(|x| {
+            let mut colors = std::collections::HashMap::<u32, u32>::new();
+            for y in top..bottom {
+                let p = frame.get_pixel(x, y);
+                let key = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+                *colors.entry(key).or_default() += 1;
+            }
+            let key = colors
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(color, _)| color)
+                .unwrap_or_default();
+            Rgba(key.to_be_bytes())
+        })
+        .collect()
+}
+
+fn paint_scrollbar_track(image: &mut RgbaImage, track: &[Rgba<u8>]) {
+    let width = track.len().min(image.width() as usize);
+    let start = image.width() - width as u32;
+    for y in 0..image.height() {
+        for (i, color) in track.iter().take(width).enumerate() {
+            image.put_pixel(start + i as u32, y, *color);
+        }
+    }
+}
+
 fn send_wheel_at(point: POINT) {
     unsafe {
         let _ = SetCursorPos(point.x, point.y);
@@ -494,6 +531,8 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     let mut aborted = false;
     // Learned on the first successful step, then held steady.
     let mut chrome: Option<(u32, u32)> = None;
+    let scrollbar_width = transient_scrollbar_width(target);
+    let mut scrollbar_track_colors: Option<Vec<Rgba<u8>>> = None;
     // Apps scroll a consistent amount per notch; that's a strong prior.
     let mut last_shift: Option<u32> = None;
 
@@ -594,6 +633,10 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
                 eprintln!("scroll: chrome — {t}px top, {b}px bottom");
             }
             chrome = Some((t, b));
+            if scrollbar_width > 0 {
+                scrollbar_track_colors =
+                    Some(scrollbar_track(&first, scrollbar_width, t, fh - b));
+            }
             // Drop the footer from the frame already on the canvas.
             if b > 0 {
                 canvas = image::imageops::crop_imm(&canvas, 0, 0, fw, fh - b).to_image();
@@ -610,7 +653,10 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         }
         let mut grown = RgbaImage::new(fw, canvas.height() + tail_h);
         image::imageops::replace(&mut grown, &canvas, 0, 0);
-        let tail = image::imageops::crop_imm(&next, 0, tail_top, fw, tail_h).to_image();
+        let mut tail = image::imageops::crop_imm(&next, 0, tail_top, fw, tail_h).to_image();
+        if let Some(track) = &scrollbar_track_colors {
+            paint_scrollbar_track(&mut tail, track);
+        }
         let at = canvas.height() as i64;
         image::imageops::replace(&mut grown, &tail, 0, at);
         canvas = grown;
@@ -629,9 +675,12 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     // Put the footer back once, at the very bottom.
     if let Some((_, bottom_chrome)) = chrome {
         if bottom_chrome > 0 && steps > 0 {
-            let footer =
+            let mut footer =
                 image::imageops::crop_imm(&prev, 0, fh - bottom_chrome, fw, bottom_chrome)
                     .to_image();
+            if let Some(track) = &scrollbar_track_colors {
+                paint_scrollbar_track(&mut footer, track);
+            }
             let mut grown = RgbaImage::new(fw, canvas.height() + bottom_chrome);
             image::imageops::replace(&mut grown, &canvas, 0, 0);
             let at = canvas.height() as i64;
@@ -640,12 +689,8 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         }
     }
 
-    let scrollbar = transient_scrollbar_width(target).min(canvas.width().saturating_sub(1));
-    if scrollbar > 0 {
-        canvas =
-            image::imageops::crop_imm(&canvas, 0, 0, canvas.width() - scrollbar, canvas.height())
-                .to_image();
-        eprintln!("scroll: removed {scrollbar}px browser scrollbar");
+    if scrollbar_track_colors.is_some() {
+        eprintln!("scroll: kept one browser scrollbar");
     }
 
     unsafe {
@@ -692,9 +737,33 @@ mod tests {
     }
 
     #[test]
-    fn browser_scrollbars_are_removed_from_stitched_output() {
+    fn browser_scrollbars_are_recognized_as_side_chrome() {
         assert_eq!(scrollbar_width_for_class("Chrome_WidgetWin_1"), 16);
         assert_eq!(scrollbar_width_for_class("MozillaWindowClass"), 16);
         assert_eq!(scrollbar_width_for_class("Notepad"), 0);
+    }
+
+    #[test]
+    fn repeated_scrollbar_thumbs_are_replaced_without_cropping() {
+        let mut first = RgbaImage::from_pixel(8, 8, Rgba([10, 10, 10, 255]));
+        for y in 0..8 {
+            for x in 6..8 {
+                first.put_pixel(x, y, Rgba([30, 30, 30, 255]));
+            }
+        }
+        for y in 2..4 {
+            for x in 6..8 {
+                first.put_pixel(x, y, Rgba([220, 220, 220, 255]));
+            }
+        }
+        let track = scrollbar_track(&first, 2, 0, 8);
+        assert_eq!(track, vec![Rgba([30, 30, 30, 255]); 2]);
+
+        let mut tail = RgbaImage::from_pixel(8, 4, Rgba([80, 80, 80, 255]));
+        paint_scrollbar_track(&mut tail, &track);
+        assert_eq!(tail.width(), 8);
+        assert_eq!(*tail.get_pixel(5, 2), Rgba([80, 80, 80, 255]));
+        assert_eq!(*tail.get_pixel(6, 2), Rgba([30, 30, 30, 255]));
+        assert_eq!(*tail.get_pixel(7, 2), Rgba([30, 30, 30, 255]));
     }
 }
