@@ -16,8 +16,7 @@ function Write-Step([string]$Message) {
 
 function Invoke-Matteshot(
     [string[]]$Arguments,
-    [string]$Name,
-    [string]$InputPath = ""
+    [string]$Name
 ) {
     $stderr = Join-Path $results "$Name.stderr.log"
     $stdout = Join-Path $results "$Name.stdout.log"
@@ -28,9 +27,6 @@ function Invoke-Matteshot(
         RedirectStandardOutput = $stdout
         PassThru = $true
         Wait = $true
-    }
-    if ($InputPath) {
-        $params.RedirectStandardInput = $InputPath
     }
     $process = Start-Process @params
     if ($process.ExitCode -ne 0) {
@@ -156,7 +152,13 @@ try {
     }
 
     Write-Step "Activating the test license"
-    $activationStatus = Invoke-Matteshot @("--activate-stdin") "license-activate" $licenseKey
+    $activationOutput = Get-Content -Raw $licenseKey |
+        & $app --activate-stdin 2>&1
+    $activationExitCode = $LASTEXITCODE
+    $activationStatus = ($activationOutput | Out-String).Trim()
+    if ($activationExitCode -ne 0) {
+        throw "license-activate failed with exit code ${activationExitCode}: $activationStatus"
+    }
     if ($activationStatus -notmatch "^Licensed") {
         throw "Activation did not produce a licensed state."
     }
