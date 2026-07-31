@@ -23,6 +23,7 @@ mod style;
 mod theme;
 mod tray;
 mod tweak;
+mod update;
 mod window;
 
 use anyhow::{bail, Context, Result};
@@ -327,6 +328,7 @@ fn run_app() -> Result<()> {
         cfg.onboarded = true;
         cfg.save();
     }
+    update::start(tray.hwnd);
 
     let mut msg = MSG::default();
     unsafe {
@@ -364,6 +366,12 @@ fn run_app() -> Result<()> {
                             let _ = prtscn::take(HOTKEY_ID_PRTSCN);
                         } else {
                             prtscn::release(HOTKEY_ID_PRTSCN);
+                        }
+                        Ok(())
+                    }
+                    tray::Action::OpenUpdate => {
+                        if let Some(url) = tray.update_url() {
+                            output::open_url(&url);
                         }
                         Ok(())
                     }
@@ -683,6 +691,17 @@ fn main() -> Result<()> {
         Some("--restore-printscreen") => {
             prtscn::set_snipping_binding(true)?;
             eprintln!("PrtScn re-bound to Snipping Tool.");
+            Ok(())
+        }
+        // Live update endpoint probe (testing; never downloads anything).
+        Some("--update-test") => {
+            match update::check_once()? {
+                Some(update) => eprintln!(
+                    "update available: {} -> {}",
+                    update.version, update.download_url
+                ),
+                None => eprintln!("update check: current ({})", env!("CARGO_PKG_VERSION")),
+            }
             Ok(())
         }
         Some(other) => bail!(

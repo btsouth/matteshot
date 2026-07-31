@@ -3,7 +3,7 @@
 //! menu picks surface as `Action`s the main loop polls after dispatch.
 
 use anyhow::Result;
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER,
@@ -25,6 +25,7 @@ use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
 
 const WM_TRAYICON: u32 = 0x8001; // WM_APP + 1
+pub(crate) const WM_UPDATE_AVAILABLE: u32 = 0x8002; // WM_APP + 2
 const CMD_CAPTURE: usize = 101;
 const CMD_CAPTURE_ACTIVE: usize = 102;
 const CMD_OPEN_FOLDER: usize = 103;
@@ -32,6 +33,7 @@ const CMD_AUTOSTART: usize = 104;
 const CMD_PRTSCN: usize = 105;
 const CMD_QUIT: usize = 106;
 const CMD_SETTINGS: usize = 107;
+const CMD_UPDATE: usize = 108;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Matteshot";
@@ -44,11 +46,13 @@ pub enum Action {
     Settings,
     ToggleAutostart,
     TogglePrtscn,
+    OpenUpdate,
     Quit,
 }
 
 struct TrayState {
     pending: Option<Action>,
+    update: Option<crate::update::AvailableUpdate>,
 }
 
 pub struct Tray {
@@ -181,6 +185,13 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         w!("Capture active window\tCtrl+Alt+S"),
     );
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_FOLDER, w!("Open captures folder"));
+    if let Some(update) = &state.update {
+        let label: Vec<u16> = format!("Update available: v{}\u{2026}", update.version)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = AppendMenuW(menu, MF_STRING, CMD_UPDATE, PCWSTR(label.as_ptr()));
+    }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Settings\u{2026}"));
     let _ = AppendMenuW(
@@ -232,9 +243,25 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         CMD_SETTINGS => Some(Action::Settings),
         CMD_AUTOSTART => Some(Action::ToggleAutostart),
         CMD_PRTSCN => Some(Action::TogglePrtscn),
+        CMD_UPDATE => Some(Action::OpenUpdate),
         CMD_QUIT => Some(Action::Quit),
         _ => None,
     };
+}
+
+unsafe fn notify(hwnd: HWND, title: &str, text: &str) {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_INFO,
+        ..Default::default()
+    };
+    let t: Vec<u16> = title.encode_utf16().collect();
+    let x: Vec<u16> = text.encode_utf16().collect();
+    data.szInfoTitle[..t.len().min(63)].copy_from_slice(&t[..t.len().min(63)]);
+    data.szInfo[..x.len().min(255)].copy_from_slice(&x[..x.len().min(255)]);
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -255,6 +282,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_UPDATE_AVAILABLE => {
+            let update = Box::from_raw(lparam.0 as *mut crate::update::AvailableUpdate);
+            let state = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState).as_mut();
+            if let Some(state) = state {
+                let changed = state.update.as_ref().map(|u| &u.version) != Some(&update.version);
+                state.update = Some(*update);
+                if changed {
+                    let version = &state.update.as_ref().unwrap().version;
+                    notify(
+                        hwnd,
+                        "Matteshot update available",
+                        &format!(
+                            "Version {version} is ready. Right-click Matteshot to download."
+                        ),
+                    );
+                }
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -271,7 +317,10 @@ impl Tray {
             };
             RegisterClassW(&class);
 
-            let mut state = Box::new(TrayState { pending: None });
+            let mut state = Box::new(TrayState {
+                pending: None,
+                update: None,
+            });
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 w!("matteshot_tray"),
@@ -308,19 +357,12 @@ impl Tray {
     /// One-shot balloon notification (first run).
     pub fn notify(&self, title: &str, text: &str) {
         unsafe {
-            let mut data = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: self.hwnd,
-                uID: 1,
-                uFlags: NIF_INFO,
-                ..Default::default()
-            };
-            let t: Vec<u16> = title.encode_utf16().collect();
-            let x: Vec<u16> = text.encode_utf16().collect();
-            data.szInfoTitle[..t.len().min(63)].copy_from_slice(&t[..t.len().min(63)]);
-            data.szInfo[..x.len().min(255)].copy_from_slice(&x[..x.len().min(255)]);
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+            notify(self.hwnd, title, text);
         }
+    }
+
+    pub fn update_url(&self) -> Option<String> {
+        self.state.update.as_ref().map(|u| u.download_url.clone())
     }
 
     /// Poll and clear the pending menu action.

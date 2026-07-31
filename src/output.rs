@@ -188,3 +188,18 @@ pub fn open_folder(dir: &Path) {
         );
     }
 }
+
+/// Open a trusted HTTPS URL with the user's default browser.
+pub fn open_url(url: &str) {
+    let url = HSTRING::from(url);
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}

@@ -65,6 +65,7 @@ matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCR
 matteshot --record-test <t>  # short recording smoke test
 matteshot --trim-test <mp4>  # probe + cut smoke test
 matteshot --ocr <png>        # OCR a file
+matteshot --update-test      # probe version.json; never downloads
 matteshot --settings / --tweak <png>   # open UI surfaces directly
 ```
 
@@ -81,6 +82,7 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 - `record.rs` — MF sink writer (H.264+AAC), WGC frame loop, audio-cursor muxing with silence fill; `audio.rs` — WASAPI loopback/mic + stateful linear resampler; `recui.rs` — stop pill; `recdone.rs` — review/trim window; `trim.rs` — source reader (`ENABLE_ADVANCED_VIDEO_PROCESSING`, streams resolved via `GetNativeMediaType`, never assume stream 0) → frame-accurate cut.
 - `scroll.rs` — scrolling capture (see above).
 - `theme.rs` — theme plumbing; `settings.rs` — settings window; `pin.rs` — floating pinned captures; `ocr.rs` — Windows.Media.Ocr; `prtscn.rs` — PrtScn acquisition; `tray.rs` — tray icon/menu; `output.rs` — clipboard (manual CF_DIB + PNG + CF_HDROP), save, reveal.
+- `update.rs` — silent WinHTTP version check on startup and daily; newer versions surface through a tray balloon and download menu item.
 
 ## Windows landmines (hard-won)
 
@@ -98,6 +100,6 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 - [x] Feature-complete core: capture, mattes, picker, tweak editor, annotations, OCR, pin, recording + audio + trim, scrolling capture, themes, settings, multi-monitor
 - [ ] Installer (Inno Setup) + code signing (Azure Trusted Signing)
 - [ ] winget manifest
-- [ ] Update check
+- [x] Update check
 - [ ] Stripe checkout + license keys
 - [ ] matteshot.app site + assets
