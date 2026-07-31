@@ -123,22 +123,24 @@ try {
         throw "Unexpected initial license state: $initialStatus"
     }
 
-    Write-Step "Launching Calculator for isolated capture"
-    Start-Process "calc.exe" | Out-Null
-    $calculator = $null
+    Write-Step "Launching a fresh Notepad file for isolated capture"
+    $notepadFile = Join-Path $env:TEMP "Matteshot-Smoke.txt"
+    "Matteshot clean-machine capture test" | Set-Content -Encoding UTF8 $notepadFile
+    Start-Process "notepad.exe" -ArgumentList "`"$notepadFile`"" | Out-Null
+    $notepad = $null
     $deadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 250
-        $calculator = Get-Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowTitle -like "*Calculator*" } |
+        $notepad = Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowTitle -like "*Matteshot-Smoke*" } |
             Select-Object -First 1
-    } while (-not $calculator -and (Get-Date) -lt $deadline)
-    if (-not $calculator) {
-        throw "Calculator did not expose a window."
+    } while (-not $notepad -and (Get-Date) -lt $deadline)
+    if (-not $notepad) {
+        throw "The fresh Notepad file did not expose a window."
     }
 
-    Write-Step "Capturing Calculator without host clipboard access"
-    Invoke-Matteshot @("--bench", "Calculator") "capture" | Out-Null
+    Write-Step "Capturing the fresh Notepad file without host clipboard access"
+    Invoke-Matteshot @("--bench", "Matteshot-Smoke") "capture" | Out-Null
     $capture = Join-Path $env:TEMP "matteshot-bench.png"
     if (-not (Test-Path $capture) -or (Get-Item $capture).Length -eq 0) {
         throw "Capture output is missing or empty."
