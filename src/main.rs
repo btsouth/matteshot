@@ -8,6 +8,7 @@ mod diagnostics;
 mod icon;
 mod license;
 mod license_ui;
+mod number_prompt;
 mod ocr;
 mod pin;
 mod audio;
@@ -191,7 +192,8 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 let auto = auto.clone();
                 let raw = raw.clone();
                 let style = styles[preselect].clone();
-                let (scale, dir) = (cfg.export_scale, cfg.save_dir());
+                let (scale, max_edge, dir) =
+                    (cfg.export_scale, cfg.output_max_edge, cfg.save_dir());
                 std::thread::spawn(move || {
                     let styled = compose::export(
                         &raw,
@@ -200,6 +202,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                         None,
                         scale,
                     );
+                    let styled = output::resize_to_max_edge(&styled, max_edge);
                     let mut st = auto.lock().unwrap();
                     if st.canceled {
                         return;
@@ -329,6 +332,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         None,
         cfg.export_scale,
     );
+    let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
     let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir())?;
     output::to_clipboard(&styled, Some(&path)).context("clipboard failed")?;
     // A different pick supersedes the auto-copied file.

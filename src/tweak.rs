@@ -50,6 +50,8 @@ const WM_RESHOOT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 42;
 enum Ctl {
     Matte(usize),
     Aspect(usize),
+    OutputSize(u32),
+    CustomSize,
     Slider,
     Tool(usize),
     Color(usize),
@@ -84,6 +86,8 @@ struct State {
     sel: usize,
     pad_factor: f32,
     aspect_idx: usize,
+    /// Per-capture override for the finished image's longest edge.
+    output_max_edge: u32,
     // Cached preview composite as BGRA.
     preview: Vec<u8>,
     preview_w: i32,
@@ -302,15 +306,17 @@ fn final_image(state: &State) -> RgbaImage {
         raw.clone()
     };
     crate::annotate::render(&mut content, &state.anns, scale as f32, (0.0, 0.0), None);
-    if plain {
-        return content;
-    }
-    let opts = ComposeOpts {
-        metric_scale: scale as f32,
-        pad_factor: state.pad_factor,
-        aspect: ASPECTS[state.aspect_idx].1,
+    let finished = if plain {
+        content
+    } else {
+        let opts = ComposeOpts {
+            metric_scale: scale as f32,
+            pad_factor: state.pad_factor,
+            aspect: ASPECTS[state.aspect_idx].1,
+        };
+        compose::compose_with(&content, &state.styles[state.sel], &opts)
     };
-    compose::compose_with(&content, &state.styles[state.sel], &opts)
+    output::resize_to_max_edge(&finished, state.output_max_edge)
 }
 
 unsafe fn chip(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot: bool) {
@@ -497,6 +503,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
     if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::Tool(0))) {
         label(hdc, state, r.left, r.top - lh, "ANNOTATE  (drag on the preview)");
     }
+    if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::OutputSize(_))) {
+        label(hdc, state, r.left, r.top - lh, "OUTPUT SIZE");
+    }
 
     // Controls.
     for (i, (r, c)) in state.controls.iter().enumerate() {
@@ -505,6 +514,31 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::Matte(n) => chip(hdc, *r, state.styles[*n].name, state, state.sel == *n, hot),
             Ctl::Aspect(n) => {
                 chip(hdc, *r, ASPECTS[*n].0, state, state.aspect_idx == *n, hot)
+            }
+            Ctl::OutputSize(max_edge) => chip(
+                hdc,
+                *r,
+                &output::output_size_label(*max_edge),
+                state,
+                state.output_max_edge == *max_edge,
+                hot,
+            ),
+            Ctl::CustomSize => {
+                let custom = ![
+                    output::OUTPUT_ORIGINAL,
+                    output::OUTPUT_EMAIL,
+                    output::OUTPUT_COMPACT,
+                ]
+                .contains(&state.output_max_edge);
+                let custom_label = format!("{}px", state.output_max_edge);
+                chip(
+                    hdc,
+                    *r,
+                    if custom { &custom_label } else { "Custom" },
+                    state,
+                    custom,
+                    hot,
+                )
             }
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
@@ -846,6 +880,16 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             state.aspect_idx = n;
             rebuild_preview(state);
             let _ = InvalidateRect(hwnd, None, false);
+        }
+        Ctl::OutputSize(max_edge) => {
+            state.output_max_edge = max_edge;
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        Ctl::CustomSize => {
+            if let Ok(Some(max_edge)) = crate::number_prompt::ask(hwnd, state.output_max_edge) {
+                state.output_max_edge = max_edge;
+                let _ = InvalidateRect(hwnd, None, false);
+            }
         }
         Ctl::Slider => {}
         Ctl::Ocr => {
@@ -1319,7 +1363,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !mmi.is_null() {
                 let s = unsafe { GetDpiForSystem() } as f32 / 96.0;
                 (*mmi).ptMinTrackSize.x = (760.0 * s) as i32;
-                (*mmi).ptMinTrackSize.y = (560.0 * s) as i32;
+                (*mmi).ptMinTrackSize.y = (620.0 * s) as i32;
             }
             LRESULT(0)
         }
@@ -1426,6 +1470,28 @@ fn layout_controls(
         ));
     }
     let by = ch - m - sc(30);
+    let output_y = by - sc(114);
+    for (i, ctl) in [
+        Ctl::OutputSize(output::OUTPUT_ORIGINAL),
+        Ctl::OutputSize(output::OUTPUT_EMAIL),
+        Ctl::OutputSize(output::OUTPUT_COMPACT),
+        Ctl::CustomSize,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = i as i32 / 2;
+        let colm = i as i32 % 2;
+        controls.push((
+            RECT {
+                left: col_x + colm * sc(112),
+                top: output_y + row * sc(34),
+                right: col_x + colm * sc(112) + sc(104),
+                bottom: output_y + row * sc(34) + sc(28),
+            },
+            ctl,
+        ));
+    }
     controls.push((
         RECT { left: col_x, top: by - sc(38), right: col_x + sc(216), bottom: by - sc(8) },
         Ctl::Ocr,
@@ -1486,6 +1552,7 @@ pub fn run(
     let (controls, preview_box, slider_rect) = layout_controls(dpi_scale, cw, ch, styles.len());
 
     let preview_metric = scale;
+    let cfg = Config::load();
     let mut state = Box::new(State {
         raw,
         small,
@@ -1494,6 +1561,7 @@ pub fn run(
         sel: initial,
         pad_factor: compose::DEFAULT_PAD_FACTOR,
         aspect_idx: 0,
+        output_max_edge: cfg.output_max_edge,
         preview: Vec::new(),
         preview_w: 1,
         preview_h: 1,

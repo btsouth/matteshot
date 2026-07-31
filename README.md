@@ -12,13 +12,13 @@ A Windows tray app in pure Rust. No UI framework — Win32 + GDI + `Windows.Grap
 
 1. **PrtScn** (or left-click the tray icon): freeze-frame overlay across **all monitors** — dimmed frozen screens, hover highlights whole windows (taskbar included), drag selects a region (cross-monitor works), clicking bare desktop grabs that monitor. Toolbar: **Window / Region / Screen / ● Record / ↓ Scroll / ✕** (keys W/R/F/V/S). Esc cancels.
 2. **Pick a matte**: contact strip of auto-styled variants. Click / 1–7 / arrows+Enter chooses, **T** opens the tweak editor, **E** opens in your default editor, **P** pins the raw capture, **C** copies its text via OCR, **PrtScn re-snips** (the strip itself is snippable), Esc cancels. Last-used matte preselected.
-3. **Done**: full-res PNG on the clipboard (as bitmap + PNG + file, so paste works everywhere) and in your captures folder.
+3. **Done**: PNG on the clipboard (as bitmap + PNG + file, so paste works everywhere) and in your captures folder. Output-size presets can preserve the original pixels or cap the finished matte to Email (1600 px), Compact (1200 px), or a custom longest edge without ever upscaling.
 
 **Ctrl+Alt+S** skips the overlay: instant capture of the active window.
 
 ## Tweak editor (T in the picker)
 
-Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips incl. None), padding slider, aspect presets (Auto / 1:1 / 4:3 / 16:9 / Social 1.91:1), and **annotations**: arrow, line, box, ellipse, highlighter, text (blinking caret, double-click to re-edit), pixelate-redact, and auto-numbered step badges — four colors, S/M/L sizes. Everything is selectable and draggable afterward: solid outline + handles on selection, dotted on hover, truthful cursors on endpoints/corners, Delete removes, Ctrl+Z undoes. Annotations live in content coordinates, render at export scale, and sit under the matte. **Copy text (OCR)** reads the capture via Windows' offline OCR. PrtScn re-snips from here too.
+Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips incl. None), padding slider, aspect presets (Auto / 1:1 / 4:3 / 16:9 / Social 1.91:1), a per-capture output-size override, and **annotations**: arrow, line, box, ellipse, highlighter, text (blinking caret, double-click to re-edit), pixelate-redact, and auto-numbered step badges — four colors, S/M/L sizes. Everything is selectable and draggable afterward: solid outline + handles on selection, dotted on hover, truthful cursors on endpoints/corners, Delete removes, Ctrl+Z undoes. Annotations live in content coordinates, render at export scale, and sit under the matte. The completed result is resized as one image so the matte and annotations stay sharp and aligned. **Copy text (OCR)** reads the capture via Windows' offline OCR. PrtScn re-snips from here too.
 
 ## Recording
 
@@ -54,7 +54,7 @@ Dark + light themes follow the system setting (`AppsUseLightTheme`), live-switch
 
 ## Settings (tray menu)
 
-Save folder + video folder (`IFileDialog` pickers, open buttons), export quality 1x/2x/3x, start with Windows, PrtScn capture toggle, GIF toggle, recording audio Off/System/Mic. First run shows a tray balloon.
+Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows, PrtScn capture toggle, GIF toggle, recording audio Off/System/Mic. First run shows a tray balloon.
 
 Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. **Copy diagnostics** in the tray produces a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path.
 

@@ -59,6 +59,10 @@ unsafe fn context_menu(hwnd: HWND) {
                 if let Some(img) =
                     RgbaImage::from_raw(state.w as u32, state.h as u32, rgba)
                 {
+                    let img = crate::output::resize_to_max_edge(
+                        &img,
+                        crate::config::Config::load().output_max_edge,
+                    );
                     let _ = crate::output::to_clipboard(&img, None);
                 }
             }
