@@ -298,12 +298,17 @@ unsafe fn paint(hdc: HDC, state: &State) {
         right: state.width - m,
         bottom: state.height - s(state, 10),
     };
+    let footer_text = format!(
+        "Matteshot {}   \u{00b7}   {}",
+        env!("CARGO_PKG_VERSION"),
+        crate::license::status().tray_label()
+    );
     draw_text_in(
         hdc,
         state.font_small,
         state.theme.muted,
         footer,
-        concat!("Matteshot ", env!("CARGO_PKG_VERSION"), "   \u{00b7}   PrtScn captures, Ctrl+Alt+S shoots the active window"),
+        &footer_text,
         0,
     );
 }

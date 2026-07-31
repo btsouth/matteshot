@@ -18,9 +18,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, GetCursorPos, GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA,
-    HICON, ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
@@ -36,6 +36,9 @@ const CMD_PRTSCN: usize = 105;
 const CMD_QUIT: usize = 106;
 const CMD_SETTINGS: usize = 107;
 const CMD_UPDATE: usize = 108;
+const CMD_BUY: usize = 109;
+const CMD_ACTIVATE: usize = 110;
+const CMD_DEACTIVATE: usize = 111;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Matteshot";
@@ -49,6 +52,9 @@ pub enum Action {
     ToggleAutostart,
     TogglePrtscn,
     OpenUpdate,
+    Buy,
+    Activate,
+    Deactivate,
     Quit,
 }
 
@@ -186,10 +192,16 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
 
     let menu = CreatePopupMenu().expect("menu");
     let check = |on: bool| if on { MF_CHECKED } else { Default::default() };
-    let _ = AppendMenuW(menu, MF_STRING, CMD_CAPTURE, w!("Capture\tPrtScn"));
+    let license = crate::license::status();
+    let capture_flags = if license.can_capture() {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    };
+    let _ = AppendMenuW(menu, capture_flags, CMD_CAPTURE, w!("Capture\tPrtScn"));
     let _ = AppendMenuW(
         menu,
-        MF_STRING,
+        capture_flags,
         CMD_CAPTURE_ACTIVE,
         w!("Capture active window\tCtrl+Alt+S"),
     );
@@ -202,6 +214,37 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         let _ = AppendMenuW(menu, MF_STRING, CMD_UPDATE, PCWSTR(label.as_ptr()));
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+    let license_label: Vec<u16> = license
+        .tray_label()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING | MF_GRAYED,
+        0,
+        PCWSTR(license_label.as_ptr()),
+    );
+    match license {
+        crate::license::Status::Licensed { .. } => {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                CMD_DEACTIVATE,
+                w!("Deactivate this PC\u{2026}"),
+            );
+        }
+        _ => {
+            let _ = AppendMenuW(menu, MF_STRING, CMD_BUY, w!("Buy Matteshot\u{2026}"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                CMD_ACTIVATE,
+                w!("Enter license key\u{2026}"),
+            );
+        }
+    }
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Settings\u{2026}"));
     let _ = AppendMenuW(
         menu,
@@ -211,7 +254,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     );
     let _ = AppendMenuW(
         menu,
-        MF_STRING,
+        capture_flags,
         CMD_PRTSCN,
         if !crate::prtscn::snipping_owns_prtscn() {
             w!("Give PrtScn back to Snipping Tool")
@@ -254,6 +297,9 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         CMD_AUTOSTART => Some(Action::ToggleAutostart),
         CMD_PRTSCN => Some(Action::TogglePrtscn),
         CMD_UPDATE => Some(Action::OpenUpdate),
+        CMD_BUY => Some(Action::Buy),
+        CMD_ACTIVATE => Some(Action::Activate),
+        CMD_DEACTIVATE => Some(Action::Deactivate),
         CMD_QUIT => Some(Action::Quit),
         _ => None,
     };
@@ -330,6 +376,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x if x == Action::ToggleAutostart as usize => Some(Action::ToggleAutostart),
                     x if x == Action::TogglePrtscn as usize => Some(Action::TogglePrtscn),
                     x if x == Action::OpenUpdate as usize => Some(Action::OpenUpdate),
+                    x if x == Action::Buy as usize => Some(Action::Buy),
+                    x if x == Action::Activate as usize => Some(Action::Activate),
+                    x if x == Action::Deactivate as usize => Some(Action::Deactivate),
                     x if x == Action::Quit as usize => Some(Action::Quit),
                     _ => None,
                 };

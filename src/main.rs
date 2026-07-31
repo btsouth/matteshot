@@ -5,6 +5,8 @@ mod capture;
 mod compose;
 mod config;
 mod icon;
+mod license;
+mod license_ui;
 mod ocr;
 mod pin;
 mod audio;
@@ -35,9 +37,12 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MessageBoxW, MB_ICONERROR, MB_OK, MSG, WM_HOTKEY,
+    DispatchMessageW, GetMessageW, MessageBoxW, IDYES, MB_ICONERROR, MB_ICONWARNING, MB_OK,
+    MB_YESNO, MSG, WM_HOTKEY,
 };
 
 use crate::config::Config;
@@ -264,6 +269,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         styled.height(),
         path.display()
     );
+    license::record_successful_capture();
     Ok(())
 }
 
@@ -273,10 +279,20 @@ fn shoot_overlay() -> Result<()> {
         Some((overlay::Selection::Window(hwnd), mon)) => shoot(Source::Window(hwnd), mon, None),
         Some((overlay::Selection::Region(img), mon)) => shoot(Source::Image(img), mon, None),
         Some((overlay::Selection::RecordWindow(hwnd), _)) => {
-            record::session(record::Target::window(hwnd), Config::load().record_gif)
+            let result =
+                record::session(record::Target::window(hwnd), Config::load().record_gif);
+            if result.is_ok() {
+                license::record_successful_capture();
+            }
+            result
         }
         Some((overlay::Selection::RecordRegion(r, mon), _)) => {
-            record::session(record::Target::region(r, mon), Config::load().record_gif)
+            let result =
+                record::session(record::Target::region(r, mon), Config::load().record_gif);
+            if result.is_ok() {
+                license::record_successful_capture();
+            }
+            result
         }
         Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
             let img = scroll::capture(scroll::Target::Window(h, anchor))?;
@@ -304,17 +320,59 @@ fn shoot_active_window(fg: HWND) -> Result<()> {
     shoot(Source::Window(fg), mon, None)
 }
 
-fn run_app() -> Result<()> {
-    capture::warmup();
+fn enable_capture_hotkeys() -> Result<bool> {
     unsafe {
         RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_S)
             .context("Ctrl+Alt+S is already taken by another app")?;
     }
-
-    let prtscn_ours = matches!(
+    Ok(matches!(
         prtscn::acquire(HOTKEY_ID_PRTSCN, true),
         prtscn::Acquire::Taken | prtscn::Acquire::TakenAfterToggle
-    );
+    ))
+}
+
+fn disable_capture_hotkeys(restore_windows_prtscn: bool) {
+    unsafe {
+        let _ = UnregisterHotKey(None, HOTKEY_ID);
+    }
+    prtscn::release(HOTKEY_ID_PRTSCN);
+    if restore_windows_prtscn {
+        let _ = prtscn::set_snipping_binding(true);
+    }
+}
+
+fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
+    if license::status().can_capture() {
+        if !*hotkeys_active {
+            let _ = enable_capture_hotkeys()?;
+            *hotkeys_active = true;
+        }
+        return Ok(true);
+    }
+
+    if *hotkeys_active {
+        disable_capture_hotkeys(true);
+        *hotkeys_active = false;
+    }
+    if license_ui::open()? {
+        let _ = enable_capture_hotkeys()?;
+        *hotkeys_active = true;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn run_app() -> Result<()> {
+    capture::warmup();
+    let initial_license = license::status();
+    let mut hotkeys_active = initial_license.can_capture();
+    let prtscn_ours = if hotkeys_active {
+        enable_capture_hotkeys()?
+    } else {
+        disable_capture_hotkeys(true);
+        false
+    };
 
     let mut tray = tray::Tray::create()?;
     eprintln!(
@@ -324,7 +382,7 @@ fn run_app() -> Result<()> {
 
     // First run: a single balloon so the user knows where the app lives.
     let mut cfg = Config::load();
-    if !cfg.onboarded {
+    if !cfg.onboarded && initial_license.can_capture() {
         tray.notify(
             "Matteshot is ready",
             "Press PrtScn to capture. Right-click the tray icon for settings.",
@@ -333,15 +391,25 @@ fn run_app() -> Result<()> {
         cfg.save();
     }
     update::start(tray.hwnd);
+    license::start_background_refresh();
+
+    if matches!(initial_license, license::Status::Expired) && license_ui::open()? {
+        let _ = enable_capture_hotkeys()?;
+        hotkeys_active = true;
+    }
 
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_HOTKEY {
-                let result = match msg.wParam.0 as i32 {
-                    HOTKEY_ID_PRTSCN => shoot_overlay(),
-                    HOTKEY_ID => shoot_active(),
-                    _ => Ok(()),
+                let result = if ensure_capture_allowed(&mut hotkeys_active)? {
+                    match msg.wParam.0 as i32 {
+                        HOTKEY_ID_PRTSCN => shoot_overlay(),
+                        HOTKEY_ID => shoot_active(),
+                        _ => Ok(()),
+                    }
+                } else {
+                    Ok(())
                 };
                 if let Err(e) = result {
                     eprintln!("error: {e:#}");
@@ -352,11 +420,22 @@ fn run_app() -> Result<()> {
 
             if let Some(action) = tray.take_action() {
                 let result = match action {
-                    tray::Action::Capture => shoot_overlay(),
-                    tray::Action::CaptureActive => tray
-                        .active_window()
-                        .context("No active app window to capture")
-                        .and_then(shoot_active_window),
+                    tray::Action::Capture => {
+                        if ensure_capture_allowed(&mut hotkeys_active)? {
+                            shoot_overlay()
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    tray::Action::CaptureActive => {
+                        if ensure_capture_allowed(&mut hotkeys_active)? {
+                            tray.active_window()
+                                .context("No active app window to capture")
+                                .and_then(shoot_active_window)
+                        } else {
+                            Ok(())
+                        }
+                    }
                     tray::Action::OpenFolder => {
                         output::open_folder(&Config::load().save_dir());
                         Ok(())
@@ -366,16 +445,45 @@ fn run_app() -> Result<()> {
                         tray::set_autostart(!tray::autostart_enabled())
                     }
                     tray::Action::TogglePrtscn => {
-                        if prtscn::snipping_owns_prtscn() {
-                            let _ = prtscn::take(HOTKEY_ID_PRTSCN);
-                        } else {
-                            prtscn::release(HOTKEY_ID_PRTSCN);
+                        if license::status().can_capture() {
+                            if prtscn::snipping_owns_prtscn() {
+                                let _ = prtscn::take(HOTKEY_ID_PRTSCN);
+                            } else {
+                                prtscn::release(HOTKEY_ID_PRTSCN);
+                            }
                         }
                         Ok(())
                     }
                     tray::Action::OpenUpdate => {
                         if let Some(url) = tray.update_url() {
                             output::open_url(&url);
+                        }
+                        Ok(())
+                    }
+                    tray::Action::Buy => {
+                        output::open_url(license::BUY_URL);
+                        Ok(())
+                    }
+                    tray::Action::Activate => {
+                        if license_ui::open()? && !hotkeys_active {
+                            let _ = enable_capture_hotkeys()?;
+                            hotkeys_active = true;
+                        }
+                        Ok(())
+                    }
+                    tray::Action::Deactivate => {
+                        let answer = MessageBoxW(
+                            None,
+                            w!("Deactivate Matteshot on this PC? This frees one of your three device slots."),
+                            w!("Matteshot"),
+                            MB_YESNO | MB_ICONWARNING,
+                        );
+                        if answer == IDYES {
+                            license::deactivate()?;
+                            if !license::status().can_capture() {
+                                disable_capture_hotkeys(true);
+                                hotkeys_active = false;
+                            }
                         }
                         Ok(())
                     }
@@ -708,8 +816,22 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Open only the activation window (testing; does not capture or write
+        // to the clipboard).
+        Some("--license") => {
+            let activated = license_ui::open()?;
+            eprintln!(
+                "license window closed: {}",
+                if activated { "activated" } else { "unchanged" }
+            );
+            Ok(())
+        }
+        Some("--license-status") => {
+            eprintln!("{}", license::status().tray_label());
+            Ok(())
+        }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-6>] [--overlay] | --take-printscreen | --restore-printscreen]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-6>] [--overlay] | --license | --license-status | --take-printscreen | --restore-printscreen]"
         ),
         None => run_app(),
     };
