@@ -106,6 +106,18 @@ enum Source {
     Image(RgbaImage),
 }
 
+/// Run a message loop until `open` reports the window is gone. Only for the
+/// standalone diagnostic commands; the resident already has a loop.
+fn pump_until_closed(open: fn() -> bool) {
+    let mut msg = MSG::default();
+    unsafe {
+        while open() && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
 fn error_box(text: &str) {
     unsafe {
         MessageBoxW(
@@ -264,27 +276,11 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             if let Some(p) = cancel_auto() {
                 let _ = std::fs::remove_file(p);
             }
-            return match tweak::run(raw, styles, i, monitor)? {
-                Some((overlay::Selection::Window(h), mon)) => shoot(Source::Window(h), mon, None),
-                Some((overlay::Selection::Region(img), mon)) => {
-                    shoot(Source::Image(img), mon, None)
-                }
-                Some((overlay::Selection::RecordWindow(h), _)) => {
-                    record::session(record::Target::window(h), cfg.record_gif)
-                }
-                Some((overlay::Selection::RecordRegion(r, m), _)) => {
-                    record::session(record::Target::region(r, m), cfg.record_gif)
-                }
-                Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
-                    let img = scroll::capture(scroll::Target::Window(h, anchor))?;
-                    shoot(Source::Image(img), mon, None)
-                }
-                Some((overlay::Selection::ScrollRegion(r, m, anchor), mon)) => {
-                    let img = scroll::capture(scroll::Target::Region(r, m, anchor))?;
-                    shoot(Source::Image(img), mon, None)
-                }
-                None => Ok(()),
-            };
+            // The editor is non-modal, so this returns immediately. PrtScn
+            // while it is open is now just another capture: the hotkey reaches
+            // the resident's loop as normal instead of tearing down the
+            // editor and replaying a reshoot through here.
+            return tweak::open(raw, styles, i, monitor);
         }
         PickAction::Reshoot(sel, mon) => {
             // PrtScn mid-pick: the user re-snipped; replace the pending shot
@@ -736,7 +732,11 @@ fn main() -> Result<()> {
                 let raw = capture::capture_window(hwnd).context("capture failed")?;
                 license::record_successful_capture();
                 let styles = style::variants(&raw);
-                tweak::run(raw, styles, 0, mon).map(|_| ())
+                tweak::open(raw, styles, 0, mon)?;
+                // The editor no longer owns a loop of its own, so this
+                // standalone probe has to pump one until the window closes.
+                pump_until_closed(tweak::is_open);
+                Ok(())
             } else {
                 let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
                 shoot(Source::Window(hwnd), mon, pick_override)

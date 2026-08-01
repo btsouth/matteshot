@@ -21,11 +21,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow,
+    GetWindowLongPtrW, IsWindow, LoadCursorW, PostMessageW, RegisterClassW,
     SetForegroundWindow,
-    SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    IDC_ARROW, MSG, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    SetWindowLongPtrW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    IDC_ARROW, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
 };
@@ -49,12 +49,14 @@ const ASPECTS: [(&str, Option<f32>); 5] = [
     ("Social", Some(1.91)),
 ];
 
-/// Posted when the resident PrtScn hotkey fires mid-tweak.
-const WM_RESHOOT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 42;
 /// Posted by the OCR worker with the recognized word boxes.
 const WM_OCR_READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 43;
 const WM_UNICHAR_MESSAGE: u32 = 0x0109;
 const UNICODE_NOCHAR: usize = 0xFFFF;
+
+/// The single editor window, or 0. One window holds every open capture.
+static WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Ctl {
@@ -194,9 +196,6 @@ struct State {
     caption_style_controls: Vec<(RECT, crate::annotate::TextStyle)>,
     hover: i32,
     dragging: Option<SliderDrag>,
-    done: bool,
-    suspended: bool,
-    reshoot: Option<(crate::overlay::Selection, HMONITOR)>,
     // Tool palette. Window-level on purpose: switching capture must not make
     // you re-pick your pen.
     tool: Option<usize>,
@@ -1177,7 +1176,6 @@ unsafe fn copy_and_finish(hwnd: HWND, state: &mut State) {
     let path = output::save_png(&img, state.doc.styles[state.doc.sel].name, &cfg.save_dir());
     let _ = output::to_clipboard(&img, path.as_deref().ok());
     Config::update(|cfg| cfg.last_style = state.doc.sel);
-    state.done = true;
     let _ = DestroyWindow(hwnd);
 }
 
@@ -1560,7 +1558,6 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             let img = final_image(state);
             let cfg = Config::load();
             let _ = output::save_png(&img, state.doc.styles[state.doc.sel].name, &cfg.save_dir());
-            state.done = true;
             let _ = DestroyWindow(hwnd);
         }
         Ctl::Edit => {
@@ -1570,7 +1567,6 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             {
                 output::open_in_editor(&path);
             }
-            state.done = true;
             let _ = DestroyWindow(hwnd);
         }
         // Tool/Color/Undo/Clear handled above.
@@ -2083,7 +2079,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
                         } else {
-                            state.done = true;
                             let _ = DestroyWindow(hwnd);
                         }
                     }
@@ -2156,26 +2151,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                         }
                         let _ = InvalidateRect(hwnd, None, false);
-                    }
-                }
-            }
-            LRESULT(0)
-        }
-        WM_RESHOOT => {
-            if let Some(state) = state_of(hwnd) {
-                if !state.suspended {
-                    state.suspended = true;
-                    let result = crate::overlay::select();
-                    state.suspended = false;
-                    match result {
-                        Ok(Some(r)) => {
-                            state.reshoot = Some(r);
-                            state.done = true;
-                            let _ = DestroyWindow(hwnd);
-                        }
-                        _ => {
-                            let _ = SetForegroundWindow(hwnd);
-                        }
                     }
                 }
             }
@@ -2262,8 +2237,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
-        WM_DESTROY => {
-            PostQuitMessage(0);
+        windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY => {
+            // The editor lives on the resident's message loop now, so its
+            // state and GDI objects are released here rather than after a
+            // nested loop returns.
+            let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
+            if !ptr.is_null() {
+                let state = Box::from_raw(ptr);
+                let _ = DeleteObject(state.font);
+                let _ = DeleteObject(state.font_small);
+            }
+            WINDOW.store(0, Ordering::SeqCst);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -2441,14 +2425,103 @@ fn layout_controls(
     }
 }
 
-/// Modal tweak panel for one capture. Returns a reshoot selection if the
-/// user pressed PrtScn mid-tweak and snipped something new.
-pub fn run(
+/// Build the per-capture half of the editor: preview sources and the starting
+/// matte choices.
+fn build_document(raw: RgbaImage, styles: Vec<Style>, initial: usize) -> Document {
+    // Preview source — large enough that text stays readable.
+    const PREVIEW_MAX: u32 = 1200;
+    let scale = (PREVIEW_MAX as f32 / raw.width().max(raw.height()) as f32).min(1.0);
+    let small = if scale < 1.0 {
+        image::imageops::resize(
+            &raw,
+            (raw.width() as f32 * scale) as u32,
+            (raw.height() as f32 * scale) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        raw.clone()
+    };
+    // Drag-quality source, built once so a padding drag never pays for a
+    // resize per frame.
+    let small_fast = image::imageops::resize(
+        &small,
+        (small.width() / 2).max(1),
+        (small.height() / 2).max(1),
+        image::imageops::FilterType::Triangle,
+    );
+    Document {
+        raw,
+        small,
+        preview_metric: scale,
+        small_fast,
+        metric_fast: scale * 0.5,
+        fast_preview: false,
+        styles,
+        sel: initial,
+        pad_factor: compose::DEFAULT_PAD_FACTOR,
+        aspect_idx: 0,
+        output_max_edge: Config::load().output_max_edge,
+        preview: Vec::new(),
+        preview_w: 1,
+        preview_h: 1,
+        base_cache: None,
+        anns: Vec::new(),
+        drawing: false,
+        editing: None,
+        editing_original: None,
+        moving: None,
+        selected: None,
+        counter_next: 1,
+        hover_ann: None,
+        text_select: None,
+        last_rebuild: std::time::Instant::now(),
+    }
+}
+
+/// Bring an existing editor to the front. After a tray menu the process has
+/// lost foreground rights, so a plain SetForegroundWindow is not enough.
+unsafe fn surface(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
+    };
+    let _ = ShowWindow(hwnd, SW_RESTORE);
+    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    let _ = SetForegroundWindow(hwnd);
+}
+
+/// Whether an editor window is currently open.
+pub fn is_open() -> bool {
+    let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
+    !hwnd.0.is_null() && unsafe { IsWindow(hwnd) }.as_bool()
+}
+
+/// Open the editor on a capture. Non-modal: this returns immediately and the
+/// window lives on the resident's message loop, like settings and pins.
+pub fn open(
     raw: RgbaImage,
     styles: Vec<Style>,
     initial: usize,
     monitor: HMONITOR,
-) -> Result<Option<(crate::overlay::Selection, HMONITOR)>> {
+) -> Result<()> {
+    let document = build_document(raw, styles, initial);
+    unsafe {
+        let existing = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
+        if !existing.0.is_null() && IsWindow(existing).as_bool() {
+            if let Some(state) = state_of(existing) {
+                state.doc = document;
+                state.tool = None;
+                rebuild_preview(state);
+                let _ = InvalidateRect(existing, None, false);
+            }
+            surface(existing);
+            return Ok(());
+        }
+    }
+    create_window(document, monitor)
+}
+
+fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
     let dpi_scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
     let sc = |v: i32| (v as f32 * dpi_scale) as i32;
 
@@ -2465,62 +2538,10 @@ pub fn run(
     let cw = ((work_w as f32 * 0.85) as i32).clamp(sc(760).min(work_w - sc(40)), work_w - sc(40));
     let ch = ((work_h as f32 * 0.85) as i32).clamp(sc(560).min(work_h - sc(40)), work_h - sc(40));
 
-    // Preview source — large enough that text stays readable.
-    const PREVIEW_MAX: u32 = 1200;
-    let scale = (PREVIEW_MAX as f32 / raw.width().max(raw.height()) as f32).min(1.0);
-    let small = if scale < 1.0 {
-        image::imageops::resize(
-            &raw,
-            (raw.width() as f32 * scale) as u32,
-            (raw.height() as f32 * scale) as u32,
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        raw.clone()
-    };
-    // Drag-quality source, built once so a padding drag never pays for a
-    // resize per frame.
-    let metric_fast = scale * 0.5;
-    let small_fast = image::imageops::resize(
-        &small,
-        (small.width() / 2).max(1),
-        (small.height() / 2).max(1),
-        image::imageops::FilterType::Triangle,
-    );
-
-    let initial_layout = layout_controls(dpi_scale, cw, ch, styles.len());
-
-    let preview_metric = scale;
-    let cfg = Config::load();
+    let initial_layout = layout_controls(dpi_scale, cw, ch, document.styles.len());
     let mut state = Box::new(State {
-        doc: Document {
-            raw,
-            small,
-            preview_metric,
-            small_fast,
-            metric_fast,
-            fast_preview: false,
-            styles,
-            sel: initial,
-            pad_factor: compose::DEFAULT_PAD_FACTOR,
-            aspect_idx: 0,
-            output_max_edge: cfg.output_max_edge,
-            preview: Vec::new(),
-            preview_w: 1,
-            preview_h: 1,
-            base_cache: None,
-            anns: Vec::new(),
-            drawing: false,
-            editing: None,
-            editing_original: None,
-            moving: None,
-            selected: None,
-            counter_next: 1,
-            hover_ann: None,
-            text_select: None,
-            last_rebuild: std::time::Instant::now(),
-        },
-        export_scale: cfg.export_scale,
+        doc: document,
+        export_scale: Config::load().export_scale,
         controls: initial_layout.controls,
         preview_box: initial_layout.preview_box,
         slider_rect: initial_layout.padding_slider,
@@ -2529,9 +2550,6 @@ pub fn run(
         caption_style_controls: initial_layout.caption_style_controls,
         hover: -1,
         dragging: None,
-        done: false,
-        suspended: false,
-        reshoot: None,
         tool: None,
         color_idx: 0,
         caret_on: true,
@@ -2595,8 +2613,10 @@ pub fn run(
             None,
             None,
             hinstance,
-            Some(&mut *state as *mut State as *const _),
+            // The window owns the state from here; WM_NCDESTROY reclaims it.
+            Some(Box::into_raw(state) as *const _),
         )?;
+        WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
         // Caret blink timer at the system rate; a rate of INFINITE means the
         // user disabled blinking — respect that and keep the caret static.
         let blink = windows::Win32::UI::WindowsAndMessaging::GetCaretBlinkTime();
@@ -2610,28 +2630,9 @@ pub fn run(
         }
 
         crate::theme::apply_titlebar(hwnd, &crate::theme::current());
-        let _ = SetForegroundWindow(hwnd);
-
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.hwnd.0.is_null()
-                && msg.message == windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY
-            {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    hwnd,
-                    WM_RESHOOT,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-                continue;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        let _ = DeleteObject(state.font);
-        let _ = DeleteObject(state.font_small);
+        surface(hwnd);
     }
-    Ok(state.reshoot.take())
+    Ok(())
 }
 
 #[cfg(test)]
