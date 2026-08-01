@@ -3322,7 +3322,7 @@ mod tests {
         };
 
         assert_eq!(ann_bounds(&annotation), (4.0, 8.0, 20.0, 16.0));
-        assert!(freehand_length(&[(0.0, 0.0), (3.0, 4.0)]) == 5.0);
+        assert!((freehand_length(&[(0.0, 0.0), (3.0, 4.0)]) - 5.0).abs() < f32::EPSILON);
 
         translate_ann(&mut annotation, (5.0, -3.0));
         let Shape::Freehand { points } = annotation.shape else {
