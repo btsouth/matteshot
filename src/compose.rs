@@ -265,9 +265,9 @@ pub fn compose_base(w: usize, h: usize, style: &Style, opts: &ComposeOpts) -> Rg
             for x in 0..cw {
                 let a = coverage[x] * shadow_strength;
                 if a > 0.002 {
-                    let pixel = &mut row[x * 4..x * 4 + 4];
-                    for c in 0..3 {
-                        pixel[c] = (pixel[c] as f32 * (1.0 - a)) as u8;
+                    // Colour channels only; alpha stays put.
+                    for channel in &mut row[x * 4..x * 4 + 3] {
+                        *channel = (*channel as f32 * (1.0 - a)) as u8;
                     }
                 }
             }
