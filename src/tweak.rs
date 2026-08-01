@@ -41,8 +41,6 @@ use crate::style::Style;
 
 
 
-const PAD_MIN: f32 = 0.04;
-const PAD_MAX: f32 = 0.18;
 const ASPECTS: [(&str, Option<f32>); 6] = [
     ("Auto", None),
     ("1:1", Some(1.0)),
@@ -1324,7 +1322,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let track = CreateSolidBrush(state.theme.track);
     FillRect(hdc, &RECT { left: sr.left, top: cy - 2, right: sr.right, bottom: cy + 2 }, track);
     let _ = DeleteObject(track);
-    let t = (state.doc().pad_factor - PAD_MIN) / (PAD_MAX - PAD_MIN);
+    let t = (state.doc().pad_factor - compose::PAD_SLIDER_MIN)
+        / (compose::PAD_SLIDER_MAX - compose::PAD_SLIDER_MIN);
     let tx = sr.left + ((sr.right - sr.left) as f32 * t) as i32;
     let filled = CreateSolidBrush(state.theme.accent);
     FillRect(hdc, &RECT { left: sr.left, top: cy - 2, right: tx, bottom: cy + 2 }, filled);
@@ -1342,7 +1341,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
 unsafe fn slider_update(hwnd: HWND, state: &mut State, x: i32) {
     let sr = state.slider_rect;
     let t = ((x - sr.left) as f32 / (sr.right - sr.left).max(1) as f32).clamp(0.0, 1.0);
-    let padding = PAD_MIN + t * (PAD_MAX - PAD_MIN);
+    let padding = compose::PAD_SLIDER_MIN
+        + t * (compose::PAD_SLIDER_MAX - compose::PAD_SLIDER_MIN);
     if padding == state.doc_mut().pad_factor {
         return;
     }

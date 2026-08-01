@@ -47,8 +47,6 @@ const WM_PROBE_READY: u32 = WM_APP + 25;
 const WM_SCRUB_FRAME: u32 = WM_APP + 26;
 static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(1);
 
-const PAD_MIN: f32 = 0.04;
-const PAD_MAX: f32 = 0.18;
 const ASPECTS: [(&str, Option<f32>); 5] = [
     ("Auto", None),
     ("1:1", Some(1.0)),
@@ -725,7 +723,8 @@ fn update_padding(state: &mut State, x: i32) {
     let slider = state.padding_slider;
     let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32)
         .clamp(0.0, 1.0);
-    state.pad_factor = PAD_MIN + t * (PAD_MAX - PAD_MIN);
+    state.pad_factor = crate::compose::PAD_SLIDER_MIN
+        + t * (crate::compose::PAD_SLIDER_MAX - crate::compose::PAD_SLIDER_MIN);
     recompose_preview(state);
 }
 
@@ -1867,7 +1866,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
         track,
     );
     let _ = DeleteObject(track);
-    let pad_t = ((state.pad_factor - PAD_MIN) / (PAD_MAX - PAD_MIN)).clamp(0.0, 1.0);
+    let pad_t = ((state.pad_factor - crate::compose::PAD_SLIDER_MIN)
+        / (crate::compose::PAD_SLIDER_MAX - crate::compose::PAD_SLIDER_MIN))
+        .clamp(0.0, 1.0);
     let thumb_x = slider.left + ((slider.right - slider.left) as f32 * pad_t) as i32;
     let active_color = if plain {
         state.theme.faint
