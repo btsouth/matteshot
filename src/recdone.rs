@@ -640,10 +640,11 @@ fn recompose_preview(state: &mut State) {
         composed
     };
     let skip = state.text_entry.as_ref().and_then(|entry| entry.editing);
+    let annotation_time = current_annotation_time(state);
     crate::video_edit::render_preview_at(
         &mut image,
         &state.annotations,
-        state.playhead,
+        annotation_time,
         skip,
         content_size,
         state.source_size,
@@ -666,7 +667,7 @@ fn recompose_preview(state: &mut State) {
         crate::video_edit::render_preview_at(
             &mut image,
             std::slice::from_ref(&draft),
-            state.playhead,
+            annotation_time,
             None,
             content_size,
             state.source_size,
@@ -811,6 +812,22 @@ fn current_size(state: &State) -> f32 {
 
 fn default_range(state: &State) -> (i64, i64) {
     (0, state.duration.max(1))
+}
+
+/// Annotation ranges are end-exclusive, but the editor deliberately leaves
+/// the visible playhead on `trim_end` when playback finishes or End is pressed.
+/// Evaluate preview annotations on the final representable instant so the held
+/// last frame remains editable without changing timeline or export semantics.
+fn annotation_preview_time(playhead: i64, trim_start: i64, trim_end: i64) -> i64 {
+    if trim_end > trim_start && playhead >= trim_end {
+        trim_end.saturating_sub(1).max(trim_start)
+    } else {
+        playhead
+    }
+}
+
+fn current_annotation_time(state: &State) -> i64 {
+    annotation_preview_time(state.playhead, state.trim_start, state.trim_end)
 }
 
 fn caption_controls_active(state: &State) -> bool {
@@ -1006,13 +1023,14 @@ fn annotation_content_size(state: &State) -> (u32, u32) {
 
 fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
     let content_size = annotation_content_size(state);
+    let time = current_annotation_time(state);
     state
         .annotations
         .iter()
         .enumerate()
         .rev()
         .find(|(_, item)| {
-            item.active_at(state.playhead)
+            item.active_at(time)
                 && crate::video_edit::hit(item, point, 0.018, content_size)
         })
         .map(|(index, _)| index)
@@ -1023,9 +1041,10 @@ fn hit_annotation_handle(
     point: (f32, f32),
 ) -> Option<(usize, crate::video_edit::ShapeHandle)> {
     let content_size = annotation_content_size(state);
+    let time = current_annotation_time(state);
     let index = state.selected.filter(|index| *index < state.annotations.len())?;
     let item = &state.annotations[index];
-    if !item.active_at(state.playhead) {
+    if !item.active_at(time) {
         return None;
     }
     crate::video_edit::hit_handle(item, point, 0.026, content_size)
@@ -1355,7 +1374,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
             .filter(|index| *index < state.annotations.len())
         {
             let item = &state.annotations[index];
-            if item.active_at(state.playhead) {
+            if item.active_at(current_annotation_time(state)) {
                 let image_rect = preview_content_rect(state)
                     .unwrap_or_else(|| preview_image_rect(state, frame));
                 let (x0, y0, x1, y1) =
@@ -3423,8 +3442,8 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_caption_input, available_export_path, layout, minimum_client_size, CaptionInput,
-        NEXT_EXPORT_ID,
+        annotation_preview_time, apply_caption_input, available_export_path, layout,
+        minimum_client_size, CaptionInput, NEXT_EXPORT_ID,
     };
     use std::sync::atomic::Ordering;
 
@@ -3507,6 +3526,39 @@ mod tests {
         let mut capped = "x".repeat(160);
         assert_eq!(apply_caption_input(&mut capped, 'y'), CaptionInput::Ignored);
         assert_eq!(capped.chars().count(), 160);
+    }
+
+    #[test]
+    fn terminal_preview_keeps_end_exclusive_annotations_visible_and_editable() {
+        let trim_start = 10_000_000;
+        let trim_end = 40_000_000;
+        let item = crate::video_edit::Item {
+            shape: crate::video_edit::Shape::Arrow {
+                from: (0.1, 0.2),
+                to: (0.8, 0.7),
+            },
+            start: trim_start,
+            end: trim_end,
+            color: 0,
+            size: 1.0,
+            caption_style: crate::video_edit::CaptionStyle::Shadow,
+            caption_box_opacity: 0.68,
+        };
+
+        // Timing/export semantics remain end-exclusive.
+        assert!(!item.active_at(trim_end));
+        // Only preview interaction maps the held terminal frame inward.
+        let preview_time = annotation_preview_time(trim_end, trim_start, trim_end);
+        assert_eq!(preview_time, trim_end - 1);
+        assert!(item.active_at(preview_time));
+        assert_eq!(
+            annotation_preview_time(trim_end - 1, trim_start, trim_end),
+            trim_end - 1
+        );
+        assert_eq!(
+            annotation_preview_time(trim_end, trim_end - 1, trim_end),
+            trim_end - 1
+        );
     }
 
     #[test]
