@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HALFTONE, InvalidateRect, RoundRect, SelectObject, SetBkMode,
     SetStretchBltMode, SetTextColor, StretchDIBits, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
-    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, PAINTSTRUCT,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, PAINTSTRUCT,
     PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -66,7 +66,7 @@ enum Ctl {
     OutputSize(u32),
     CustomSize,
     CustomSizeField,
-    CustomSizeApply,
+    CustomSizeDone,
     CustomSizeCancel,
     Slider,
     Tool(usize),
@@ -233,6 +233,8 @@ struct CustomSizeEdit {
     input: String,
     replace_on_type: bool,
     invalid: bool,
+    /// Restored by Cancel/Esc after live preview changes.
+    original_max_edge: u32,
 }
 
 /// A drawn tab and the two things you can click on it.
@@ -344,7 +346,7 @@ fn control_visible(state: &State, control: Ctl) -> bool {
     let custom_size = state.custom_size_edit.is_some();
     if matches!(
         control,
-        Ctl::CustomSizeField | Ctl::CustomSizeApply | Ctl::CustomSizeCancel
+        Ctl::CustomSizeField | Ctl::CustomSizeDone | Ctl::CustomSizeCancel
     ) {
         return custom_size && !text_context(state);
     }
@@ -359,7 +361,7 @@ fn control_visible(state: &State, control: Ctl) -> bool {
                 | Ctl::Ocr
                 | Ctl::Size(_)
                 | Ctl::CustomSizeField
-                | Ctl::CustomSizeApply
+                | Ctl::CustomSizeDone
                 | Ctl::CustomSizeCancel
         )
 }
@@ -437,6 +439,46 @@ fn preview_draw_geometry(
     (dx, dy, source_scale, dw, dh)
 }
 
+/// Keep the selected output size visible in the editor. The fitted preview is
+/// treated as Original size; smaller exports occupy proportionally less of the
+/// viewport. Extremely small exports retain a practical editing floor.
+fn output_preview_geometry(
+    preview_box: RECT,
+    preview_w: i32,
+    preview_h: i32,
+    quality_scale: f32,
+    output_scale: f32,
+) -> (i32, i32, f32, i32, i32) {
+    let (_, _, source_scale, fitted_w, fitted_h) =
+        preview_draw_geometry(preview_box, preview_w, preview_h, quality_scale);
+    let output_scale = output_scale.clamp(0.30, 1.0);
+    let draw_scale = source_scale * output_scale;
+    let (dw, dh) = (
+        (fitted_w as f32 * output_scale).round() as i32,
+        (fitted_h as f32 * output_scale).round() as i32,
+    );
+    let (bw, bh) = (
+        preview_box.right - preview_box.left,
+        preview_box.bottom - preview_box.top,
+    );
+    let (dx, dy) = (
+        preview_box.left + (bw - dw) / 2,
+        preview_box.top + (bh - dh) / 2,
+    );
+    (dx, dy, draw_scale, dw, dh)
+}
+
+fn output_preview_scale(state: &State) -> f32 {
+    let composed = composed_dimensions(state);
+    let finished = final_dimensions(state);
+    let composed_edge = composed.0.max(composed.1);
+    if composed_edge == 0 {
+        1.0
+    } else {
+        finished.0.max(finished.1) as f32 / composed_edge as f32
+    }
+}
+
 fn preview_quality_scale(state: &State) -> f32 {
     let active_metric = preview_source(state).1;
     if active_metric > 0.0 {
@@ -448,11 +490,12 @@ fn preview_quality_scale(state: &State) -> f32 {
 
 /// Shared view transform: preview blit offset/scale and content padding.
 fn view_params(state: &State) -> (i32, i32, f32, f32, f32) {
-    let (dx, dy, draw_scale, _, _) = preview_draw_geometry(
+    let (dx, dy, draw_scale, _, _) = output_preview_geometry(
         state.preview_box,
         state.doc().preview_w,
         state.doc().preview_h,
         preview_quality_scale(state),
+        output_preview_scale(state),
     );
     if compose::is_plain(&state.doc().styles[state.doc().sel]) {
         return (dx, dy, draw_scale, 0.0, 0.0);
@@ -914,6 +957,57 @@ unsafe fn label(hdc: HDC, state: &State, x: i32, y: i32, text: &str) {
     DrawTextW(hdc, &mut t, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 }
 
+unsafe fn clipped_label(hdc: HDC, state: &State, mut r: RECT, text: &str) {
+    SelectObject(hdc, state.font_small);
+    SetTextColor(hdc, state.theme.muted);
+    let mut t = wide(text);
+    DrawTextW(
+        hdc,
+        &mut t,
+        &mut r,
+        DT_LEFT
+            | DT_SINGLELINE
+            | DT_VCENTER
+            | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
+    );
+}
+
+unsafe fn custom_size_field(hdc: HDC, r: RECT, state: &State, _hot: bool) {
+    let fill = CreateSolidBrush(state.theme.bg);
+    let pen = CreatePen(PS_SOLID, 2, state.theme.accent);
+    let old_brush = SelectObject(hdc, fill);
+    let old_pen = SelectObject(hdc, pen);
+    let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, 10, 10);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(fill);
+    let _ = DeleteObject(pen);
+
+    let edit = state.custom_size_edit.as_ref().unwrap();
+    let axis = custom_size_axis(composed_dimensions(state)).to_uppercase();
+    let pad = (10.0 * state.scale) as i32;
+    let split = r.left + (96.0 * state.scale) as i32;
+    let label_rect = RECT {
+        left: r.left + pad,
+        top: r.top,
+        right: split,
+        bottom: r.bottom,
+    };
+    clipped_label(hdc, state, label_rect, &format!("{axis} (PX)"));
+
+    SelectObject(hdc, state.font);
+    SetTextColor(hdc, state.theme.text);
+    let caret = if state.caret_on { "\u{2502}" } else { " " };
+    let mut value = wide(&format!("{}{caret}", edit.input));
+    let mut value_rect = RECT {
+        left: split,
+        top: r.top,
+        right: r.right - pad,
+        bottom: r.bottom,
+    };
+    DrawTextW(hdc, &mut value, &mut value_rect, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+}
+
 unsafe fn paint_slider(hdc: HDC, state: &State, rect: RECT, t: f32, active: bool) {
     let cy = (rect.top + rect.bottom) / 2;
     let track = CreateSolidBrush(state.theme.track);
@@ -1020,11 +1114,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
     paint_tabs(hdc, state);
 
     // Preview, letterboxed into its box.
-    let (dx, dy, _, dw, dh) = preview_draw_geometry(
+    let (dx, dy, _, dw, dh) = output_preview_geometry(
         state.preview_box,
         state.doc().preview_w,
         state.doc().preview_h,
         preview_quality_scale(state),
+        output_preview_scale(state),
     );
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -1172,7 +1267,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let hint: Option<&str> = if let Some(text) = &select_hint {
         Some(text.as_str())
     } else if state.custom_size_edit.is_some() {
-        Some("the other dimension adjusts automatically   \u{00b7}   images are never enlarged   \u{00b7}   Enter applies   \u{00b7}   Esc cancels")
+        Some("type a size to preview it live   \u{00b7}   the other dimension adjusts automatically   \u{00b7}   Enter finishes   \u{00b7}   Esc restores")
     } else if state.doc().editing.is_some() {
         Some("type your caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel")
     } else if state.tool == Some(PEN_TOOL) {
@@ -1226,38 +1321,37 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let result = custom_size_result(input, current);
         let detail = if edit.invalid {
             let (minimum, maximum) = custom_size_bounds(current);
-            format!("Choose a value from {minimum} to {maximum} px")
+            format!("Use {minimum} to {maximum} px")
         } else if let Some((width, height)) = result {
-            format!(
-                "Current {} \u{00d7} {} px   \u{00b7}   Result {width} \u{00d7} {height} px",
-                current.0, current.1
-            )
+            format!("Live result  {width} \u{00d7} {height} px")
         } else {
             let (minimum, maximum) = custom_size_bounds(current);
-            format!("Enter a value from {minimum} to {maximum} px")
+            format!("Use {minimum} to {maximum} px")
         };
-        label(
+        clipped_label(
             hdc,
             state,
-            r.left,
-            r.top - lh * 2,
-            "SET OUTPUT SIZE  \u{00b7}  THIS SCREENSHOT ONLY",
+            RECT { left: r.left, top: r.top - lh * 2, right: r.right, bottom: r.top - lh },
+            "CUSTOM OUTPUT SIZE",
         );
-        label(hdc, state, r.left, r.top - lh, &detail);
-    } else if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::OutputSize(_))) {
-        label(
+        clipped_label(
             hdc,
             state,
-            r.left,
-            r.top - lh * 2,
-            "OUTPUT SIZE  ·  THIS SCREENSHOT ONLY",
+            RECT { left: r.left, top: r.top - lh, right: r.right, bottom: r.top },
+            &detail,
+        );
+    } else if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::OutputSize(_))) {
+        clipped_label(
+            hdc,
+            state,
+            RECT { left: r.left, top: r.top - lh * 2, right: r.left + (216.0 * state.scale) as i32, bottom: r.top - lh },
+            "OUTPUT SIZE",
         );
         let (width, height) = final_dimensions(state);
-        label(
+        clipped_label(
             hdc,
             state,
-            r.left,
-            r.top - lh,
+            RECT { left: r.left, top: r.top - lh, right: r.left + (216.0 * state.scale) as i32, bottom: r.top },
             &format!("Final size: {width} × {height} px"),
         );
     }
@@ -1303,13 +1397,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 )
             }
             Ctl::CustomSizeField => {
-                let edit = state.custom_size_edit.as_ref().unwrap();
-                let axis = custom_size_axis(composed_dimensions(state));
-                let caret = if state.caret_on { "\u{2502}" } else { " " };
-                let field = format!("Final {axis}:  {}{caret} px", edit.input);
-                chip(hdc, *r, &field, state, false, hot)
+                custom_size_field(hdc, *r, state, hot)
             }
-            Ctl::CustomSizeApply => chip(hdc, *r, "Apply", state, true, hot),
+            Ctl::CustomSizeDone => chip(hdc, *r, "Done", state, true, hot),
             Ctl::CustomSizeCancel => chip(hdc, *r, "Cancel", state, false, hot),
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
@@ -1622,8 +1712,24 @@ fn begin_custom_size(state: &mut State) {
         input: initial.to_string(),
         replace_on_type: true,
         invalid: false,
+        original_max_edge: current,
     });
     state.caret_on = true;
+}
+
+fn preview_custom_size(state: &mut State) {
+    let Some(input) = state.custom_size_edit.as_ref().map(|edit| edit.input.clone()) else {
+        return;
+    };
+    if let Some(value) = custom_size_value(&input, composed_dimensions(state)) {
+        state.doc_mut().output_max_edge = value;
+    }
+}
+
+fn cancel_custom_size(state: &mut State) {
+    if let Some(edit) = state.custom_size_edit.take() {
+        state.doc_mut().output_max_edge = edit.original_max_edge;
+    }
 }
 
 fn commit_custom_size(state: &mut State) -> bool {
@@ -1869,7 +1975,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
     if state.custom_size_edit.is_some()
         && !matches!(
             ctl,
-            Ctl::CustomSizeField | Ctl::CustomSizeApply | Ctl::CustomSizeCancel
+            Ctl::CustomSizeField | Ctl::CustomSizeDone | Ctl::CustomSizeCancel
         )
     {
         state.custom_size_edit = None;
@@ -1975,12 +2081,12 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             state.caret_on = true;
             let _ = InvalidateRect(hwnd, None, false);
         }
-        Ctl::CustomSizeApply => {
+        Ctl::CustomSizeDone => {
             commit_custom_size(state);
             let _ = InvalidateRect(hwnd, None, false);
         }
         Ctl::CustomSizeCancel => {
-            state.custom_size_edit = None;
+            cancel_custom_size(state);
             let _ = InvalidateRect(hwnd, None, false);
         }
         Ctl::Slider => {}
@@ -2211,7 +2317,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         matches!(
                             control,
                             Ctl::CustomSizeField
-                                | Ctl::CustomSizeApply
+                                | Ctl::CustomSizeDone
                                 | Ctl::CustomSizeCancel
                         ) && in_rect(rect, x, y)
                     });
@@ -2507,11 +2613,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 // Typing keeps the caret solid, like every real text box.
                 state.caret_on = true;
-                if let Some(edit) = state.custom_size_edit.as_mut() {
+                if state.custom_size_edit.is_some() {
                     let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
-                    let action = apply_custom_size_input(edit, ch);
+                    let action = apply_custom_size_input(state.custom_size_edit.as_mut().unwrap(), ch);
                     if action == CustomInput::Commit {
                         commit_custom_size(state);
+                    } else if action == CustomInput::Changed {
+                        preview_custom_size(state);
                     }
                     if action != CustomInput::Ignored {
                         let _ = InvalidateRect(hwnd, None, false);
@@ -2549,7 +2657,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if state.custom_size_edit.is_some() {
                     let key = wparam.0 as u16;
                     if key == VK_ESCAPE.0 {
-                        state.custom_size_edit = None;
+                        cancel_custom_size(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     } else if key == VK_RETURN.0 {
                         commit_custom_size(state);
@@ -3011,25 +3119,25 @@ fn layout_controls(
             left: col_x,
             top: output_y,
             right: col_x + sc(216),
-            bottom: output_y + sc(28),
+            bottom: output_y + sc(34),
         },
         Ctl::CustomSizeField,
     ));
     controls.push((
         RECT {
             left: col_x,
-            top: output_y + sc(34),
+            top: output_y + sc(40),
             right: col_x + sc(104),
-            bottom: output_y + sc(62),
+            bottom: output_y + sc(68),
         },
-        Ctl::CustomSizeApply,
+        Ctl::CustomSizeDone,
     ));
     controls.push((
         RECT {
             left: col_x + sc(112),
-            top: output_y + sc(34),
+            top: output_y + sc(40),
             right: col_x + sc(216),
-            bottom: output_y + sc(62),
+            bottom: output_y + sc(68),
         },
         Ctl::CustomSizeCancel,
     ));
@@ -3365,7 +3473,8 @@ mod tests {
         active_after_close, ann_bounds, annotation_tool_index, apply_custom_size_input,
         apply_text_input, custom_size_axis, custom_size_bounds, custom_size_result,
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
-        preview_draw_geometry, redacted, tab_for_digit, tool_stays_active_after_use,
+        output_preview_geometry, preview_draw_geometry, redacted, tab_for_digit,
+        tool_stays_active_after_use,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
         PEN_TOOL, TOOLS,
     };
@@ -3565,6 +3674,7 @@ mod tests {
             input: "2712".into(),
             replace_on_type: true,
             invalid: true,
+            original_max_edge: 0,
         };
         for ch in "1920".chars() {
             assert_eq!(apply_custom_size_input(&mut edit, ch), CustomInput::Changed);
@@ -3620,6 +3730,27 @@ mod tests {
         for tool in 0..TOOLS.len() {
             assert_eq!(tool_stays_active_after_use(tool), tool == PEN_TOOL);
         }
+    }
+
+    #[test]
+    fn output_size_changes_are_visible_without_moving_the_preview() {
+        let preview_box = RECT { left: 100, top: 50, right: 1100, bottom: 750 };
+        let original = output_preview_geometry(preview_box, 960, 600, 1.0, 1.0);
+        let compact = output_preview_geometry(preview_box, 960, 600, 1.0, 0.5);
+        let tiny = output_preview_geometry(preview_box, 960, 600, 1.0, 0.1);
+
+        assert_eq!((compact.3, compact.4), (original.3 / 2, original.4 / 2));
+        assert!(compact.0 > original.0 && compact.1 > original.1);
+        assert_eq!(compact.0 + compact.3 / 2, original.0 + original.3 / 2);
+        assert_eq!(compact.1 + compact.4 / 2, original.1 + original.4 / 2);
+        // Keep very small outputs editable while still making the reduction
+        // unmistakable.
+        assert_eq!(tiny.3, (original.3 as f32 * 0.30).round() as i32);
+        assert_eq!(tiny.4, (original.4 as f32 * 0.30).round() as i32);
+
+        let draft = output_preview_geometry(preview_box, 480, 300, 2.0, 0.5);
+        assert_eq!((draft.0, draft.1, draft.3, draft.4), (compact.0, compact.1, compact.3, compact.4));
+        assert!((draft.2 - compact.2 * 2.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -3691,15 +3822,15 @@ mod tests {
                     .unwrap()
             };
             let field = rect_for(Ctl::CustomSizeField);
-            let apply = rect_for(Ctl::CustomSizeApply);
+            let done = rect_for(Ctl::CustomSizeDone);
             let cancel = rect_for(Ctl::CustomSizeCancel);
             let ocr = rect_for(Ctl::Ocr);
 
-            assert_eq!(field.left, apply.left);
+            assert_eq!(field.left, done.left);
             assert_eq!(field.right, cancel.right);
-            assert!(field.bottom < apply.top);
-            assert_eq!((apply.top, apply.bottom), (cancel.top, cancel.bottom));
-            assert!(apply.bottom < ocr.top);
+            assert!(field.bottom < done.top);
+            assert_eq!((done.top, done.bottom), (cancel.top, cancel.bottom));
+            assert!(done.bottom < ocr.top);
         }
     }
 
