@@ -409,9 +409,11 @@ fn opts_of(state: &State, metric: f32) -> ComposeOpts {
     }
 }
 
-/// Locate a preview bitmap inside its viewport. Draft previews contain fewer
+/// Zoom a preview bitmap to fill its viewport. Draft previews contain fewer
 /// pixels, but `quality_scale` expands them back to their full-preview logical
-/// size so changing render quality never changes the geometry on screen.
+/// size so changing render quality never changes the geometry on screen. The
+/// editor may upscale this working bitmap: exported pixels are unaffected, and
+/// readable editing is more useful than leaving large monitors half empty.
 fn preview_draw_geometry(
     preview_box: RECT,
     preview_w: i32,
@@ -424,9 +426,7 @@ fn preview_draw_geometry(
     );
     let logical_w = preview_w as f32 * quality_scale;
     let logical_h = preview_h as f32 * quality_scale;
-    let fit = (bw as f32 / logical_w)
-        .min(bh as f32 / logical_h)
-        .min(1.0);
+    let fit = (bw as f32 / logical_w).min(bh as f32 / logical_h);
     let source_scale = quality_scale * fit;
     let (dw, dh) = (
         (preview_w as f32 * source_scale) as i32,
@@ -3448,7 +3448,7 @@ mod tests {
     use windows::Win32::Foundation::RECT;
 
     #[test]
-    fn padding_drag_quality_does_not_shrink_preview() {
+    fn preview_fills_the_workspace_and_padding_drag_quality_does_not_shrink_it() {
         for preview_box in [
             RECT { left: 0, top: 0, right: 1200, bottom: 800 },
             RECT { left: 50, top: 25, right: 750, bottom: 525 },
@@ -3458,6 +3458,10 @@ mod tests {
 
             assert_eq!((draft.0, draft.1, draft.3, draft.4), (full.0, full.1, full.3, full.4));
             assert!((draft.2 - full.2 * 2.0).abs() < f32::EPSILON);
+
+            let available_width = preview_box.right - preview_box.left;
+            let available_height = preview_box.bottom - preview_box.top;
+            assert!(full.3 == available_width || full.4 == available_height);
         }
     }
 
