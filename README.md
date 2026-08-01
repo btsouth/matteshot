@@ -112,6 +112,8 @@ Run every headless probe at once and fail loudly if one breaks:
 
 Covers capture, OCR, playback, all three export paths, and the auto-update trust gates (ours accepted, a foreign signature and a tampered copy both refused). Safe to run while working: it writes no clipboard, injects no input (`--scroll-test` is opt-in behind `-IncludeScroll`), and opens no window unless it has to record a fixture. `-Offline` skips the network checks. The interactive surfaces — picker, editors, overlay — still need a human.
 
+Use [`INTERACTIVE-REGRESSION.md`](INTERACTIVE-REGRESSION.md) for the release-blocking human pass over those surfaces.
+
 Run the same static code gate used by CI, signed candidates, and releases:
 
 ```powershell

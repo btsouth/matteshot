@@ -1,5 +1,5 @@
 //! Native contact-strip picker: a borderless topmost window showing the
-//! styled variants. Click / 1-6 / arrows+Enter chooses, E opens the result
+//! styled variants. Click / 1-7 / arrows+Enter chooses, E opens the result
 //! in the default editor, Esc cancels. Plain Win32 + GDI, double-buffered.
 
 use anyhow::{Context, Result};
@@ -36,6 +36,48 @@ const HINT_H: i32 = 20;
 const VK_E: u16 = 0x45;
 /// Posted to the strip when the resident PrtScn hotkey fires mid-pick.
 const WM_RETAKE: u32 = WM_USER + 41;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyAction {
+    Choose(usize),
+    Edit(usize),
+    Tweak(usize),
+    Pin,
+    CopyText,
+    Cancel,
+    Hover(i32),
+}
+
+fn key_action(vk: u16, hover: i32, count: usize) -> Option<KeyAction> {
+    let selected = (count > 0).then(|| (hover.max(0) as usize).min(count - 1));
+    match vk {
+        v if v == VK_ESCAPE.0 => Some(KeyAction::Cancel),
+        v if v == VK_RETURN.0 => selected.map(KeyAction::Choose),
+        v if v == VK_E => selected.map(KeyAction::Edit),
+        0x54 => selected.map(KeyAction::Tweak), // T
+        0x50 => Some(KeyAction::Pin),           // P
+        0x43 => Some(KeyAction::CopyText),      // C
+        v if v == VK_LEFT.0 && count > 0 => Some(KeyAction::Hover(
+            (hover.max(0) - 1).rem_euclid(count as i32),
+        )),
+        v if v == VK_RIGHT.0 && count > 0 => Some(KeyAction::Hover(
+            (hover + 1).rem_euclid(count as i32),
+        )),
+        v if (0x31..=0x39).contains(&v) => {
+            let index = (v - 0x31) as usize;
+            (index < count).then_some(KeyAction::Choose(index))
+        }
+        _ => None,
+    }
+}
+
+fn should_cancel_on_deactivate(
+    action_chosen: bool,
+    suspended: bool,
+    visible_for_ms: u128,
+) -> bool {
+    !action_chosen && !suspended && visible_for_ms > 500
+}
 
 
 
@@ -310,36 +352,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_KEYDOWN => {
             if let Some(state) = state_of(hwnd) {
                 let vk = wparam.0 as u16;
-                let n = state.thumbs.len() as i32;
-                match vk {
-                    v if v == VK_ESCAPE.0 => finish(hwnd, state, PickAction::Cancel),
-                    v if v == VK_RETURN.0 => {
-                        finish(hwnd, state, PickAction::Choose(state.hover.max(0) as usize))
+                match key_action(vk, state.hover, state.thumbs.len()) {
+                    Some(KeyAction::Cancel) => finish(hwnd, state, PickAction::Cancel),
+                    Some(KeyAction::Choose(index)) => {
+                        finish(hwnd, state, PickAction::Choose(index))
                     }
-                    v if v == VK_E => {
-                        finish(hwnd, state, PickAction::Edit(state.hover.max(0) as usize))
-                    }
-                    0x54 => {
-                        // T
-                        finish(hwnd, state, PickAction::Tweak(state.hover.max(0) as usize))
-                    }
-                    0x50 => finish(hwnd, state, PickAction::Pin), // P
-                    0x43 => finish(hwnd, state, PickAction::CopyText), // C
-                    v if v == VK_LEFT.0 => {
-                        state.hover = (state.hover.max(0) - 1).rem_euclid(n);
+                    Some(KeyAction::Edit(index)) => finish(hwnd, state, PickAction::Edit(index)),
+                    Some(KeyAction::Tweak(index)) => finish(hwnd, state, PickAction::Tweak(index)),
+                    Some(KeyAction::Pin) => finish(hwnd, state, PickAction::Pin),
+                    Some(KeyAction::CopyText) => finish(hwnd, state, PickAction::CopyText),
+                    Some(KeyAction::Hover(index)) => {
+                        state.hover = index;
                         let _ = InvalidateRect(hwnd, None, false);
                     }
-                    v if v == VK_RIGHT.0 => {
-                        state.hover = (state.hover + 1).rem_euclid(n);
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
-                    v if (0x31..=0x39).contains(&v) => {
-                        let idx = (v - 0x31) as i32;
-                        if idx < n {
-                            finish(hwnd, state, PickAction::Choose(idx as usize));
-                        }
-                    }
-                    _ => {}
+                    None => {}
                 }
             }
             LRESULT(0)
@@ -348,9 +374,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Clicking away cancels — but ignore the initial activation churn.
             if let Some(state) = state_of(hwnd) {
                 if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE
-                    && state.action.is_none()
-                    && !state.suspended
-                    && state.shown_at.elapsed().as_millis() > 500
+                    && should_cancel_on_deactivate(
+                        state.action.is_some(),
+                        state.suspended,
+                        state.shown_at.elapsed().as_millis(),
+                    )
                 {
                     finish(hwnd, state, PickAction::Cancel);
                 }
@@ -478,5 +506,48 @@ pub fn pick(
     }
 
     Ok(state.action.unwrap_or(PickAction::Cancel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{key_action, should_cancel_on_deactivate, KeyAction, VK_E};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
+    };
+
+    #[test]
+    fn picker_shortcuts_choose_the_visible_variant() {
+        assert_eq!(key_action(VK_RETURN.0, 3, 7), Some(KeyAction::Choose(3)));
+        assert_eq!(key_action(VK_E, 3, 7), Some(KeyAction::Edit(3)));
+        assert_eq!(key_action(0x54, 3, 7), Some(KeyAction::Tweak(3)));
+        assert_eq!(key_action(0x50, 3, 7), Some(KeyAction::Pin));
+        assert_eq!(key_action(0x43, 3, 7), Some(KeyAction::CopyText));
+        assert_eq!(key_action(VK_ESCAPE.0, 3, 7), Some(KeyAction::Cancel));
+    }
+
+    #[test]
+    fn picker_arrows_wrap_and_recover_an_unset_hover() {
+        assert_eq!(key_action(VK_LEFT.0, 0, 7), Some(KeyAction::Hover(6)));
+        assert_eq!(key_action(VK_RIGHT.0, 6, 7), Some(KeyAction::Hover(0)));
+        assert_eq!(key_action(VK_RIGHT.0, -1, 7), Some(KeyAction::Hover(0)));
+        assert_eq!(key_action(VK_LEFT.0, -1, 7), Some(KeyAction::Hover(6)));
+    }
+
+    #[test]
+    fn numeric_shortcuts_cannot_select_a_missing_variant() {
+        assert_eq!(key_action(0x31, 0, 7), Some(KeyAction::Choose(0)));
+        assert_eq!(key_action(0x37, 0, 7), Some(KeyAction::Choose(6)));
+        assert_eq!(key_action(0x38, 0, 7), None);
+        assert_eq!(key_action(VK_RETURN.0, 0, 0), None);
+        assert_eq!(key_action(VK_RIGHT.0, 0, 0), None);
+    }
+
+    #[test]
+    fn focus_loss_only_cancels_a_stable_unsuspended_picker() {
+        assert!(!should_cancel_on_deactivate(false, false, 500));
+        assert!(should_cancel_on_deactivate(false, false, 501));
+        assert!(!should_cancel_on_deactivate(true, false, 1_000));
+        assert!(!should_cancel_on_deactivate(false, true, 1_000));
+    }
 }
 

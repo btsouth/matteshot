@@ -90,7 +90,8 @@ Keep all three in sync if the design changes.
   not enough.** `.\scripts\verify-code.ps1` is the shared code gate used by CI,
   signed-candidate builds, and tagged releases: all tests, strict Clippy, then a
   release build. Use `-SkipReleaseBuild` only while the resident owns the local
-  release binary.
+  release binary. The surfaces that must remain human-driven are covered by
+  `INTERACTIVE-REGRESSION.md`; a failed or ambiguous row blocks release.
 - **NEVER run `--once --pick N` or anything that writes his clipboard** while
   he's active; he has complained about test artifacts on his clipboard.
 - **Never inject keyboard/mouse input during his work hours** — foreground
