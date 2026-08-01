@@ -5,7 +5,7 @@ Owner: Brandon Tyler South, who goes by **Tyler** (the code-signing certificate
 reads `CN=Brandon South`, which is the legal name and is deliberate — the
 updater pins that exact string). Works in IT/cybersecurity; this is his
 commercial side project. Repo: `tsouth89/matteshot` (private). Everything below
-is current as of v0.12.0.
+is current as of v0.13.0.
 
 ## What this is
 
@@ -49,7 +49,7 @@ Read `README.md` for the full feature map and architecture — it is accurate.
    momentarily out of step with its checksum, which would fail every client's
    hash gate. The custom domain can lag a Pages deploy by ~15s.
 
-**v0.12.0 is fully shipped**: signed, uploaded to R2 (versioned + stable, verified matching its published checksum on the public URL), version.json bumped to 0.12.0 pointing at the versioned installer. Nothing in flight.
+**v0.13.0 is fully shipped**: signed, uploaded to R2 (versioned + stable, verified matching its published checksum on the public URL), version.json bumped to 0.13.0 pointing at the versioned installer. It includes faster PrtScn activation, the refined photo editor controls and sizing flow, and all nine photo annotation tools in the video editor. Nothing in flight.
 
 **The app updates itself.** `installer.rs` downloads the signed installer,
 requires the published SHA-256 to match and Authenticode to be valid with the
