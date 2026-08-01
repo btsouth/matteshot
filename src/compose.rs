@@ -6,8 +6,12 @@ use rayon::prelude::*;
 use crate::style::{Backdrop, Rgb, Style};
 
 /// Product default for automatic matte framing. Editors may override it
-/// within their 4–18% range, while hand-tuned assets can opt out entirely.
+/// within their slider range, while hand-tuned assets can opt out entirely.
 pub const DEFAULT_PAD_FACTOR: f32 = 0.08;
+/// Tight enough for deliberate edge-to-edge compositions. `layout` still
+/// enforces its pixel safety floor so shadows and rounded corners have room.
+pub const PAD_SLIDER_MIN: f32 = 0.015;
+pub const PAD_SLIDER_MAX: f32 = 0.18;
 
 /// Antialiased coverage for a rounded-rect mask at pixel (x, y).
 fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
@@ -385,7 +389,9 @@ pub fn blend_bgra_content(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_with, ComposeOpts};
+    use super::{
+        compose_with, layout, ComposeOpts, PAD_SLIDER_MAX, PAD_SLIDER_MIN,
+    };
     use crate::style::{Backdrop, Rgb, Style};
     use image::{Rgba, RgbaImage};
 
@@ -421,7 +427,7 @@ mod tests {
             &raw,
             &style(),
             &ComposeOpts {
-                pad_factor: 0.04,
+                pad_factor: PAD_SLIDER_MIN,
                 ..Default::default()
             },
         );
@@ -429,7 +435,7 @@ mod tests {
             &raw,
             &style(),
             &ComposeOpts {
-                pad_factor: 0.18,
+                pad_factor: PAD_SLIDER_MAX,
                 ..Default::default()
             },
         );
@@ -438,6 +444,16 @@ mod tests {
         assert!(default.width() < roomy.width());
         assert!(roomy.width() > tight.width());
         assert!(roomy.height() > tight.height());
+    }
+
+    #[test]
+    fn tight_padding_reaches_desktop_edges_without_losing_the_safety_floor() {
+        let opts = ComposeOpts { pad_factor: PAD_SLIDER_MIN, ..Default::default() };
+        let desktop = layout(2560, 1440, &opts);
+        let small = layout(800, 450, &opts);
+
+        assert!((28..=29).contains(&desktop.pad));
+        assert_eq!(small.pad, 24);
     }
 }
 
