@@ -439,46 +439,6 @@ fn preview_draw_geometry(
     (dx, dy, source_scale, dw, dh)
 }
 
-/// Keep the selected output size visible in the editor. The fitted preview is
-/// treated as Original size; smaller exports occupy proportionally less of the
-/// viewport. Extremely small exports retain a practical editing floor.
-fn output_preview_geometry(
-    preview_box: RECT,
-    preview_w: i32,
-    preview_h: i32,
-    quality_scale: f32,
-    output_scale: f32,
-) -> (i32, i32, f32, i32, i32) {
-    let (_, _, source_scale, fitted_w, fitted_h) =
-        preview_draw_geometry(preview_box, preview_w, preview_h, quality_scale);
-    let output_scale = output_scale.clamp(0.30, 1.0);
-    let draw_scale = source_scale * output_scale;
-    let (dw, dh) = (
-        (fitted_w as f32 * output_scale).round() as i32,
-        (fitted_h as f32 * output_scale).round() as i32,
-    );
-    let (bw, bh) = (
-        preview_box.right - preview_box.left,
-        preview_box.bottom - preview_box.top,
-    );
-    let (dx, dy) = (
-        preview_box.left + (bw - dw) / 2,
-        preview_box.top + (bh - dh) / 2,
-    );
-    (dx, dy, draw_scale, dw, dh)
-}
-
-fn output_preview_scale(state: &State) -> f32 {
-    let composed = composed_dimensions(state);
-    let finished = final_dimensions(state);
-    let composed_edge = composed.0.max(composed.1);
-    if composed_edge == 0 {
-        1.0
-    } else {
-        finished.0.max(finished.1) as f32 / composed_edge as f32
-    }
-}
-
 fn preview_quality_scale(state: &State) -> f32 {
     let active_metric = preview_source(state).1;
     if active_metric > 0.0 {
@@ -490,12 +450,11 @@ fn preview_quality_scale(state: &State) -> f32 {
 
 /// Shared view transform: preview blit offset/scale and content padding.
 fn view_params(state: &State) -> (i32, i32, f32, f32, f32) {
-    let (dx, dy, draw_scale, _, _) = output_preview_geometry(
+    let (dx, dy, draw_scale, _, _) = preview_draw_geometry(
         state.preview_box,
         state.doc().preview_w,
         state.doc().preview_h,
         preview_quality_scale(state),
-        output_preview_scale(state),
     );
     if compose::is_plain(&state.doc().styles[state.doc().sel]) {
         return (dx, dy, draw_scale, 0.0, 0.0);
@@ -901,6 +860,15 @@ fn final_dimensions(state: &State) -> (u32, u32) {
     output::resized_dimensions(width, height, state.doc().output_max_edge)
 }
 
+fn output_size_summary(max_edge: u32, dimensions: (u32, u32)) -> String {
+    format!(
+        "{}  \u{00b7}  {} \u{00d7} {} px",
+        output::output_size_label(max_edge),
+        dimensions.0,
+        dimensions.1
+    )
+}
+
 fn custom_size_axis(dimensions: (u32, u32)) -> &'static str {
     if dimensions.0 >= dimensions.1 { "width" } else { "height" }
 }
@@ -1114,12 +1082,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
     paint_tabs(hdc, state);
 
     // Preview, letterboxed into its box.
-    let (dx, dy, _, dw, dh) = output_preview_geometry(
+    let (dx, dy, _, dw, dh) = preview_draw_geometry(
         state.preview_box,
         state.doc().preview_w,
         state.doc().preview_h,
         preview_quality_scale(state),
-        output_preview_scale(state),
     );
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -1352,7 +1319,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
             hdc,
             state,
             RECT { left: r.left, top: r.top - lh, right: r.left + (216.0 * state.scale) as i32, bottom: r.top },
-            &format!("Final size: {width} × {height} px"),
+            &output_size_summary(state.doc().output_max_edge, (width, height)),
         );
     }
 
@@ -3473,7 +3440,7 @@ mod tests {
         active_after_close, ann_bounds, annotation_tool_index, apply_custom_size_input,
         apply_text_input, custom_size_axis, custom_size_bounds, custom_size_result,
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
-        output_preview_geometry, preview_draw_geometry, redacted, tab_for_digit,
+        output_size_summary, preview_draw_geometry, redacted, tab_for_digit,
         tool_stays_active_after_use,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
         PEN_TOOL, TOOLS,
@@ -3733,24 +3700,15 @@ mod tests {
     }
 
     #[test]
-    fn output_size_changes_are_visible_without_moving_the_preview() {
-        let preview_box = RECT { left: 100, top: 50, right: 1100, bottom: 750 };
-        let original = output_preview_geometry(preview_box, 960, 600, 1.0, 1.0);
-        let compact = output_preview_geometry(preview_box, 960, 600, 1.0, 0.5);
-        let tiny = output_preview_geometry(preview_box, 960, 600, 1.0, 0.1);
-
-        assert_eq!((compact.3, compact.4), (original.3 / 2, original.4 / 2));
-        assert!(compact.0 > original.0 && compact.1 > original.1);
-        assert_eq!(compact.0 + compact.3 / 2, original.0 + original.3 / 2);
-        assert_eq!(compact.1 + compact.4 / 2, original.1 + original.4 / 2);
-        // Keep very small outputs editable while still making the reduction
-        // unmistakable.
-        assert_eq!(tiny.3, (original.3 as f32 * 0.30).round() as i32);
-        assert_eq!(tiny.4, (original.4 as f32 * 0.30).round() as i32);
-
-        let draft = output_preview_geometry(preview_box, 480, 300, 2.0, 0.5);
-        assert_eq!((draft.0, draft.1, draft.3, draft.4), (compact.0, compact.1, compact.3, compact.4));
-        assert!((draft.2 - compact.2 * 2.0).abs() < f32::EPSILON);
+    fn output_size_feedback_names_the_choice_and_exact_pixels() {
+        assert_eq!(
+            output_size_summary(crate::output::OUTPUT_EMAIL, (1495, 1600)),
+            "Email  \u{00b7}  1495 \u{00d7} 1600 px"
+        );
+        assert_eq!(
+            output_size_summary(crate::output::OUTPUT_COMPACT, (1121, 1200)),
+            "Compact  \u{00b7}  1121 \u{00d7} 1200 px"
+        );
     }
 
     #[test]
