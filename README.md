@@ -92,6 +92,7 @@ matteshot --ocr-words <substr|png> # print every OCR word box in capture coordin
 matteshot --update-test      # probe version.json; never downloads
 matteshot --update-stage-test [url] # download + verify hash and signature; never installs
 matteshot --verify-signature-test <exe> # Authenticode gate: accept ours, reject everything else
+matteshot --update-install-now [url] # the real thing: download, verify, install silently
 matteshot --settings         # open the settings window directly
 matteshot --once --tweak     # capture the foreground window and open the tweak editor
 ```

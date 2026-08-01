@@ -1,9 +1,11 @@
 # Matteshot — agent handoff
 
 Written 2026-07-30 by the previous agent (Claude) for whoever picks this up.
-Owner: Brandon South (works in IT/cybersecurity; this is his commercial side
-project). Repo: `tsouth89/matteshot` (private). Everything below is current as
-of v0.9.1.
+Owner: Brandon Tyler South, who goes by **Tyler** (the code-signing certificate
+reads `CN=Brandon South`, which is the legal name and is deliberate — the
+updater pins that exact string). Works in IT/cybersecurity; this is his
+commercial side project. Repo: `tsouth89/matteshot` (private). Everything below
+is current as of v0.11.1.
 
 ## What this is
 
@@ -44,9 +46,18 @@ Read `README.md` for the full feature map and architecture — it is accurate.
    and the stable `MatteshotSetup.exe`.
 5. Update `public/version.json` in the site repo, deploy, purge zone cache.
 
-**v0.9.1 is fully shipped**: signed (verified `Valid`, CN=Brandon South),
-uploaded to R2 (versioned + stable), version.json bumped to 0.9.1, zone cache
-purged. Nothing in flight.
+**v0.11.1 is fully shipped**: signed (verified `Valid`, CN=Brandon South),
+uploaded to R2 (versioned + stable), version.json bumped to 0.11.1 pointing at
+the versioned installer. `CLOUDFLARE_R2_API_TOKEN` now exists in the `release`
+environment, so R2 publishing is automatic. Nothing in flight.
+
+**The app updates itself.** `installer.rs` downloads the signed installer,
+requires the published SHA-256 to match and Authenticode to be valid with the
+subject `Brandon South`, then runs it `/VERYSILENT` under `SW_HIDE`. Verified
+end to end: 0.11.0 updated itself to 0.11.1 unattended with no window shown.
+Test flags: `--update-test`, `--update-stage-test [url]`,
+`--verify-signature-test <exe>`, `--update-install-now [url]` (this one really
+installs).
 
 ## The app icon / brand
 
@@ -91,15 +102,24 @@ must SetWindowPos topmost→notopmost to surface); AdjustWindowRectEx always.
 
 ## TODO queue (in priority order)
 
-1. **Brandon**: add secret `CLOUDFLARE_R2_API_TOKEN` to matteshot repo →
-   Settings → Environments → release (same value as cubby-clipboard's). Then
-   releases self-publish to R2.
-2. **In-app update check**: on startup (and daily), fetch
-   `https://matteshot.app/version.json`, compare to `env!("CARGO_PKG_VERSION")`,
-   tray balloon + menu item when newer. Keep it silent on failure. No auto-download.
-4. **winget manifest**: unblocked (signed installer at stable public URL).
-   `winget-pkgs` PR: package id `SouthForgeAI.Matteshot`, installer type inno,
-   use the VERSIONED R2 URL (winget requires stable per-version URLs + sha256).
+1. **Tyler**: grant the release Cloudflare token **Zone → Cache Purge** on zone
+   `771cdfef44652b2f2e10751563682e19`. `download.matteshot.app` returns
+   `cache-control: max-age=14400`, so after a release the *stable*
+   `MatteshotSetup.exe` keeps serving the PREVIOUS installer for up to four
+   hours while its `.sha256` already describes the new one. The release
+   workflow tries to purge and currently gets a Cloudflare 10000
+   (Authentication error), so it only warns. Uploads now set a 60s TTL on the
+   stable objects, so this stops recurring once the current cached entry
+   expires, but until the permission exists a release cannot correct the edge
+   immediately. **Auto-update is not affected** — it reads the immutable
+   versioned URL on purpose.
+2. **winget manifest**: unblocked (signed installer, versioned public URL,
+   published sha256). `winget-pkgs` PR: package id `SouthForgeAI.Matteshot`,
+   installer type inno, VERSIONED R2 URL (winget requires stable per-version
+   URLs + sha256). Local clone of `winget-pkgs` is next to this repo.
+3. **version.json is still hand-maintained** in the site repo after each
+   release, and it must point `download` at the VERSIONED installer or
+   auto-update breaks on edge caching. Worth folding into the release workflow.
 5. **Stripe checkout + license keys**: $19 one-time (price `$12.99` launch
    coupon). Suggested shape: Stripe Payment Link or Checkout → webhook on a
    Cloudflare Worker → generate license key (signed token), email via Resend
