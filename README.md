@@ -104,6 +104,14 @@ matteshot --tweak-tabs-test <title>... # open several captures as tabs in one ed
 
 Capture-producing diagnostic commands honor the same trial and license gate as the resident app.
 
+Run every headless probe at once and fail loudly if one breaks:
+
+```powershell
+.\scripts\run-probes.ps1
+```
+
+Covers capture, OCR, playback, all three export paths, and the auto-update trust gates (ours accepted, a foreign signature and a tampered copy both refused). Safe to run while working: it writes no clipboard, injects no input (`--scroll-test` is opt-in behind `-IncludeScroll`), and opens no window unless it has to record a fixture. `-Offline` skips the network checks. The interactive surfaces — picker, editors, overlay — still need a human.
+
 Release acceptance runs in Windows Sandbox with clipboard redirection disabled:
 
 ```powershell

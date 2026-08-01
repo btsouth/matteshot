@@ -80,6 +80,14 @@ Keep all three in sync if the design changes.
   `--scroll-test <title>` (+ env `MATTESHOT_SCROLL_DEBUG=1`), `--record-test`,
   `--trim-test`, `--ocr`, `--assets <title> <dir>` (marketing exports),
   `--icon [dir]`, `--settings`, `--tweak`, `--once [--window <t>] [--pick N]`.
+- **Run `.\scripts\run-probes.ps1` before calling anything done.** It runs every
+  headless probe (capture, OCR, playback, all three export paths, the
+  auto-update trust gates) and fails loudly. It is safe mid-work: no clipboard,
+  no injected input, no windows. Two silent breakages got shipped for want of
+  this — `--video-edit-test` was broken for weeks, and clippy was red through a
+  release. `reliability-soak.ps1` covers the static side (test, clippy, audit);
+  **CI gates on `cargo clippy -- -D warnings`, so build+test passing locally is
+  not enough.**
 - **NEVER run `--once --pick N` or anything that writes his clipboard** while
   he's active; he has complained about test artifacts on his clipboard.
 - **Never inject keyboard/mouse input during his work hours** — foreground
