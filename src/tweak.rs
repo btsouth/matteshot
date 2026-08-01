@@ -3020,6 +3020,21 @@ mod tests {
     }
 
     #[test]
+    fn successful_copy_returns_the_saved_path() {
+        let saved = PathBuf::from(r"C:\captures\finished.png");
+        let copied = Cell::new(false);
+        let result = persist_and_copy_with(
+            || Ok(saved.clone()),
+            |path| {
+                copied.set(path == saved);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap(), saved);
+        assert!(copied.get());
+    }
+
+    #[test]
     fn closing_a_tab_lands_on_the_right_neighbour() {
         // [a b* c] close c -> b stays active at 1.
         assert_eq!(active_after_close(1, 2, 2), 1);
