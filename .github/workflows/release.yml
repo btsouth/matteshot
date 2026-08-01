@@ -50,11 +50,14 @@ jobs:
           }
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --release
+      - name: Verify code
+        shell: pwsh
+        run: .\scripts\verify-code.ps1
 
       - name: Sign in to Azure with GitHub OIDC
         uses: azure/login@v3

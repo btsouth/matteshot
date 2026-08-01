@@ -87,7 +87,10 @@ Keep all three in sync if the design changes.
   this — `--video-edit-test` was broken for weeks, and clippy was red through a
   release. `reliability-soak.ps1` covers the static side (test, clippy, audit);
   **CI gates on `cargo clippy -- -D warnings`, so build+test passing locally is
-  not enough.**
+  not enough.** `.\scripts\verify-code.ps1` is the shared code gate used by CI,
+  signed-candidate builds, and tagged releases: all tests, strict Clippy, then a
+  release build. Use `-SkipReleaseBuild` only while the resident owns the local
+  release binary.
 - **NEVER run `--once --pick N` or anything that writes his clipboard** while
   he's active; he has complained about test artifacts on his clipboard.
 - **Never inject keyboard/mouse input during his work hours** — foreground

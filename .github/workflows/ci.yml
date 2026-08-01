@@ -36,11 +36,6 @@ jobs:
           ).Groups[1].Value
           .\scripts\validate-release-version.ps1 -Tag "v$version"
 
-      - name: Test
-        run: cargo test --all-targets --all-features
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Release build
-        run: cargo build --release
+      - name: Verify code
+        shell: pwsh
+        run: .\scripts\verify-code.ps1
