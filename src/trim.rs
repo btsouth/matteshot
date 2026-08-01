@@ -31,6 +31,17 @@ pub struct PlaybackFrame {
     pub timestamp: i64,
 }
 
+fn fit_inside(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let (w, h) = (w.max(1), h.max(1));
+    let scale = (max_w.max(1) as f64 / w as f64)
+        .min(max_h.max(1) as f64 / h as f64)
+        .min(1.0);
+    (
+        (w as f64 * scale).round().max(1.0) as u32,
+        (h as f64 * scale).round().max(1.0) as u32,
+    )
+}
+
 fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u32, i32)> {
     unsafe {
         // Without video processing the reader only emits the native format
@@ -147,7 +158,13 @@ pub fn preview_frame(
     let (bgra, _) = read_video_frame(&reader, w, h, stride)?
         .context("video has no frame at the requested position")?;
     let rgba = bgra_to_rgba(&bgra, w, h);
-    let scaled = image::imageops::thumbnail(&rgba, max_w.max(2), max_h.max(2));
+    let (target_w, target_h) = fit_inside(w, h, max_w.max(2), max_h.max(2));
+    let scaled = image::imageops::resize(
+        &rgba,
+        target_w,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    );
     let (sw, sh) = scaled.dimensions();
     Ok((rgba_to_bgra(&scaled, sw, sh), sw, sh))
 }
@@ -209,7 +226,13 @@ pub fn playback_frames(
         }
 
         let rgba = bgra_to_rgba(&bgra, w, h);
-        let scaled = image::imageops::thumbnail(&rgba, max_w.max(2), max_h.max(2));
+        let (target_w, target_h) = fit_inside(w, h, max_w.max(2), max_h.max(2));
+        let scaled = image::imageops::resize(
+            &rgba,
+            target_w,
+            target_h,
+            image::imageops::FilterType::Triangle,
+        );
         let (width, height) = scaled.dimensions();
         if !deliver(PlaybackFrame {
             bytes: rgba_to_bgra(&scaled, width, height),
@@ -606,7 +629,14 @@ pub fn cut_with_edit_progress_cancel(
 
 #[cfg(test)]
 mod tests {
-    use super::{bgra_to_rgba, rgba_to_bgra, validate_video};
+    use super::{bgra_to_rgba, fit_inside, rgba_to_bgra, validate_video};
+
+    #[test]
+    fn preview_fit_preserves_the_recorded_aspect_ratio() {
+        assert_eq!(fit_inside(1920, 1036, 960, 540), (960, 518));
+        assert_eq!(fit_inside(1920, 1036, 1600, 420), (778, 420));
+        assert_eq!(fit_inside(640, 480, 1920, 1080), (640, 480));
+    }
 
     #[test]
     fn video_pixel_channel_conversion_round_trips() {

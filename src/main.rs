@@ -973,10 +973,12 @@ fn main() -> Result<()> {
         Some("--playback-test") => {
             let src =
                 std::path::PathBuf::from(args.get(1).context("--playback-test <mp4>")?);
+            let paused = trim::preview_frame(&src, 0, 960, 540)?;
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let started = std::time::Instant::now();
             let mut frames = 0u32;
             let mut last = 0i64;
+            let mut playback_size = None;
             trim::playback_frames(
                 &src,
                 0,
@@ -987,11 +989,16 @@ fn main() -> Result<()> {
                 |frame| {
                     frames += 1;
                     last = frame.timestamp;
+                    playback_size.get_or_insert((frame.width, frame.height));
                     true
                 },
             )?;
             eprintln!(
-                "playback: {frames} frames through {:.2}s in {:.2}s",
+                "paused: {}x{} · playback: {}x{} · {frames} frames through {:.2}s in {:.2}s",
+                paused.1,
+                paused.2,
+                playback_size.unwrap_or_default().0,
+                playback_size.unwrap_or_default().1,
                 last as f64 / 10_000_000.0,
                 started.elapsed().as_secs_f64()
             );

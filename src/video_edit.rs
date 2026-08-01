@@ -125,12 +125,16 @@ pub fn bounds(item: &Item) -> (f32, f32, f32, f32) {
             (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
         }
         Shape::Text { pos, text } => {
-            let width = (text.chars().count() as f32 * 0.018 * item.size).clamp(0.06, 0.72);
-            let height = 0.055 * item.size;
+            // Caption glyphs are sized from video height. The earlier generic
+            // estimate treated every character as a percentage of video
+            // width, producing selection boxes several times wider than the
+            // rendered caption on landscape footage.
+            let width = (text.chars().count() as f32 * 0.0055 * item.size).clamp(0.04, 0.62);
+            let height = 0.035 * item.size;
             let pad = if item.caption_style == CaptionStyle::Box {
-                0.014 * item.size
-            } else {
                 0.006 * item.size
+            } else {
+                0.003 * item.size
             };
             (
                 (pos.0 - pad).max(0.0),
