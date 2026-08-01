@@ -1237,8 +1237,8 @@ fn draw_shape_is_degenerate(shape: &crate::video_edit::Shape) -> bool {
 fn next_counter_number(annotations: &[crate::video_edit::Item]) -> u32 {
     annotations
         .iter()
-        .filter_map(|item| match item.shape {
-            crate::video_edit::Shape::Counter { n, .. } => Some(n),
+        .filter_map(|item| match &item.shape {
+            crate::video_edit::Shape::Counter { n, .. } => Some(*n),
             _ => None,
         })
         .max()
