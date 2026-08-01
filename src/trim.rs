@@ -23,7 +23,6 @@ pub struct Probe {
     pub thumbs: Vec<(Vec<u8>, u32, u32)>,
     /// Higher-quality BGRA frames used while scrubbing in the editor.
     pub previews: Vec<(Vec<u8>, u32, u32)>,
-    pub source_size: (u32, u32),
 }
 
 /// The cheap half of a probe: everything the editor needs to appear.
@@ -51,6 +50,44 @@ fn fit_inside(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
         (w as f64 * scale).round().max(1.0) as u32,
         (h as f64 * scale).round().max(1.0) as u32,
     )
+}
+
+/// H.264 tops out near 9.4M luma samples in a frame. A matte with a forced
+/// aspect can compose a large recording well past that, and Media Foundation
+/// then refuses the media type with nothing useful to say.
+///
+/// Shrink the *content* until the framed result fits, rather than failing the
+/// export. Returns the content size to feed the compositor; equal to the input
+/// whenever nothing needs to give, which is the overwhelmingly common case.
+fn content_size_for_encoder(
+    w: u32,
+    h: u32,
+    opts: &crate::compose::ComposeOpts,
+    framed: bool,
+) -> (u32, u32) {
+    const MAX_PIXELS: u64 = 9_400_000;
+    let even = |v: u32| (v.max(2)) & !1;
+    let composed = |cw: u32, ch: u32| -> u64 {
+        if !framed {
+            return cw as u64 * ch as u64;
+        }
+        let layout = crate::compose::layout(cw as usize, ch as usize, opts);
+        (cw as u64 + layout.pad_x as u64 * 2) * (ch as u64 + layout.pad_y as u64 * 2)
+    };
+    let (mut cw, mut ch) = (w.max(2), h.max(2));
+    // Padding is proportional to the content, so shrinking shrinks the frame
+    // too and this converges quickly. The 0.98 keeps it from stalling right on
+    // the boundary.
+    for _ in 0..16 {
+        let pixels = composed(cw, ch);
+        if pixels <= MAX_PIXELS {
+            break;
+        }
+        let factor = (MAX_PIXELS as f64 / pixels as f64).sqrt() * 0.98;
+        cw = ((cw as f64 * factor) as u32).max(2);
+        ch = ((ch as f64 * factor) as u32).max(2);
+    }
+    (even(cw), even(ch))
 }
 
 fn scrub_cache_plan(
@@ -370,7 +407,6 @@ fn probe_impl(
         duration_100ns: duration,
         thumbs,
         previews,
-        source_size: (w, h),
     })
 }
 
@@ -598,10 +634,17 @@ pub fn cut_with_edit_progress_cancel(
         Some((style, opts)) if !crate::compose::is_plain(style) => (Some(style), *opts),
         _ => (None, crate::compose::ComposeOpts::default()),
     };
-    let matte_base =
-        matte.map(|style| crate::compose::compose_base(w as usize, h as usize, style, &matte_opts));
+    // Content may have to shrink so the framed result stays encodable.
+    let (cw, ch) = content_size_for_encoder(w, h, &matte_opts, matte.is_some());
+    let downscaled = (cw, ch) != (w, h);
+    if downscaled {
+        crate::diagnostics::log("export content scaled down to stay encodable");
+        eprintln!("export: content {w}x{h} -> {cw}x{ch} so the framed result fits H.264");
+    }
+    let matte_base = matte
+        .map(|style| crate::compose::compose_base(cw as usize, ch as usize, style, &matte_opts));
     let annotation_offset = if matte_base.is_some() {
-        let layout = crate::compose::layout(w as usize, h as usize, &matte_opts);
+        let layout = crate::compose::layout(cw as usize, ch as usize, &matte_opts);
         (layout.pad_x as f32, layout.pad_y as f32)
     } else {
         (0.0, 0.0)
@@ -609,9 +652,9 @@ pub fn cut_with_edit_progress_cancel(
     let (ow, oh) = matte_base
         .as_ref()
         .map(|base| (even(base.width()), even(base.height())))
-        .unwrap_or_else(|| (even(w), even(h)));
+        .unwrap_or_else(|| (even(cw), even(ch)));
     let (writer, vstream, astream) = unsafe {
-        crate::record::make_sink_for_content(dst, ow, oh, even(w), even(h), audio_fmt.as_ref())?
+        crate::record::make_sink_for_content(dst, ow, oh, even(cw), even(ch), audio_fmt.as_ref())?
     };
 
     unsafe {
@@ -621,7 +664,14 @@ pub fn cut_with_edit_progress_cancel(
 
     let row = (ow * 4) as usize;
     let source_row = (w * 4) as usize;
+    let content_row = (cw * 4) as usize;
     let mut raw = vec![0u8; source_row * h as usize];
+    // Only allocated when the content actually has to shrink.
+    let mut scaled_content = if downscaled {
+        vec![0u8; content_row * ch as usize]
+    } else {
+        Vec::new()
+    };
     let mut plain_out = vec![0u8; row * oh as usize];
     let mut composed_frame = if let Some(base) = &matte_base {
         Some(base.clone())
@@ -689,33 +739,55 @@ pub fn cut_with_edit_progress_cancel(
                 }
                 buf.Unlock()?;
 
+                // Everything downstream works in content coordinates, which
+                // are the source's unless the frame had to shrink to stay
+                // encodable.
+                let content: &[u8] = if downscaled {
+                    let rgba = bgra_to_rgba(&raw, w, h);
+                    let small = image::imageops::resize(
+                        &rgba,
+                        cw,
+                        ch,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    scaled_content
+                        .par_chunks_exact_mut(4)
+                        .zip(small.as_raw().par_chunks_exact(4))
+                        .for_each(|(dst, src)| {
+                            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]])
+                        });
+                    &scaled_content
+                } else {
+                    &raw
+                };
+
                 let out = if let Some(composed) = composed_frame.as_mut() {
                     if let Some(base) = &matte_base {
                         composed.as_mut().copy_from_slice(base.as_raw());
                         crate::compose::blend_bgra_content(
                             composed,
-                            &raw,
-                            w as usize,
-                            h as usize,
+                            content,
+                            cw as usize,
+                            ch as usize,
                             &matte_opts,
                         );
                     } else {
-                        bgra_to_rgba_into(&raw, composed);
+                        bgra_to_rgba_into(content, composed);
                     }
                     crate::video_edit::render_at(
                         composed,
                         annotations,
                         ts,
                         None,
-                        (w, h),
+                        (cw, ch),
                         annotation_offset,
                     );
                     rgba_to_bgra_in_place(composed);
                     composed.as_raw()
                 } else {
-                    for y in 0..oh.min(h) as usize {
+                    for y in 0..oh.min(ch) as usize {
                         plain_out[y * row..(y + 1) * row]
-                            .copy_from_slice(&raw[y * source_row..y * source_row + row]);
+                            .copy_from_slice(&content[y * content_row..y * content_row + row]);
                     }
                     plain_out.as_slice()
                 };
@@ -813,6 +885,37 @@ mod tests {
         .unwrap();
         assert_eq!(rgba_to_bgra(&wide, 1, 2), vec![3, 2, 1, 255, 6, 5, 4, 200]);
         assert!(rgba_to_bgra(&wide, 0, 2).is_empty());
+    }
+
+    #[test]
+    fn oversized_framed_exports_shrink_until_h264_accepts_them() {
+        use super::content_size_for_encoder;
+        let opts = crate::compose::ComposeOpts {
+            metric_scale: 1.0,
+            pad_factor: 0.14,
+            aspect: Some(1.0),
+        };
+        let composed_pixels = |cw: u32, ch: u32| {
+            let l = crate::compose::layout(cw as usize, ch as usize, &opts);
+            (cw as u64 + l.pad_x as u64 * 2) * (ch as u64 + l.pad_y as u64 * 2)
+        };
+
+        // The real failure: 1:1 aspect on a large recording composed to
+        // 3088x3088, which is 9.5 megapixels.
+        let (cw, ch) = content_size_for_encoder(2560, 1440, &opts, true);
+        assert!(
+            composed_pixels(cw, ch) <= 9_400_000,
+            "still {} pixels at {cw}x{ch}",
+            composed_pixels(cw, ch)
+        );
+        assert!(cw < 2560 && ch < 1440, "should have shrunk");
+        assert_eq!((cw % 2, ch % 2), (0, 0), "encoder needs even dimensions");
+
+        // Ordinary sizes must pass through untouched.
+        assert_eq!(content_size_for_encoder(1920, 1080, &opts, true), (1920, 1080));
+        assert_eq!(content_size_for_encoder(960, 522, &opts, true), (960, 522));
+        // Unframed output is its own size, so only absurd sources shrink.
+        assert_eq!(content_size_for_encoder(3840, 2160, &opts, false), (3840, 2160));
     }
 
     #[test]

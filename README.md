@@ -26,7 +26,7 @@ Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips in
 
 **● Record** (V) in the overlay, then the same gesture — click a window or drag a region. A floating pill shows elapsed time with Stop (`Ctrl+Shift+R` also stops); it excludes itself from the video via `WDA_EXCLUDEFROMCAPTURE`.
 
-- H.264 MP4 via Media Foundation, ~30fps, bitrate scaled to pixel count, saved to the videos folder, file on clipboard.
+- H.264 MP4 via Media Foundation, ~30fps, bitrate scaled to pixel count, saved to the videos folder, file on clipboard. A keyframe every second: seeking decodes forward from the preceding keyframe, so the encoder default is what makes scrubbing and filmstrip loading slow, and the tighter spacing costs about 2% in file size.
 - Window recording keeps a stable canvas if the target is resized, ignores duplicate high-refresh frames, and fails clearly instead of saving an all-black capture when a hardware surface never produces an initial frame.
 - **Audio**: Off / System (WASAPI loopback) / Mic in settings. Float PCM → resampled to an AAC-legal rate (192 kHz interfaces are common; AAC takes only 44.1/48 kHz) → stereo downmix → AAC muxed into the same MP4.
 - Optional share-sized **GIF** alongside (settings toggle).
@@ -137,6 +137,7 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 - **MF AAC** rejects float PCM (`0xC00D36B4`) and non-44.1/48k rates — convert to 16-bit PCM and resample first.
 - **MF source reader**: stream 0 is not necessarily video — resolve via `GetNativeMediaType` or you'll mux garbage.
 - **AdjustWindowRectEx everywhere** — never guess non-client frame sizes.
+- **H.264 caps a frame** near 9.4M luma samples. A matte with a forced aspect can compose a large recording past that (a 2560x1392 source at 1:1 lands on 3088x3088), and Media Foundation reports only an invalid-media-type error. Exports shrink the content until the framed result fits rather than failing.
 - **OCR input is capped** at `MaxImageDimension` (2600). Oversized captures are downscaled before recognition and word boxes are scaled back out, so select-text stays aligned — but a tall scrolling stitch loses enough detail that recognition itself suffers. Tiled recognition is the fix if that matters.
 - **GDI has no alpha on `Rectangle`** — translucent overlays (select-text highlights) stretch a 1x1 solid through `AlphaBlend`.
 

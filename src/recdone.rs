@@ -3507,9 +3507,11 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
                 let target = hwnd.0 as isize;
                 std::thread::spawn(move || {
                     let com = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    let started = std::time::Instant::now();
                     let probed = crate::trim::probe_editor(
                         &source, probe_w, probe_h, preview_w, preview_h,
                     );
+                    eprintln!("timing: filmstrip + scrub cache in {:?}", started.elapsed());
                     if com.is_ok() {
                         CoUninitialize();
                     }

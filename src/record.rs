@@ -24,7 +24,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateSinkWriterFromURL, MFStartup, MFVideoFormat_H264, MFVideoFormat_RGB32,
     MFVideoInterlace_Progressive, MFMediaType_Video, MFSTARTUP_FULL, MF_MT_AVG_BITRATE,
     MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
+    MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_VERSION,
 };
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -146,6 +147,11 @@ pub unsafe fn make_sink_for_content(
     out.SetUINT64(&MF_MT_FRAME_RATE, ((FPS as u64) << 32) | 1)?;
     out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+    // A keyframe every second. Seeking decodes forward from the preceding
+    // keyframe, so the encoder's default spacing is what makes scrubbing,
+    // filmstrip probing and export seeking slow. Best-effort: some encoders
+    // ignore the hint, and it is not worth failing a recording over.
+    let _ = out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, FPS);
     let stream = writer.AddStream(&out).context("add stream")?;
 
     // Input: BGRA32, top-down (positive stride).
