@@ -2233,11 +2233,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     match &done.result {
                         Ok(()) => {
                             crate::diagnostics::log("video export complete");
-                            let _ = crate::output::file_to_clipboard(&done.path);
-                            state.status = Some(format!(
-                                "saved {} · edit on clipboard",
-                                done.path.file_name().unwrap_or_default().to_string_lossy()
-                            ));
+                            let name = done.path.file_name().unwrap_or_default().to_string_lossy();
+                            state.status = Some(match crate::output::file_to_clipboard(&done.path) {
+                                Ok(()) => format!("saved {name} · edit on clipboard"),
+                                Err(error) => {
+                                    crate::diagnostics::log("video export clipboard copy failed");
+                                    eprintln!("video export clipboard copy failed: {error:#}");
+                                    format!("saved {name} · clipboard unavailable")
+                                }
+                            });
                             state.exported = Some(done.path.clone());
                         }
                         Err(error) if error == "export cancelled" => {
@@ -2871,7 +2875,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Act::Play => toggle_playback(hwnd, state),
                         Act::Reveal => crate::output::reveal_in_explorer(&state.mp4),
                         Act::Copy => {
-                            let _ = crate::output::file_to_clipboard(&state.mp4);
+                            state.status = Some(match crate::output::file_to_clipboard(&state.mp4) {
+                                Ok(()) => "original copied to clipboard".into(),
+                                Err(error) => {
+                                    crate::diagnostics::log("video clipboard copy failed");
+                                    eprintln!("video clipboard copy failed: {error:#}");
+                                    "could not copy original to the clipboard".into()
+                                }
+                            });
+                            let _ = InvalidateRect(hwnd, None, false);
                         }
                         Act::Delete => {
                             if state.exporting {
@@ -3362,7 +3374,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 /// Show the review window. Returns immediately; lives on the main loop.
-pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Result<()> {
+pub fn show(
+    mp4: PathBuf,
+    gif: Option<PathBuf>,
+    frames: u32,
+    secs: u64,
+    initial_status: Option<String>,
+) -> Result<()> {
     if let Some(parent) = mp4.parent() {
         crate::output::cleanup_stale_video_partials(parent);
     }
@@ -3495,7 +3513,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         timing_controls: initial.timing_controls,
         undo_control: initial.undo_control,
         delete_control: initial.delete_control,
-        status: None,
+        status: initial_status,
         exported: None,
         exporting: false,
         export_id: None,

@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use image::RgbaImage;
-use windows::core::w;
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, HALFTONE,
@@ -15,8 +15,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongPtrW, LoadCursorW,
-    RegisterClassW, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HTCAPTION, HWND_TOPMOST, IDC_SIZEALL, SWP_NOMOVE, SWP_NOZORDER,
+    MessageBoxW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, HTCAPTION, HWND_TOPMOST, IDC_SIZEALL, MB_ICONWARNING, MB_OK, SWP_NOMOVE, SWP_NOZORDER,
     WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
     WM_NCLBUTTONDBLCLK, WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     WS_VISIBLE,
@@ -63,7 +63,18 @@ unsafe fn context_menu(hwnd: HWND) {
                         &img,
                         crate::config::Config::load().output_max_edge,
                     );
-                    let _ = crate::output::to_clipboard(&img, None);
+                    if let Err(error) = crate::output::to_clipboard(&img, None) {
+                        crate::diagnostics::log("pinned image clipboard copy failed");
+                        let message = HSTRING::from(format!(
+                            "The pinned image could not be copied. The pin is still open so you can try again.\n\n{error:#}"
+                        ));
+                        let _ = MessageBoxW(
+                            hwnd,
+                            PCWSTR(message.as_ptr()),
+                            w!("Matteshot"),
+                            MB_OK | MB_ICONWARNING,
+                        );
+                    }
                 }
             }
         }

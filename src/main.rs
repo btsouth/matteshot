@@ -201,6 +201,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     }
     let auto = std::sync::Arc::new(std::sync::Mutex::new(AutoCopy { canceled: false, path: None }));
     let preselect = cfg.last_style.min(styles.len().saturating_sub(1));
+    let mut auto_worker = None;
 
     let action = match pick_override {
         Some(i) => {
@@ -216,7 +217,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 let style = styles[preselect].clone();
                 let (scale, max_edge, dir) =
                     (cfg.export_scale, cfg.output_max_edge, cfg.save_dir());
-                std::thread::spawn(move || {
+                let worker = std::thread::spawn(move || {
                     let styled = compose::export(
                         &raw,
                         &style,
@@ -240,8 +241,11 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                                 let _ = std::fs::remove_file(path);
                             }
                         }
+                    } else {
+                        eprintln!("auto-copy failed [{}]: could not save capture", style.name);
                     }
                 });
+                auto_worker = Some(worker);
             }
             let previews = previews_for(&raw, &styles);
             picker::pick(&previews, &names, monitor, cfg.last_style)?
@@ -261,9 +265,19 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         PickAction::Edit(i) => (i, true),
         PickAction::Cancel => {
             // Esc keeps the auto-copy: the no-touch flow — PrtScn, select,
-            // Esc, paste.
-            eprintln!("cancelled (auto-copy stands)");
-            return Ok(());
+            // Esc, paste. Wait for the background attempt so a failed save or
+            // clipboard write cannot disappear silently after the picker has
+            // closed. Falling through retries the same output synchronously;
+            // a second failure reaches the resident's visible error dialog.
+            if let Some(worker) = auto_worker.take() {
+                let _ = worker.join();
+            }
+            if let Some(path) = auto.lock().unwrap().path.take() {
+                eprintln!("cancelled (auto-copy stands): {}", path.display());
+                return Ok(());
+            }
+            eprintln!("background auto-copy failed; retrying synchronously");
+            (preselect, false)
         }
         PickAction::Pin => {
             return pin::show(raw, monitor);
@@ -1104,6 +1118,7 @@ fn main() -> Result<()> {
                 None,
                 ((duration as f64 / 10_000_000.0) * 30.0).round() as u32,
                 (duration as u64 / 10_000_000).max(1),
+                None,
             )?;
             let mut msg = MSG::default();
             unsafe {

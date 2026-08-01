@@ -2,9 +2,11 @@
 //! Matte swap, padding slider, aspect presets, live preview. Reached with T
 //! from the picker; the core loop never sees it.
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Error, Result};
 use image::RgbaImage;
-use windows::core::w;
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
@@ -22,10 +24,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow,
-    GetWindowLongPtrW, IsWindow, LoadCursorW, PostMessageW, RegisterClassW,
+    GetWindowLongPtrW, IsWindow, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW,
     SetForegroundWindow,
     SetWindowLongPtrW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    IDC_ARROW, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
+    IDC_ARROW, MB_ICONERROR, MB_ICONWARNING, MB_OK, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
 };
@@ -1286,6 +1288,34 @@ unsafe fn slider_update(hwnd: HWND, state: &mut State, x: i32) {
     let _ = InvalidateRect(hwnd, None, false);
 }
 
+#[derive(Debug)]
+enum FinishError {
+    Save(Error),
+    Clipboard { path: PathBuf, source: Error },
+}
+
+fn persist_and_copy_with(
+    save: impl FnOnce() -> Result<PathBuf>,
+    copy: impl FnOnce(&Path) -> Result<()>,
+) -> std::result::Result<PathBuf, FinishError> {
+    let path = save().map_err(FinishError::Save)?;
+    copy(&path).map_err(|source| FinishError::Clipboard {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+unsafe fn show_output_error(hwnd: HWND, summary: &str, error: &Error, save_failed: bool) {
+    let message = HSTRING::from(format!("{summary}\n\n{error:#}"));
+    let _ = MessageBoxW(
+        hwnd,
+        PCWSTR(message.as_ptr()),
+        w!("Matteshot"),
+        MB_OK | if save_failed { MB_ICONERROR } else { MB_ICONWARNING },
+    );
+}
+
 /// Save the edited result, put it on the clipboard, and close. Shared by the
 /// Copy chip and Ctrl+C so the keyboard can never do something subtly
 /// different from the button.
@@ -1293,11 +1323,32 @@ unsafe fn copy_and_finish(hwnd: HWND, state: &mut State) {
     commit_editing(state);
     let img = final_image(state);
     let cfg = Config::load();
-    let path = output::save_png(&img, state.doc().styles[state.doc().sel].name, &cfg.save_dir());
-    let _ = output::to_clipboard(&img, path.as_deref().ok());
-    Config::update(|cfg| cfg.last_style = state.doc_mut().sel);
-    let active = state.active;
-    close_tab(hwnd, state, active);
+    let style_name = state.doc().styles[state.doc().sel].name;
+    match persist_and_copy_with(
+        || output::save_png(&img, style_name, &cfg.save_dir()),
+        |path| output::to_clipboard(&img, Some(path)),
+    ) {
+        Ok(_) => {
+            Config::update(|cfg| cfg.last_style = state.doc_mut().sel);
+            let active = state.active;
+            close_tab(hwnd, state, active);
+        }
+        Err(FinishError::Save(error)) => show_output_error(
+            hwnd,
+            "The edited screenshot could not be saved. Your tab is still open.",
+            &error,
+            true,
+        ),
+        Err(FinishError::Clipboard { path, source }) => show_output_error(
+            hwnd,
+            &format!(
+                "The edited screenshot was saved to {} but could not be copied. Your tab is still open so you can try again.",
+                path.display()
+            ),
+            &source,
+            false,
+        ),
+    }
 }
 
 /// Leave drag quality and repaint at full resolution.
@@ -1680,19 +1731,35 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         Ctl::Save => {
             let img = final_image(state);
             let cfg = Config::load();
-            let _ = output::save_png(&img, state.doc().styles[state.doc().sel].name, &cfg.save_dir());
-            let active = state.active;
-            close_tab(hwnd, state, active);
+            match output::save_png(&img, state.doc().styles[state.doc().sel].name, &cfg.save_dir()) {
+                Ok(_) => {
+                    let active = state.active;
+                    close_tab(hwnd, state, active);
+                }
+                Err(error) => show_output_error(
+                    hwnd,
+                    "The edited screenshot could not be saved. Your tab is still open.",
+                    &error,
+                    true,
+                ),
+            }
         }
         Ctl::Edit => {
             let img = final_image(state);
             let cfg = Config::load();
-            if let Ok(path) = output::save_png(&img, state.doc().styles[state.doc().sel].name, &cfg.save_dir())
-            {
-                output::open_in_editor(&path);
+            match output::save_png(&img, state.doc().styles[state.doc().sel].name, &cfg.save_dir()) {
+                Ok(path) => {
+                    output::open_in_editor(&path);
+                    let active = state.active;
+                    close_tab(hwnd, state, active);
+                }
+                Err(error) => show_output_error(
+                    hwnd,
+                    "The edited screenshot could not be saved or opened. Your tab is still open.",
+                    &error,
+                    true,
+                ),
             }
-            let active = state.active;
-            close_tab(hwnd, state, active);
         }
         // Tool/Color/Undo/Clear handled above.
         _ => {}
@@ -2917,10 +2984,40 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
     use super::{
         active_after_close, annotation_tool_index, apply_text_input, join_words, layout_controls,
-        nearest_word, redacted, tab_for_digit, Ctl, TextInput,
+        nearest_word, persist_and_copy_with, redacted, tab_for_digit, Ctl, FinishError, TextInput,
     };
+
+    #[test]
+    fn failed_save_never_attempts_the_clipboard() {
+        let copied = Cell::new(false);
+        let result = persist_and_copy_with(
+            || Err(anyhow::anyhow!("disk full")),
+            |_| {
+                copied.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(FinishError::Save(_))));
+        assert!(!copied.get());
+    }
+
+    #[test]
+    fn clipboard_failure_keeps_the_saved_path() {
+        let saved = PathBuf::from(r"C:\captures\kept.png");
+        let result = persist_and_copy_with(
+            || Ok(saved.clone()),
+            |_| Err(anyhow::anyhow!("clipboard busy")),
+        );
+        match result {
+            Err(FinishError::Clipboard { path, .. }) => assert_eq!(path, saved),
+            other => panic!("expected clipboard failure, got {other:?}"),
+        }
+    }
 
     #[test]
     fn closing_a_tab_lands_on_the_right_neighbour() {

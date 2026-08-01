@@ -723,9 +723,16 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     crate::diagnostics::log(&format!("recording complete frames={frames} seconds={secs}"));
     eprintln!("recorded {frames} frames -> {}", mp4.display());
     // The file itself on the clipboard: paste straight into chat or a ticket.
-    let _ = crate::output::file_to_clipboard(&mp4);
+    let initial_status = match crate::output::file_to_clipboard(&mp4) {
+        Ok(()) => None,
+        Err(error) => {
+            crate::diagnostics::log("recording clipboard copy failed");
+            eprintln!("recording clipboard copy failed: {error:#}");
+            Some("recording saved · clipboard unavailable".into())
+        }
+    };
     // And a review window so stopping never feels like the recording vanished.
-    let _ = crate::recdone::show(mp4, gif_saved, frames, secs);
+    let _ = crate::recdone::show(mp4, gif_saved, frames, secs, initial_status);
     Ok(())
 }
 
