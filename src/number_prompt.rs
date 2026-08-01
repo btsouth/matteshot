@@ -141,7 +141,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     hdc,
                     state,
                     RECT { left: margin, top: sc(state, 46), right: client.right - margin, bottom: sc(state, 68) },
-                    "Maximum edge in pixels",
+                    "Resize the longer side to",
                     true,
                     state.theme.muted,
                     DT_LEFT.0,
@@ -149,7 +149,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let helper = if state.invalid {
                     "Enter a value from 320 to 10,000."
                 } else {
-                    "Images are never enlarged."
+                    "Preserves shape and never enlarges images."
                 };
                 draw_text(
                     hdc,

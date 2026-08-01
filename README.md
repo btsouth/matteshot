@@ -12,7 +12,7 @@ A Windows tray app in pure Rust. No UI framework — Win32 + GDI + `Windows.Grap
 
 1. **PrtScn** (or left-click the tray icon): freeze-frame overlay across **all monitors** — dimmed frozen screens, hover highlights whole windows (taskbar included), drag selects a region (cross-monitor works), clicking bare desktop grabs that monitor. Toolbar: **Window / Region / Screen / ● Record / ↓ Scroll / ✕** (keys W/R/F/V/S). Esc cancels.
 2. **Pick a matte**: contact strip of auto-styled variants. Click / 1–7 / arrows+Enter chooses, **T** opens the tweak editor, **E** opens in your default editor, **P** pins the raw capture, **C** copies its text via OCR, **PrtScn re-snips** (the strip itself is snippable), Esc cancels. Last-used matte preselected.
-3. **Done**: PNG on the clipboard (as bitmap + PNG + file, so paste works everywhere) and in your captures folder. Output-size presets can preserve the original pixels or cap the finished matte to Email (1600 px), Compact (1200 px), or a custom longest edge without ever upscaling.
+3. **Done**: PNG on the clipboard (as bitmap + PNG + file, so paste works everywhere) and in your captures folder. Output-size presets can preserve the original pixels or cap the finished matte to Email (1600 px), Compact (1200 px), or a custom final width or height without ever upscaling.
 
 **Ctrl+Alt+S** skips the overlay: instant capture of the active window.
 
