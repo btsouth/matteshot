@@ -429,22 +429,37 @@ fn stream_indices(reader: &IMFSourceReader) -> (u32, Option<u32>) {
     (video, audio)
 }
 
+/// These two run per frame during playback and per frame while recording, so
+/// they get the same parallel treatment as the export path rather than walking
+/// a megapixel with bounds-checked pixel accessors.
 pub(crate) fn bgra_to_rgba(bytes: &[u8], w: u32, h: u32) -> RgbaImage {
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for pixel in bytes.chunks_exact(4) {
-        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-    }
+    let mut rgba = vec![0u8; w as usize * h as usize * 4];
+    rgba.par_chunks_exact_mut(4)
+        .zip(bytes.par_chunks_exact(4))
+        .for_each(|(dst, src)| dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]));
     RgbaImage::from_raw(w, h, rgba).expect("BGRA frame has exact dimensions")
 }
 
+/// Crops to `w` x `h` when the image is larger, which callers rely on for
+/// odd-sized preview frames.
 fn rgba_to_bgra(image: &RgbaImage, w: u32, h: u32) -> Vec<u8> {
-    let mut bgra = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h.min(image.height()) {
-        for x in 0..w.min(image.width()) {
-            let pixel = image.get_pixel(x, y);
-            bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-        }
+    let cols = w.min(image.width()) as usize;
+    let rows = h.min(image.height()) as usize;
+    if cols == 0 || rows == 0 {
+        return Vec::new();
     }
+    let src_stride = image.width() as usize * 4;
+    let src = image.as_raw();
+    let mut bgra = vec![0u8; cols * rows * 4];
+    bgra.par_chunks_mut(cols * 4)
+        .enumerate()
+        .for_each(|(y, dst_row)| {
+            let row = &src[y * src_stride..y * src_stride + cols * 4];
+            for x in 0..cols {
+                let s = &row[x * 4..x * 4 + 4];
+                dst_row[x * 4..x * 4 + 4].copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+            }
+        });
     bgra
 }
 
@@ -753,6 +768,20 @@ mod tests {
         let rgba = bgra_to_rgba(&bgra, 2, 1);
         assert_eq!(rgba.as_raw(), &[1, 2, 3, 255, 10, 20, 30, 128]);
         assert_eq!(rgba_to_bgra(&rgba, 2, 1), bgra);
+
+        // Callers pass a smaller target than the image and expect a crop from
+        // the top-left, not a rescale or a panic.
+        let wide = image::RgbaImage::from_raw(
+            2,
+            2,
+            vec![
+                1, 2, 3, 255, 9, 9, 9, 9, // row 0: keep px0, drop px1
+                4, 5, 6, 200, 8, 8, 8, 8, // row 1: keep px0, drop px1
+            ],
+        )
+        .unwrap();
+        assert_eq!(rgba_to_bgra(&wide, 1, 2), vec![3, 2, 1, 255, 6, 5, 4, 200]);
+        assert!(rgba_to_bgra(&wide, 0, 2).is_empty());
     }
 
     #[test]

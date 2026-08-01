@@ -159,7 +159,21 @@ pub unsafe fn make_sink_for_content(
     inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4)?;
     writer
         .SetInputMediaType(stream, &inp, None)
-        .context("set input type (no H.264 encoder?)")?;
+        .with_context(|| {
+            // H.264 caps a frame at roughly 9.4M luma samples. A matte with a
+            // forced aspect can push a large recording past that, and Media
+            // Foundation only reports an unhelpful invalid-media-type error.
+            let pixels = w as u64 * h as u64;
+            if pixels > 9_400_000 {
+                format!(
+                    "{w}x{h} is {:.1} megapixels, past what H.264 can encode; \
+                     reduce the padding or choose a different aspect",
+                    pixels as f64 / 1_000_000.0
+                )
+            } else {
+                format!("set input type for {w}x{h} (no H.264 encoder?)")
+            }
+        })?;
 
     // Optional AAC audio track fed with float PCM.
     let audio_stream = if let Some(fmt) = audio {
