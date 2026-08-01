@@ -26,6 +26,14 @@ pub struct Probe {
     pub source_size: (u32, u32),
 }
 
+/// The cheap half of a probe: everything the editor needs to appear.
+pub struct OpeningProbe {
+    pub duration_100ns: i64,
+    pub source_size: (u32, u32),
+    /// One BGRA frame at preview size, from the start of the recording.
+    pub first: (Vec<u8>, u32, u32),
+}
+
 pub struct PlaybackFrame {
     /// Tightly packed BGRA pixels sized for the editor preview.
     pub bytes: Vec<u8>,
@@ -368,6 +376,29 @@ fn probe_impl(
 
 pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
     probe_impl(path, strip_w, thumb_h, None)
+}
+
+/// Just enough to put the editor on screen: how long the recording is, how big
+/// its frames are, and one frame to show.
+///
+/// The filmstrip and the scrub cache together cost dozens of seeks, and a seek
+/// runs about 100ms because the decoder restarts from the preceding keyframe.
+/// Paying for all of them before the window exists is what made opening the
+/// editor take seconds, and get worse the longer the recording was.
+pub fn probe_opening(path: &Path, preview_w: u32, preview_h: u32) -> Result<OpeningProbe> {
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
+    let (reader, w, h, stride) = open_reader(path, false)?;
+    let duration = duration_of(&reader)?;
+    let (bgra, _) = read_video_frame(&reader, w, h, stride)?
+        .context("the finished recording has no decodable video frames")?;
+    let rgba = bgra_to_rgba(&bgra, w, h);
+    let (pw, ph) = fit_inside(w, h, preview_w.max(2), preview_h.max(2));
+    let scaled = image::imageops::resize(&rgba, pw, ph, image::imageops::FilterType::Triangle);
+    Ok(OpeningProbe {
+        duration_100ns: duration,
+        source_size: (w, h),
+        first: (rgba_to_bgra(&scaled, pw, ph), pw, ph),
+    })
 }
 
 /// Probe a recording for the editor. Filmstrip cells stay compact, while a

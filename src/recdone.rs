@@ -41,6 +41,8 @@ const WM_EXPORT_DONE: u32 = WM_APP + 21;
 const WM_PLAYBACK_FRAME: u32 = WM_APP + 22;
 const WM_PLAYBACK_DONE: u32 = WM_APP + 23;
 const WM_EXPORT_STALLED: u32 = WM_APP + 24;
+/// The filmstrip and scrub cache finished loading in the background.
+const WM_PROBE_READY: u32 = WM_APP + 25;
 static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(1);
 
 const PAD_MIN: f32 = 0.04;
@@ -2230,6 +2232,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_PROBE_READY => {
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
+            let probe = Box::from_raw(lparam.0 as *mut crate::trim::Probe);
+            if let Some(state) = state_of(hwnd) {
+                if !probe.thumbs.is_empty() {
+                    state.raw_thumbs = probe.thumbs;
+                    refresh_matte_thumbs(state);
+                }
+                if !probe.previews.is_empty() {
+                    state.scrub_previews = probe.previews;
+                    // Only take the newly cached frame if the user is not
+                    // mid-drag and playback is not driving the preview.
+                    if state.dragging.is_none() && !state.playing {
+                        refresh_preview(state);
+                    }
+                }
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         WM_EXPORT_STALLED => {
             if let Some(state) = state_of(hwnd) {
                 if state.exporting && state.export_id == Some(lparam.0 as u64) {
@@ -3324,18 +3348,19 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
             (initial.preview.bottom - initial.preview.top).max(2) as u32,
         )
     };
-    let probe = crate::trim::probe_editor(&mp4, probe_w, probe_h, preview_w, preview_h)
+    // Open on one decoded frame. The filmstrip and the scrub cache are dozens
+    // of seeks and arrive on a worker thread.
+    let opening = crate::trim::probe_opening(&mp4, preview_w, preview_h)
         .context("open the finished recording in the editor")?;
-    if probe.duration_100ns <= 0 || probe.thumbs.is_empty() {
+    if opening.duration_100ns <= 0 {
         anyhow::bail!("the finished recording has no decodable video frames");
     }
-    let duration = probe.duration_100ns;
-    let source_size = probe.source_size;
-    let scrub_previews = probe.previews;
-    let raw_thumbs = probe.thumbs;
+    let duration = opening.duration_100ns;
+    let source_size = opening.source_size;
+    let scrub_previews = vec![opening.first];
+    let raw_thumbs: Vec<(Vec<u8>, u32, u32)> = Vec::new();
     let style_source = scrub_previews
         .first()
-        .or_else(|| raw_thumbs.first())
         .map(|(bytes, w, h)| thumb_image(bytes, *w, *h))
         .unwrap_or_else(|| RgbaImage::from_pixel(1, 1, image::Rgba([42, 46, 58, 255])));
     let styles = crate::style::variants(&style_source);
@@ -3360,15 +3385,9 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
     }
 
     let initial = layout(scale, cw, ch, styles.len());
-    let preview_raw = crate::trim::preview_frame(
-        &mp4,
-        0,
-        (initial.preview.right - initial.preview.left).max(2) as u32,
-        (initial.preview.bottom - initial.preview.top).max(2) as u32,
-    )
-    .ok()
-    .or_else(|| scrub_previews.first().cloned())
-    .or_else(|| raw_thumbs.first().cloned());
+    // The frame the opening probe already decoded; re-decoding it here cost
+    // another seek for the same picture.
+    let preview_raw = scrub_previews.first().cloned();
     // Build the opening still through the same cached composition path used
     // by playback frames. Two subtly different paths made the first frame
     // change shape as soon as Play delivered its first decoded frame.
@@ -3482,6 +3501,31 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
                 crate::theme::apply_titlebar(hwnd, &(*state).theme);
                 let _ = SetForegroundWindow(hwnd);
                 let _ = SetFocus(hwnd);
+                // Now that the editor is on screen, fill in the filmstrip and
+                // the scrub cache behind it.
+                let source = (*state).mp4.clone();
+                let target = hwnd.0 as isize;
+                std::thread::spawn(move || {
+                    let com = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    let probed = crate::trim::probe_editor(
+                        &source, probe_w, probe_h, preview_w, preview_h,
+                    );
+                    if com.is_ok() {
+                        CoUninitialize();
+                    }
+                    let Ok(probed) = probed else {
+                        crate::diagnostics::log("editor filmstrip probe failed");
+                        return;
+                    };
+                    let payload = Box::into_raw(Box::new(probed));
+                    let hwnd = HWND(target as *mut _);
+                    if !crate::window::has_class(hwnd, "matteshot_recdone")
+                        || PostMessageW(hwnd, WM_PROBE_READY, WPARAM(0), LPARAM(payload as isize))
+                            .is_err()
+                    {
+                        drop(Box::from_raw(payload));
+                    }
+                });
             }
             Err(_) => drop(Box::from_raw(state)),
         }
