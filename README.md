@@ -83,6 +83,7 @@ matteshot                    # tray app (normal mode)
 matteshot --take-printscreen # unbind PrtScn from Snipping Tool
 matteshot --restore-printscreen
 matteshot --bench <substr>   # timed capture of a window, raw PNG to %TEMP%
+matteshot --overlay-bench [batched|sequential] # headless multi-monitor freeze/layer timing
 matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCROLL_DEBUG=1 for per-step diagnostics)
 matteshot --record-test [s]  # short recording smoke test, optionally auto-stop after s seconds
 matteshot --record-window-test <title> [s] # real named-window recording with timed stop
