@@ -30,6 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
 };
 
+use rayon::prelude::*;
+
 use crate::compose::{self, ComposeOpts};
 use crate::config::Config;
 use crate::output;
@@ -125,47 +127,45 @@ struct WindowLayout {
     caption_style_controls: Vec<(RECT, crate::annotate::TextStyle)>,
 }
 
-struct State {
+/// One capture being edited: its pixels, its matte choices, its annotations,
+/// and the render caches derived from them.
+///
+/// Everything here is per-capture and will become one tab. Nothing in here may
+/// reference the window: the split is what lets several of these live in a
+/// single editor at once.
+struct Document {
     raw: RgbaImage,
     small: RgbaImage,
     preview_metric: f32,
+    /// Half-scale preview source. Dragging the padding slider changes the
+    /// canvas geometry, so the whole matte has to be recomposed on every mouse
+    /// move; at full resolution that is ~20ms a frame and the slider visibly
+    /// trails the cursor. The drag runs at quarter the pixels and snaps back to
+    /// full quality on release.
+    small_fast: RgbaImage,
+    metric_fast: f32,
+    fast_preview: bool,
     styles: Vec<Style>,
     sel: usize,
     pad_factor: f32,
     aspect_idx: usize,
-    export_scale: u32,
     /// Per-capture override for the finished image's longest edge.
     output_max_edge: u32,
     // Cached preview composite as BGRA.
     preview: Vec<u8>,
     preview_w: i32,
     preview_h: i32,
-    controls: Vec<(RECT, Ctl)>,
-    preview_box: RECT,
-    slider_rect: RECT,
-    caption_size_slider: RECT,
-    caption_opacity_slider: RECT,
-    caption_style_controls: Vec<(RECT, crate::annotate::TextStyle)>,
-    hover: i32,
-    dragging: Option<SliderDrag>,
-    done: bool,
-    suspended: bool,
-    reshoot: Option<(crate::overlay::Selection, HMONITOR)>,
-    /// Cached matte+shadow+content canvas keyed by (matte, pad bits,
-    /// aspect) — annotation edits only stamp onto a clone of this.
-    base_cache: Option<((usize, u32, usize), RgbaImage)>,
+    /// Cached matte+shadow+content canvas keyed by (matte, pad bits, aspect,
+    /// draft quality) — annotation edits only stamp onto a clone of this.
+    base_cache: Option<((usize, u32, usize, bool), RgbaImage)>,
     // Annotations, in raw-capture coordinates.
     anns: Vec<crate::annotate::Annotation>,
-    tool: Option<usize>,
-    color_idx: usize,
     /// In-progress drag annotation (last element of `anns` while active).
     drawing: bool,
     /// Text annotation being typed (index into `anns`).
     editing: Option<usize>,
     /// Original content when re-editing. None means this is a new caption.
     editing_original: Option<String>,
-    /// Caret blink phase while editing.
-    caret_on: bool,
     /// Annotation being dragged in selector mode: (index, last raw point,
     /// grabbed part).
     moving: Option<(usize, (f32, f32), Grab)>,
@@ -177,11 +177,36 @@ struct State {
     hover_ann: Option<usize>,
     /// Select-text mode, when armed. None means normal annotation editing.
     text_select: Option<TextSelect>,
+    last_rebuild: std::time::Instant,
+}
+
+/// The editor window: chrome, layout, and the tool palette shared across every
+/// open capture.
+struct State {
+    doc: Document,
+    /// Supersampling factor from settings; the same for every capture.
+    export_scale: u32,
+    controls: Vec<(RECT, Ctl)>,
+    preview_box: RECT,
+    slider_rect: RECT,
+    caption_size_slider: RECT,
+    caption_opacity_slider: RECT,
+    caption_style_controls: Vec<(RECT, crate::annotate::TextStyle)>,
+    hover: i32,
+    dragging: Option<SliderDrag>,
+    done: bool,
+    suspended: bool,
+    reshoot: Option<(crate::overlay::Selection, HMONITOR)>,
+    // Tool palette. Window-level on purpose: switching capture must not make
+    // you re-pick your pen.
+    tool: Option<usize>,
+    color_idx: usize,
     size_idx: usize,
     caption_size: f32,
     caption_style: crate::annotate::TextStyle,
     caption_box_opacity: f32,
-    last_rebuild: std::time::Instant,
+    /// Caret blink phase while editing; one timer serves the window.
+    caret_on: bool,
     font: HFONT,
     font_small: HFONT,
     scale: f32,
@@ -236,11 +261,11 @@ fn annotation_tool_index(shape: &crate::annotate::Shape) -> usize {
 }
 
 fn text_context(state: &State) -> bool {
-    state.editing.is_some()
+    state.doc.editing.is_some()
         || state.tool == Some(5)
-        || state
+        || state.doc
             .selected
-            .and_then(|index| state.anns.get(index))
+            .and_then(|index| state.doc.anns.get(index))
             .is_some_and(|ann| matches!(ann.shape, crate::annotate::Shape::Text { .. }))
 }
 
@@ -255,7 +280,7 @@ fn control_visible(state: &State, control: Ctl) -> bool {
 }
 
 fn sync_annotation_controls(state: &mut State, index: usize) {
-    let Some(ann) = state.anns.get(index) else {
+    let Some(ann) = state.doc.anns.get(index) else {
         return;
     };
     state.color_idx = ann.color.min(crate::annotate::COLORS.len() - 1);
@@ -275,11 +300,22 @@ fn sync_annotation_controls(state: &mut State, index: usize) {
     state.caption_box_opacity = ann.text_box_opacity;
 }
 
+/// Preview source for the current interaction: reduced while a geometry drag
+/// is in flight, full otherwise. Every coordinate mapping divides by the
+/// metric, so both paths agree on raw-capture coordinates.
+fn preview_source(state: &State) -> (&RgbaImage, f32) {
+    if state.doc.fast_preview {
+        (&state.doc.small_fast, state.doc.metric_fast)
+    } else {
+        (&state.doc.small, state.doc.preview_metric)
+    }
+}
+
 fn opts_of(state: &State, metric: f32) -> ComposeOpts {
     ComposeOpts {
         metric_scale: metric,
-        pad_factor: state.pad_factor,
-        aspect: ASPECTS[state.aspect_idx].1,
+        pad_factor: state.doc.pad_factor,
+        aspect: ASPECTS[state.doc.aspect_idx].1,
     }
 }
 
@@ -287,19 +323,20 @@ fn opts_of(state: &State, metric: f32) -> ComposeOpts {
 fn view_params(state: &State) -> (i32, i32, f32, f32, f32) {
     let bx = state.preview_box;
     let (bw, bh) = (bx.right - bx.left, bx.bottom - bx.top);
-    let draw_scale = (bw as f32 / state.preview_w as f32)
-        .min(bh as f32 / state.preview_h as f32)
+    let draw_scale = (bw as f32 / state.doc.preview_w as f32)
+        .min(bh as f32 / state.doc.preview_h as f32)
         .min(1.0);
     let (dw, dh) = (
-        (state.preview_w as f32 * draw_scale) as i32,
-        (state.preview_h as f32 * draw_scale) as i32,
+        (state.doc.preview_w as f32 * draw_scale) as i32,
+        (state.doc.preview_h as f32 * draw_scale) as i32,
     );
     let (dx, dy) = (bx.left + (bw - dw) / 2, bx.top + (bh - dh) / 2);
-    if compose::is_plain(&state.styles[state.sel]) {
+    if compose::is_plain(&state.doc.styles[state.doc.sel]) {
         return (dx, dy, draw_scale, 0.0, 0.0);
     }
-    let opts = opts_of(state, state.preview_metric);
-    let l = compose::layout(state.small.width() as usize, state.small.height() as usize, &opts);
+    let (source, metric) = preview_source(state);
+    let opts = opts_of(state, metric);
+    let l = compose::layout(source.width() as usize, source.height() as usize, &opts);
     (dx, dy, draw_scale, l.pad_x as f32, l.pad_y as f32)
 }
 
@@ -309,9 +346,10 @@ fn to_raw(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
     let (dx, dy, draw_scale, pad_x, pad_y) = view_params(state);
     let cx = (x - dx) as f32 / draw_scale;
     let cy = (y - dy) as f32 / draw_scale;
-    let rx = (cx - pad_x) / state.preview_metric;
-    let ry = (cy - pad_y) / state.preview_metric;
-    let (rw, rh) = (state.raw.width() as f32, state.raw.height() as f32);
+    let metric = preview_source(state).1;
+    let rx = (cx - pad_x) / metric;
+    let ry = (cy - pad_y) / metric;
+    let (rw, rh) = (state.doc.raw.width() as f32, state.doc.raw.height() as f32);
     if rx < -40.0 || ry < -40.0 || rx > rw + 40.0 || ry > rh + 40.0 {
         return None;
     }
@@ -321,8 +359,8 @@ fn to_raw(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
 fn raw_to_screen(state: &State, p: (f32, f32)) -> (i32, i32) {
     let (dx, dy, draw_scale, pad_x, pad_y) = view_params(state);
     (
-        dx + ((p.0 * state.preview_metric + pad_x) * draw_scale) as i32,
-        dy + ((p.1 * state.preview_metric + pad_y) * draw_scale) as i32,
+        dx + ((p.0 * preview_source(state).1 + pad_x) * draw_scale) as i32,
+        dy + ((p.1 * preview_source(state).1 + pad_y) * draw_scale) as i32,
     )
 }
 
@@ -415,11 +453,11 @@ fn redacted(anns: &[crate::annotate::Annotation], word: &crate::ocr::Word) -> bo
 
 /// First selectable word containing the point, if any.
 fn word_at(state: &State, p: (f32, f32)) -> Option<usize> {
-    let select = state.text_select.as_ref()?;
+    let select = state.doc.text_select.as_ref()?;
     select
         .words
         .iter()
-        .position(|word| word_contains(word, p) && !redacted(&state.anns, word))
+        .position(|word| word_contains(word, p) && !redacted(&state.doc.anns, word))
 }
 
 /// Word to anchor a selection on: the one under the cursor, or the nearest one
@@ -429,10 +467,10 @@ fn anchor_word(state: &State, p: (f32, f32)) -> Option<usize> {
     if let Some(index) = word_at(state, p) {
         return Some(index);
     }
-    let select = state.text_select.as_ref()?;
+    let select = state.doc.text_select.as_ref()?;
     let index = nearest_word(&select.words, p)?;
     let word = select.words.get(index)?;
-    if redacted(&state.anns, word) {
+    if redacted(&state.doc.anns, word) {
         return None;
     }
     let reach = (word.rect.3 - word.rect.1).max(8.0) * 1.5;
@@ -460,7 +498,7 @@ fn join_words(words: &[crate::ocr::Word], skip: impl Fn(&crate::ocr::Word) -> bo
 }
 
 fn selected_text(state: &State) -> String {
-    let Some(select) = state.text_select.as_ref() else {
+    let Some(select) = state.doc.text_select.as_ref() else {
         return String::new();
     };
     let Some((start, end)) = select.range() else {
@@ -469,7 +507,7 @@ fn selected_text(state: &State) -> String {
     let Some(words) = select.words.get(start..=end.min(select.words.len() - 1)) else {
         return String::new();
     };
-    join_words(words, |word| redacted(&state.anns, word))
+    join_words(words, |word| redacted(&state.doc.anns, word))
 }
 
 /// Arm select-text mode and kick off recognition. The engine takes a few
@@ -478,10 +516,10 @@ fn selected_text(state: &State) -> String {
 fn enter_text_select(hwnd: HWND, state: &mut State) {
     commit_editing(state);
     state.tool = None;
-    state.selected = None;
-    state.hover_ann = None;
-    state.moving = None;
-    state.text_select = Some(TextSelect {
+    state.doc.selected = None;
+    state.doc.hover_ann = None;
+    state.doc.moving = None;
+    state.doc.text_select = Some(TextSelect {
         words: Vec::new(),
         anchor: None,
         focus: None,
@@ -491,7 +529,7 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
     });
     rebuild_preview(state);
 
-    let raw = state.raw.clone();
+    let raw = state.doc.raw.clone();
     let target = hwnd.0 as isize;
     std::thread::spawn(move || {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
@@ -556,53 +594,64 @@ unsafe fn wash_all(hdc: HDC, color: COLORREF, rects: &[(RECT, u8)]) {
 }
 
 fn rebuild_preview(state: &mut State) {
-    let opts = opts_of(state, state.preview_metric);
-    let plain = compose::is_plain(&state.styles[state.sel]);
-    let caret = if state.caret_on { state.editing } else { None };
+    let (source, metric) = preview_source(state);
+    let source = source.clone();
+    let opts = opts_of(state, metric);
+    let plain = compose::is_plain(&state.doc.styles[state.doc.sel]);
+    let caret = if state.caret_on { state.doc.editing } else { None };
     let mut img;
     let (off_x, off_y);
     if plain {
-        img = state.small.clone();
+        img = source;
         (off_x, off_y) = (0.0, 0.0);
     } else {
-        let key = (state.sel, state.pad_factor.to_bits(), state.aspect_idx);
-        if state.base_cache.as_ref().map(|(k, _)| *k) != Some(key) {
+        // The resolution is part of the key: a drag-quality base must never be
+        // mistaken for the full-quality one when the drag ends.
+        let key = (
+            state.doc.sel,
+            state.doc.pad_factor.to_bits(),
+            state.doc.aspect_idx,
+            state.doc.fast_preview,
+        );
+        if state.doc.base_cache.as_ref().map(|(k, _)| *k) != Some(key) {
             let mut base = compose::compose_base(
-                state.small.width() as usize,
-                state.small.height() as usize,
-                &state.styles[state.sel],
+                source.width() as usize,
+                source.height() as usize,
+                &state.doc.styles[state.doc.sel],
                 &opts,
             );
-            compose::blend_content(&mut base, &state.small, &opts);
-            state.base_cache = Some((key, base));
+            compose::blend_content(&mut base, &source, &opts);
+            state.doc.base_cache = Some((key, base));
         }
-        img = state.base_cache.as_ref().unwrap().1.clone();
-        let l =
-            compose::layout(state.small.width() as usize, state.small.height() as usize, &opts);
+        img = state.doc.base_cache.as_ref().unwrap().1.clone();
+        let l = compose::layout(source.width() as usize, source.height() as usize, &opts);
         (off_x, off_y) = (l.pad_x as f32, l.pad_y as f32);
     }
     // Annotations stamp directly onto the composite at the content offset.
     crate::annotate::render(
         &mut img,
-        &state.anns,
-        state.preview_metric,
+        &state.doc.anns,
+        metric,
         (off_x, off_y),
         caret,
     );
-    state.last_rebuild = std::time::Instant::now();
-    state.preview_w = img.width() as i32;
-    state.preview_h = img.height() as i32;
-    let mut bgra = Vec::with_capacity((img.width() * img.height() * 4) as usize);
-    for p in img.pixels() {
-        bgra.extend_from_slice(&[p[2], p[1], p[0], 255]);
-    }
-    state.preview = bgra;
+    state.doc.last_rebuild = std::time::Instant::now();
+    state.doc.preview_w = img.width() as i32;
+    state.doc.preview_h = img.height() as i32;
+    // RGBA to BGRA in place. A per-pixel push over a megapixel canvas was
+    // several milliseconds of every rebuild on its own.
+    let mut bgra = img.into_raw();
+    bgra.par_chunks_mut(4).for_each(|pixel| {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    });
+    state.doc.preview = bgra;
 }
 
 /// Full-quality result with the current tweaks and annotations applied.
 fn final_image(state: &State) -> RgbaImage {
-    let raw = &state.raw;
-    let plain = compose::is_plain(&state.styles[state.sel]);
+    let raw = &state.doc.raw;
+    let plain = compose::is_plain(&state.doc.styles[state.doc.sel]);
     let scale = if plain || raw.width().max(raw.height()) >= 1600 {
         1
     } else {
@@ -618,24 +667,24 @@ fn final_image(state: &State) -> RgbaImage {
     } else {
         raw.clone()
     };
-    crate::annotate::render(&mut content, &state.anns, scale as f32, (0.0, 0.0), None);
+    crate::annotate::render(&mut content, &state.doc.anns, scale as f32, (0.0, 0.0), None);
     let finished = if plain {
         content
     } else {
         let opts = ComposeOpts {
             metric_scale: scale as f32,
-            pad_factor: state.pad_factor,
-            aspect: ASPECTS[state.aspect_idx].1,
+            pad_factor: state.doc.pad_factor,
+            aspect: ASPECTS[state.doc.aspect_idx].1,
         };
-        compose::compose_with(&content, &state.styles[state.sel], &opts)
+        compose::compose_with(&content, &state.doc.styles[state.doc.sel], &opts)
     };
-    output::resize_to_max_edge(&finished, state.output_max_edge)
+    output::resize_to_max_edge(&finished, state.doc.output_max_edge)
 }
 
 /// Exact Copy/Save dimensions without rendering the full-size image.
 fn final_dimensions(state: &State) -> (u32, u32) {
-    let (mut width, mut height) = state.raw.dimensions();
-    if !compose::is_plain(&state.styles[state.sel]) {
+    let (mut width, mut height) = state.doc.raw.dimensions();
+    if !compose::is_plain(&state.doc.styles[state.doc.sel]) {
         let scale = if width.max(height) >= 1600 {
             1
         } else {
@@ -645,14 +694,14 @@ fn final_dimensions(state: &State) -> (u32, u32) {
         height *= scale;
         let opts = ComposeOpts {
             metric_scale: scale as f32,
-            pad_factor: state.pad_factor,
-            aspect: ASPECTS[state.aspect_idx].1,
+            pad_factor: state.doc.pad_factor,
+            aspect: ASPECTS[state.doc.aspect_idx].1,
         };
         let layout = compose::layout(width as usize, height as usize, &opts);
         width += (layout.pad_x * 2) as u32;
         height += (layout.pad_y * 2) as u32;
     }
-    output::resized_dimensions(width, height, state.output_max_edge)
+    output::resized_dimensions(width, height, state.doc.output_max_edge)
 }
 
 unsafe fn chip(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot: bool) {
@@ -734,19 +783,19 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // Preview, letterboxed into its box.
     let bx = state.preview_box;
     let (bw, bh) = (bx.right - bx.left, bx.bottom - bx.top);
-    let scale = (bw as f32 / state.preview_w as f32)
-        .min(bh as f32 / state.preview_h as f32)
+    let scale = (bw as f32 / state.doc.preview_w as f32)
+        .min(bh as f32 / state.doc.preview_h as f32)
         .min(1.0);
     let (dw, dh) = (
-        (state.preview_w as f32 * scale) as i32,
-        (state.preview_h as f32 * scale) as i32,
+        (state.doc.preview_w as f32 * scale) as i32,
+        (state.doc.preview_h as f32 * scale) as i32,
     );
     let (dx, dy) = (bx.left + (bw - dw) / 2, bx.top + (bh - dh) / 2);
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: state.preview_w,
-            biHeight: -state.preview_h,
+            biWidth: state.doc.preview_w,
+            biHeight: -state.doc.preview_h,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -763,9 +812,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
         dh,
         0,
         0,
-        state.preview_w,
-        state.preview_h,
-        Some(state.preview.as_ptr() as *const _),
+        state.doc.preview_w,
+        state.doc.preview_h,
+        Some(state.doc.preview.as_ptr() as *const _),
         &info,
         DIB_RGB_COLORS,
         SRCCOPY,
@@ -773,12 +822,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
     // Selection / hover overlay (screen-space, no recompose).
     if state.tool.is_none() {
-        for (idx, solid) in [(state.selected, true), (state.hover_ann, false)] {
+        for (idx, solid) in [(state.doc.selected, true), (state.doc.hover_ann, false)] {
             let Some(i) = idx else { continue };
-            if !solid && state.selected == Some(i) {
+            if !solid && state.doc.selected == Some(i) {
                 continue;
             }
-            let Some(ann) = state.anns.get(i) else { continue };
+            let Some(ann) = state.doc.anns.get(i) else { continue };
             let (x0, y0, x1, y1) = ann_bounds(ann);
             let (sx0, sy0) = raw_to_screen(state, (x0, y0));
             let (sx1, sy1) = raw_to_screen(state, (x1, y1));
@@ -808,8 +857,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
         // Grab handles on the selected annotation: arrow tips and box
         // corners are pullable, and the squares say so.
-        if let Some(i) = state.selected {
-            if let Some(ann) = state.anns.get(i) {
+        if let Some(i) = state.doc.selected {
+            if let Some(ann) = state.doc.anns.get(i) {
                 let pts: Vec<(f32, f32)> = match &ann.shape {
                     crate::annotate::Shape::Arrow { from, to }
                     | crate::annotate::Shape::Line { from, to } => vec![*from, *to],
@@ -850,13 +899,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // Select-text overlay: every recognized word faintly marked so you can
     // see what is grabbable, the selection filled solid. Screen-space, so a
     // sweep never recomposes the preview.
-    if let Some(select) = state.text_select.as_ref() {
+    if let Some(select) = state.doc.text_select.as_ref() {
         let range = select.range();
         let boxes: Vec<(RECT, u8)> = select
             .words
             .iter()
             .enumerate()
-            .filter(|(_, word)| !redacted(&state.anns, word))
+            .filter(|(_, word)| !redacted(&state.doc.anns, word))
             .map(|(index, word)| {
                 let (x0, y0, x1, y1) = word.rect;
                 let (sx0, sy0) = raw_to_screen(state, (x0, y0));
@@ -872,7 +921,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     }
 
     // Contextual hint line under the preview.
-    let select_hint = state.text_select.as_ref().map(|select| {
+    let select_hint = state.doc.text_select.as_ref().map(|select| {
         if let Some(message) = &select.message {
             message.clone()
         } else if select.pending {
@@ -882,22 +931,28 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 .to_string()
         }
     });
-    let hint = if let Some(text) = &select_hint {
-        text.as_str()
-    } else if state.editing.is_some() {
-        "type your caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel"
+    // Only say something when there is something to say. A fresh editor with
+    // no annotations does not need a list of things you cannot do yet.
+    let hint: Option<&str> = if let Some(text) = &select_hint {
+        Some(text.as_str())
+    } else if state.doc.editing.is_some() {
+        Some("type your caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel")
     } else if state.tool.is_some() {
-        "drag on the preview to draw   \u{00b7}   tool clears after each add"
+        Some("drag on the preview to draw   \u{00b7}   tool clears after each add")
+    } else if !state.doc.anns.is_empty() {
+        Some("drag to move   \u{00b7}   grab handles to reshape   \u{00b7}   right-click for properties   \u{00b7}   double-click text to edit   \u{00b7}   Del removes")
     } else {
-        "drag to move   \u{00b7}   grab handles to reshape   \u{00b7}   right-click for properties   \u{00b7}   double-click text to edit   \u{00b7}   Del removes"
+        None
     };
-    label(
-        hdc,
-        state,
-        state.preview_box.left,
-        state.height - (34.0 * state.scale) as i32,
-        hint,
-    );
+    if let Some(hint) = hint {
+        label(
+            hdc,
+            state,
+            state.preview_box.left,
+            state.height - (34.0 * state.scale) as i32,
+            hint,
+        );
+    }
 
     // Section labels.
     let lh = (20.0 * state.scale) as i32;
@@ -944,16 +999,16 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
         let hot = i as i32 == state.hover;
         match c {
-            Ctl::Matte(n) => chip(hdc, *r, state.styles[*n].name, state, state.sel == *n, hot),
+            Ctl::Matte(n) => chip(hdc, *r, state.doc.styles[*n].name, state, state.doc.sel == *n, hot),
             Ctl::Aspect(n) => {
-                chip(hdc, *r, ASPECTS[*n].0, state, state.aspect_idx == *n, hot)
+                chip(hdc, *r, ASPECTS[*n].0, state, state.doc.aspect_idx == *n, hot)
             }
             Ctl::OutputSize(max_edge) => chip(
                 hdc,
                 *r,
                 &output::output_size_label(*max_edge),
                 state,
-                state.output_max_edge == *max_edge,
+                state.doc.output_max_edge == *max_edge,
                 hot,
             ),
             Ctl::CustomSize => {
@@ -962,8 +1017,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     output::OUTPUT_EMAIL,
                     output::OUTPUT_COMPACT,
                 ]
-                .contains(&state.output_max_edge);
-                let custom_label = format!("{}px", state.output_max_edge);
+                .contains(&state.doc.output_max_edge);
+                let custom_label = format!("{}px", state.doc.output_max_edge);
                 chip(
                     hdc,
                     *r,
@@ -978,9 +1033,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::Edit => chip(hdc, *r, "Editor", state, false, hot),
             Ctl::Tool(n) => {
                 let property_tool = if state.tool.is_none() {
-                    state
+                    state.doc
                         .selected
-                        .and_then(|index| state.anns.get(index))
+                        .and_then(|index| state.doc.anns.get(index))
                         .map(|ann| annotation_tool_index(&ann.shape))
                 } else {
                     None
@@ -1009,7 +1064,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 *r,
                 "Select text",
                 state,
-                state.text_select.is_some(),
+                state.doc.text_select.is_some(),
                 hot,
             ),
             Ctl::Color(n) => {
@@ -1085,7 +1140,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let track = CreateSolidBrush(state.theme.track);
     FillRect(hdc, &RECT { left: sr.left, top: cy - 2, right: sr.right, bottom: cy + 2 }, track);
     let _ = DeleteObject(track);
-    let t = (state.pad_factor - PAD_MIN) / (PAD_MAX - PAD_MIN);
+    let t = (state.doc.pad_factor - PAD_MIN) / (PAD_MAX - PAD_MIN);
     let tx = sr.left + ((sr.right - sr.left) as f32 * t) as i32;
     let filled = CreateSolidBrush(state.theme.accent);
     FillRect(hdc, &RECT { left: sr.left, top: cy - 2, right: tx, bottom: cy + 2 }, filled);
@@ -1103,17 +1158,44 @@ unsafe fn paint(hdc: HDC, state: &State) {
 unsafe fn slider_update(hwnd: HWND, state: &mut State, x: i32) {
     let sr = state.slider_rect;
     let t = ((x - sr.left) as f32 / (sr.right - sr.left).max(1) as f32).clamp(0.0, 1.0);
-    state.pad_factor = PAD_MIN + t * (PAD_MAX - PAD_MIN);
+    let padding = PAD_MIN + t * (PAD_MAX - PAD_MIN);
+    if padding == state.doc.pad_factor {
+        return;
+    }
+    state.doc.pad_factor = padding;
     rebuild_preview(state);
     let _ = InvalidateRect(hwnd, None, false);
+}
+
+/// Save the edited result, put it on the clipboard, and close. Shared by the
+/// Copy chip and Ctrl+C so the keyboard can never do something subtly
+/// different from the button.
+unsafe fn copy_and_finish(hwnd: HWND, state: &mut State) {
+    commit_editing(state);
+    let img = final_image(state);
+    let cfg = Config::load();
+    let path = output::save_png(&img, state.doc.styles[state.doc.sel].name, &cfg.save_dir());
+    let _ = output::to_clipboard(&img, path.as_deref().ok());
+    Config::update(|cfg| cfg.last_style = state.doc.sel);
+    state.done = true;
+    let _ = DestroyWindow(hwnd);
+}
+
+/// Leave drag quality and repaint at full resolution.
+unsafe fn end_fast_preview(hwnd: HWND, state: &mut State) {
+    if state.doc.fast_preview {
+        state.doc.fast_preview = false;
+        rebuild_preview(state);
+        let _ = InvalidateRect(hwnd, None, false);
+    }
 }
 
 unsafe fn caption_size_update(hwnd: HWND, state: &mut State, x: i32) {
     let rect = state.caption_size_slider;
     let t = ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0);
     state.caption_size = 0.7 + t * (3.4 - 0.7);
-    if let Some(index) = state.editing.or(state.selected) {
-        if let Some(ann) = state.anns.get_mut(index) {
+    if let Some(index) = state.doc.editing.or(state.doc.selected) {
+        if let Some(ann) = state.doc.anns.get_mut(index) {
             if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
                 ann.size = state.caption_size;
             }
@@ -1127,8 +1209,8 @@ unsafe fn caption_opacity_update(hwnd: HWND, state: &mut State, x: i32) {
     let rect = state.caption_opacity_slider;
     let t = ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0);
     state.caption_box_opacity = 0.20 + t * 0.75;
-    if let Some(index) = state.editing.or(state.selected) {
-        if let Some(ann) = state.anns.get_mut(index) {
+    if let Some(index) = state.doc.editing.or(state.doc.selected) {
+        if let Some(ann) = state.doc.anns.get_mut(index) {
             if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
                 ann.text_box_opacity = state.caption_box_opacity;
             }
@@ -1163,19 +1245,19 @@ fn apply_text_input(text: &mut String, ch: char) -> TextInput {
 /// Commit any in-progress text annotation (drop it if empty). Returns true
 /// if a non-empty annotation was committed.
 fn commit_editing(state: &mut State) -> bool {
-    if let Some(i) = state.editing.take() {
+    if let Some(i) = state.doc.editing.take() {
         let empty = matches!(
-            state.anns.get(i).map(|a| &a.shape),
+            state.doc.anns.get(i).map(|a| &a.shape),
             Some(crate::annotate::Shape::Text { text, .. }) if text.is_empty()
         );
         if empty {
-            state.anns.remove(i);
-            state.editing_original = None;
+            state.doc.anns.remove(i);
+            state.doc.editing_original = None;
             return false;
         }
         // One-shot tools: a successful add returns to the selector.
         state.tool = None;
-        state.editing_original = None;
+        state.doc.editing_original = None;
         return true;
     }
     false
@@ -1191,8 +1273,8 @@ fn dist_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 
 /// Topmost annotation under a raw-space point, for selector-mode dragging.
 fn hit_ann(state: &State, p: (f32, f32)) -> Option<usize> {
-    let tol = (8.0 / state.preview_metric).max(6.0);
-    for (i, ann) in state.anns.iter().enumerate().rev() {
+    let tol = (8.0 / state.doc.preview_metric).max(6.0);
+    for (i, ann) in state.doc.anns.iter().enumerate().rev() {
         let hit = match &ann.shape {
             crate::annotate::Shape::Arrow { from, to }
             | crate::annotate::Shape::Line { from, to } => dist_seg(p, *from, *to) <= tol,
@@ -1373,7 +1455,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
     // and aspect are safe to keep it: word boxes live in capture coordinates,
     // so the overlay follows the new layout on its own.
     if matches!(ctl, Ctl::Tool(_) | Ctl::Undo | Ctl::Clear) {
-        state.text_select = None;
+        state.doc.text_select = None;
     }
     match ctl {
         Ctl::Tool(n) => {
@@ -1382,7 +1464,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 state.tool = None;
             } else {
                 state.tool = Some(n);
-                state.selected = None;
+                state.doc.selected = None;
                 if n == 5 {
                     state.color_idx = 3;
                     state.caption_style = crate::annotate::TextStyle::Box;
@@ -1395,9 +1477,9 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         Ctl::Color(n) => {
             state.color_idx = n;
             // Recolor whatever is selected or being typed.
-            let target = state.editing.or(state.selected);
+            let target = state.doc.editing.or(state.doc.selected);
             if let Some(i) = target {
-                if let Some(ann) = state.anns.get_mut(i) {
+                if let Some(ann) = state.doc.anns.get_mut(i) {
                     ann.color = n;
                 }
                 rebuild_preview(state);
@@ -1407,9 +1489,9 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         }
         Ctl::Size(n) => {
             state.size_idx = n;
-            let target = state.editing.or(state.selected);
+            let target = state.doc.editing.or(state.doc.selected);
             if let Some(i) = target {
-                if let Some(ann) = state.anns.get_mut(i) {
+                if let Some(ann) = state.doc.anns.get_mut(i) {
                     ann.size = SIZES[n];
                 }
                 rebuild_preview(state);
@@ -1419,24 +1501,24 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         }
         Ctl::Undo => {
             commit_editing(state);
-            if let Some(ann) = state.anns.pop() {
+            if let Some(ann) = state.doc.anns.pop() {
                 if matches!(ann.shape, crate::annotate::Shape::Counter { .. }) {
-                    state.counter_next = state.counter_next.saturating_sub(1).max(1);
+                    state.doc.counter_next = state.doc.counter_next.saturating_sub(1).max(1);
                 }
             }
-            state.selected = None;
-            state.hover_ann = None;
+            state.doc.selected = None;
+            state.doc.hover_ann = None;
             rebuild_preview(state);
             let _ = InvalidateRect(hwnd, None, false);
             return;
         }
         Ctl::Clear => {
-            state.editing = None;
-            state.editing_original = None;
-            state.anns.clear();
-            state.selected = None;
-            state.hover_ann = None;
-            state.counter_next = 1;
+            state.doc.editing = None;
+            state.doc.editing_original = None;
+            state.doc.anns.clear();
+            state.doc.selected = None;
+            state.doc.hover_ann = None;
+            state.doc.counter_next = 1;
             rebuild_preview(state);
             let _ = InvalidateRect(hwnd, None, false);
             return;
@@ -1445,54 +1527,46 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
     }
     match ctl {
         Ctl::Matte(n) => {
-            state.sel = n;
+            state.doc.sel = n;
             rebuild_preview(state);
             let _ = InvalidateRect(hwnd, None, false);
         }
         Ctl::Aspect(n) => {
-            state.aspect_idx = n;
+            state.doc.aspect_idx = n;
             rebuild_preview(state);
             let _ = InvalidateRect(hwnd, None, false);
         }
         Ctl::OutputSize(max_edge) => {
-            state.output_max_edge = max_edge;
+            state.doc.output_max_edge = max_edge;
             let _ = InvalidateRect(hwnd, None, false);
         }
         Ctl::CustomSize => {
-            if let Ok(Some(max_edge)) = crate::number_prompt::ask(hwnd, state.output_max_edge) {
-                state.output_max_edge = max_edge;
+            if let Ok(Some(max_edge)) = crate::number_prompt::ask(hwnd, state.doc.output_max_edge) {
+                state.doc.output_max_edge = max_edge;
                 let _ = InvalidateRect(hwnd, None, false);
             }
         }
         Ctl::Slider => {}
         Ctl::Ocr => {
-            if state.text_select.is_some() {
-                state.text_select = None;
+            if state.doc.text_select.is_some() {
+                state.doc.text_select = None;
             } else {
                 enter_text_select(hwnd, state);
             }
             let _ = InvalidateRect(hwnd, None, false);
         }
-        Ctl::Copy => {
-            let img = final_image(state);
-            let cfg = Config::load();
-            let path = output::save_png(&img, state.styles[state.sel].name, &cfg.save_dir());
-            let _ = output::to_clipboard(&img, path.as_deref().ok());
-            Config::update(|cfg| cfg.last_style = state.sel);
-            state.done = true;
-            let _ = DestroyWindow(hwnd);
-        }
+        Ctl::Copy => copy_and_finish(hwnd, state),
         Ctl::Save => {
             let img = final_image(state);
             let cfg = Config::load();
-            let _ = output::save_png(&img, state.styles[state.sel].name, &cfg.save_dir());
+            let _ = output::save_png(&img, state.doc.styles[state.doc.sel].name, &cfg.save_dir());
             state.done = true;
             let _ = DestroyWindow(hwnd);
         }
         Ctl::Edit => {
             let img = final_image(state);
             let cfg = Config::load();
-            if let Ok(path) = output::save_png(&img, state.styles[state.sel].name, &cfg.save_dir())
+            if let Ok(path) = output::save_png(&img, state.doc.styles[state.doc.sel].name, &cfg.save_dir())
             {
                 output::open_in_editor(&path);
             }
@@ -1534,11 +1608,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if state.text_select.as_ref().is_some_and(|s| s.dragging) {
+                if state.doc.text_select.as_ref().is_some_and(|s| s.dragging) {
                     let focus = to_raw(state, x, y).and_then(|p| {
-                        nearest_word(&state.text_select.as_ref()?.words, p)
+                        nearest_word(&state.doc.text_select.as_ref()?.words, p)
                     });
-                    if let Some(select) = state.text_select.as_mut() {
+                    if let Some(select) = state.doc.text_select.as_mut() {
                         if focus.is_some() && select.focus != focus {
                             select.focus = focus;
                             let _ = InvalidateRect(hwnd, None, false);
@@ -1552,19 +1626,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         SliderDrag::CaptionSize => caption_size_update(hwnd, state, x),
                         SliderDrag::CaptionOpacity => caption_opacity_update(hwnd, state, x),
                     }
-                } else if let Some((i, last, grab)) = state.moving {
+                } else if let Some((i, last, grab)) = state.doc.moving {
                     if let Some(p) = to_raw(state, x, y) {
-                        if let Some(ann) = state.anns.get_mut(i) {
+                        if let Some(ann) = state.doc.anns.get_mut(i) {
                             apply_grab(ann, grab, p, (p.0 - last.0, p.1 - last.1));
                         }
-                        state.moving = Some((i, p, grab));
-                        if state.last_rebuild.elapsed().as_millis() > 15 {
+                        state.doc.moving = Some((i, p, grab));
+                        if state.doc.last_rebuild.elapsed().as_millis() > 15 {
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                     }
-                } else if state.drawing {
-                    if let (Some(p), Some(ann)) = (to_raw(state, x, y), state.anns.last_mut()) {
+                } else if state.doc.drawing {
+                    if let (Some(p), Some(ann)) = (to_raw(state, x, y), state.doc.anns.last_mut()) {
                         match &mut ann.shape {
                             crate::annotate::Shape::Arrow { to, .. }
                             | crate::annotate::Shape::Line { to, .. } => *to = p,
@@ -1575,7 +1649,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             _ => {}
                         }
                         // Annotation stamping is cheap now; near-frame-rate.
-                        if state.last_rebuild.elapsed().as_millis() > 15 {
+                        if state.doc.last_rebuild.elapsed().as_millis() > 15 {
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
                         }
@@ -1589,14 +1663,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         })
                         .map(|i| i as i32)
                         .unwrap_or(-1);
-                    let hover_ann = if state.tool.is_none() && state.text_select.is_none() {
+                    let hover_ann = if state.tool.is_none() && state.doc.text_select.is_none() {
                         to_raw(state, x, y).and_then(|p| hit_ann(state, p))
                     } else {
                         None
                     };
-                    if hover != state.hover || hover_ann != state.hover_ann {
+                    if hover != state.hover || hover_ann != state.doc.hover_ann {
                         state.hover = hover;
-                        state.hover_ann = hover_ann;
+                        state.doc.hover_ann = hover_ann;
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
@@ -1610,10 +1684,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if state.text_select.is_some() {
+                if state.doc.text_select.is_some() {
                     // Double-click picks the single word under the cursor.
                     let hit = to_raw(state, x, y).and_then(|p| word_at(state, p));
-                    if let Some(select) = state.text_select.as_mut() {
+                    if let Some(select) = state.doc.text_select.as_mut() {
                         if hit.is_some() {
                             select.anchor = hit;
                             select.focus = hit;
@@ -1627,15 +1701,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(p) = to_raw(state, x, y) {
                         if let Some(i) = hit_ann(state, p) {
                             if let crate::annotate::Shape::Text { text, .. } =
-                                &state.anns[i].shape
+                                &state.doc.anns[i].shape
                             {
                                 let original = text.clone();
                                 // Re-edit an existing caption.
-                                state.moving = None;
+                                state.doc.moving = None;
                                 let _ = ReleaseCapture();
-                                state.editing_original = Some(original);
-                                state.editing = Some(i);
-                                state.selected = Some(i);
+                                state.doc.editing_original = Some(original);
+                                state.doc.editing = Some(i);
+                                state.doc.selected = Some(i);
                                 sync_annotation_controls(state, i);
                                 state.caret_on = true;
                                 rebuild_preview(state);
@@ -1654,9 +1728,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if state.text_select.is_some() && in_rect(&state.preview_box, x, y) {
+                if state.doc.text_select.is_some() && in_rect(&state.preview_box, x, y) {
                     let hit = to_raw(state, x, y).and_then(|p| anchor_word(state, p));
-                    if let Some(select) = state.text_select.as_mut() {
+                    if let Some(select) = state.doc.text_select.as_mut() {
                         select.anchor = hit;
                         select.focus = hit;
                         select.dragging = hit.is_some();
@@ -1697,8 +1771,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .copied()
                     {
                         state.caption_style = style;
-                        if let Some(index) = state.editing.or(state.selected) {
-                            if let Some(ann) = state.anns.get_mut(index) {
+                        if let Some(index) = state.doc.editing.or(state.doc.selected) {
+                            if let Some(ann) = state.doc.anns.get_mut(index) {
                                 if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
                                     ann.text_style = style;
                                 }
@@ -1711,13 +1785,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 // Clicking away accepts the caption and returns to Select.
                 // Enter remains optional, matching the video editor.
-                if state.editing.is_some() {
+                if state.doc.editing.is_some() {
                     commit_editing(state);
                     rebuild_preview(state);
                 }
                 if in_rect(&grab, x, y) {
                     commit_editing(state);
                     state.dragging = Some(SliderDrag::Padding);
+                    // Padding changes the canvas geometry, so nothing caches
+                    // between frames. Drop to drag quality for the duration.
+                    state.doc.fast_preview = true;
                     SetCapture(hwnd);
                     slider_update(hwnd, state, x);
                 } else if let (Some(tool), Some(p)) = (state.tool, to_raw(state, x, y)) {
@@ -1735,48 +1812,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         _ => None,
                     };
                     if let Some(shape) = drag_shape {
-                        state.anns.push(crate::annotate::Annotation {
+                        state.doc.anns.push(crate::annotate::Annotation {
                             shape,
                             color,
                             size,
                             text_style: crate::annotate::TextStyle::Shadow,
                             text_box_opacity: state.caption_box_opacity,
                         });
-                        state.drawing = true;
+                        state.doc.drawing = true;
                         SetCapture(hwnd);
                     } else if tool == 7 {
                         // Step badge: click places, auto-numbered, one-shot.
-                        let n = state.counter_next;
-                        state.counter_next += 1;
-                        state.anns.push(crate::annotate::Annotation {
+                        let n = state.doc.counter_next;
+                        state.doc.counter_next += 1;
+                        state.doc.anns.push(crate::annotate::Annotation {
                             shape: Shape::Counter { pos: p, n },
                             color,
                             size,
                             text_style: crate::annotate::TextStyle::Shadow,
                             text_box_opacity: state.caption_box_opacity,
                         });
-                        state.selected = Some(state.anns.len() - 1);
+                        state.doc.selected = Some(state.doc.anns.len() - 1);
                         state.tool = None;
                         rebuild_preview(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     } else {
                         // Text: click places, then type.
-                        state.anns.push(crate::annotate::Annotation {
+                        state.doc.anns.push(crate::annotate::Annotation {
                             shape: Shape::Text { pos: p, text: String::new() },
                             color: 3,
                             size: state.caption_size,
                             text_style: state.caption_style,
                             text_box_opacity: state.caption_box_opacity,
                         });
-                        state.editing = Some(state.anns.len() - 1);
-                        state.editing_original = None;
-                        state.selected = Some(state.anns.len() - 1);
+                        state.doc.editing = Some(state.doc.anns.len() - 1);
+                        state.doc.editing_original = None;
+                        state.doc.selected = Some(state.doc.anns.len() - 1);
                         state.caret_on = true;
                         rebuild_preview(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 } else {
-                    if state.editing.is_some() {
+                    if state.doc.editing.is_some() {
                         commit_editing(state);
                         rebuild_preview(state);
                         let _ = InvalidateRect(hwnd, None, false);
@@ -1785,15 +1862,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // endpoint, or corner) to manipulate it.
                     if let Some(p) = to_raw(state, x, y) {
                         if let Some(i) = hit_ann(state, p) {
-                            let tol = (8.0 / state.preview_metric).max(6.0);
-                            normalize_rect(&mut state.anns[i]);
-                            let grab = grab_probe(&state.anns[i], p, tol);
-                            state.selected = Some(i);
+                            let tol = (8.0 / state.doc.preview_metric).max(6.0);
+                            normalize_rect(&mut state.doc.anns[i]);
+                            let grab = grab_probe(&state.doc.anns[i], p, tol);
+                            state.doc.selected = Some(i);
                             sync_annotation_controls(state, i);
-                            state.moving = Some((i, p, grab));
+                            state.doc.moving = Some((i, p, grab));
                             SetCapture(hwnd);
                             let _ = InvalidateRect(hwnd, None, false);
-                        } else if state.selected.take().is_some() {
+                        } else if state.doc.selected.take().is_some() {
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                     }
@@ -1803,8 +1880,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             if let Some(state) = state_of(hwnd) {
-                if state.text_select.as_ref().is_some_and(|s| s.dragging) {
-                    if let Some(select) = state.text_select.as_mut() {
+                if state.doc.text_select.as_ref().is_some_and(|s| s.dragging) {
+                    if let Some(select) = state.doc.text_select.as_mut() {
                         select.dragging = false;
                     }
                     let _ = ReleaseCapture();
@@ -1813,19 +1890,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if state.dragging.take().is_some() {
                     let _ = ReleaseCapture();
+                    end_fast_preview(hwnd, state);
                     return LRESULT(0);
                 }
-                if state.moving.take().is_some() {
+                if state.doc.moving.take().is_some() {
                     let _ = ReleaseCapture();
                     rebuild_preview(state);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
-                if state.drawing {
-                    state.drawing = false;
+                if state.doc.drawing {
+                    state.doc.drawing = false;
                     let _ = ReleaseCapture();
                     // Drop degenerate shapes (a stray click).
-                    let degenerate = match state.anns.last().map(|a| &a.shape) {
+                    let degenerate = match state.doc.anns.last().map(|a| &a.shape) {
                         Some(crate::annotate::Shape::Arrow { from, to })
                         | Some(crate::annotate::Shape::Line { from, to }) => {
                             (from.0 - to.0).abs() < 3.0 && (from.1 - to.1).abs() < 3.0
@@ -1839,12 +1917,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         _ => false,
                     };
                     if degenerate {
-                        state.anns.pop();
+                        state.doc.anns.pop();
                     } else {
                         // One-shot tools: a successful add returns to the
                         // selector so the next drag moves instead of drawing.
                         state.tool = None;
-                        state.selected = Some(state.anns.len() - 1);
+                        state.doc.selected = Some(state.doc.anns.len() - 1);
                     }
                     rebuild_preview(state);
                     let _ = InvalidateRect(hwnd, None, false);
@@ -1870,13 +1948,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if state.editing.is_some() {
+                if state.doc.editing.is_some() {
                     commit_editing(state);
                 }
                 if let Some(point) = to_raw(state, x, y) {
                     if let Some(index) = hit_ann(state, point) {
                         state.tool = None;
-                        state.selected = Some(index);
+                        state.doc.selected = Some(index);
                         sync_annotation_controls(state, index);
                         rebuild_preview(state);
                         let _ = InvalidateRect(hwnd, None, false);
@@ -1888,7 +1966,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_RBUTTONUP | WM_CONTEXTMENU => LRESULT(0),
         windows::Win32::UI::WindowsAndMessaging::WM_TIMER => {
             if let Some(state) = state_of(hwnd) {
-                if state.editing.is_some() {
+                if state.doc.editing.is_some() {
                     state.caret_on = !state.caret_on;
                     rebuild_preview(state);
                     let _ = InvalidateRect(hwnd, None, false);
@@ -1906,9 +1984,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 // Typing keeps the caret solid, like every real text box.
                 state.caret_on = true;
-                if let Some(i) = state.editing {
+                if let Some(i) = state.doc.editing {
                     let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
-                    let action = state
+                    let action = state.doc
                         .anns
                         .get_mut(i)
                         .and_then(|ann| match &mut ann.shape {
@@ -1936,20 +2014,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 ) < 0;
                 // Select-text mode owns Esc and the clipboard keys while armed;
                 // everything else still falls through to the editor.
-                if state.text_select.is_some() {
+                if state.doc.text_select.is_some() {
                     let key = wparam.0 as u16;
                     if key == VK_ESCAPE.0 {
-                        state.text_select = None;
+                        state.doc.text_select = None;
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
                     if ctrl_down && key == b'A' as u16 {
-                        let last = state
+                        let last = state.doc
                             .text_select
                             .as_ref()
                             .map(|select| select.words.len())
                             .unwrap_or(0);
-                        if let Some(select) = state.text_select.as_mut() {
+                        if let Some(select) = state.doc.text_select.as_mut() {
                             if last > 0 {
                                 select.anchor = Some(0);
                                 select.focus = Some(last - 1);
@@ -1973,27 +2051,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 }
                             }
                         };
-                        if let Some(select) = state.text_select.as_mut() {
+                        if let Some(select) = state.doc.text_select.as_mut() {
                             select.message = Some(message);
                         }
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
                 }
+                // Ctrl+C copies the finished image, exactly as the Copy chip
+                // does. Not while typing a caption, where it means the text.
+                if ctrl_down && wparam.0 as u16 == b'C' as u16 && state.doc.editing.is_none() {
+                    copy_and_finish(hwnd, state);
+                    return LRESULT(0);
+                }
                 match wparam.0 as u16 {
                     v if v == VK_ESCAPE.0 => {
-                        if let Some(i) = state.editing.take() {
-                            if let Some(original) = state.editing_original.take() {
+                        if let Some(i) = state.doc.editing.take() {
+                            if let Some(original) = state.doc.editing_original.take() {
                                 if let Some(crate::annotate::Shape::Text { text, .. }) =
-                                    state.anns.get_mut(i).map(|ann| &mut ann.shape)
+                                    state.doc.anns.get_mut(i).map(|ann| &mut ann.shape)
                                 {
                                     *text = original;
                                 }
-                                state.selected = Some(i);
-                            } else if i < state.anns.len() {
+                                state.doc.selected = Some(i);
+                            } else if i < state.doc.anns.len() {
                                 // A brand-new empty caption is discarded.
-                                state.anns.remove(i);
-                                state.selected = None;
+                                state.doc.anns.remove(i);
+                                state.doc.selected = None;
                             }
                             state.tool = None;
                             rebuild_preview(state);
@@ -2004,7 +2088,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                     v if v == VK_RETURN.0 => {
-                        if state.editing.is_some() {
+                        if state.doc.editing.is_some() {
                             commit_editing(state);
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
@@ -2015,29 +2099,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     0x5A if ctrl_down => {
                         // Ctrl+Z
                         commit_editing(state);
-                        state.anns.pop();
-                        state.selected = None;
-                        state.hover_ann = None;
+                        state.doc.anns.pop();
+                        state.doc.selected = None;
+                        state.doc.hover_ann = None;
                         rebuild_preview(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     // Delete removes the selected annotation.
-                    0x2E if state.editing.is_none() => {
-                        if let Some(i) = state.selected.take() {
-                            if i < state.anns.len() {
-                                state.anns.remove(i);
+                    0x2E if state.doc.editing.is_none() => {
+                        if let Some(i) = state.doc.selected.take() {
+                            if i < state.doc.anns.len() {
+                                state.doc.anns.remove(i);
                             }
-                            state.hover_ann = None;
+                            state.doc.hover_ann = None;
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                     }
                     // Tool shortcuts (A/R/T/B) and colors (1-4).
-                    0x41 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(0)), // Arrow
-                    0x52 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(2)), // Rectangle
-                    0x54 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(5)), // Text
-                    0x42 if state.editing.is_none() => activate(hwnd, state, Ctl::Tool(6)), // Blur
-                    v @ 0x31..=0x34 if state.editing.is_none() => {
+                    0x41 if state.doc.editing.is_none() => activate(hwnd, state, Ctl::Tool(0)), // Arrow
+                    0x52 if state.doc.editing.is_none() => activate(hwnd, state, Ctl::Tool(2)), // Rectangle
+                    0x54 if state.doc.editing.is_none() => activate(hwnd, state, Ctl::Tool(5)), // Text
+                    0x42 if state.doc.editing.is_none() => activate(hwnd, state, Ctl::Tool(6)), // Blur
+                    v @ 0x31..=0x34 if state.doc.editing.is_none() => {
                         activate(hwnd, state, Ctl::Color((v - 0x31) as usize))
                     }
                     _ => {}
@@ -2055,7 +2139,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 lparam.0 as *mut std::result::Result<Vec<crate::ocr::Word>, String>,
             );
             if let Some(state) = state_of(hwnd) {
-                if let Some(select) = state.text_select.as_mut() {
+                if let Some(select) = state.doc.text_select.as_mut() {
                     // A stale result from a mode the user already left has
                     // nothing to attach to.
                     if select.pending {
@@ -2109,7 +2193,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = GetCursorPos(&mut pt);
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
                     let raw = to_raw(state, pt.x, pt.y);
-                    let id = if state.text_select.is_some() {
+                    let id = if state.doc.text_select.is_some() {
                         if raw.is_some() && in_rect(&state.preview_box, pt.x, pt.y) {
                             windows::Win32::UI::WindowsAndMessaging::IDC_IBEAM
                         } else {
@@ -2117,14 +2201,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     } else if state.tool.is_some() && raw.is_some() {
                         IDC_CROSS
-                    } else if let Some((_, _, grab)) = state.moving {
+                    } else if let Some((_, _, grab)) = state.doc.moving {
                         // Mid-drag: keep showing what the drag is doing.
                         cursor_for(grab)
                     } else if let Some(p) = raw {
                         match hit_ann(state, p) {
                             Some(i) => {
-                                let tol = (8.0 / state.preview_metric).max(6.0);
-                                cursor_for(grab_probe(&state.anns[i], p, tol))
+                                let tol = (8.0 / state.doc.preview_metric).max(6.0);
+                                cursor_for(grab_probe(&state.doc.anns[i], p, tol))
                             }
                             None => ARROW,
                         }
@@ -2153,7 +2237,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if w > 0 && h > 0 {
                     state.width = w;
                     state.height = h;
-                    let next = layout_controls(state.scale, w, h, state.styles.len());
+                    let next = layout_controls(state.scale, w, h, state.doc.styles.len());
                     state.controls = next.controls;
                     state.preview_box = next.preview_box;
                     state.slider_rect = next.padding_slider;
@@ -2394,24 +2478,49 @@ pub fn run(
     } else {
         raw.clone()
     };
+    // Drag-quality source, built once so a padding drag never pays for a
+    // resize per frame.
+    let metric_fast = scale * 0.5;
+    let small_fast = image::imageops::resize(
+        &small,
+        (small.width() / 2).max(1),
+        (small.height() / 2).max(1),
+        image::imageops::FilterType::Triangle,
+    );
 
     let initial_layout = layout_controls(dpi_scale, cw, ch, styles.len());
 
     let preview_metric = scale;
     let cfg = Config::load();
     let mut state = Box::new(State {
-        raw,
-        small,
-        preview_metric,
-        styles,
-        sel: initial,
-        pad_factor: compose::DEFAULT_PAD_FACTOR,
-        aspect_idx: 0,
+        doc: Document {
+            raw,
+            small,
+            preview_metric,
+            small_fast,
+            metric_fast,
+            fast_preview: false,
+            styles,
+            sel: initial,
+            pad_factor: compose::DEFAULT_PAD_FACTOR,
+            aspect_idx: 0,
+            output_max_edge: cfg.output_max_edge,
+            preview: Vec::new(),
+            preview_w: 1,
+            preview_h: 1,
+            base_cache: None,
+            anns: Vec::new(),
+            drawing: false,
+            editing: None,
+            editing_original: None,
+            moving: None,
+            selected: None,
+            counter_next: 1,
+            hover_ann: None,
+            text_select: None,
+            last_rebuild: std::time::Instant::now(),
+        },
         export_scale: cfg.export_scale,
-        output_max_edge: cfg.output_max_edge,
-        preview: Vec::new(),
-        preview_w: 1,
-        preview_h: 1,
         controls: initial_layout.controls,
         preview_box: initial_layout.preview_box,
         slider_rect: initial_layout.padding_slider,
@@ -2423,24 +2532,13 @@ pub fn run(
         done: false,
         suspended: false,
         reshoot: None,
-        base_cache: None,
-        anns: Vec::new(),
         tool: None,
         color_idx: 0,
-        drawing: false,
-        editing: None,
-        editing_original: None,
         caret_on: true,
-        moving: None,
-        selected: None,
-        counter_next: 1,
-        hover_ann: None,
-        text_select: None,
         size_idx: 1,
         caption_size: 1.75,
         caption_style: crate::annotate::TextStyle::Box,
         caption_box_opacity: 0.68,
-        last_rebuild: std::time::Instant::now(),
         font: unsafe { make_font(-sc(14), 400) },
         font_small: unsafe { make_font(-sc(12), 400) },
         scale: dpi_scale,
