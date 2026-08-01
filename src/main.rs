@@ -8,6 +8,7 @@ mod diagnostics;
 mod icon;
 mod license;
 mod license_ui;
+mod number_prompt;
 mod ocr;
 mod pin;
 mod audio;
@@ -191,7 +192,8 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 let auto = auto.clone();
                 let raw = raw.clone();
                 let style = styles[preselect].clone();
-                let (scale, dir) = (cfg.export_scale, cfg.save_dir());
+                let (scale, max_edge, dir) =
+                    (cfg.export_scale, cfg.output_max_edge, cfg.save_dir());
                 std::thread::spawn(move || {
                     let styled = compose::export(
                         &raw,
@@ -200,6 +202,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                         None,
                         scale,
                     );
+                    let styled = output::resize_to_max_edge(&styled, max_edge);
                     let mut st = auto.lock().unwrap();
                     if st.canceled {
                         return;
@@ -329,6 +332,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         None,
         cfg.export_scale,
     );
+    let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
     let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir())?;
     output::to_clipboard(&styled, Some(&path)).context("clipboard failed")?;
     // A different pick supersedes the auto-copied file.
@@ -518,6 +522,7 @@ fn run_app() -> Result<()> {
                     error_box(&format!("Capture failed: {e:#}"));
                 }
             }
+            let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
             DispatchMessageW(&msg);
 
             // A timer message reaches this loop every 250 ms. If Windows or
@@ -909,6 +914,8 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 3,
                     size: 1.35,
+                    caption_style: video_edit::CaptionStyle::Box,
+                    caption_box_opacity: 0.68,
                 },
                 video_edit::Item {
                     shape: video_edit::Shape::Arrow {
@@ -919,6 +926,8 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 0,
                     size: 1.0,
+                    caption_style: video_edit::CaptionStyle::Shadow,
+                    caption_box_opacity: 0.68,
                 },
                 video_edit::Item {
                     shape: video_edit::Shape::Rect {
@@ -929,6 +938,8 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 2,
                     size: 1.0,
+                    caption_style: video_edit::CaptionStyle::Shadow,
+                    caption_box_opacity: 0.68,
                 },
                 video_edit::Item {
                     shape: video_edit::Shape::Blur {
@@ -939,6 +950,8 @@ fn main() -> Result<()> {
                     end: duration,
                     color: 0,
                     size: 1.0,
+                    caption_style: video_edit::CaptionStyle::Shadow,
+                    caption_box_opacity: 0.68,
                 },
             ];
             let dst = src.with_extension("edit.mp4");
@@ -964,10 +977,12 @@ fn main() -> Result<()> {
         Some("--playback-test") => {
             let src =
                 std::path::PathBuf::from(args.get(1).context("--playback-test <mp4>")?);
+            let paused = trim::preview_frame(&src, 0, 960, 540)?;
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let started = std::time::Instant::now();
             let mut frames = 0u32;
             let mut last = 0i64;
+            let mut playback_size = None;
             trim::playback_frames(
                 &src,
                 0,
@@ -978,11 +993,16 @@ fn main() -> Result<()> {
                 |frame| {
                     frames += 1;
                     last = frame.timestamp;
+                    playback_size.get_or_insert((frame.width, frame.height));
                     true
                 },
             )?;
             eprintln!(
-                "playback: {frames} frames through {:.2}s in {:.2}s",
+                "paused: {}x{} · playback: {}x{} · {frames} frames through {:.2}s in {:.2}s",
+                paused.1,
+                paused.2,
+                playback_size.unwrap_or_default().0,
+                playback_size.unwrap_or_default().1,
                 last as f64 / 10_000_000.0,
                 started.elapsed().as_secs_f64()
             );
@@ -1025,6 +1045,45 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Word-box probe for select-text mode: prints each recognized word in
+        // capture coordinates so the overlay geometry can be checked headlessly.
+        Some("--ocr-words") => {
+            require_capture_license()?;
+            let target = args
+                .get(1)
+                .context("--ocr-words needs a title substring or a png path")?;
+            // A path exercises oversized captures (scroll stitches) that no
+            // live window can reach.
+            let img = if std::path::Path::new(target).is_file() {
+                image::open(target).context("open image")?.to_rgba8()
+            } else {
+                let hwnd = window::find_by_title(target)
+                    .with_context(|| format!("no visible window matching {target:?}"))?;
+                let captured = capture::capture_window(hwnd)?;
+                license::record_successful_capture();
+                captured
+            };
+            let words = ocr::recognize_words(&img)?;
+            eprintln!(
+                "--- {} words over {}x{} ---",
+                words.len(),
+                img.width(),
+                img.height()
+            );
+            for word in words.iter() {
+                let (x0, y0, x1, y1) = word.rect;
+                eprintln!(
+                    "line {:>2}  [{:>6.1},{:>6.1} {:>6.1}x{:>5.1}]  {}",
+                    word.line,
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    word.text
+                );
+            }
+            Ok(())
+        }
         // Render sample annotations onto a capture and save raw (testing).
         Some("--annotate-demo") => {
             require_capture_license()?;
@@ -1042,6 +1101,8 @@ fn main() -> Result<()> {
                     },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Rect {
@@ -1050,6 +1111,8 @@ fn main() -> Result<()> {
                     },
                     color: 2,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Blur {
@@ -1058,6 +1121,8 @@ fn main() -> Result<()> {
                     },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Text {
@@ -1066,6 +1131,8 @@ fn main() -> Result<()> {
                     },
                     color: 1,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Box,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Line {
@@ -1074,6 +1141,8 @@ fn main() -> Result<()> {
                     },
                     color: 3,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Ellipse {
@@ -1082,6 +1151,8 @@ fn main() -> Result<()> {
                     },
                     color: 1,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Highlight {
@@ -1090,16 +1161,22 @@ fn main() -> Result<()> {
                     },
                     color: 1,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Counter { pos: (w * 0.2, h * 0.55), n: 1 },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Counter { pos: (w * 0.5, h * 0.62), n: 2 },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
             ];
             annotate::render(&mut img, &anns, 1.0, (0.0, 0.0), None);

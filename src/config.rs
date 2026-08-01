@@ -14,6 +14,9 @@ pub struct Config {
     /// Export supersampling factor (1-4). Content is Lanczos-upscaled; the
     /// frame (gradient, corners, shadow) renders natively at this scale.
     pub export_scale: u32,
+    /// Maximum pixel length of the finished screenshot's longest edge.
+    /// Zero preserves the original output dimensions.
+    pub output_max_edge: u32,
     /// First-run notification shown.
     pub onboarded: bool,
     /// Whether the resident should own PrtScn while capture is licensed.
@@ -33,6 +36,7 @@ impl Default for Config {
             save_dir: None,
             last_style: 0,
             export_scale: 1,
+            output_max_edge: 0,
             onboarded: false,
             capture_prtscn: true,
             record_gif: false,

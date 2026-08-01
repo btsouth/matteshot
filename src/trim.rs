@@ -21,6 +21,9 @@ pub struct Probe {
     pub duration_100ns: i64,
     /// BGRA thumbnails: (pixels, w, h).
     pub thumbs: Vec<(Vec<u8>, u32, u32)>,
+    /// Higher-quality BGRA frames used while scrubbing in the editor.
+    pub previews: Vec<(Vec<u8>, u32, u32)>,
+    pub source_size: (u32, u32),
 }
 
 pub struct PlaybackFrame {
@@ -29,6 +32,41 @@ pub struct PlaybackFrame {
     pub width: u32,
     pub height: u32,
     pub timestamp: i64,
+}
+
+fn fit_inside(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let (w, h) = (w.max(1), h.max(1));
+    let scale = (max_w.max(1) as f64 / w as f64)
+        .min(max_h.max(1) as f64 / h as f64)
+        .min(1.0);
+    (
+        (w as f64 * scale).round().max(1.0) as u32,
+        (h as f64 * scale).round().max(1.0) as u32,
+    )
+}
+
+fn scrub_cache_plan(
+    duration: i64,
+    source_size: (u32, u32),
+    preview_bounds: (u32, u32),
+) -> (usize, u32, u32) {
+    const SCRUB_CACHE_BUDGET: u64 = 96 * 1024 * 1024;
+    let seconds = (duration.max(1) as f64 / 10_000_000.0).max(1.0);
+    let count = ((seconds * 2.0).ceil() as usize).clamp(24, 96);
+    let (mut width, mut height) = fit_inside(
+        source_size.0,
+        source_size.1,
+        preview_bounds.0.max(2),
+        preview_bounds.1.max(2),
+    );
+    let allowed_pixels = (SCRUB_CACHE_BUDGET / count as u64 / 4).max(1) as f64;
+    let requested_pixels = width as f64 * height as f64;
+    if requested_pixels > allowed_pixels {
+        let scale = (allowed_pixels / requested_pixels).sqrt();
+        width = (width as f64 * scale).floor().max(2.0) as u32;
+        height = (height as f64 * scale).floor().max(2.0) as u32;
+    }
+    (count, width, height)
 }
 
 fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u32, i32)> {
@@ -147,7 +185,13 @@ pub fn preview_frame(
     let (bgra, _) = read_video_frame(&reader, w, h, stride)?
         .context("video has no frame at the requested position")?;
     let rgba = bgra_to_rgba(&bgra, w, h);
-    let scaled = image::imageops::thumbnail(&rgba, max_w.max(2), max_h.max(2));
+    let (target_w, target_h) = fit_inside(w, h, max_w.max(2), max_h.max(2));
+    let scaled = image::imageops::resize(
+        &rgba,
+        target_w,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    );
     let (sw, sh) = scaled.dimensions();
     Ok((rgba_to_bgra(&scaled, sw, sh), sw, sh))
 }
@@ -209,7 +253,13 @@ pub fn playback_frames(
         }
 
         let rgba = bgra_to_rgba(&bgra, w, h);
-        let scaled = image::imageops::thumbnail(&rgba, max_w.max(2), max_h.max(2));
+        let (target_w, target_h) = fit_inside(w, h, max_w.max(2), max_h.max(2));
+        let scaled = image::imageops::resize(
+            &rgba,
+            target_w,
+            target_h,
+            image::imageops::FilterType::Triangle,
+        );
         let (width, height) = scaled.dimensions();
         if !deliver(PlaybackFrame {
             bytes: rgba_to_bgra(&scaled, width, height),
@@ -226,11 +276,17 @@ pub fn playback_frames(
 /// Duration + filmstrip thumbnails sized to tile `strip_w` x `strip_h` at
 /// the video's own aspect ratio (stretching frames to fixed cells makes the
 /// strip look wrong).
-pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
+fn probe_impl(
+    path: &Path,
+    strip_w: u32,
+    thumb_h: u32,
+    preview_bounds: Option<(u32, u32)>,
+) -> Result<Probe> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
     let (reader, w, h, stride) = open_reader(path, false)?;
     let duration = duration_of(&reader)?;
     let mut thumbs = Vec::new();
+    let mut previews = Vec::new();
     let tw = ((w as f32 * thumb_h as f32 / h as f32) as u32).max(2);
     // Enough frames to fill the strip, capped so probing stays quick.
     let n_thumbs = ((strip_w as f32 / tw as f32).ceil() as usize).clamp(3, 24);
@@ -262,10 +318,73 @@ pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
         }
         thumbs.push((t, tw, thumb_h));
     }
+
+    if let Some((max_w, max_h)) = preview_bounds {
+        // Filmstrip cells are intentionally tiny and must never be stretched
+        // into the main preview. Keep a separate scrub cache sampled at about
+        // 2 fps, with a bounded memory footprint. Mouse-up still decodes the
+        // exact requested frame.
+        let (preview_count, preview_w, preview_h) =
+            scrub_cache_plan(duration, (w, h), (max_w, max_h));
+        for index in 0..preview_count {
+            let position = if preview_count > 1 {
+                duration * index as i64 / (preview_count - 1) as i64
+            } else {
+                0
+            };
+            unsafe {
+                let pv = PROPVARIANT::from(position.max(0));
+                if reader
+                    .SetCurrentPosition(&windows::core::GUID::zeroed(), &pv)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let Some((bgra, _)) = read_video_frame(&reader, w, h, stride)? else {
+                break;
+            };
+            let rgba = bgra_to_rgba(&bgra, w, h);
+            let scaled = image::imageops::resize(
+                &rgba,
+                preview_w,
+                preview_h,
+                image::imageops::FilterType::Triangle,
+            );
+            previews.push((
+                rgba_to_bgra(&scaled, preview_w, preview_h),
+                preview_w,
+                preview_h,
+            ));
+        }
+    }
     Ok(Probe {
         duration_100ns: duration,
         thumbs,
+        previews,
+        source_size: (w, h),
     })
+}
+
+pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
+    probe_impl(path, strip_w, thumb_h, None)
+}
+
+/// Probe a recording for the editor. Filmstrip cells stay compact, while a
+/// separate high-quality cache keeps the large preview sharp during scrubs.
+pub fn probe_editor(
+    path: &Path,
+    strip_w: u32,
+    thumb_h: u32,
+    preview_w: u32,
+    preview_h: u32,
+) -> Result<Probe> {
+    probe_impl(
+        path,
+        strip_w,
+        thumb_h,
+        Some((preview_w, preview_h)),
+    )
 }
 
 /// A finalized MP4 is trusted only after Media Foundation can read its
@@ -606,7 +725,27 @@ pub fn cut_with_edit_progress_cancel(
 
 #[cfg(test)]
 mod tests {
-    use super::{bgra_to_rgba, rgba_to_bgra, validate_video};
+    use super::{bgra_to_rgba, fit_inside, rgba_to_bgra, scrub_cache_plan, validate_video};
+
+    #[test]
+    fn preview_fit_preserves_the_recorded_aspect_ratio() {
+        assert_eq!(fit_inside(1920, 1036, 960, 540), (960, 518));
+        assert_eq!(fit_inside(1920, 1036, 1600, 420), (778, 420));
+        assert_eq!(fit_inside(640, 480, 1920, 1080), (640, 480));
+    }
+
+    #[test]
+    fn scrub_cache_is_smooth_sharp_and_memory_bounded() {
+        let (count, width, height) =
+            scrub_cache_plan(30 * 10_000_000, (1920, 1036), (1600, 700));
+        assert_eq!(count, 60);
+        assert!(width >= 700 && height >= 375, "cache frame was {width}x{height}");
+        assert!((width as f32 / height as f32 - 1920.0 / 1036.0).abs() < 0.01);
+        assert!(count as u64 * width as u64 * height as u64 * 4 <= 96 * 1024 * 1024);
+
+        assert_eq!(scrub_cache_plan(2 * 10_000_000, (1280, 720), (900, 600)).0, 24);
+        assert_eq!(scrub_cache_plan(90 * 10_000_000, (1280, 720), (900, 600)).0, 96);
+    }
 
     #[test]
     fn video_pixel_channel_conversion_round_trips() {

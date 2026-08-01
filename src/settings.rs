@@ -41,6 +41,8 @@ enum Ctrl {
     ChangeVideoDir,
     OpenVideoDir,
     Scale(u32),
+    OutputSize(u32),
+    CustomSize,
     Autostart,
     Prtscn,
     RecordGif,
@@ -239,6 +241,31 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 state.cfg.export_scale == *n,
                 hot,
             ),
+            Ctrl::OutputSize(max_edge) => draw_chip_button(
+                hdc,
+                *r,
+                &crate::output::output_size_label(*max_edge),
+                state,
+                state.cfg.output_max_edge == *max_edge,
+                hot,
+            ),
+            Ctrl::CustomSize => {
+                let custom = ![
+                    crate::output::OUTPUT_ORIGINAL,
+                    crate::output::OUTPUT_EMAIL,
+                    crate::output::OUTPUT_COMPACT,
+                ]
+                .contains(&state.cfg.output_max_edge);
+                let custom_label = format!("{}px", state.cfg.output_max_edge);
+                draw_chip_button(
+                    hdc,
+                    *r,
+                    if custom { &custom_label } else { "Custom" },
+                    state,
+                    custom,
+                    hot,
+                )
+            }
             Ctrl::Autostart => {
                 draw_checkbox(hdc, *r, "Start with Windows", state, tray::autostart_enabled(), hot)
             }
@@ -297,14 +324,33 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
     }
 
-    // Section label for quality
+    // Section label for supersampled matte rendering.
     y = s(state, 152);
     draw_text_in(
         hdc,
         state.font_small,
         state.theme.muted,
         RECT { left: m, top: y, right: state.width - m, bottom: y + s(state, 20) },
-        "EXPORT QUALITY  (2x recommended for sharing)",
+        "RENDER QUALITY  (2x recommended for sharing)",
+        0,
+    );
+
+    // Finished screenshot size.
+    let size_summary = match state.cfg.output_max_edge {
+        crate::output::OUTPUT_ORIGINAL => "Original pixels".to_string(),
+        value => format!("{} px maximum edge", value),
+    };
+    draw_text_in(
+        hdc,
+        state.font_small,
+        state.theme.muted,
+        RECT {
+            left: m,
+            top: s(state, 216),
+            right: state.width - m,
+            bottom: s(state, 238),
+        },
+        &format!("SCREENSHOT SIZE  ({size_summary})"),
         0,
     );
 
@@ -315,9 +361,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
         state.theme.text,
         RECT {
             left: m,
-            top: s(state, 324),
+            top: s(state, 390),
             right: m + s(state, 145),
-            bottom: s(state, 352),
+            bottom: s(state, 418),
         },
         "Recording audio",
         0,
@@ -374,6 +420,14 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
         Ctrl::OpenVideoDir => crate::output::open_folder(&state.cfg.video_dir()),
         Ctrl::Scale(n) => {
             state.cfg = Config::update(|cfg| cfg.export_scale = n);
+        }
+        Ctrl::OutputSize(max_edge) => {
+            state.cfg = Config::update(|cfg| cfg.output_max_edge = max_edge);
+        }
+        Ctrl::CustomSize => {
+            if let Ok(Some(max_edge)) = crate::number_prompt::ask(hwnd, state.cfg.output_max_edge) {
+                state.cfg = Config::update(|cfg| cfg.output_max_edge = max_edge);
+            }
         }
         Ctrl::Autostart => {
             let _ = tray::set_autostart(!tray::autostart_enabled());
@@ -504,7 +558,7 @@ pub fn open() -> Result<()> {
 
         let scale = GetDpiForSystem() as f32 / 96.0;
         let sc = |v: i32| (v as f32 * scale) as i32;
-        let (cw, ch) = (sc(500), sc(424));
+        let (cw, ch) = (sc(500), sc(472));
 
         let font = make_font(-sc(15));
         let font_small = make_font(-sc(12));
@@ -538,24 +592,39 @@ pub fn open() -> Result<()> {
                 Ctrl::Scale(*n),
             ));
         }
+        // Finished screenshot size. These cap the completed matte and never
+        // upscale a smaller image.
+        let size_controls = [
+            (Ctrl::OutputSize(crate::output::OUTPUT_ORIGINAL), 0),
+            (Ctrl::OutputSize(crate::output::OUTPUT_EMAIL), 1),
+            (Ctrl::OutputSize(crate::output::OUTPUT_COMPACT), 2),
+            (Ctrl::CustomSize, 3),
+        ];
+        for (ctrl, i) in size_controls {
+            let x = m + i * sc(110);
+            controls.push((
+                RECT { left: x, top: sc(240), right: x + sc(102), bottom: sc(270) },
+                ctrl,
+            ));
+        }
         // Checkboxes.
         controls.push((
-            RECT { left: m, top: sc(226), right: cw - m, bottom: sc(254) },
+            RECT { left: m, top: sc(286), right: cw - m, bottom: sc(314) },
             Ctrl::Autostart,
         ));
         controls.push((
-            RECT { left: m, top: sc(258), right: cw - m, bottom: sc(286) },
+            RECT { left: m, top: sc(318), right: cw - m, bottom: sc(346) },
             Ctrl::Prtscn,
         ));
         controls.push((
-            RECT { left: m, top: sc(290), right: cw - m, bottom: sc(318) },
+            RECT { left: m, top: sc(350), right: cw - m, bottom: sc(378) },
             Ctrl::RecordGif,
         ));
         // Recording audio segmented control.
         for (i, mode) in ["off", "system", "mic"].iter().enumerate() {
             let x = m + sc(150) + i as i32 * sc(78);
             controls.push((
-                RECT { left: x, top: sc(324), right: x + sc(70), bottom: sc(352) },
+                RECT { left: x, top: sc(390), right: x + sc(70), bottom: sc(418) },
                 Ctrl::Audio(mode),
             ));
         }

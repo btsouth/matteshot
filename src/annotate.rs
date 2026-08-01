@@ -33,12 +33,20 @@ pub enum Shape {
     Counter { pos: (f32, f32), n: u32 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextStyle {
+    Shadow,
+    Box,
+}
+
 #[derive(Clone)]
 pub struct Annotation {
     pub shape: Shape,
     pub color: usize,
     /// Stroke/text size multiplier (S/M/L in the editor).
     pub size: f32,
+    pub text_style: TextStyle,
+    pub text_box_opacity: f32,
 }
 
 fn blend(img: &mut RgbaImage, x: i32, y: i32, color: [u8; 3], a: f32) {
@@ -248,17 +256,174 @@ pub fn render(
     offset: (f32, f32),
     caret: Option<usize>,
 ) {
+    render_with_metric(img, anns, scale, scale, offset, caret);
+}
+
+/// Return the exact pixel box produced by the caption rasterizer. Selection,
+/// hit testing, and rendering all use this measurement so the editor outline
+/// cannot drift away from the text it represents.
+pub(crate) fn caption_text_size(
+    text: &str,
+    size: f32,
+    metric_scale: f32,
+) -> Option<(i32, i32)> {
+    if text.is_empty() {
+        return None;
+    }
+    let px_h = (24.0 * metric_scale * size).max(12.0) as i32;
+    raster_text(text, px_h).map(|(_, width, height)| (width, height))
+}
+
+fn rounded_plate(
+    img: &mut RgbaImage,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    radius: f32,
+    opacity: f32,
+) {
+    let width = (right - left).max(1) as f32;
+    let height = (bottom - top).max(1) as f32;
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(1.0);
+    for y in top..bottom {
+        for x in left..right {
+            let px = x as f32 + 0.5 - left as f32;
+            let py = y as f32 + 0.5 - top as f32;
+            let qx = (px - width / 2.0).abs() - (width / 2.0 - radius);
+            let qy = (py - height / 2.0).abs() - (height / 2.0 - radius);
+            let distance = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt()
+                + qx.max(qy).min(0.0)
+                - radius;
+            let coverage = (0.5 - distance).clamp(0.0, 1.0);
+            blend(
+                img,
+                x,
+                y,
+                [12, 14, 20],
+                coverage * opacity.clamp(0.0, 1.0),
+            );
+        }
+    }
+}
+
+/// Draw a video caption at an already-expanded destination-pixel position.
+/// `boxed` adds a translucent rounded plate for busy footage; shadow mode is
+/// deliberately stronger than screenshot text so captions remain readable.
+pub struct CaptionOptions {
+    pub color_index: usize,
+    pub size: f32,
+    pub metric_scale: f32,
+    pub offset: (f32, f32),
+    pub boxed: bool,
+    pub box_opacity: f32,
+}
+
+pub fn render_caption(
+    img: &mut RgbaImage,
+    pos: (f32, f32),
+    text: &str,
+    options: CaptionOptions,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let px_h = (24.0 * options.metric_scale * options.size).max(12.0) as i32;
+    let Some((alpha, tw, th)) = raster_text(text, px_h) else {
+        return;
+    };
+    let color = COLORS[options.color_index.min(COLORS.len() - 1)];
+    let ox = (pos.0 + options.offset.0) as i32;
+    let oy = (pos.1 + options.offset.1) as i32;
+    if options.boxed {
+        // A compact plate reads like modern UI instead of a large subtitle
+        // banner. Opacity is user-controlled by the video editor.
+        let pad_x = (px_h as f32 * 0.30).round() as i32;
+        let pad_y = (px_h as f32 * 0.16).round() as i32;
+        rounded_plate(
+            img,
+            ox - pad_x,
+            oy - pad_y,
+            ox + tw + pad_x,
+            oy + th + pad_y,
+            px_h as f32 * 0.24,
+            options.box_opacity,
+        );
+    }
+    let shadow = if options.boxed {
+        (options.metric_scale * options.size)
+            .round()
+            .clamp(1.0, 3.0) as i32
+    } else {
+        (options.metric_scale * options.size * 2.0)
+            .round()
+            .clamp(1.0, 5.0) as i32
+    };
+    let shadow_offsets: &[(i32, i32)] = if options.boxed {
+        &[(0, shadow), (shadow / 2, shadow)]
+    } else {
+        &[
+            (-shadow, 0),
+            (shadow, 0),
+            (0, -shadow),
+            (0, shadow),
+            (shadow, shadow),
+        ]
+    };
+    let shadow_alpha = if options.boxed { 0.46 } else { 0.72 };
+    for y in 0..th {
+        for x in 0..tw {
+            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
+            if a > 0.0 {
+                for (nx, ny) in shadow_offsets {
+                    blend(
+                        img,
+                        ox + x + *nx,
+                        oy + y + *ny,
+                        [8, 9, 13],
+                        a * shadow_alpha,
+                    );
+                }
+            }
+        }
+    }
+    for y in 0..th {
+        for x in 0..tw {
+            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
+            blend(img, ox + x, oy + y, color, a);
+        }
+    }
+}
+
+/// Render when coordinates are already in destination pixels but strokes and
+/// text still need to scale for preview/output resolution. Video annotations
+/// use this because their normalized coordinates are expanded before render.
+pub fn render_with_metric(
+    img: &mut RgbaImage,
+    anns: &[Annotation],
+    coordinate_scale: f32,
+    metric_scale: f32,
+    offset: (f32, f32),
+    caret: Option<usize>,
+) {
     for (i, ann) in anns.iter().enumerate() {
-        let stroke = (5.0 * scale * ann.size).max(2.0);
+        let stroke = (5.0 * metric_scale * ann.size).max(2.0);
         let color = COLORS[ann.color.min(COLORS.len() - 1)];
-        let s = |p: (f32, f32)| (p.0 * scale + offset.0, p.1 * scale + offset.1);
+        let s = |p: (f32, f32)| {
+            (
+                p.0 * coordinate_scale + offset.0,
+                p.1 * coordinate_scale + offset.1,
+            )
+        };
         match &ann.shape {
             Shape::Arrow { from, to } => {
                 let (f, t) = (s(*from), s(*to));
                 let (dx, dy) = (t.0 - f.0, t.1 - f.1);
                 let len = (dx * dx + dy * dy).sqrt().max(1e-3);
                 let (ux, uy) = (dx / len, dy / len);
-                let head = (stroke * 3.4).min(len * 0.5).max(14.0 * scale * ann.size);
+                let head = (stroke * 3.4)
+                    .min(len * 0.5)
+                    .max(14.0 * metric_scale * ann.size);
                 // Shorten the shaft so it doesn't poke out of the head.
                 let shaft_end = (t.0 - ux * head * 0.7, t.1 - uy * head * 0.7);
                 line(img, f, shaft_end, stroke, color);
@@ -312,7 +477,7 @@ pub fn render(
             }
             Shape::Counter { pos, n } => {
                 let c = s(*pos);
-                let r = (14.0 * scale * ann.size).max(9.0);
+                let r = (14.0 * metric_scale * ann.size).max(9.0);
                 // Filled badge with AA edge.
                 let (min_x, max_x) = ((c.0 - r - 1.0) as i32, (c.0 + r + 1.0) as i32);
                 let (min_y, max_y) = ((c.1 - r - 1.0) as i32, (c.1 + r + 1.0) as i32);
@@ -340,7 +505,7 @@ pub fn render(
                 }
             }
             Shape::Blur { a, b } => {
-                pixelate(img, s(*a), s(*b), (14.0 * scale) as u32);
+                pixelate(img, s(*a), s(*b), (14.0 * metric_scale) as u32);
             }
             Shape::Text { pos, text } => {
                 let shown = if caret == Some(i) {
@@ -350,31 +515,19 @@ pub fn render(
                 } else {
                     text.clone()
                 };
-                let px_h = (21.0 * scale * ann.size).max(12.0) as i32;
-                if let Some((alpha, tw, th)) = raster_text(&shown, px_h) {
-                    let p = s(*pos);
-                    let (ox, oy) = (p.0 as i32, p.1 as i32);
-                    // Soft dark plate behind the text for legibility.
-                    for y in 0..th {
-                        for x in 0..tw {
-                            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
-                            if a > 0.0 {
-                                // Halo: darken a small neighborhood.
-                                for (nx, ny) in
-                                    [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1)]
-                                {
-                                    blend(img, ox + x + nx, oy + y + ny, [20, 18, 16], a * 0.45);
-                                }
-                            }
-                        }
-                    }
-                    for y in 0..th {
-                        for x in 0..tw {
-                            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
-                            blend(img, ox + x, oy + y, color, a);
-                        }
-                    }
-                }
+                render_caption(
+                    img,
+                    s(*pos),
+                    &shown,
+                    CaptionOptions {
+                        color_index: ann.color,
+                        size: ann.size,
+                        metric_scale,
+                        offset: (0.0, 0.0),
+                        boxed: ann.text_style == TextStyle::Box,
+                        box_opacity: ann.text_box_opacity,
+                    },
+                );
             }
         }
     }

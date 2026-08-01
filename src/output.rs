@@ -14,8 +14,47 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+pub const OUTPUT_ORIGINAL: u32 = 0;
+pub const OUTPUT_EMAIL: u32 = 1600;
+pub const OUTPUT_COMPACT: u32 = 1200;
+pub const OUTPUT_CUSTOM_MIN: u32 = 320;
+pub const OUTPUT_CUSTOM_MAX: u32 = 10_000;
+
 const CF_DIB: u32 = 8;
 const CF_HDROP: u32 = 15;
+
+/// Cap the finished screenshot by its longest edge. The matte, annotations,
+/// and shadows are resized together, and small captures are never enlarged.
+pub fn resize_to_max_edge(img: &RgbaImage, max_edge: u32) -> RgbaImage {
+    let (width, height) = resized_dimensions(img.width(), img.height(), max_edge);
+    if (width, height) == img.dimensions() {
+        return img.clone();
+    }
+    image::imageops::resize(img, width, height, image::imageops::FilterType::Lanczos3)
+}
+
+/// Dimensions produced by [`resize_to_max_edge`], without doing the work.
+/// Interactive editors use this to show the exact final pixel size live.
+pub fn resized_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    if max_edge == OUTPUT_ORIGINAL || longest <= max_edge {
+        return (width, height);
+    }
+    let scale = max_edge as f64 / longest as f64;
+    (
+        (width as f64 * scale).round().max(1.0) as u32,
+        (height as f64 * scale).round().max(1.0) as u32,
+    )
+}
+
+pub fn output_size_label(max_edge: u32) -> String {
+    match max_edge {
+        OUTPUT_ORIGINAL => "Original".into(),
+        OUTPUT_EMAIL => "Email".into(),
+        OUTPUT_COMPACT => "Compact".into(),
+        value => format!("{value}px"),
+    }
+}
 
 pub fn partial_video_path(destination: &Path, id: u64) -> PathBuf {
     let parent = destination.parent().unwrap_or_else(|| Path::new(""));
@@ -280,6 +319,37 @@ pub fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::Rgba;
+
+    fn image(width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_pixel(width, height, Rgba([30, 60, 90, 255]))
+    }
+
+    #[test]
+    fn output_size_caps_landscape_longest_edge() {
+        let resized = resize_to_max_edge(&image(2400, 1200), 1600);
+        assert_eq!(resized.dimensions(), (1600, 800));
+    }
+
+    #[test]
+    fn output_size_caps_portrait_longest_edge() {
+        let resized = resize_to_max_edge(&image(1200, 2400), 1200);
+        assert_eq!(resized.dimensions(), (600, 1200));
+    }
+
+    #[test]
+    fn output_size_never_upscales_or_changes_original() {
+        assert_eq!(resize_to_max_edge(&image(800, 600), 1600).dimensions(), (800, 600));
+        assert_eq!(resize_to_max_edge(&image(2400, 1200), 0).dimensions(), (2400, 1200));
+    }
+
+    #[test]
+    fn output_size_preview_matches_resize_rounding() {
+        let source = image(2345, 1333);
+        let expected = resized_dimensions(source.width(), source.height(), 1600);
+        assert_eq!(resize_to_max_edge(&source, 1600).dimensions(), expected);
+        assert_eq!(expected, (1600, 910));
+    }
 
     #[test]
     fn partial_video_names_are_narrow_and_owner_aware() {

@@ -3,10 +3,12 @@
 //! bounds), dragging selects a region with a live size readout. Click picks
 //! a window, drag picks a region, Esc cancels.
 
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+
 use anyhow::{Context, Result};
 use image::RgbaImage;
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
@@ -21,21 +23,78 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
-    GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, LoadCursorW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow,
-    SetCursor, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWL_EXSTYLE, GWLP_USERDATA, IDC_ARROW, IDC_CROSS, MSG, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
+    GetClassNameW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, HC_ACTION, HWND_TOPMOST, IDC_ARROW,
+    IDC_CROSS, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WH_KEYBOARD_LL, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 const WHITE: COLORREF = COLORREF(0x00FFFFFF);
 
 const DRAG_THRESHOLD: i32 = 6;
+
+// The frozen overlay is modal even when Windows rejects a foreground request
+// (common immediately after a tray menu closes). Route keyboard input directly
+// to it and suppress delivery to the previously focused application.
+static OVERLAY_KEY_TARGET: AtomicIsize = AtomicIsize::new(0);
+static OVERLAY_KEYS_DOWN: AtomicU32 = AtomicU32::new(0);
+
+fn shortcut_bit(vk: u32) -> Option<u32> {
+    match vk as u16 {
+        key if key == VK_ESCAPE.0 => Some(0),
+        0x57 => Some(1), // W
+        0x52 => Some(2), // R
+        0x46 => Some(3), // F
+        0x56 => Some(4), // V
+        0x53 => Some(5), // S
+        _ => None,
+    }
+}
+
+unsafe extern "system" fn overlay_keyboard_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let target = OVERLAY_KEY_TARGET.load(Ordering::SeqCst);
+    if code == HC_ACTION as i32 && target != 0 {
+        match wparam.0 as u32 {
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let key = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+                if let Some(bit) = shortcut_bit(key.vkCode) {
+                    let mask = 1u32 << bit;
+                    if OVERLAY_KEYS_DOWN.fetch_or(mask, Ordering::SeqCst) & mask == 0 {
+                        let hwnd = HWND(target as *mut _);
+                        let _ = PostMessageW(
+                            hwnd,
+                            WM_KEYDOWN,
+                            WPARAM(key.vkCode as usize),
+                            LPARAM(0),
+                        );
+                    }
+                }
+                return LRESULT(1);
+            }
+            WM_KEYUP | WM_SYSKEYUP => {
+                let key = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+                if let Some(bit) = shortcut_bit(key.vkCode) {
+                    OVERLAY_KEYS_DOWN.fetch_and(!(1u32 << bit), Ordering::SeqCst);
+                }
+                return LRESULT(1);
+            }
+            _ => {}
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
 
 pub enum Selection {
     Window(HWND),
@@ -63,6 +122,17 @@ enum Btn {
     Record,
     Scroll,
     Close,
+}
+
+fn shortcut_button(vk: u16) -> Option<Btn> {
+    match vk {
+        0x57 => Some(Btn::Window), // W
+        0x52 => Some(Btn::Region), // R
+        0x46 => Some(Btn::Screen), // F
+        0x56 => Some(Btn::Record), // V
+        0x53 => Some(Btn::Scroll), // S
+        _ => None,
+    }
 }
 
 struct Button {
@@ -551,19 +621,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             if let Some(state) = state_of(hwnd) {
-                match wparam.0 as u16 {
-                    v if v == VK_ESCAPE.0 => finish(hwnd, state, None),
-                    0x57 => press_button(hwnd, state, Btn::Window), // W
-                    0x52 => press_button(hwnd, state, Btn::Region), // R
-                    0x46 => press_button(hwnd, state, Btn::Screen), // F
-                    0x56 => press_button(hwnd, state, Btn::Record), // V
-                    0x53 => press_button(hwnd, state, Btn::Scroll), // S
-                    _ => {}
+                let key = wparam.0 as u16;
+                if key == VK_ESCAPE.0 {
+                    finish(hwnd, state, None);
+                } else if let Some(button) = shortcut_button(key) {
+                    press_button(hwnd, state, button);
                 }
             }
             LRESULT(0)
         }
         WM_DESTROY => {
+            let raw = hwnd.0 as isize;
+            let _ = OVERLAY_KEY_TARGET.compare_exchange(raw, 0, Ordering::SeqCst, Ordering::SeqCst);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -894,12 +963,42 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
             hinstance,
             Some(&mut *state as *mut State as *const _),
         )?;
+        OVERLAY_KEY_TARGET.store(hwnd.0 as isize, Ordering::SeqCst);
+        OVERLAY_KEYS_DOWN.store(0, Ordering::SeqCst);
+        let keyboard_hook = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(overlay_keyboard_hook),
+            HINSTANCE(hinstance.0),
+            0,
+        )
+        .ok();
+        if keyboard_hook.is_none() {
+            crate::diagnostics::log("overlay keyboard guard unavailable");
+        }
+        // SetWindowPos can activate a newly shown topmost window even when a
+        // preceding tray menu caused SetForegroundWindow permission to lapse.
+        // The keyboard guard above remains the reliable fallback.
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
         let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(hwnd);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        OVERLAY_KEY_TARGET.store(0, Ordering::SeqCst);
+        OVERLAY_KEYS_DOWN.store(0, Ordering::SeqCst);
+        if let Some(hook) = keyboard_hook {
+            let _ = UnhookWindowsHookEx(hook);
         }
 
         let _ = DeleteDC(state.dim_dc);
@@ -918,6 +1017,24 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
         let anchor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
 
         Ok(state.selection.take().flatten().map(|sel| (sel, anchor)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shortcut_bit, shortcut_button, Btn};
+
+    #[test]
+    fn frozen_overlay_shortcuts_map_to_the_visible_toolbar() {
+        assert!(matches!(shortcut_button(0x57), Some(Btn::Window)));
+        assert!(matches!(shortcut_button(0x52), Some(Btn::Region)));
+        assert!(matches!(shortcut_button(0x46), Some(Btn::Screen)));
+        assert!(matches!(shortcut_button(0x56), Some(Btn::Record)));
+        assert!(matches!(shortcut_button(0x53), Some(Btn::Scroll)));
+        assert!(shortcut_button(0x41).is_none());
+        assert!(shortcut_bit(0x1B).is_some());
+        assert!(shortcut_bit(0x56).is_some());
+        assert!(shortcut_bit(0x41).is_none());
     }
 }
 
