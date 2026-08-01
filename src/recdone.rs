@@ -206,6 +206,10 @@ struct State {
     undo_control: RECT,
     delete_control: RECT,
     status: Option<String>,
+    /// Last successful edit export. The action buttons keep pointing at the
+    /// original recording; this only drives their labels and the reveal on
+    /// close.
+    exported: Option<PathBuf>,
     exporting: bool,
     export_id: Option<u64>,
     export_cancel: Option<Arc<AtomicBool>>,
@@ -356,7 +360,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         (Act::SaveTrim, "Export edit", 108),
         (Act::Play, "Play", 82),
         (Act::Reveal, "Show in folder", 126),
-        (Act::Copy, "Copy", 72),
+        (Act::Copy, "Copy", 112),
         (Act::Delete, "Delete", 80),
     ];
     let mut x = m;
@@ -936,6 +940,20 @@ fn sync_selected_controls(state: &mut State, index: usize) {
             1
         };
     }
+}
+
+/// True once the editor holds changes the recorded file on disk does not have.
+/// The action buttons act on that original file either way; this only decides
+/// whether their labels have to say so.
+fn has_edits(state: &State) -> bool {
+    let matte = state
+        .styles
+        .get(state.matte_index)
+        .is_some_and(|style| !crate::compose::is_plain(style));
+    matte
+        || state.trim_start > 0
+        || state.trim_end < state.duration
+        || !state.annotations.is_empty()
 }
 
 fn push_undo(state: &mut State) {
@@ -2122,10 +2140,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 state.theme.muted
             },
         );
+        // Copy and Show in folder always act on the recorded original, never on
+        // an edit export. Say so as soon as an edit exists, or the buttons look
+        // like they hand you what the preview is showing.
+        let original_only = state.exported.is_some() || has_edits(state);
         let shown = if *act == Act::SaveTrim && state.exporting {
             "Cancel export"
         } else if *act == Act::Play && state.playing {
             "Pause"
+        } else if *act == Act::Reveal && original_only {
+            "Show original"
+        } else if *act == Act::Copy && original_only {
+            "Copy original"
         } else {
             label
         };
@@ -2169,9 +2195,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             crate::diagnostics::log("video export complete");
                             let _ = crate::output::file_to_clipboard(&done.path);
                             state.status = Some(format!(
-                                "saved {} · copied",
+                                "saved {} · edit on clipboard",
                                 done.path.file_name().unwrap_or_default().to_string_lossy()
                             ));
+                            state.exported = Some(done.path.clone());
                         }
                         Err(error) if error == "export cancelled" => {
                             crate::diagnostics::log("video export cancelled");
@@ -3223,6 +3250,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
+                // The export already put itself on the clipboard, so Explorer
+                // only earns a window once the editor is done. Show the edit
+                // there rather than leaving the user to hunt for it.
+                if let Some(exported) = &state.exported {
+                    if exported.exists() {
+                        crate::output::reveal_in_explorer(exported);
+                    }
+                }
                 if let Some(cancel) = &state.export_cancel {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -3379,6 +3414,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         undo_control: initial.undo_control,
         delete_control: initial.delete_control,
         status: None,
+        exported: None,
         exporting: false,
         export_id: None,
         export_cancel: None,
