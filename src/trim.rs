@@ -241,6 +241,67 @@ pub fn preview_frame(
     Ok((rgba_to_bgra(&scaled, sw, sh), sw, sh))
 }
 
+/// One frame the scrubber wants. `generation` lets the editor ignore frames
+/// for a drag position it has already moved past.
+pub struct ScrubRequest {
+    pub position: i64,
+    pub generation: u64,
+}
+
+/// Serve scrub requests from a long-lived reader.
+///
+/// `preview_frame` opens a fresh source reader per call, which costs more than
+/// the decode does and is why scrubbing only ever showed cached frames until
+/// the mouse came up. This keeps one reader open for the life of the editor.
+///
+/// Requests coalesce: while decoding, everything the user scrubbed past is
+/// dropped and only the newest position is served, so the decoder never falls
+/// behind the cursor.
+pub fn scrub_worker(
+    path: &Path,
+    max_w: u32,
+    max_h: u32,
+    requests: std::sync::mpsc::Receiver<ScrubRequest>,
+    mut deliver: impl FnMut(u64, Vec<u8>, u32, u32) -> bool,
+) -> Result<()> {
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
+    let (reader, w, h, stride) = open_reader(path, false)?;
+    let (target_w, target_h) = fit_inside(w, h, max_w.max(2), max_h.max(2));
+    while let Ok(mut request) = requests.recv() {
+        while let Ok(newer) = requests.try_recv() {
+            request = newer;
+        }
+        unsafe {
+            let pv = PROPVARIANT::from(request.position.max(0));
+            if reader
+                .SetCurrentPosition(&windows::core::GUID::zeroed(), &pv)
+                .is_err()
+            {
+                continue;
+            }
+        }
+        let Ok(Some((bgra, _))) = read_video_frame(&reader, w, h, stride) else {
+            continue;
+        };
+        let rgba = bgra_to_rgba(&bgra, w, h);
+        let scaled = image::imageops::resize(
+            &rgba,
+            target_w,
+            target_h,
+            image::imageops::FilterType::Triangle,
+        );
+        if !deliver(
+            request.generation,
+            rgba_to_bgra(&scaled, target_w, target_h),
+            target_w,
+            target_h,
+        ) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Sequential, wall-clock-paced preview decode for the in-app video editor.
 /// Frames are decoded on a worker thread; late frames are dropped so the UI
 /// follows media time instead of accumulating an ever-growing message queue.

@@ -43,6 +43,8 @@ const WM_PLAYBACK_DONE: u32 = WM_APP + 23;
 const WM_EXPORT_STALLED: u32 = WM_APP + 24;
 /// The filmstrip and scrub cache finished loading in the background.
 const WM_PROBE_READY: u32 = WM_APP + 25;
+/// The scrub decoder produced the exact frame under the playhead.
+const WM_SCRUB_FRAME: u32 = WM_APP + 26;
 static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(1);
 
 const PAD_MIN: f32 = 0.04;
@@ -222,6 +224,12 @@ struct State {
     playback_cancel: Option<Arc<AtomicBool>>,
     playback_mailbox: Arc<Mutex<PlaybackMailbox>>,
     resume_after_drag: bool,
+    /// Requests to the scrub decoder. Dropped with the window, which ends the
+    /// worker's loop.
+    scrub_tx: Option<std::sync::mpsc::Sender<crate::trim::ScrubRequest>>,
+    /// Bumped on every scrub request so frames for a position the user has
+    /// already left can be discarded on arrival.
+    scrub_generation: u64,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -574,7 +582,26 @@ fn set_playhead(state: &mut State, x: i32) {
     let span = (state.strip.right - state.strip.left).max(1) as f64;
     state.playhead = ((((x - state.strip.left) as f64 / span) * state.duration as f64) as i64)
         .clamp(0, state.duration);
+    // Show the nearest cached frame straight away so the picture always tracks
+    // the cursor, then ask the decoder for the exact one.
     refresh_preview(state);
+    request_scrub_frame(state);
+}
+
+/// Ask the scrub decoder for the frame under the playhead. Cheap and
+/// non-blocking: the worker coalesces, so spamming this during a drag is fine.
+fn request_scrub_frame(state: &mut State) {
+    state.scrub_generation = state.scrub_generation.wrapping_add(1);
+    let request = crate::trim::ScrubRequest {
+        position: state.playhead,
+        generation: state.scrub_generation,
+    };
+    if let Some(tx) = &state.scrub_tx {
+        if tx.send(request).is_err() {
+            // The decoder died; cached frames still drive the preview.
+            state.scrub_tx = None;
+        }
+    }
 }
 
 fn refresh_preview(state: &mut State) {
@@ -2266,6 +2293,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_SCRUB_FRAME => {
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
+            let frame = Box::from_raw(lparam.0 as *mut (u64, Vec<u8>, u32, u32));
+            if let Some(state) = state_of(hwnd) {
+                // Playback owns the preview while it runs, and a frame for a
+                // position the user has already scrubbed past is stale.
+                if !state.playing && frame.0 == state.scrub_generation {
+                    state.preview_raw = Some((frame.1, frame.2, frame.3));
+                    recompose_preview(state);
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
         WM_PLAYBACK_FRAME => {
             if let Some(state) = state_of(hwnd) {
                 let next = {
@@ -2758,7 +2801,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(drag) = state.dragging.take() {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                     if matches!(drag, Drag::Trim(_) | Drag::Playhead) {
-                        refresh_preview_exact(state);
+                        // The decoder is already chasing this position, so
+                        // releasing no longer blocks on a fresh seek.
+                        request_scrub_frame(state);
                         if state.resume_after_drag {
                             state.resume_after_drag = false;
                             start_playback(hwnd, state);
@@ -3112,7 +3157,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let resume = state.playing;
                         stop_playback(state);
                         state.playhead = (state.playhead - 5_000_000).max(state.trim_start);
-                        refresh_preview_exact(state);
+                        refresh_preview(state);
+                        request_scrub_frame(state);
                         if resume {
                             start_playback(hwnd, state);
                         }
@@ -3122,7 +3168,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let resume = state.playing;
                         stop_playback(state);
                         state.playhead = (state.playhead + 5_000_000).min(state.trim_end);
-                        refresh_preview_exact(state);
+                        refresh_preview(state);
+                        request_scrub_frame(state);
                         if resume && state.playhead < state.trim_end {
                             start_playback(hwnd, state);
                         }
@@ -3132,7 +3179,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let resume = state.playing;
                         stop_playback(state);
                         state.playhead = state.trim_start;
-                        refresh_preview_exact(state);
+                        refresh_preview(state);
+                        request_scrub_frame(state);
                         if resume {
                             start_playback(hwnd, state);
                         }
@@ -3141,7 +3189,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     key if key == VK_END.0 => {
                         stop_playback(state);
                         state.playhead = state.trim_end;
-                        refresh_preview_exact(state);
+                        refresh_preview(state);
+                        request_scrub_frame(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     _ => {}
@@ -3458,6 +3507,8 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         playback_cancel: None,
         playback_mailbox: Arc::new(Mutex::new(PlaybackMailbox::default())),
         resume_after_drag: false,
+        scrub_tx: None,
+        scrub_generation: 0,
     });
     recompose_preview(&mut state);
     let state = Box::into_raw(state);
@@ -3501,6 +3552,47 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
                 crate::theme::apply_titlebar(hwnd, &(*state).theme);
                 let _ = SetForegroundWindow(hwnd);
                 let _ = SetFocus(hwnd);
+                // Live scrubbing: one long-lived decoder chasing the playhead.
+                let (scrub_tx, scrub_rx) = std::sync::mpsc::channel();
+                (*state).scrub_tx = Some(scrub_tx);
+                {
+                    let source = (*state).mp4.clone();
+                    let target = hwnd.0 as isize;
+                    std::thread::spawn(move || {
+                        let com = CoInitializeEx(None, COINIT_MULTITHREADED);
+                        let result = crate::trim::scrub_worker(
+                            &source,
+                            preview_w,
+                            preview_h,
+                            scrub_rx,
+                            |generation, bytes, fw, fh| {
+                                let payload =
+                                    Box::into_raw(Box::new((generation, bytes, fw, fh)));
+                                let hwnd = HWND(target as *mut _);
+                                if !crate::window::has_class(hwnd, "matteshot_recdone")
+                                    || PostMessageW(
+                                        hwnd,
+                                        WM_SCRUB_FRAME,
+                                        WPARAM(0),
+                                        LPARAM(payload as isize),
+                                    )
+                                    .is_err()
+                                {
+                                    drop(Box::from_raw(payload));
+                                    return false;
+                                }
+                                true
+                            },
+                        );
+                        if result.is_err() {
+                            crate::diagnostics::log("scrub decoder unavailable");
+                        }
+                        if com.is_ok() {
+                            CoUninitialize();
+                        }
+                    });
+                }
+
                 // Now that the editor is on screen, fill in the filmstrip and
                 // the scrub cache behind it.
                 let source = (*state).mp4.clone();
