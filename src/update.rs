@@ -24,6 +24,10 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// How often to re-ask whether the user has finished what they were doing.
+const IDLE_POLL: Duration = Duration::from_secs(30);
+/// Long enough for the "updating" balloon to be seen before the app restarts.
+const BALLOON_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvailableUpdate {
@@ -169,12 +173,12 @@ pub fn check_once() -> Result<Option<AvailableUpdate>> {
     available_from(&fetch_manifest()?, env!("CARGO_PKG_VERSION"))
 }
 
-fn post_available(hwnd_value: isize, update: AvailableUpdate) {
-    let raw = Box::into_raw(Box::new(update));
+fn post<T>(hwnd_value: isize, message: u32, payload: T) {
+    let raw = Box::into_raw(Box::new(payload));
     let posted = unsafe {
         PostMessageW(
             HWND(hwnd_value as *mut c_void),
-            crate::tray::WM_UPDATE_AVAILABLE,
+            message,
             WPARAM(0),
             LPARAM(raw as isize),
         )
@@ -186,17 +190,58 @@ fn post_available(hwnd_value: isize, update: AvailableUpdate) {
     }
 }
 
+/// Fetch and verify the installer, then install it the moment the user is not
+/// in the middle of something. Returns only if the update could not be applied;
+/// a successful install replaces this process.
+fn apply(hwnd_value: isize, update: &AvailableUpdate) -> Result<()> {
+    let staged = crate::installer::stage(&update.download_url, &update.version, |_| {})?;
+    crate::diagnostics::log("update staged and verified");
+
+    // Never interrupt a capture, a recording, or an open editor. The installer
+    // would shut them down cleanly, but "cleanly" still means losing the work
+    // in front of the user.
+    let mut waited = Duration::ZERO;
+    while crate::window::any_surface_open() {
+        // A whole day of waiting means the next check can supersede this.
+        if waited >= CHECK_EVERY {
+            crate::diagnostics::log("update deferred: surfaces stayed open");
+            return Ok(());
+        }
+        thread::sleep(IDLE_POLL);
+        waited += IDLE_POLL;
+    }
+
+    post(
+        hwnd_value,
+        crate::tray::WM_UPDATE_INSTALLING,
+        update.version.clone(),
+    );
+    thread::sleep(BALLOON_GRACE);
+    crate::diagnostics::log("update installing");
+    crate::installer::launch(&staged)
+}
+
 /// Check immediately, then once every 24 hours while Matteshot stays open.
 /// Failures are deliberately silent and retried at the next interval.
 pub fn start(hwnd: HWND) {
     let hwnd_value = hwnd.0 as isize;
     thread::spawn(move || {
-        let mut posted_version: Option<String> = None;
+        let mut handled_version: Option<String> = None;
         loop {
             if let Ok(Some(update)) = check_once() {
-                if posted_version.as_deref() != Some(update.version.as_str()) {
-                    posted_version = Some(update.version.clone());
-                    post_available(hwnd_value, update);
+                if handled_version.as_deref() != Some(update.version.as_str()) {
+                    handled_version = Some(update.version.clone());
+                    let automatic = crate::config::Config::load().auto_update;
+                    post(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, update.clone());
+                    if automatic {
+                        if let Err(error) = apply(hwnd_value, &update) {
+                            // Staging failed or the installer would not start.
+                            // The tray still offers the manual download, so
+                            // this is a quiet degradation, not a dead end.
+                            crate::diagnostics::log("update could not be applied");
+                            eprintln!("update failed: {error:#}");
+                        }
+                    }
                 }
             }
             thread::sleep(CHECK_EVERY);

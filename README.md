@@ -52,9 +52,21 @@ All derived from the capture's dominant hue (indigo fallback for grayscale UIs),
 
 Dark + light themes follow the system setting (`AppsUseLightTheme`), live-switch on `WM_SETTINGCHANGE`, and cover every surface: windows, popup menus (uxtheme ordinal 135 `SetPreferredAppMode`), titlebars (`DWMWA_USE_IMMERSIVE_DARK_MODE` + caption color). `MATTESHOT_THEME=dark|light` overrides for testing.
 
+## Updating
+
+Matteshot updates itself, and you never see it happen. A daily silent check against `matteshot.app/version.json` finds the new version, the signed installer downloads in the background, and the update applies the moment no Matteshot window is open, then the tray app comes back on its own. A balloon says what is happening; nothing else interrupts.
+
+Nothing downloaded is trusted on the strength of where it came from:
+
+- HTTPS only, to a fixed host. Plaintext, embedded credentials, and alternate ports are rejected before a connection is opened.
+- The download must match the SHA-256 published beside it.
+- It must carry a valid Authenticode signature **and** the certificate subject must be ours. A validly signed binary from anyone else is refused, which is what stops a compromised mirror from shipping somebody else's real installer.
+
+Any failure removes the download and leaves the running app untouched; the tray menu still offers the manual download. The installer is per-user, so nothing prompts for elevation, and it runs `/VERYSILENT` under `SW_HIDE` with no shell in the chain, so no console window ever appears. Work in progress is never interrupted: a recording, an export, or an open editor defers the restart until it is finished. **Install updates automatically** in Settings turns the whole thing off and goes back to notify-only.
+
 ## Settings (tray menu)
 
-Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows, PrtScn capture toggle, GIF toggle, recording audio Off/System/Mic. First run shows a tray balloon.
+Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows, PrtScn capture toggle, GIF toggle, automatic updates toggle, recording audio Off/System/Mic. First run shows a tray balloon.
 
 Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. **Copy diagnostics** in the tray produces a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path.
 
@@ -78,6 +90,8 @@ matteshot --welcome          # preview first-run onboarding without changing con
 matteshot --ocr <substr>     # capture a window and print its OCR text
 matteshot --ocr-words <substr|png> # print every OCR word box in capture coordinates
 matteshot --update-test      # probe version.json; never downloads
+matteshot --update-stage-test [url] # download + verify hash and signature; never installs
+matteshot --verify-signature-test <exe> # Authenticode gate: accept ours, reject everything else
 matteshot --settings         # open the settings window directly
 matteshot --once --tweak     # capture the foreground window and open the tweak editor
 ```
@@ -106,7 +120,7 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 - `record.rs` — MF sink writer (H.264+AAC), WGC frame loop, audio-cursor muxing with silence fill; `audio.rs` — WASAPI loopback/mic + stateful linear resampler; `recui.rs` — stop pill; `recdone.rs` — matte-aware video editor; `video_edit.rs` — normalized time-ranged annotation model shared by preview and export; `trim.rs` — source reader (`ENABLE_ADVANCED_VIDEO_PROCESSING`, streams resolved via `GetNativeMediaType`, never assume stream 0) → frame-accurate edit export.
 - `scroll.rs` — scrolling capture (see above).
 - `theme.rs` — theme plumbing; `settings.rs` — settings window; `pin.rs` — floating pinned captures; `ocr.rs` — Windows.Media.Ocr, whole-capture text plus per-word boxes mapped back out of the engine's input downscale; `prtscn.rs` — PrtScn acquisition; `tray.rs` — tray icon/menu; `output.rs` — clipboard (manual CF_DIB + PNG + CF_HDROP), save, reveal.
-- `update.rs` — silent WinHTTP version check on startup and daily; newer versions surface through a tray balloon and download menu item.
+- `update.rs` — silent WinHTTP version check on startup and daily, then the background install; `installer.rs` — download, verification, and silent execution.
 
 ## Windows landmines (hard-won)
 
@@ -126,7 +140,7 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 - [x] Feature-complete core: capture, mattes, picker, tweak editor, annotations, OCR, pin, recording + audio + trim, scrolling capture, themes, settings, multi-monitor
 - [x] Inno Setup installer + Azure Trusted Signing release pipeline
 - [ ] winget manifest
-- [x] Update check
+- [x] Silent verified auto-update
 - [x] 14-day trial + Lemon Squeezy license activation
 - [ ] Lemon Squeezy merchant approval + live checkout
 - [x] matteshot.app site + assets

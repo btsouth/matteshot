@@ -2,7 +2,7 @@
 ; Build: ISCC.exe installer\matteshot.iss   (from the repo root)
 
 #ifndef AppVersion
-  #define AppVersion "0.10.0"
+  #define AppVersion "0.11.0"
 #endif
 
 [Setup]
@@ -40,6 +40,9 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\matteshot.exe"; Description: "Launch Matteshot"; Flags: nowait postinstall skipifsilent
+; A silent run is a background self-update: nothing offers to relaunch, so put
+; the resident back ourselves or the user silently loses their tray app.
+Filename: "{app}\matteshot.exe"; Flags: nowait runhidden; Check: WizardSilent
 
 [UninstallRun]
 ; Stop through Matteshot's own cleanup path, then restore the Windows binding.
@@ -62,7 +65,9 @@ begin
     if R <> 0 then
       // Older Matteshot builds do not know --quit. Ask Windows to close them
       // without /f; CloseApplications remains the final file-lock safeguard.
-      Exec(ExpandConstant('{cmd}'), '/C taskkill /im matteshot.exe', '', SW_HIDE,
+      // taskkill is run directly: routing it through cmd would flash a console
+      // window during an otherwise invisible background update.
+      Exec('taskkill.exe', '/im matteshot.exe', '', SW_HIDE,
         ewWaitUntilTerminated, R);
   end;
   Result := '';

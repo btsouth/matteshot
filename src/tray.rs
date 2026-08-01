@@ -27,6 +27,8 @@ use winreg::RegKey;
 
 const WM_TRAYICON: u32 = 0x8001; // WM_APP + 1
 pub(crate) const WM_UPDATE_AVAILABLE: u32 = 0x8002; // WM_APP + 2
+/// The verified installer is about to run and take the app with it.
+pub(crate) const WM_UPDATE_INSTALLING: u32 = 0x8004; // WM_APP + 4
 const WM_TRAY_ACTION: u32 = 0x8003; // defer until the native popup is fully dismissed
 const CMD_CAPTURE: usize = 101;
 const CMD_CAPTURE_ACTIVE: usize = 102;
@@ -210,10 +212,15 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     );
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_FOLDER, w!("Open captures folder"));
     if let Some(update) = &state.update {
-        let label: Vec<u16> = format!("Update available: v{}\u{2026}", update.version)
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        // A staged installer is already downloaded and verified, so the menu
+        // promises an install rather than a trip to the browser.
+        let staged = crate::installer::staged_path(&update.version).is_file();
+        let text = if staged {
+            format!("Install update v{} now", update.version)
+        } else {
+            format!("Update available: v{}\u{2026}", update.version)
+        };
+        let label: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let _ = AppendMenuW(menu, MF_STRING, CMD_UPDATE, PCWSTR(label.as_ptr()));
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -374,15 +381,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.update = Some(*update);
                 if changed {
                     let version = &state.update.as_ref().unwrap().version;
+                    let automatic = crate::config::Config::load().auto_update;
                     notify(
                         hwnd,
                         "Matteshot update available",
-                        &format!(
-                            "Version {version} is ready. Right-click Matteshot to download."
-                        ),
+                        &if automatic {
+                            format!("Version {version} is downloading in the background.")
+                        } else {
+                            format!("Version {version} is ready. Right-click Matteshot to download.")
+                        },
                     );
                 }
             }
+            LRESULT(0)
+        }
+        WM_UPDATE_INSTALLING => {
+            let version = Box::from_raw(lparam.0 as *mut String);
+            notify(
+                hwnd,
+                "Matteshot is updating",
+                &format!("Installing version {version}. Matteshot will restart on its own."),
+            );
             LRESULT(0)
         }
         WM_TRAY_ACTION => {
@@ -484,6 +503,10 @@ impl Tray {
 
     pub fn update_url(&self) -> Option<String> {
         self.state.update.as_ref().map(|u| u.download_url.clone())
+    }
+
+    pub fn update_version(&self) -> Option<String> {
+        self.state.update.as_ref().map(|u| u.version.clone())
     }
 
     pub fn active_window(&self) -> Option<HWND> {

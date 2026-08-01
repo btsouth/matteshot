@@ -143,6 +143,29 @@ pub fn find_by_class(class_name: &str) -> Option<HWND> {
     state.found
 }
 
+/// Every Matteshot surface that can hold work the user would lose. The
+/// shutdown path closes these in order; the updater refuses to restart while
+/// any of them is on screen.
+pub const SURFACE_CLASSES: [&str; 10] = [
+    "matteshot_recui",
+    "matteshot_scrollpill",
+    "matteshot_overlay",
+    "matteshot_picker",
+    "matteshot_tweak",
+    "matteshot_recdone",
+    "matteshot_settings",
+    "matteshot_activation",
+    "matteshot_welcome",
+    "matteshot_pin",
+];
+
+/// True while the user has any Matteshot window in front of them.
+pub fn any_surface_open() -> bool {
+    SURFACE_CLASSES
+        .iter()
+        .any(|class| find_by_class(class).is_some())
+}
+
 pub fn has_class(hwnd: HWND, class_name: &str) -> bool {
     if hwnd.is_invalid() || !unsafe { IsWindow(hwnd).as_bool() } {
         return false;

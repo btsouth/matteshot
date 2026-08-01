@@ -28,6 +28,8 @@ pub struct Config {
     pub record_audio: String,
     /// Where recordings go. Default: Videos\Matteshot.
     pub video_dir: Option<PathBuf>,
+    /// Install updates in the background instead of only announcing them.
+    pub auto_update: bool,
 }
 
 impl Default for Config {
@@ -42,6 +44,7 @@ impl Default for Config {
             record_gif: false,
             record_audio: "off".into(),
             video_dir: None,
+            auto_update: true,
         }
     }
 }

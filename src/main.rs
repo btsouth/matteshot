@@ -6,6 +6,7 @@ mod compose;
 mod config;
 mod diagnostics;
 mod icon;
+mod installer;
 mod license;
 mod license_ui;
 mod number_prompt;
@@ -452,9 +453,23 @@ fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
 }
 
 fn run_app() -> Result<()> {
-    let Some(_resident_guard) =
-        state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?
-    else {
+    // A resident that is on its way out still owns the slot for a moment. An
+    // update restarts the app the instant the installer finishes, so give the
+    // previous process time to release before deciding a resident is really
+    // there; otherwise the relaunch hands off to a corpse and exits, leaving
+    // the user with no tray app and no PrtScn.
+    let mut guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
+    if guard.is_none() {
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
+            if guard.is_some() {
+                diagnostics::log("resident slot claimed after the previous process exited");
+                break;
+            }
+        }
+    }
+    let Some(_resident_guard) = guard else {
         // A shortcut or autostart race should never create a second tray app
         // that competes for PrtScn. Make an intentional second launch useful
         // by opening Settings on the established resident.
@@ -601,8 +616,23 @@ fn run_app() -> Result<()> {
                         Ok(())
                     }
                     tray::Action::OpenUpdate => {
-                        if let Some(url) = tray.update_url() {
-                            output::open_url(&url);
+                        // Prefer an installer we have already downloaded and
+                        // proved is ours; the download page is the fallback
+                        // when staging never happened or failed.
+                        match tray.update_version().map(|v| installer::staged_path(&v)) {
+                            Some(staged) if staged.is_file() => {
+                                tray.notify(
+                                    "Matteshot is updating",
+                                    "Installing now. Matteshot will restart on its own.",
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(1200));
+                                installer::launch(&staged)?;
+                            }
+                            _ => {
+                                if let Some(url) = tray.update_url() {
+                                    output::open_url(&url);
+                                }
+                            }
                         }
                         Ok(())
                     }
@@ -1254,6 +1284,48 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("--quit") => request_graceful_shutdown(),
+        // Download and fully verify the published installer without running
+        // it. Proves the hash and signature gates before anything is trusted
+        // enough to execute.
+        // Authenticode gate probe: must accept our installer and reject
+        // everything else, including files Windows itself trusts.
+        Some("--verify-signature-test") => {
+            let path = args
+                .get(1)
+                .context("--verify-signature-test needs a file path")?;
+            match installer::verify_signature(std::path::Path::new(path)) {
+                Ok(()) => eprintln!("ACCEPT {path}"),
+                Err(error) => eprintln!("REJECT {path}: {error:#}"),
+            }
+            Ok(())
+        }
+        Some("--update-stage-test") => {
+            // An explicit URL lets this exercise the gates even when the app is
+            // already current.
+            let (url, version) = match args.get(1) {
+                Some(url) => (url.clone(), "probe".to_string()),
+                None => match update::check_once()? {
+                    Some(update) => (update.download_url, update.version),
+                    None => {
+                        eprintln!("already current at {}", env!("CARGO_PKG_VERSION"));
+                        return Ok(());
+                    }
+                },
+            };
+            eprintln!("staging {version} from {url}");
+            let staged = installer::stage(&url, &version, |percent| {
+                if percent % 25 == 0 {
+                    eprintln!("  {percent}%");
+                }
+            })?;
+            let bytes = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "verified hash + signature: {} ({bytes} bytes)",
+                staged.display()
+            );
+            eprintln!("not installing (probe only)");
+            Ok(())
+        }
         // Live update endpoint probe (testing; never downloads anything).
         Some("--update-test") => {
             match update::check_once()? {
