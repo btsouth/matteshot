@@ -172,19 +172,35 @@ jobs:
               "https://download.matteshot.app/MatteshotSetup.exe",
               "https://download.matteshot.app/MatteshotSetup.exe.sha256"
             ) } | ConvertTo-Json
+          # Say exactly why a refusal happened. Swallowing the Cloudflare error
+          # made a failing purge indistinguishable from a missing permission.
+          try {
+            $token = Invoke-RestMethod -Method Get `
+              -Uri "https://api.cloudflare.com/client/v4/user/tokens/verify" `
+              -Headers @{ Authorization = "Bearer $env:CLOUDFLARE_API_TOKEN" }
+            Write-Host "Release token status: $($token.result.status)"
+          } catch {
+            Write-Host "Could not verify the release token: $_"
+          }
             try {
               $purge = Invoke-RestMethod -Method Post `
                 -Uri "https://api.cloudflare.com/client/v4/zones/$env:CLOUDFLARE_ZONE_ID/purge_cache" `
                 -Headers @{ Authorization = "Bearer $env:CLOUDFLARE_API_TOKEN" } `
                 -ContentType "application/json" -Body $body
               $ok = [bool]$purge.success
+              if (-not $ok) {
+                Write-Host "Cloudflare rejected the purge: $($purge.errors | ConvertTo-Json -Compress)"
+              }
             } catch {
               $ok = $false
+              $detail = $_.ErrorDetails.Message
+              if (-not $detail) { $detail = $_.Exception.Message }
+              Write-Host "Purge call failed against zone $env:CLOUDFLARE_ZONE_ID : $detail"
             }
             if ($ok) {
               Write-Host "Purged the stable installer and checksum from the edge."
             } else {
-              Write-Warning "Cache purge was refused. Grant the release token Zone > Cache Purge, or the stable download URL will serve the previous installer until its TTL expires."
+              Write-Warning "Cache purge was refused. The release token needs Zone > Cache Purge on zone $env:CLOUDFLARE_ZONE_ID. Uploads set a 60s TTL, so the stable URL still corrects itself shortly; this only removes the wait."
             }
           }
           "purged=$($ok.ToString().ToLower())" >> $env:GITHUB_OUTPUT

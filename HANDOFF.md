@@ -46,10 +46,7 @@ Read `README.md` for the full feature map and architecture — it is accurate.
    and the stable `MatteshotSetup.exe`.
 5. Update `public/version.json` in the site repo, deploy, purge zone cache.
 
-**v0.11.1 is fully shipped**: signed (verified `Valid`, CN=Brandon South),
-uploaded to R2 (versioned + stable), version.json bumped to 0.11.1 pointing at
-the versioned installer. `CLOUDFLARE_R2_API_TOKEN` now exists in the `release`
-environment, so R2 publishing is automatic. Nothing in flight.
+**v0.12.0 is fully shipped**: signed, uploaded to R2 (versioned + stable, verified matching its published checksum on the public URL), version.json bumped to 0.12.0 pointing at the versioned installer. Nothing in flight.
 
 **The app updates itself.** `installer.rs` downloads the signed installer,
 requires the published SHA-256 to match and Authenticode to be valid with the
@@ -102,17 +99,15 @@ must SetWindowPos topmost→notopmost to surface); AdjustWindowRectEx always.
 
 ## TODO queue (in priority order)
 
-1. **Tyler**: grant the release Cloudflare token **Zone → Cache Purge** on zone
-   `771cdfef44652b2f2e10751563682e19`. `download.matteshot.app` returns
-   `cache-control: max-age=14400`, so after a release the *stable*
-   `MatteshotSetup.exe` keeps serving the PREVIOUS installer for up to four
-   hours while its `.sha256` already describes the new one. The release
-   workflow tries to purge and currently gets a Cloudflare 10000
-   (Authentication error), so it only warns. Uploads now set a 60s TTL on the
-   stable objects, so this stops recurring once the current cached entry
-   expires, but until the permission exists a release cannot correct the edge
-   immediately. **Auto-update is not affected** — it reads the immutable
-   versioned URL on purpose.
+1. **Cache purge is still refused** even after the permission was granted, so
+   something about the token is still wrong: it may not be the same token as
+   the `CLOUDFLARE_R2_API_TOKEN` secret in the `release` environment, or the
+   grant may not cover zone `771cdfef44652b2f2e10751563682e19`. The workflow
+   now prints the token status and the Cloudflare error, so the next release
+   says why. **This is no longer urgent**: R2 uploads set a 60s TTL on the
+   stable objects, and v0.12.0 verified the public stable URL and its checksum
+   agreed immediately after publishing. Purging only removes the short wait.
+   Auto-update never depended on it — it reads the immutable versioned URL.
 2. **winget manifest**: unblocked (signed installer, versioned public URL,
    published sha256). `winget-pkgs` PR: package id `SouthForgeAI.Matteshot`,
    installer type inno, VERSIONED R2 URL (winget requires stable per-version
