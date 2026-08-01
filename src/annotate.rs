@@ -33,12 +33,20 @@ pub enum Shape {
     Counter { pos: (f32, f32), n: u32 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextStyle {
+    Shadow,
+    Box,
+}
+
 #[derive(Clone)]
 pub struct Annotation {
     pub shape: Shape,
     pub color: usize,
     /// Stroke/text size multiplier (S/M/L in the editor).
     pub size: f32,
+    pub text_style: TextStyle,
+    pub text_box_opacity: f32,
 }
 
 fn blend(img: &mut RgbaImage, x: i32, y: i32, color: [u8; 3], a: f32) {
@@ -507,31 +515,19 @@ pub fn render_with_metric(
                 } else {
                     text.clone()
                 };
-                let px_h = (21.0 * metric_scale * ann.size).max(12.0) as i32;
-                if let Some((alpha, tw, th)) = raster_text(&shown, px_h) {
-                    let p = s(*pos);
-                    let (ox, oy) = (p.0 as i32, p.1 as i32);
-                    // Soft dark plate behind the text for legibility.
-                    for y in 0..th {
-                        for x in 0..tw {
-                            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
-                            if a > 0.0 {
-                                // Halo: darken a small neighborhood.
-                                for (nx, ny) in
-                                    [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1)]
-                                {
-                                    blend(img, ox + x + nx, oy + y + ny, [20, 18, 16], a * 0.45);
-                                }
-                            }
-                        }
-                    }
-                    for y in 0..th {
-                        for x in 0..tw {
-                            let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
-                            blend(img, ox + x, oy + y, color, a);
-                        }
-                    }
-                }
+                render_caption(
+                    img,
+                    s(*pos),
+                    &shown,
+                    CaptionOptions {
+                        color_index: ann.color,
+                        size: ann.size,
+                        metric_scale,
+                        offset: (0.0, 0.0),
+                        boxed: ann.text_style == TextStyle::Box,
+                        box_opacity: ann.text_box_opacity,
+                    },
+                );
             }
         }
     }

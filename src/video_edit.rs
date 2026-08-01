@@ -3,11 +3,7 @@
 
 use image::RgbaImage;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaptionStyle {
-    Shadow,
-    Box,
-}
+pub use crate::annotate::TextStyle as CaptionStyle;
 
 #[derive(Clone, Debug)]
 pub enum Shape {
@@ -71,6 +67,8 @@ fn annotation(item: &Item, w: u32, h: u32) -> crate::annotate::Annotation {
         shape,
         color: item.color.min(crate::annotate::COLORS.len() - 1),
         size: item.size,
+        text_style: item.caption_style,
+        text_box_opacity: item.caption_box_opacity,
     }
 }
 

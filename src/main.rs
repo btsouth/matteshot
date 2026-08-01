@@ -1062,6 +1062,8 @@ fn main() -> Result<()> {
                     },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Rect {
@@ -1070,6 +1072,8 @@ fn main() -> Result<()> {
                     },
                     color: 2,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Blur {
@@ -1078,6 +1082,8 @@ fn main() -> Result<()> {
                     },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Text {
@@ -1086,6 +1092,8 @@ fn main() -> Result<()> {
                     },
                     color: 1,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Box,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Line {
@@ -1094,6 +1102,8 @@ fn main() -> Result<()> {
                     },
                     color: 3,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Ellipse {
@@ -1102,6 +1112,8 @@ fn main() -> Result<()> {
                     },
                     color: 1,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Highlight {
@@ -1110,16 +1122,22 @@ fn main() -> Result<()> {
                     },
                     color: 1,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Counter { pos: (w * 0.2, h * 0.55), n: 1 },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
                 annotate::Annotation {
                     shape: annotate::Shape::Counter { pos: (w * 0.5, h * 0.62), n: 2 },
                     color: 0,
                     size: 1.0,
+                    text_style: annotate::TextStyle::Shadow,
+                    text_box_opacity: 0.68,
                 },
             ];
             annotate::render(&mut img, &anns, 1.0, (0.0, 0.0), None);

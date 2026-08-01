@@ -28,9 +28,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, WM_APP, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WINDOW_STYLE,
-    WS_CAPTION, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    SWP_NOZORDER, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW, WINDOW_STYLE, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_MAXIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 const WM_EXPORT_PROGRESS: u32 = WM_APP + 20;
@@ -89,7 +90,7 @@ enum Handle {
     End,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Tool {
     Text,
     Arrow,
@@ -296,7 +297,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         left: m,
         top: sc(74),
         right: cw - m,
-        bottom: strip.top - sc(76),
+        bottom: strip.top - sc(86),
     };
     let mut matte_controls = Vec::new();
     if style_count > 0 {
@@ -318,7 +319,13 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
             ));
         }
     }
-    let settings_top = preview.bottom + sc(32);
+    // The second settings row must be visually separate from the matte chips.
+    // They previously shared the exact same boundary, which made the controls
+    // run together (and overlap after DPI rounding).
+    let settings_top = matte_controls
+        .first()
+        .map(|(rect, _)| rect.bottom + sc(8))
+        .unwrap_or(preview.bottom + sc(12));
     let padding_slider = RECT {
         left: m + sc(68),
         top: settings_top,
@@ -1118,6 +1125,22 @@ fn commit_text(state: &mut State) {
     recompose_preview(state);
 }
 
+fn tool_for_shape(shape: &crate::video_edit::Shape) -> Tool {
+    match shape {
+        crate::video_edit::Shape::Text { .. } => Tool::Text,
+        crate::video_edit::Shape::Arrow { .. } => Tool::Arrow,
+        crate::video_edit::Shape::Rect { .. } => Tool::Rect,
+        crate::video_edit::Shape::Blur { .. } => Tool::Blur,
+    }
+}
+
+fn selected_tool(state: &State) -> Option<Tool> {
+    state
+        .selected
+        .and_then(|index| state.annotations.get(index))
+        .map(|item| tool_for_shape(&item.shape))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptionInput {
     Changed,
@@ -1417,8 +1440,19 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let _ = DeleteObject(fill);
         let _ = DeleteObject(pen);
 
+        let property_tool = if state.tool.is_none() {
+            selected_tool(state)
+        } else {
+            None
+        };
         for (rect, tool, label) in &state.tool_controls {
-            paint_chip(hdc, *rect, label, state.tool == Some(*tool), state);
+            paint_chip(
+                hdc,
+                *rect,
+                label,
+                state.tool == Some(*tool) || property_tool == Some(*tool),
+                state,
+            );
         }
         for (rect, index) in &state.color_controls {
             let [r, g, b] = crate::annotate::COLORS[*index];
@@ -1621,13 +1655,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
         } else if let Some(index) = state.selected {
             match state.annotations.get(index).map(|item| &item.shape) {
                 Some(crate::video_edit::Shape::Arrow { .. }) => {
-                    "Selected   \u{00b7}   drag line to move   \u{00b7}   drag endpoints to redirect"
+                    "Selected   \u{00b7}   drag line to move   \u{00b7}   drag endpoints to redirect   \u{00b7}   right-click for properties"
                 }
                 Some(crate::video_edit::Shape::Rect { .. })
                 | Some(crate::video_edit::Shape::Blur { .. }) => {
-                    "Selected   \u{00b7}   drag to move   \u{00b7}   drag corner handles to resize"
+                    "Selected   \u{00b7}   drag to move   \u{00b7}   drag corner handles to resize   \u{00b7}   right-click for properties"
                 }
-                _ => "Selected   \u{00b7}   drag to move   \u{00b7}   + Add for style and timing",
+                _ => "Selected   \u{00b7}   drag to move   \u{00b7}   right-click for properties",
             }
         } else {
             ""
@@ -2608,6 +2642,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_RBUTTONDOWN => {
+            if let Some(state) = state_of(hwnd) {
+                let _ = SetFocus(hwnd);
+                let (x, y) = (
+                    (lparam.0 & 0xFFFF) as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                if state.text_entry.is_some() {
+                    commit_text(state);
+                }
+                if let Some(point) = screen_to_preview(state, x, y) {
+                    if let Some(index) = hit_annotation(state, point) {
+                        stop_playback(state);
+                        state.selected = Some(index);
+                        sync_selected_controls(state, index);
+                        state.tool = None;
+                        state.tools_open = true;
+                        state.status = None;
+                        recompose_preview(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP | WM_CONTEXTMENU => LRESULT(0),
         WM_LBUTTONUP => {
             if let Some(state) = state_of(hwnd) {
                 let (x, y) = (
@@ -3393,6 +3453,21 @@ mod tests {
         assert!(timeline_h >= (60.0 * scale) as i32);
         assert!(window.preview.left >= 0 && window.preview.right <= width);
         assert!(window.preview.top >= 0 && window.preview.bottom < window.strip.top);
+        let matte_bottom = window
+            .matte_controls
+            .iter()
+            .map(|(rect, _)| rect.bottom)
+            .max()
+            .unwrap();
+        assert!(
+            matte_bottom + (6.0 * scale).round() as i32 <= window.padding_slider.top,
+            "matte row ended at {matte_bottom}, settings began at {}",
+            window.padding_slider.top
+        );
+        assert!(
+            matte_bottom + (6.0 * scale).round() as i32
+                <= window.aspect_controls[0].0.top
+        );
         assert!(window.padding_slider.bottom < window.strip.top);
         assert!(window.strip.bottom < window.controls[0].0.top);
         assert!(window.controls.iter().all(|(rect, ..)| rect.bottom <= height));
@@ -3432,6 +3507,16 @@ mod tests {
         let mut capped = "x".repeat(160);
         assert_eq!(apply_caption_input(&mut capped, 'y'), CaptionInput::Ignored);
         assert_eq!(capped.chars().count(), 160);
+    }
+
+    #[test]
+    fn every_annotation_shape_opens_the_matching_property_tool() {
+        use crate::video_edit::Shape;
+
+        assert_eq!(super::tool_for_shape(&Shape::Text { pos: (0.0, 0.0), text: String::new() }), super::Tool::Text);
+        assert_eq!(super::tool_for_shape(&Shape::Arrow { from: (0.0, 0.0), to: (1.0, 1.0) }), super::Tool::Arrow);
+        assert_eq!(super::tool_for_shape(&Shape::Rect { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Rect);
+        assert_eq!(super::tool_for_shape(&Shape::Blur { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Blur);
     }
 
     #[test]

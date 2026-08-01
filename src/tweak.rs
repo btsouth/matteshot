@@ -16,14 +16,16 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    IDC_ARROW, MSG, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_CAPTION,
-    WS_SYSMENU, WS_VISIBLE,
+    IDC_ARROW, MSG, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::compose::{self, ComposeOpts};
@@ -45,6 +47,8 @@ const ASPECTS: [(&str, Option<f32>); 5] = [
 
 /// Posted when the resident PrtScn hotkey fires mid-tweak.
 const WM_RESHOOT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 42;
+const WM_UNICHAR_MESSAGE: u32 = 0x0109;
+const UNICODE_NOCHAR: usize = 0xFFFF;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Ctl {
@@ -78,6 +82,22 @@ enum Grab {
     Corner(u8),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SliderDrag {
+    Padding,
+    CaptionSize,
+    CaptionOpacity,
+}
+
+struct WindowLayout {
+    controls: Vec<(RECT, Ctl)>,
+    preview_box: RECT,
+    padding_slider: RECT,
+    caption_size_slider: RECT,
+    caption_opacity_slider: RECT,
+    caption_style_controls: Vec<(RECT, crate::annotate::TextStyle)>,
+}
+
 struct State {
     raw: RgbaImage,
     small: RgbaImage,
@@ -96,8 +116,11 @@ struct State {
     controls: Vec<(RECT, Ctl)>,
     preview_box: RECT,
     slider_rect: RECT,
+    caption_size_slider: RECT,
+    caption_opacity_slider: RECT,
+    caption_style_controls: Vec<(RECT, crate::annotate::TextStyle)>,
     hover: i32,
-    dragging: bool,
+    dragging: Option<SliderDrag>,
     done: bool,
     suspended: bool,
     reshoot: Option<(crate::overlay::Selection, HMONITOR)>,
@@ -112,6 +135,8 @@ struct State {
     drawing: bool,
     /// Text annotation being typed (index into `anns`).
     editing: Option<usize>,
+    /// Original content when re-editing. None means this is a new caption.
+    editing_original: Option<String>,
     /// Caret blink phase while editing.
     caret_on: bool,
     /// Annotation being dragged in selector mode: (index, last raw point,
@@ -124,6 +149,9 @@ struct State {
     /// Annotation under the cursor in selector mode (highlight only).
     hover_ann: Option<usize>,
     size_idx: usize,
+    caption_size: f32,
+    caption_style: crate::annotate::TextStyle,
+    caption_box_opacity: f32,
     last_rebuild: std::time::Instant,
     font: HFONT,
     font_small: HFONT,
@@ -163,6 +191,59 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 
 fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+fn annotation_tool_index(shape: &crate::annotate::Shape) -> usize {
+    match shape {
+        crate::annotate::Shape::Arrow { .. } => 0,
+        crate::annotate::Shape::Line { .. } => 1,
+        crate::annotate::Shape::Rect { .. } => 2,
+        crate::annotate::Shape::Ellipse { .. } => 3,
+        crate::annotate::Shape::Highlight { .. } => 4,
+        crate::annotate::Shape::Text { .. } => 5,
+        crate::annotate::Shape::Blur { .. } => 6,
+        crate::annotate::Shape::Counter { .. } => 7,
+    }
+}
+
+fn text_context(state: &State) -> bool {
+    state.editing.is_some()
+        || state.tool == Some(5)
+        || state
+            .selected
+            .and_then(|index| state.anns.get(index))
+            .is_some_and(|ann| matches!(ann.shape, crate::annotate::Shape::Text { .. }))
+}
+
+fn control_visible(state: &State, control: Ctl) -> bool {
+    if !text_context(state) {
+        return true;
+    }
+    !matches!(
+        control,
+        Ctl::OutputSize(_) | Ctl::CustomSize | Ctl::Ocr | Ctl::Size(_)
+    )
+}
+
+fn sync_annotation_controls(state: &mut State, index: usize) {
+    let Some(ann) = state.anns.get(index) else {
+        return;
+    };
+    state.color_idx = ann.color.min(crate::annotate::COLORS.len() - 1);
+    state.size_idx = SIZES
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (**a - ann.size)
+                .abs()
+                .partial_cmp(&(**b - ann.size).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(1);
+    state.caption_size = ann.size;
+    state.caption_style = ann.text_style;
+    state.caption_box_opacity = ann.text_box_opacity;
 }
 
 fn opts_of(state: &State, metric: f32) -> ComposeOpts {
@@ -232,8 +313,9 @@ fn ann_bounds(ann: &crate::annotate::Annotation) -> (f32, f32, f32, f32) {
             (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
         }
         crate::annotate::Shape::Text { pos, text } => {
-            let w = (text.chars().count() as f32 * 11.5 * ann.size).max(20.0);
-            (pos.0, pos.1, pos.0 + w, pos.1 + 26.0 * ann.size)
+            let (width, height) = crate::annotate::caption_text_size(text, ann.size, 1.0)
+                .unwrap_or((20, (24.0 * ann.size).max(12.0) as i32));
+            (pos.0, pos.1, pos.0 + width as f32, pos.1 + height as f32)
         }
         crate::annotate::Shape::Counter { pos, .. } => {
             let r = 14.0 * ann.size;
@@ -376,6 +458,42 @@ unsafe fn label(hdc: HDC, state: &State, x: i32, y: i32, text: &str) {
     DrawTextW(hdc, &mut t, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 }
 
+unsafe fn paint_slider(hdc: HDC, state: &State, rect: RECT, t: f32, active: bool) {
+    let cy = (rect.top + rect.bottom) / 2;
+    let track = CreateSolidBrush(state.theme.track);
+    FillRect(
+        hdc,
+        &RECT { left: rect.left, top: cy - 2, right: rect.right, bottom: cy + 2 },
+        track,
+    );
+    let _ = DeleteObject(track);
+    let tx = rect.left + ((rect.right - rect.left) as f32 * t.clamp(0.0, 1.0)) as i32;
+    let color = if active { state.theme.accent } else { state.theme.chip_line };
+    let fill = CreateSolidBrush(color);
+    FillRect(
+        hdc,
+        &RECT { left: rect.left, top: cy - 2, right: tx, bottom: cy + 2 },
+        fill,
+    );
+    let pen = CreatePen(PS_SOLID, 1, color);
+    let old_brush = SelectObject(hdc, fill);
+    let old_pen = SelectObject(hdc, pen);
+    let radius = (6.0 * state.scale).round() as i32;
+    let _ = RoundRect(
+        hdc,
+        tx - radius,
+        cy - radius,
+        tx + radius,
+        cy + radius,
+        radius * 2,
+        radius * 2,
+    );
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(fill);
+    let _ = DeleteObject(pen);
+}
+
 unsafe fn paint(hdc: HDC, state: &State) {
     let bg = CreateSolidBrush(state.theme.bg);
     FillRect(hdc, &RECT { left: 0, top: 0, right: state.width, bottom: state.height }, bg);
@@ -500,11 +618,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
     // Contextual hint line under the preview.
     let hint = if state.editing.is_some() {
-        "type your caption   \u{00b7}   Enter done   \u{00b7}   Esc cancel"
+        "type your caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel"
     } else if state.tool.is_some() {
         "drag on the preview to draw   \u{00b7}   tool clears after each add"
     } else {
-        "drag annotations to move   \u{00b7}   grab arrow tips / box corners to reshape   \u{00b7}   double-click text to edit   \u{00b7}   Del removes   \u{00b7}   A/R/T/B tools"
+        "drag to move   \u{00b7}   grab handles to reshape   \u{00b7}   right-click for properties   \u{00b7}   double-click text to edit   \u{00b7}   Del removes"
     };
     label(
         hdc,
@@ -526,7 +644,15 @@ unsafe fn paint(hdc: HDC, state: &State) {
     if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::Tool(0))) {
         label(hdc, state, r.left, r.top - lh, "ANNOTATE  (drag on the preview)");
     }
-    if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::OutputSize(_))) {
+    if text_context(state) {
+        label(
+            hdc,
+            state,
+            state.caption_size_slider.left - (52.0 * state.scale) as i32,
+            state.caption_size_slider.top - lh,
+            "TEXT PROPERTIES",
+        );
+    } else if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::OutputSize(_))) {
         label(
             hdc,
             state,
@@ -546,6 +672,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
     // Controls.
     for (i, (r, c)) in state.controls.iter().enumerate() {
+        if !control_visible(state, *c) {
+            continue;
+        }
         let hot = i as i32 == state.hover;
         match c {
             Ctl::Matte(n) => chip(hdc, *r, state.styles[*n].name, state, state.sel == *n, hot),
@@ -580,7 +709,24 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
             Ctl::Edit => chip(hdc, *r, "Editor", state, false, hot),
-            Ctl::Tool(n) => chip(hdc, *r, TOOLS[*n], state, state.tool == Some(*n), hot),
+            Ctl::Tool(n) => {
+                let property_tool = if state.tool.is_none() {
+                    state
+                        .selected
+                        .and_then(|index| state.anns.get(index))
+                        .map(|ann| annotation_tool_index(&ann.shape))
+                } else {
+                    None
+                };
+                chip(
+                    hdc,
+                    *r,
+                    TOOLS[*n],
+                    state,
+                    state.tool == Some(*n) || property_tool == Some(*n),
+                    hot,
+                )
+            }
             Ctl::Size(n) => chip(
                 hdc,
                 *r,
@@ -613,6 +759,52 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
     }
 
+    if text_context(state) {
+        let size_value = (state.caption_size * 24.0).round() as i32;
+        label(
+            hdc,
+            state,
+            state.caption_size_slider.left - (52.0 * state.scale) as i32,
+            state.caption_size_slider.top,
+            &format!("Size {size_value}"),
+        );
+        paint_slider(
+            hdc,
+            state,
+            state.caption_size_slider,
+            (state.caption_size - 0.7) / (3.4 - 0.7),
+            true,
+        );
+        for (rect, style) in &state.caption_style_controls {
+            chip(
+                hdc,
+                *rect,
+                match style {
+                    crate::annotate::TextStyle::Shadow => "Shadow",
+                    crate::annotate::TextStyle::Box => "Caption box",
+                },
+                state,
+                state.caption_style == *style,
+                false,
+            );
+        }
+        let opacity_active = state.caption_style == crate::annotate::TextStyle::Box;
+        label(
+            hdc,
+            state,
+            state.caption_opacity_slider.left - (52.0 * state.scale) as i32,
+            state.caption_opacity_slider.top,
+            &format!("Box {}%", (state.caption_box_opacity * 100.0).round() as i32),
+        );
+        paint_slider(
+            hdc,
+            state,
+            state.caption_opacity_slider,
+            (state.caption_box_opacity - 0.20) / 0.75,
+            opacity_active,
+        );
+    }
+
     // Slider.
     let sr = state.slider_rect;
     let cy = (sr.top + sr.bottom) / 2;
@@ -642,6 +834,58 @@ unsafe fn slider_update(hwnd: HWND, state: &mut State, x: i32) {
     let _ = InvalidateRect(hwnd, None, false);
 }
 
+unsafe fn caption_size_update(hwnd: HWND, state: &mut State, x: i32) {
+    let rect = state.caption_size_slider;
+    let t = ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0);
+    state.caption_size = 0.7 + t * (3.4 - 0.7);
+    if let Some(index) = state.editing.or(state.selected) {
+        if let Some(ann) = state.anns.get_mut(index) {
+            if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
+                ann.size = state.caption_size;
+            }
+        }
+    }
+    rebuild_preview(state);
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+unsafe fn caption_opacity_update(hwnd: HWND, state: &mut State, x: i32) {
+    let rect = state.caption_opacity_slider;
+    let t = ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0);
+    state.caption_box_opacity = 0.20 + t * 0.75;
+    if let Some(index) = state.editing.or(state.selected) {
+        if let Some(ann) = state.anns.get_mut(index) {
+            if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
+                ann.text_box_opacity = state.caption_box_opacity;
+            }
+        }
+    }
+    rebuild_preview(state);
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextInput {
+    Changed,
+    Commit,
+    Ignored,
+}
+
+fn apply_text_input(text: &mut String, ch: char) -> TextInput {
+    match ch {
+        '\r' => TextInput::Commit,
+        '\u{8}' => {
+            text.pop();
+            TextInput::Changed
+        }
+        ch if !ch.is_control() && text.chars().count() < 160 => {
+            text.push(ch);
+            TextInput::Changed
+        }
+        _ => TextInput::Ignored,
+    }
+}
+
 /// Commit any in-progress text annotation (drop it if empty). Returns true
 /// if a non-empty annotation was committed.
 fn commit_editing(state: &mut State) -> bool {
@@ -652,10 +896,12 @@ fn commit_editing(state: &mut State) -> bool {
         );
         if empty {
             state.anns.remove(i);
+            state.editing_original = None;
             return false;
         }
         // One-shot tools: a successful add returns to the selector.
         state.tool = None;
+        state.editing_original = None;
         return true;
     }
     false
@@ -705,12 +951,12 @@ fn hit_ann(state: &State, p: (f32, f32)) -> Option<usize> {
                     && p.1 >= a.1.min(b.1) - tol
                     && p.1 <= a.1.max(b.1) + tol
             }
-            crate::annotate::Shape::Text { pos, text } => {
-                let w = (text.chars().count() as f32 * 11.5).max(20.0);
-                p.0 >= pos.0 - tol
-                    && p.0 <= pos.0 + w + tol
-                    && p.1 >= pos.1 - tol
-                    && p.1 <= pos.1 + 26.0 + tol
+            crate::annotate::Shape::Text { .. } => {
+                let (x0, y0, x1, y1) = ann_bounds(ann);
+                p.0 >= x0 - tol
+                    && p.0 <= x1 + tol
+                    && p.1 >= y0 - tol
+                    && p.1 <= y1 + tol
             }
         };
         if hit {
@@ -852,7 +1098,16 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
     match ctl {
         Ctl::Tool(n) => {
             commit_editing(state);
-            state.tool = if state.tool == Some(n) { None } else { Some(n) };
+            if state.tool == Some(n) {
+                state.tool = None;
+            } else {
+                state.tool = Some(n);
+                state.selected = None;
+                if n == 5 {
+                    state.color_idx = 3;
+                    state.caption_style = crate::annotate::TextStyle::Box;
+                }
+            }
             rebuild_preview(state);
             let _ = InvalidateRect(hwnd, None, false);
             return;
@@ -897,6 +1152,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         }
         Ctl::Clear => {
             state.editing = None;
+            state.editing_original = None;
             state.anns.clear();
             state.selected = None;
             state.hover_ann = None;
@@ -995,8 +1251,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if state.dragging {
-                    slider_update(hwnd, state, x);
+                if let Some(drag) = state.dragging {
+                    match drag {
+                        SliderDrag::Padding => slider_update(hwnd, state, x),
+                        SliderDrag::CaptionSize => caption_size_update(hwnd, state, x),
+                        SliderDrag::CaptionOpacity => caption_opacity_update(hwnd, state, x),
+                    }
                 } else if let Some((i, last, grab)) = state.moving {
                     if let Some(p) = to_raw(state, x, y) {
                         if let Some(ann) = state.anns.get_mut(i) {
@@ -1029,7 +1289,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let hover = state
                         .controls
                         .iter()
-                        .position(|(r, _)| in_rect(r, x, y))
+                        .position(|(r, control)| {
+                            control_visible(state, *control) && in_rect(r, x, y)
+                        })
                         .map(|i| i as i32)
                         .unwrap_or(-1);
                     let hover_ann = if state.tool.is_none() {
@@ -1048,6 +1310,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK => {
             if let Some(state) = state_of(hwnd) {
+                let _ = SetFocus(hwnd);
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -1055,15 +1318,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if state.tool.is_none() {
                     if let Some(p) = to_raw(state, x, y) {
                         if let Some(i) = hit_ann(state, p) {
-                            if matches!(
-                                state.anns[i].shape,
-                                crate::annotate::Shape::Text { .. }
-                            ) {
+                            if let crate::annotate::Shape::Text { text, .. } =
+                                &state.anns[i].shape
+                            {
+                                let original = text.clone();
                                 // Re-edit an existing caption.
                                 state.moving = None;
                                 let _ = ReleaseCapture();
+                                state.editing_original = Some(original);
                                 state.editing = Some(i);
                                 state.selected = Some(i);
+                                sync_annotation_controls(state, i);
                                 state.caret_on = true;
                                 rebuild_preview(state);
                                 let _ = InvalidateRect(hwnd, None, false);
@@ -1076,6 +1341,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN => {
             if let Some(state) = state_of(hwnd) {
+                let _ = SetFocus(hwnd);
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -1086,9 +1352,50 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     right: state.slider_rect.right + 8,
                     bottom: state.slider_rect.bottom + 8,
                 };
+                if text_context(state) && in_rect(&state.caption_size_slider, x, y) {
+                    state.dragging = Some(SliderDrag::CaptionSize);
+                    SetCapture(hwnd);
+                    caption_size_update(hwnd, state, x);
+                    return LRESULT(0);
+                }
+                if text_context(state)
+                    && state.caption_style == crate::annotate::TextStyle::Box
+                    && in_rect(&state.caption_opacity_slider, x, y)
+                {
+                    state.dragging = Some(SliderDrag::CaptionOpacity);
+                    SetCapture(hwnd);
+                    caption_opacity_update(hwnd, state, x);
+                    return LRESULT(0);
+                }
+                if text_context(state) {
+                    if let Some((_, style)) = state
+                        .caption_style_controls
+                        .iter()
+                        .find(|(rect, _)| in_rect(rect, x, y))
+                        .copied()
+                    {
+                        state.caption_style = style;
+                        if let Some(index) = state.editing.or(state.selected) {
+                            if let Some(ann) = state.anns.get_mut(index) {
+                                if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
+                                    ann.text_style = style;
+                                }
+                            }
+                        }
+                        rebuild_preview(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                }
+                // Clicking away accepts the caption and returns to Select.
+                // Enter remains optional, matching the video editor.
+                if state.editing.is_some() {
+                    commit_editing(state);
+                    rebuild_preview(state);
+                }
                 if in_rect(&grab, x, y) {
                     commit_editing(state);
-                    state.dragging = true;
+                    state.dragging = Some(SliderDrag::Padding);
                     SetCapture(hwnd);
                     slider_update(hwnd, state, x);
                 } else if let (Some(tool), Some(p)) = (state.tool, to_raw(state, x, y)) {
@@ -1106,7 +1413,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         _ => None,
                     };
                     if let Some(shape) = drag_shape {
-                        state.anns.push(crate::annotate::Annotation { shape, color, size });
+                        state.anns.push(crate::annotate::Annotation {
+                            shape,
+                            color,
+                            size,
+                            text_style: crate::annotate::TextStyle::Shadow,
+                            text_box_opacity: state.caption_box_opacity,
+                        });
                         state.drawing = true;
                         SetCapture(hwnd);
                     } else if tool == 7 {
@@ -1117,6 +1430,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             shape: Shape::Counter { pos: p, n },
                             color,
                             size,
+                            text_style: crate::annotate::TextStyle::Shadow,
+                            text_box_opacity: state.caption_box_opacity,
                         });
                         state.selected = Some(state.anns.len() - 1);
                         state.tool = None;
@@ -1126,10 +1441,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Text: click places, then type.
                         state.anns.push(crate::annotate::Annotation {
                             shape: Shape::Text { pos: p, text: String::new() },
-                            color,
-                            size,
+                            color: 3,
+                            size: state.caption_size,
+                            text_style: state.caption_style,
+                            text_box_opacity: state.caption_box_opacity,
                         });
                         state.editing = Some(state.anns.len() - 1);
+                        state.editing_original = None;
                         state.selected = Some(state.anns.len() - 1);
                         state.caret_on = true;
                         rebuild_preview(state);
@@ -1149,6 +1467,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             normalize_rect(&mut state.anns[i]);
                             let grab = grab_probe(&state.anns[i], p, tol);
                             state.selected = Some(i);
+                            sync_annotation_controls(state, i);
                             state.moving = Some((i, p, grab));
                             SetCapture(hwnd);
                             let _ = InvalidateRect(hwnd, None, false);
@@ -1162,8 +1481,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             if let Some(state) = state_of(hwnd) {
-                if state.dragging {
-                    state.dragging = false;
+                if state.dragging.take().is_some() {
                     let _ = ReleaseCapture();
                     return LRESULT(0);
                 }
@@ -1206,13 +1524,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if let Some(i) = state.controls.iter().position(|(r, _)| in_rect(r, x, y)) {
+                if let Some(i) = state.controls.iter().position(|(r, control)| {
+                    control_visible(state, *control) && in_rect(r, x, y)
+                }) {
                     let ctl = state.controls[i].1;
                     activate(hwnd, state, ctl);
                 }
             }
             LRESULT(0)
         }
+        WM_RBUTTONDOWN => {
+            if let Some(state) = state_of(hwnd) {
+                let _ = SetFocus(hwnd);
+                let (x, y) = (
+                    (lparam.0 & 0xFFFF) as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                if state.editing.is_some() {
+                    commit_editing(state);
+                }
+                if let Some(point) = to_raw(state, x, y) {
+                    if let Some(index) = hit_ann(state, point) {
+                        state.tool = None;
+                        state.selected = Some(index);
+                        sync_annotation_controls(state, index);
+                        rebuild_preview(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP | WM_CONTEXTMENU => LRESULT(0),
         windows::Win32::UI::WindowsAndMessaging::WM_TIMER => {
             if let Some(state) = state_of(hwnd) {
                 if state.editing.is_some() {
@@ -1226,29 +1569,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        windows::Win32::UI::WindowsAndMessaging::WM_CHAR => {
+        windows::Win32::UI::WindowsAndMessaging::WM_CHAR | WM_UNICHAR_MESSAGE => {
             if let Some(state) = state_of(hwnd) {
+                if msg == WM_UNICHAR_MESSAGE && wparam.0 == UNICODE_NOCHAR {
+                    return LRESULT(1);
+                }
                 // Typing keeps the caret solid, like every real text box.
                 state.caret_on = true;
                 if let Some(i) = state.editing {
-                    let c = wparam.0 as u32;
-                    if let Some(crate::annotate::Shape::Text { text, .. }) =
-                        state.anns.get_mut(i).map(|a| &mut a.shape)
-                    {
-                        match c {
-                            0x08 => {
-                                text.pop();
+                    let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
+                    let action = state
+                        .anns
+                        .get_mut(i)
+                        .and_then(|ann| match &mut ann.shape {
+                            crate::annotate::Shape::Text { text, .. } => {
+                                Some(apply_text_input(text, ch))
                             }
-                            0x0D | 0x1B => {}
-                            _ if c >= 0x20 => {
-                                if let Some(ch) = char::from_u32(c) {
-                                    text.push(ch);
-                                }
-                            }
-                            _ => {}
-                        }
+                            _ => None,
+                        })
+                        .unwrap_or(TextInput::Ignored);
+                    if action == TextInput::Commit {
+                        commit_editing(state);
                     }
-                    rebuild_preview(state);
+                    if action != TextInput::Ignored {
+                        rebuild_preview(state);
+                    }
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
@@ -1262,8 +1607,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 match wparam.0 as u16 {
                     v if v == VK_ESCAPE.0 => {
                         if let Some(i) = state.editing.take() {
-                            // Cancel the text being typed.
-                            state.anns.remove(i);
+                            if let Some(original) = state.editing_original.take() {
+                                if let Some(crate::annotate::Shape::Text { text, .. }) =
+                                    state.anns.get_mut(i).map(|ann| &mut ann.shape)
+                                {
+                                    *text = original;
+                                }
+                                state.selected = Some(i);
+                            } else if i < state.anns.len() {
+                                // A brand-new empty caption is discarded.
+                                state.anns.remove(i);
+                                state.selected = None;
+                            }
+                            state.tool = None;
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
                         } else {
@@ -1385,11 +1741,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if w > 0 && h > 0 {
                     state.width = w;
                     state.height = h;
-                    let (controls, preview_box, slider_rect) =
-                        layout_controls(state.scale, w, h, state.styles.len());
-                    state.controls = controls;
-                    state.preview_box = preview_box;
-                    state.slider_rect = slider_rect;
+                    let next = layout_controls(state.scale, w, h, state.styles.len());
+                    state.controls = next.controls;
+                    state.preview_box = next.preview_box;
+                    state.slider_rect = next.padding_slider;
+                    state.caption_size_slider = next.caption_size_slider;
+                    state.caption_opacity_slider = next.caption_opacity_slider;
+                    state.caption_style_controls = next.caption_style_controls;
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
@@ -1422,7 +1780,7 @@ fn layout_controls(
     cw: i32,
     ch: i32,
     n_styles: usize,
-) -> (Vec<(RECT, Ctl)>, RECT, RECT) {
+) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
     let m = sc(20);
     let col_x = cw - sc(250);
@@ -1508,6 +1866,38 @@ fn layout_controls(
     }
     let by = ch - m - sc(30);
     let output_y = by - sc(114);
+    let caption_size_slider = RECT {
+        left: col_x + sc(64),
+        top: output_y,
+        right: col_x + sc(216),
+        bottom: output_y + sc(26),
+    };
+    let caption_style_controls = vec![
+        (
+            RECT {
+                left: col_x,
+                top: output_y + sc(34),
+                right: col_x + sc(104),
+                bottom: output_y + sc(62),
+            },
+            crate::annotate::TextStyle::Shadow,
+        ),
+        (
+            RECT {
+                left: col_x + sc(112),
+                top: output_y + sc(34),
+                right: col_x + sc(216),
+                bottom: output_y + sc(62),
+            },
+            crate::annotate::TextStyle::Box,
+        ),
+    ];
+    let caption_opacity_slider = RECT {
+        left: col_x + sc(64),
+        top: output_y + sc(68),
+        right: col_x + sc(216),
+        bottom: output_y + sc(94),
+    };
     for (i, ctl) in [
         Ctl::OutputSize(output::OUTPUT_ORIGINAL),
         Ctl::OutputSize(output::OUTPUT_EMAIL),
@@ -1545,7 +1935,14 @@ fn layout_controls(
         RECT { left: col_x + sc(144), top: by, right: col_x + sc(216), bottom: by + sc(30) },
         Ctl::Edit,
     ));
-    (controls, preview_box, slider_rect)
+    WindowLayout {
+        controls,
+        preview_box,
+        padding_slider: slider_rect,
+        caption_size_slider,
+        caption_opacity_slider,
+        caption_style_controls,
+    }
 }
 
 /// Modal tweak panel for one capture. Returns a reshoot selection if the
@@ -1586,7 +1983,7 @@ pub fn run(
         raw.clone()
     };
 
-    let (controls, preview_box, slider_rect) = layout_controls(dpi_scale, cw, ch, styles.len());
+    let initial_layout = layout_controls(dpi_scale, cw, ch, styles.len());
 
     let preview_metric = scale;
     let cfg = Config::load();
@@ -1603,11 +2000,14 @@ pub fn run(
         preview: Vec::new(),
         preview_w: 1,
         preview_h: 1,
-        controls,
-        preview_box,
-        slider_rect,
+        controls: initial_layout.controls,
+        preview_box: initial_layout.preview_box,
+        slider_rect: initial_layout.padding_slider,
+        caption_size_slider: initial_layout.caption_size_slider,
+        caption_opacity_slider: initial_layout.caption_opacity_slider,
+        caption_style_controls: initial_layout.caption_style_controls,
         hover: -1,
-        dragging: false,
+        dragging: None,
         done: false,
         suspended: false,
         reshoot: None,
@@ -1617,12 +2017,16 @@ pub fn run(
         color_idx: 0,
         drawing: false,
         editing: None,
+        editing_original: None,
         caret_on: true,
         moving: None,
         selected: None,
         counter_next: 1,
         hover_ann: None,
         size_idx: 1,
+        caption_size: 1.75,
+        caption_style: crate::annotate::TextStyle::Box,
+        caption_box_opacity: 0.68,
         last_rebuild: std::time::Instant::now(),
         font: unsafe { make_font(-sc(14), 400) },
         font_small: unsafe { make_font(-sc(12), 400) },
@@ -1717,5 +2121,87 @@ pub fn run(
         let _ = DeleteObject(state.font_small);
     }
     Ok(state.reshoot.take())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{annotation_tool_index, apply_text_input, layout_controls, Ctl, TextInput};
+    use crate::annotate::Shape;
+
+    #[test]
+    fn caption_input_accepts_unicode_without_requiring_enter() {
+        let mut text = String::new();
+        for ch in "Clean caption 👍".chars() {
+            assert_eq!(apply_text_input(&mut text, ch), TextInput::Changed);
+        }
+        assert_eq!(text, "Clean caption 👍");
+        assert_eq!(apply_text_input(&mut text, '\u{8}'), TextInput::Changed);
+        assert_eq!(text, "Clean caption ");
+        assert_eq!(apply_text_input(&mut text, '\r'), TextInput::Commit);
+        assert_eq!(apply_text_input(&mut text, '\n'), TextInput::Ignored);
+
+        let mut capped = "x".repeat(160);
+        assert_eq!(apply_text_input(&mut capped, 'y'), TextInput::Ignored);
+        assert_eq!(capped.chars().count(), 160);
+    }
+
+    #[test]
+    fn every_annotation_shape_opens_the_matching_property_tool() {
+        assert_eq!(
+            annotation_tool_index(&Shape::Arrow { from: (0.0, 0.0), to: (1.0, 1.0) }),
+            0
+        );
+        assert_eq!(
+            annotation_tool_index(&Shape::Line { from: (0.0, 0.0), to: (1.0, 1.0) }),
+            1
+        );
+        assert_eq!(
+            annotation_tool_index(&Shape::Rect { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            2
+        );
+        assert_eq!(
+            annotation_tool_index(&Shape::Ellipse { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            3
+        );
+        assert_eq!(
+            annotation_tool_index(&Shape::Highlight { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            4
+        );
+        assert_eq!(
+            annotation_tool_index(&Shape::Text { pos: (0.0, 0.0), text: String::new() }),
+            5
+        );
+        assert_eq!(
+            annotation_tool_index(&Shape::Blur { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            6
+        );
+        assert_eq!(annotation_tool_index(&Shape::Counter { pos: (0.0, 0.0), n: 1 }), 7);
+    }
+
+    #[test]
+    fn text_properties_fit_cleanly_above_picture_actions_at_every_dpi() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let width = (1180.0 * scale) as i32;
+            let height = (760.0 * scale) as i32;
+            let layout = layout_controls(scale, width, height, 7);
+            let action_top = layout
+                .controls
+                .iter()
+                .filter(|(_, control)| matches!(control, Ctl::Copy | Ctl::Save | Ctl::Edit))
+                .map(|(rect, _)| rect.top)
+                .min()
+                .unwrap();
+            let opacity_bottom = layout.caption_opacity_slider.bottom;
+            assert!(
+                opacity_bottom + (12.0 * scale).round() as i32 <= action_top,
+                "text properties ended at {opacity_bottom}, actions began at {action_top}"
+            );
+            assert!(layout.caption_size_slider.bottom < layout.caption_style_controls[0].0.top);
+            assert!(layout.caption_style_controls[0].0.bottom < layout.caption_opacity_slider.top);
+            assert!(layout.caption_style_controls.iter().all(|(rect, _)| {
+                rect.left >= 0 && rect.right <= width && rect.bottom <= height
+            }));
+        }
+    }
 }
 
