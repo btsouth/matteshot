@@ -377,18 +377,53 @@ fn opts_of(state: &State, metric: f32) -> ComposeOpts {
     }
 }
 
+/// Locate a preview bitmap inside its viewport. Draft previews contain fewer
+/// pixels, but `quality_scale` expands them back to their full-preview logical
+/// size so changing render quality never changes the geometry on screen.
+fn preview_draw_geometry(
+    preview_box: RECT,
+    preview_w: i32,
+    preview_h: i32,
+    quality_scale: f32,
+) -> (i32, i32, f32, i32, i32) {
+    let (bw, bh) = (
+        preview_box.right - preview_box.left,
+        preview_box.bottom - preview_box.top,
+    );
+    let logical_w = preview_w as f32 * quality_scale;
+    let logical_h = preview_h as f32 * quality_scale;
+    let fit = (bw as f32 / logical_w)
+        .min(bh as f32 / logical_h)
+        .min(1.0);
+    let source_scale = quality_scale * fit;
+    let (dw, dh) = (
+        (preview_w as f32 * source_scale) as i32,
+        (preview_h as f32 * source_scale) as i32,
+    );
+    let (dx, dy) = (
+        preview_box.left + (bw - dw) / 2,
+        preview_box.top + (bh - dh) / 2,
+    );
+    (dx, dy, source_scale, dw, dh)
+}
+
+fn preview_quality_scale(state: &State) -> f32 {
+    let active_metric = preview_source(state).1;
+    if active_metric > 0.0 {
+        state.doc().preview_metric / active_metric
+    } else {
+        1.0
+    }
+}
+
 /// Shared view transform: preview blit offset/scale and content padding.
 fn view_params(state: &State) -> (i32, i32, f32, f32, f32) {
-    let bx = state.preview_box;
-    let (bw, bh) = (bx.right - bx.left, bx.bottom - bx.top);
-    let draw_scale = (bw as f32 / state.doc().preview_w as f32)
-        .min(bh as f32 / state.doc().preview_h as f32)
-        .min(1.0);
-    let (dw, dh) = (
-        (state.doc().preview_w as f32 * draw_scale) as i32,
-        (state.doc().preview_h as f32 * draw_scale) as i32,
+    let (dx, dy, draw_scale, _, _) = preview_draw_geometry(
+        state.preview_box,
+        state.doc().preview_w,
+        state.doc().preview_h,
+        preview_quality_scale(state),
     );
-    let (dx, dy) = (bx.left + (bw - dw) / 2, bx.top + (bh - dh) / 2);
     if compose::is_plain(&state.doc().styles[state.doc().sel]) {
         return (dx, dy, draw_scale, 0.0, 0.0);
     }
@@ -902,16 +937,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
     paint_tabs(hdc, state);
 
     // Preview, letterboxed into its box.
-    let bx = state.preview_box;
-    let (bw, bh) = (bx.right - bx.left, bx.bottom - bx.top);
-    let scale = (bw as f32 / state.doc().preview_w as f32)
-        .min(bh as f32 / state.doc().preview_h as f32)
-        .min(1.0);
-    let (dw, dh) = (
-        (state.doc().preview_w as f32 * scale) as i32,
-        (state.doc().preview_h as f32 * scale) as i32,
+    let (dx, dy, _, dw, dh) = preview_draw_geometry(
+        state.preview_box,
+        state.doc().preview_w,
+        state.doc().preview_h,
+        preview_quality_scale(state),
     );
-    let (dx, dy) = (bx.left + (bw - dw) / 2, bx.top + (bh - dh) / 2);
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -2989,8 +3020,24 @@ mod tests {
 
     use super::{
         active_after_close, annotation_tool_index, apply_text_input, join_words, layout_controls,
-        nearest_word, persist_and_copy_with, redacted, tab_for_digit, Ctl, FinishError, TextInput,
+        nearest_word, persist_and_copy_with, preview_draw_geometry, redacted, tab_for_digit, Ctl,
+        FinishError, TextInput,
     };
+    use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn padding_drag_quality_does_not_shrink_preview() {
+        for preview_box in [
+            RECT { left: 0, top: 0, right: 1200, bottom: 800 },
+            RECT { left: 50, top: 25, right: 750, bottom: 525 },
+        ] {
+            let full = preview_draw_geometry(preview_box, 960, 600, 1.0);
+            let draft = preview_draw_geometry(preview_box, 480, 300, 2.0);
+
+            assert_eq!((draft.0, draft.1, draft.3, draft.4), (full.0, full.1, full.3, full.4));
+            assert!((draft.2 - full.2 * 2.0).abs() < f32::EPSILON);
+        }
+    }
 
     #[test]
     fn failed_save_never_attempts_the_clipboard() {
