@@ -1,6 +1,6 @@
 [package]
 name = "matteshot"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 description = "Every screenshot, a matte shot. PrtScn -> six styled mattes -> pick one -> premium PNG on your clipboard."
 
