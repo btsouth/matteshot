@@ -81,6 +81,7 @@ enum Ctl {
 
 const TOOLS: [&str; 9] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"];
 const SIZES: [f32; 3] = [0.7, 1.0, 1.4];
+const PEN_TOOL: usize = 8;
 
 /// What part of an annotation a selector-mode drag grabbed.
 #[derive(Clone, Copy, PartialEq)]
@@ -313,8 +314,12 @@ fn annotation_tool_index(shape: &crate::annotate::Shape) -> usize {
         crate::annotate::Shape::Text { .. } => 5,
         crate::annotate::Shape::Blur { .. } => 6,
         crate::annotate::Shape::Counter { .. } => 7,
-        crate::annotate::Shape::Freehand { .. } => 8,
+        crate::annotate::Shape::Freehand { .. } => PEN_TOOL,
     }
+}
+
+fn tool_stays_active_after_use(tool: usize) -> bool {
+    tool == PEN_TOOL
 }
 
 fn text_context(state: &State) -> bool {
@@ -2091,7 +2096,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         3 => Some(Shape::Ellipse { a: p, b: p }),
                         4 => Some(Shape::Highlight { a: p, b: p }),
                         6 => Some(Shape::Blur { a: p, b: p }),
-                        8 => Some(Shape::Freehand { points: vec![p] }),
+                        PEN_TOOL => Some(Shape::Freehand { points: vec![p] }),
                         _ => None,
                     };
                     if let Some(shape) = drag_shape {
@@ -2205,9 +2210,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if degenerate {
                         state.doc_mut().anns.pop();
                     } else {
-                        // One-shot tools: a successful add returns to the
-                        // selector so the next drag moves instead of drawing.
-                        state.tool = None;
+                        // Shapes are one-shot, but Pen stays armed so lifting
+                        // the mouse does not interrupt handwriting or a
+                        // multi-stroke drawing.
+                        if !state.tool.is_some_and(tool_stays_active_after_use) {
+                            state.tool = None;
+                        }
                         state.doc_mut().selected = Some(state.doc_mut().anns.len() - 1);
                     }
                     rebuild_preview(state);
@@ -2415,6 +2423,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.tool = None;
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
+                        } else if state.tool.take().is_some() {
+                            // Esc leaves an armed tool first. A second Esc can
+                            // close the tab, which is especially important for
+                            // the persistent Pen mode.
+                            let _ = InvalidateRect(hwnd, None, false);
                         } else {
                             let active = state.active;
                             close_tab(hwnd, state, active);
@@ -2454,7 +2467,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     0x52 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(2)), // Rectangle
                     0x54 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(5)), // Text
                     0x42 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(6)), // Blur
-                    0x50 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(8)), // Pen
+                    0x50 if state.doc_mut().editing.is_none() => activate(
+                        hwnd,
+                        state,
+                        Ctl::Tool(PEN_TOOL),
+                    ), // Pen
                     v @ 0x31..=0x34 if state.doc_mut().editing.is_none() => {
                         activate(hwnd, state, Ctl::Color((v - 0x31) as usize))
                     }
@@ -3074,7 +3091,8 @@ mod tests {
     use super::{
         active_after_close, ann_bounds, annotation_tool_index, apply_text_input, freehand_length,
         join_words, layout_controls, nearest_word, persist_and_copy_with, preview_draw_geometry,
-        redacted, tab_for_digit, translate_ann, Ctl, FinishError, TextInput, ASPECTS, TOOLS,
+        redacted, tab_for_digit, tool_stays_active_after_use, translate_ann, Ctl, FinishError,
+        TextInput, ASPECTS, PEN_TOOL, TOOLS,
     };
     use windows::Win32::Foundation::RECT;
 
@@ -3282,6 +3300,13 @@ mod tests {
             annotation_tool_index(&Shape::Freehand { points: vec![(0.0, 0.0), (1.0, 1.0)] }),
             8
         );
+    }
+
+    #[test]
+    fn pen_is_the_only_tool_that_stays_armed_after_a_stroke() {
+        for tool in 0..TOOLS.len() {
+            assert_eq!(tool_stays_active_after_use(tool), tool == PEN_TOOL);
+        }
     }
 
     #[test]
