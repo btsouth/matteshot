@@ -1,6 +1,6 @@
 //! Compositing: rounded corners, soft shadow, padding, styled backdrop.
 
-use image::{Rgba, RgbaImage};
+use image::RgbaImage;
 use rayon::prelude::*;
 
 use crate::style::{Backdrop, Rgb, Style};
@@ -22,39 +22,57 @@ fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
     (0.5 - dist).clamp(0.0, 1.0)
 }
 
-/// Separable box blur on a single channel, repeated 3x to approximate gaussian.
-fn blur_alpha(buf: &mut [f32], w: usize, h: usize, radius: usize) {
-    if radius == 0 {
-        return;
-    }
-    let mut tmp = vec![0f32; buf.len()];
+/// One horizontal box-blur pass, every row independent so they run in parallel.
+fn box_blur_rows(src: &[f32], dst: &mut [f32], w: usize, radius: usize) {
     let norm = 1.0 / (2 * radius + 1) as f32;
-    for _ in 0..3 {
-        // horizontal
-        for y in 0..h {
-            let row = &buf[y * w..(y + 1) * w];
+    dst.par_chunks_mut(w)
+        .zip(src.par_chunks(w))
+        .for_each(|(out, row)| {
+            // Edge pixels are replicated, matching a clamped sample.
             let mut acc: f32 =
                 row[0] * radius as f32 + row[..=(radius.min(w - 1))].iter().sum::<f32>();
             for x in 0..w {
-                tmp[y * w + x] = acc * norm;
-                let add = row[(x + radius + 1).min(w - 1)];
-                let sub = row[x.saturating_sub(radius)];
-                acc += add - sub;
+                out[x] = acc * norm;
+                acc += row[(x + radius + 1).min(w - 1)] - row[x.saturating_sub(radius)];
             }
+        });
+}
+
+/// `src` is `w` wide and `h` tall; `dst` comes back `h` wide and `w` tall.
+fn transpose(src: &[f32], dst: &mut [f32], w: usize, h: usize) {
+    dst.par_chunks_mut(h).enumerate().for_each(|(x, column)| {
+        for y in 0..h {
+            column[y] = src[y * w + x];
         }
-        // vertical
-        for x in 0..w {
-            let col = |yy: usize| tmp[yy * w + x];
-            let mut acc: f32 =
-                col(0) * radius as f32 + (0..=radius.min(h - 1)).map(col).sum::<f32>();
-            for y in 0..h {
-                buf[y * w + x] = acc * norm;
-                let add = col((y + radius + 1).min(h - 1));
-                let sub = col(y.saturating_sub(radius));
-                acc += add - sub;
-            }
-        }
+    });
+}
+
+fn blur_axis(mut src: Vec<f32>, w: usize, radius: usize) -> Vec<f32> {
+    let mut dst = vec![0f32; src.len()];
+    for _ in 0..3 {
+        box_blur_rows(&src, &mut dst, w, radius);
+        std::mem::swap(&mut src, &mut dst);
     }
+    src
+}
+
+/// Separable box blur on a single channel, repeated 3x to approximate gaussian.
+///
+/// The two axes are independent linear operators, so they commute: running all
+/// three horizontal passes before all three vertical ones gives the same result
+/// as alternating. That matters because it lets the vertical passes run as row
+/// passes over a transposed buffer, which is both cache-friendly and
+/// parallelisable. This blur dominates matte composition, and composition runs
+/// on every mouse move while the padding slider is dragged.
+fn blur_alpha(buf: &mut [f32], w: usize, h: usize, radius: usize) {
+    if radius == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let horizontal = blur_axis(buf.to_vec(), w, radius);
+    let mut transposed = vec![0f32; buf.len()];
+    transpose(&horizontal, &mut transposed, w, h);
+    let vertical = blur_axis(transposed, h, radius);
+    transpose(&vertical, buf, h, w);
 }
 
 fn backdrop_at(backdrop: &Backdrop, x: usize, y: usize, cw: usize, ch: usize) -> Rgb {
@@ -202,45 +220,58 @@ pub fn compose_base(w: usize, h: usize, style: &Style, opts: &ComposeOpts) -> Rg
 
     let (cw, ch) = (w + pad_x * 2, h + pad_y * 2);
 
-    // 1) Backdrop.
+    // 1) Backdrop. Rows are independent, and Aurora's per-pixel blob maths is
+    // the most expensive backdrop we ship.
     let mut canvas = RgbaImage::new(cw as u32, ch as u32);
-    for y in 0..ch {
-        for x in 0..cw {
-            let c = backdrop_at(&style.backdrop, x, y, cw, ch);
-            canvas.put_pixel(
-                x as u32,
-                y as u32,
-                Rgba([
-                    (c.0 * 255.0) as u8,
-                    (c.1 * 255.0) as u8,
-                    (c.2 * 255.0) as u8,
-                    255,
-                ]),
-            );
-        }
-    }
+    canvas
+        .as_mut()
+        .par_chunks_mut(cw * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..cw {
+                let c = backdrop_at(&style.backdrop, x, y, cw, ch);
+                let pixel = &mut row[x * 4..x * 4 + 4];
+                pixel[0] = (c.0 * 255.0) as u8;
+                pixel[1] = (c.1 * 255.0) as u8;
+                pixel[2] = (c.2 * 255.0) as u8;
+                pixel[3] = 255;
+            }
+        });
 
     // 2) Shadow: blurred rounded-rect silhouette, offset downward.
     let mut shadow = vec![0f32; cw * ch];
-    for y in 0..h {
-        for x in 0..w {
-            let cov =
-                rounded_rect_coverage(x as f32 + 0.5, y as f32 + 0.5, w as f32, h as f32, corner);
-            shadow[(y + pad_y + shadow_offset_y) * cw + (x + pad_x)] = cov;
-        }
-    }
+    shadow
+        .par_chunks_mut(cw)
+        .skip(pad_y + shadow_offset_y)
+        .take(h)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..w {
+                row[pad_x + x] = rounded_rect_coverage(
+                    x as f32 + 0.5,
+                    y as f32 + 0.5,
+                    w as f32,
+                    h as f32,
+                    corner,
+                );
+            }
+        });
     blur_alpha(&mut shadow, cw, ch, shadow_blur);
-    for y in 0..ch {
-        for x in 0..cw {
-            let a = shadow[y * cw + x] * shadow_strength;
-            if a > 0.002 {
-                let px = canvas.get_pixel_mut(x as u32, y as u32);
-                for c in 0..3 {
-                    px[c] = (px[c] as f32 * (1.0 - a)) as u8;
+    canvas
+        .as_mut()
+        .par_chunks_mut(cw * 4)
+        .zip(shadow.par_chunks(cw))
+        .for_each(|(row, coverage)| {
+            for x in 0..cw {
+                let a = coverage[x] * shadow_strength;
+                if a > 0.002 {
+                    let pixel = &mut row[x * 4..x * 4 + 4];
+                    for c in 0..3 {
+                        pixel[c] = (pixel[c] as f32 * (1.0 - a)) as u8;
+                    }
                 }
             }
-        }
-    }
+        });
 
     canvas
 }
@@ -407,5 +438,85 @@ mod tests {
         assert!(default.width() < roomy.width());
         assert!(roomy.width() > tight.width());
         assert!(roomy.height() > tight.height());
+    }
+}
+
+#[cfg(test)]
+mod blur_tests {
+    use super::*;
+
+    /// The original alternating implementation, kept as the reference the fast
+    /// path has to agree with.
+    fn blur_alpha_reference(buf: &mut [f32], w: usize, h: usize, radius: usize) {
+        if radius == 0 {
+            return;
+        }
+        let mut tmp = vec![0f32; buf.len()];
+        let norm = 1.0 / (2 * radius + 1) as f32;
+        for _ in 0..3 {
+            for y in 0..h {
+                let row = &buf[y * w..(y + 1) * w];
+                let mut acc: f32 =
+                    row[0] * radius as f32 + row[..=(radius.min(w - 1))].iter().sum::<f32>();
+                for x in 0..w {
+                    tmp[y * w + x] = acc * norm;
+                    acc += row[(x + radius + 1).min(w - 1)] - row[x.saturating_sub(radius)];
+                }
+            }
+            for x in 0..w {
+                let col = |yy: usize| tmp[yy * w + x];
+                let mut acc: f32 =
+                    col(0) * radius as f32 + (0..=radius.min(h - 1)).map(col).sum::<f32>();
+                for y in 0..h {
+                    buf[y * w + x] = acc * norm;
+                    acc += col((y + radius + 1).min(h - 1)) - col(y.saturating_sub(radius));
+                }
+            }
+        }
+    }
+
+    fn sample(w: usize, h: usize) -> Vec<f32> {
+        // Deterministic, asymmetric, and not separable, so an axis mix-up shows.
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                if x * 3 % 7 == 0 || y % 5 == 0 {
+                    ((x * 13 + y * 29) % 97) as f32 / 97.0
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_blur_matches_the_alternating_reference() {
+        // Non-square, and a radius that exceeds one dimension, to cover the
+        // edge clamping on both axes.
+        for (w, h, radius) in [(64, 40, 7), (40, 64, 19), (33, 17, 25), (9, 9, 0)] {
+            let source = sample(w, h);
+            let mut fast = source.clone();
+            let mut reference = source.clone();
+            blur_alpha(&mut fast, w, h, radius);
+            blur_alpha_reference(&mut reference, w, h, radius);
+            for (index, (a, b)) in fast.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "{w}x{h} r{radius} differs at {index}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transpose_round_trips() {
+        let (w, h) = (7, 5);
+        let source = sample(w, h);
+        let mut once = vec![0f32; source.len()];
+        let mut back = vec![0f32; source.len()];
+        transpose(&source, &mut once, w, h);
+        assert_eq!(once[2 * 5 + 3], source[3 * 7 + 2]);
+        transpose(&once, &mut back, h, w);
+        assert_eq!(back, source);
     }
 }

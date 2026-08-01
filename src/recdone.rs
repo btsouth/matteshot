@@ -609,7 +609,18 @@ fn recompose_preview(state: &mut State) {
         state.preview = None;
         return;
     };
-    let raw = thumb_image(&frame.0, frame.1, frame.2);
+    let mut raw = thumb_image(&frame.0, frame.1, frame.2);
+    // Padding changes the canvas geometry, so the matte has to be rebuilt from
+    // scratch on every mouse move. Drag at quarter the pixels; the mouse-up
+    // handler recomposes at full quality.
+    if state.dragging == Some(Drag::Padding) {
+        raw = image::imageops::resize(
+            &raw,
+            (raw.width() / 2).max(1),
+            (raw.height() / 2).max(1),
+            image::imageops::FilterType::Triangle,
+        );
+    }
     let content_size = (raw.width(), raw.height());
     let plain = crate::compose::is_plain(&state.styles[state.matte_index]);
     let content_offset = if plain {
@@ -2731,6 +2742,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     } else {
                         if drag == Drag::Padding {
                             refresh_matte_thumbs(state);
+                            // `dragging` is already cleared, so this recomposes
+                            // at full resolution.
+                            recompose_preview(state);
                         }
                         if let Drag::Draw { index, .. } = drag {
                             if let Some(item) = state.annotations.get(index) {
