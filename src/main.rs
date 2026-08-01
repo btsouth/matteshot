@@ -1326,6 +1326,26 @@ fn main() -> Result<()> {
             eprintln!("not installing (probe only)");
             Ok(())
         }
+        // The whole production path end to end, minus the wait for an idle
+        // moment: check, download, verify, install silently (testing).
+        Some("--update-install-now") => {
+            // An explicit URL skips the version comparison so a build can
+            // install the published artifact regardless of its own version.
+            let (url, version) = match args.get(1) {
+                Some(url) => (url.clone(), "probe".to_string()),
+                None => {
+                    let update =
+                        update::check_once()?.context("no newer version published")?;
+                    (update.download_url, update.version)
+                }
+            };
+            eprintln!("staging {version} from {url}");
+            let staged = installer::stage(&url, &version, |_| {})?;
+            eprintln!("verified: {}", staged.display());
+            installer::launch(&staged)?;
+            eprintln!("installer started silently");
+            Ok(())
+        }
         // Live update endpoint probe (testing; never downloads anything).
         Some("--update-test") => {
             match update::check_once()? {
