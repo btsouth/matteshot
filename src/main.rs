@@ -807,6 +807,17 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Headless timing of the multi-monitor freeze and GDI-layer path.
+        // `sequential` keeps the old capture order as a local baseline.
+        Some("--overlay-bench") => {
+            require_capture_license()?;
+            let batched = match args.get(1).map(String::as_str) {
+                None | Some("batched") => true,
+                Some("sequential") => false,
+                Some(other) => bail!("unknown overlay benchmark mode {other:?}"),
+            };
+            overlay::benchmark_freeze(batched)
+        }
         // Regenerate the app icon (assets\matteshot.ico) with the product's
         // own compositing pipeline.
         Some("--icon") => {
@@ -1429,7 +1440,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --welcome | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --welcome | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
         None => run_app(),
     };

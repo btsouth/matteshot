@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
+use rayon::prelude::*;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -187,9 +188,8 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
     ptr.as_mut()
 }
 
-/// Create a 32bpp DIB-backed memory DC holding `img` at brightness `mul`.
-unsafe fn make_layer(reference: HDC, img: &RgbaImage, mul: f32) -> (HDC, HBITMAP) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
+/// Allocate a 32bpp DIB-backed memory DC for one overlay layer.
+unsafe fn make_layer_storage(reference: HDC, w: i32, h: i32) -> (HDC, HBITMAP, *mut u8) {
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -205,22 +205,44 @@ unsafe fn make_layer(reference: HDC, img: &RgbaImage, mul: f32) -> (HDC, HBITMAP
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
     let bmp = CreateDIBSection(reference, &info, DIB_RGB_COLORS, &mut bits, None, 0)
         .expect("CreateDIBSection");
-    let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
-    // LUT beats per-pixel float math over a multi-megapixel monitor.
-    let mut lut = [0u8; 256];
-    for (i, v) in lut.iter_mut().enumerate() {
-        *v = (i as f32 * mul) as u8;
-    }
-    let src = img.as_raw();
-    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-        d[0] = lut[s[2] as usize];
-        d[1] = lut[s[1] as usize];
-        d[2] = lut[s[0] as usize];
-        d[3] = 255;
-    }
     let dc = CreateCompatibleDC(reference);
     SelectObject(dc, bmp);
-    (dc, bmp)
+    (dc, bmp, bits.cast())
+}
+
+fn write_overlay_layers(src: &[u8], dim: &mut [u8], bright: &mut [u8], dim_mul: f32) {
+    debug_assert_eq!(src.len(), dim.len());
+    debug_assert_eq!(src.len(), bright.len());
+    // LUT beats per-pixel float math over a multi-megapixel desktop. Produce
+    // both DIBs while the source pixel is hot instead of traversing it twice.
+    let mut lut = [0u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = (i as f32 * dim_mul) as u8;
+    }
+    dim.par_chunks_exact_mut(4)
+        .zip(bright.par_chunks_exact_mut(4))
+        .zip(src.par_chunks_exact(4))
+        .for_each(|((dim, bright), src)| {
+            dim.copy_from_slice(&[
+                lut[src[2] as usize],
+                lut[src[1] as usize],
+                lut[src[0] as usize],
+                255,
+            ]);
+            bright.copy_from_slice(&[src[2], src[1], src[0], 255]);
+        });
+}
+
+/// Create the dim and bright overlay DIBs in a single parallel traversal.
+unsafe fn make_layers(reference: HDC, img: &RgbaImage) -> (HDC, HBITMAP, HDC, HBITMAP) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let len = (w * h * 4) as usize;
+    let (dim_dc, dim_bmp, dim_bits) = make_layer_storage(reference, w, h);
+    let (bright_dc, bright_bmp, bright_bits) = make_layer_storage(reference, w, h);
+    let dim = std::slice::from_raw_parts_mut(dim_bits, len);
+    let bright = std::slice::from_raw_parts_mut(bright_bits, len);
+    write_overlay_layers(img.as_raw(), dim, bright, 0.42);
+    (dim_dc, dim_bmp, bright_dc, bright_bmp)
 }
 
 fn norm_rect(a: POINT, b: POINT) -> RECT {
@@ -746,40 +768,105 @@ unsafe extern "system" fn mon_enum(
     true.into()
 }
 
-/// Run the overlay across every monitor. The freeze happens here, so
-/// whatever is on screen at call time (including a live picker strip) is
-/// snippable as a region. Returns the selection and the monitor to anchor
-/// follow-up UI on, or None if cancelled.
-pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
-    let mut mons: Vec<MonitorEntry> = Vec::new();
+fn monitors() -> Result<Vec<MonitorEntry>> {
+    let mut monitors = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
             None,
             Some(mon_enum),
-            LPARAM(&mut mons as *mut Vec<MonitorEntry> as isize),
+            LPARAM(&mut monitors as *mut Vec<MonitorEntry> as isize),
         );
     }
-    if mons.is_empty() {
+    if monitors.is_empty() {
         anyhow::bail!("no monitors found");
     }
+    Ok(monitors)
+}
+
+fn virtual_rect(monitors: &[MonitorEntry]) -> RECT {
+    RECT {
+        left: monitors.iter().map(|monitor| monitor.rect.left).min().unwrap(),
+        top: monitors.iter().map(|monitor| monitor.rect.top).min().unwrap(),
+        right: monitors.iter().map(|monitor| monitor.rect.right).max().unwrap(),
+        bottom: monitors.iter().map(|monitor| monitor.rect.bottom).max().unwrap(),
+    }
+}
+
+fn freeze_monitors(monitors: &[MonitorEntry], bounds: RECT, batched: bool) -> Result<RgbaImage> {
+    let captures = if batched {
+        let handles: Vec<HMONITOR> = monitors.iter().map(|monitor| monitor.hmon).collect();
+        crate::capture::capture_monitors(&handles).context("freeze monitors")?
+    } else {
+        monitors
+            .iter()
+            .map(|monitor| crate::capture::capture_monitor(monitor.hmon))
+            .collect::<Result<Vec<_>>>()
+            .context("freeze monitors sequentially")?
+    };
+    let mut frozen = RgbaImage::new(
+        (bounds.right - bounds.left) as u32,
+        (bounds.bottom - bounds.top) as u32,
+    );
+    for (monitor, image) in monitors.iter().zip(captures) {
+        use image::GenericImage;
+        let _ = frozen.copy_from(
+            &image,
+            (monitor.rect.left - bounds.left) as u32,
+            (monitor.rect.top - bounds.top) as u32,
+        );
+    }
+    Ok(frozen)
+}
+
+/// Headless timing rig for the expensive part of overlay startup. It captures
+/// the real desktop and builds both GDI layers, but never opens a window,
+/// changes focus, touches the clipboard, or injects input.
+pub fn benchmark_freeze(batched: bool) -> Result<()> {
+    let monitors = monitors()?;
+    let bounds = virtual_rect(&monitors);
+    crate::capture::warmup();
+    let started = std::time::Instant::now();
+    let frozen = freeze_monitors(&monitors, bounds, batched)?;
+    let freeze_elapsed = started.elapsed();
+    unsafe {
+        let screen_dc = windows::Win32::Graphics::Gdi::GetDC(None);
+        let (dim_dc, dim_bmp, bright_dc, bright_bmp) = make_layers(screen_dc, &frozen);
+        windows::Win32::Graphics::Gdi::ReleaseDC(None, screen_dc);
+        let layer_elapsed = started.elapsed() - freeze_elapsed;
+        let _ = DeleteDC(dim_dc);
+        let _ = DeleteDC(bright_dc);
+        let _ = DeleteObject(dim_bmp);
+        let _ = DeleteObject(bright_bmp);
+        eprintln!(
+            "overlay bench {}: {} monitor(s), {}x{}, freeze {:?}, layers {:?}, total {:?}",
+            if batched { "batched" } else { "sequential" },
+            monitors.len(),
+            frozen.width(),
+            frozen.height(),
+            freeze_elapsed,
+            layer_elapsed,
+            started.elapsed()
+        );
+    }
+    Ok(())
+}
+
+/// Run the overlay across every monitor. The freeze happens here, so
+/// whatever is on screen at call time (including a live picker strip) is
+/// snippable as a region. Returns the selection and the monitor to anchor
+/// follow-up UI on, or None if cancelled.
+pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
+    let mons = monitors()?;
 
     // Virtual-screen bounding box.
-    let vleft = mons.iter().map(|m| m.rect.left).min().unwrap();
-    let vtop = mons.iter().map(|m| m.rect.top).min().unwrap();
-    let vright = mons.iter().map(|m| m.rect.right).max().unwrap();
-    let vbottom = mons.iter().map(|m| m.rect.bottom).max().unwrap();
-    let mrect = RECT { left: vleft, top: vtop, right: vright, bottom: vbottom };
+    let mrect = virtual_rect(&mons);
+    let (vleft, vtop, vright, vbottom) = (mrect.left, mrect.top, mrect.right, mrect.bottom);
     let (mw, mh) = (vright - vleft, vbottom - vtop);
 
     // Freeze every monitor into one combined image; gaps stay black.
     let t0 = std::time::Instant::now();
-    let mut frozen = RgbaImage::new(mw as u32, mh as u32);
-    for m in &mons {
-        let img = crate::capture::capture_monitor(m.hmon).context("freeze monitor")?;
-        use image::GenericImage;
-        let _ = frozen.copy_from(&img, (m.rect.left - vleft) as u32, (m.rect.top - vtop) as u32);
-    }
+    let frozen = freeze_monitors(&mons, mrect, true)?;
     let t_freeze = t0.elapsed();
 
     // Local (overlay-relative) monitor rects, for Screen/desktop targets.
@@ -837,8 +924,7 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
 
         // Layers are created against the screen DC before the window exists.
         let screen_dc = windows::Win32::Graphics::Gdi::GetDC(None);
-        let (dim_dc, dim_bmp) = make_layer(screen_dc, &frozen, 0.42);
-        let (bright_dc, bright_bmp) = make_layer(screen_dc, &frozen, 1.0);
+        let (dim_dc, dim_bmp, bright_dc, bright_bmp) = make_layers(screen_dc, &frozen);
 
         let font = CreateFontW(
             -15,
@@ -944,11 +1030,6 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
             recording: false,
             scrolling: false,
         });
-        eprintln!(
-            "timing: overlay ready — freeze {t_freeze:?}, total {:?}",
-            t0.elapsed()
-        );
-
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             w!("matteshot_overlay"),
@@ -989,6 +1070,13 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
         );
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);
+        let visible_elapsed = t0.elapsed();
+        eprintln!("timing: overlay visible — freeze {t_freeze:?}, total {visible_elapsed:?}");
+        crate::diagnostics::log(&format!(
+            "overlay visible freeze_ms={} total_ms={}",
+            t_freeze.as_millis(),
+            visible_elapsed.as_millis()
+        ));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1022,7 +1110,7 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{shortcut_bit, shortcut_button, Btn};
+    use super::{shortcut_bit, shortcut_button, write_overlay_layers, Btn};
 
     #[test]
     fn frozen_overlay_shortcuts_map_to_the_visible_toolbar() {
@@ -1035,6 +1123,18 @@ mod tests {
         assert!(shortcut_bit(0x1B).is_some());
         assert!(shortcut_bit(0x56).is_some());
         assert!(shortcut_bit(0x41).is_none());
+    }
+
+    #[test]
+    fn overlay_layers_convert_rgba_to_dim_and_bright_bgra_together() {
+        let source = [100, 150, 200, 17, 255, 10, 0, 99];
+        let mut dim = [0; 8];
+        let mut bright = [0; 8];
+
+        write_overlay_layers(&source, &mut dim, &mut bright, 0.42);
+
+        assert_eq!(dim, [84, 62, 42, 255, 0, 4, 107, 255]);
+        assert_eq!(bright, [200, 150, 100, 255, 0, 10, 255, 255]);
     }
 }
 

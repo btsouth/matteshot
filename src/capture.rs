@@ -1,17 +1,21 @@
 //! Single-frame window capture via Windows.Graphics.Capture.
 
-use anyhow::{Context, Result};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
 use image::RgbaImage;
 use windows::core::Interface;
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
@@ -117,10 +121,35 @@ pub fn capture_monitor(hmonitor: windows::Win32::Graphics::Gdi::HMONITOR) -> Res
     capture_item(item)
 }
 
-fn capture_item(item: GraphicsCaptureItem) -> Result<RgbaImage> {
-    let t0 = std::time::Instant::now();
-    let (device, context) = cached_device()?;
-    let winrt_device = WINRT_DEVICE.with(|cell| -> Result<IDirect3DDevice> {
+/// Capture several monitors as one batch. All WGC sessions are started before
+/// any frame is awaited, so the compositor can prepare their first/second
+/// frames together instead of charging the overlay one wait per monitor.
+pub fn capture_monitors(
+    monitors: &[windows::Win32::Graphics::Gdi::HMONITOR],
+) -> Result<Vec<RgbaImage>> {
+    let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+    let mut items = Vec::with_capacity(monitors.len());
+    for &monitor in monitors {
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor)? };
+        items.push(item);
+    }
+    capture_items(items)
+}
+
+struct PendingCapture {
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+}
+
+impl Drop for PendingCapture {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
+fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
+    WINRT_DEVICE.with(|cell| -> Result<IDirect3DDevice> {
         if cell.get().is_none() {
             let dxgi: IDXGIDevice = device.cast()?;
             let wrapped: IDirect3DDevice =
@@ -128,51 +157,98 @@ fn capture_item(item: GraphicsCaptureItem) -> Result<RgbaImage> {
             let _ = cell.set(wrapped);
         }
         Ok(cell.get().unwrap().clone())
-    })?;
+    })
+}
 
+fn start_capture(item: &GraphicsCaptureItem, device: &IDirect3DDevice) -> Result<PendingCapture> {
     let size = item.Size()?;
-
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &winrt_device,
+        device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
         2,
         size,
     )?;
-    let session = pool.CreateCaptureSession(&item)?;
+    let session = pool.CreateCaptureSession(item)?;
     let _ = session.SetIsCursorCaptureEnabled(false);
     // Removing the capture border needs a capability grant on some builds; best-effort.
     let _ = session.SetIsBorderRequired(false);
     session.StartCapture()?;
+    Ok(PendingCapture { pool, session })
+}
 
-    let wait_frame = |timeout_ms: u32| {
-        for _ in 0..timeout_ms / 4 {
-            if let Ok(f) = pool.TryGetNextFrame() {
-                return Some(f);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(4));
-        }
-        None
-    };
-    // The very first WGC frame can be stale or partially composited (seen
-    // as missing taskbar in overlay freezes) — prefer the second frame.
-    // Phase timings are opt-in: they are only meaningful on an idle machine,
-    // and under load they mislead badly enough to send you optimising the
-    // wrong thing. MATTESHOT_CAPTURE_TIMING=1 turns them on.
-    let timing = std::env::var_os("MATTESHOT_CAPTURE_TIMING").is_some();
-    let t_setup = t0.elapsed();
-    let first = wait_frame(3000).context("no capture frame arrived within 3s")?;
-    let t_first = t0.elapsed();
-    let frame = wait_frame(80).unwrap_or(first);
-    let t_second = t0.elapsed();
-    if timing {
-        eprintln!(
-            "  phase: setup {:?} first-frame {:?} second-frame {:?}",
-            t_setup,
-            t_first - t_setup,
-            t_second - t_first
-        );
+fn wait_for_frames(captures: &[PendingCapture]) -> Result<Vec<Direct3D11CaptureFrame>> {
+    struct Slot {
+        first: Option<Direct3D11CaptureFrame>,
+        second: Option<Direct3D11CaptureFrame>,
     }
 
+    let mut slots: Vec<Slot> = (0..captures.len())
+        .map(|_| Slot {
+            first: None,
+            second: None,
+        })
+        .collect();
+    let first_deadline = Instant::now() + Duration::from_secs(3);
+    while slots.iter().any(|slot| slot.first.is_none()) {
+        let mut progressed = false;
+        for (capture, slot) in captures.iter().zip(&mut slots) {
+            if slot.second.is_some() {
+                continue;
+            }
+            if let Ok(frame) = capture.pool.TryGetNextFrame() {
+                progressed = true;
+                if slot.first.is_none() {
+                    slot.first = Some(frame);
+                } else {
+                    slot.second = Some(frame);
+                }
+            }
+        }
+        if Instant::now() >= first_deadline {
+            bail!("no capture frame arrived within 3s");
+        }
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(4));
+        }
+    }
+
+    // The very first WGC frame can be stale or partially composited (seen
+    // as missing taskbar in overlay freezes) — prefer the second frame.
+    // Poll every active session within one shared window. This preserves the
+    // correctness guard while preventing N monitors from paying N x 80ms.
+    let second_deadline = Instant::now() + Duration::from_millis(80);
+    while slots.iter().any(|slot| slot.second.is_none()) && Instant::now() < second_deadline {
+        let mut progressed = false;
+        for (capture, slot) in captures.iter().zip(&mut slots) {
+            if slot.second.is_none() {
+                if let Ok(frame) = capture.pool.TryGetNextFrame() {
+                    slot.second = Some(frame);
+                    progressed = true;
+                }
+            }
+        }
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(4));
+        }
+    }
+
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.second
+                .or(slot.first)
+                .context("capture frame disappeared")
+        })
+        .collect()
+}
+
+fn frame_to_image(
+    frame: &Direct3D11CaptureFrame,
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    timing: bool,
+) -> Result<RgbaImage> {
+    let t0 = Instant::now();
     let surface = frame.Surface()?;
     let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
     let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
@@ -180,7 +256,7 @@ fn capture_item(item: GraphicsCaptureItem) -> Result<RgbaImage> {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     unsafe { texture.GetDesc(&mut desc) };
 
-    let staging = staging_for(&device, &desc)?;
+    let staging = staging_for(device, &desc)?;
     unsafe { context.CopyResource(&staging, &texture) };
 
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -210,17 +286,57 @@ fn capture_item(item: GraphicsCaptureItem) -> Result<RgbaImage> {
     for px in buf.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
+    // Phase timings are opt-in: they are only meaningful on an idle machine,
+    // and under load they mislead badly enough to send you optimising the
+    // wrong thing. MATTESHOT_CAPTURE_TIMING=1 turns them on.
     if timing {
         eprintln!(
             "  phase: stage+map+copy {:?} bgra-swap {:?}",
-            t_copy - t_second,
+            t_copy,
             t0.elapsed() - t_copy
         );
     }
-    let img = RgbaImage::from_raw(width, height, buf).context("assemble image")?;
+    RgbaImage::from_raw(width, height, buf).context("assemble image")
+}
 
-    let _ = session.Close();
-    let _ = pool.Close();
-    eprintln!("timing: capture {}x{} in {:?}", width, height, t0.elapsed());
-    Ok(img)
+fn capture_items(items: Vec<GraphicsCaptureItem>) -> Result<Vec<RgbaImage>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let t0 = Instant::now();
+    let timing = std::env::var_os("MATTESHOT_CAPTURE_TIMING").is_some();
+    let (device, context) = cached_device()?;
+    let direct3d = winrt_device(&device)?;
+    let mut captures = Vec::with_capacity(items.len());
+    for item in &items {
+        captures.push(start_capture(item, &direct3d)?);
+    }
+    let t_setup = t0.elapsed();
+    let frames = wait_for_frames(&captures)?;
+    let t_frames = t0.elapsed();
+    if timing {
+        eprintln!(
+            "  phase: setup {:?} shared-frame-wait {:?} sessions {}",
+            t_setup,
+            t_frames - t_setup,
+            captures.len()
+        );
+    }
+
+    let mut images = Vec::with_capacity(frames.len());
+    for frame in &frames {
+        images.push(frame_to_image(frame, &device, &context, timing)?);
+    }
+    eprintln!(
+        "timing: capture batch {} image(s) in {:?}",
+        images.len(),
+        t0.elapsed()
+    );
+    Ok(images)
+}
+
+fn capture_item(item: GraphicsCaptureItem) -> Result<RgbaImage> {
+    capture_items(vec![item])?
+        .pop()
+        .context("capture returned no image")
 }

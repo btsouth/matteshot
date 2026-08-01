@@ -77,6 +77,7 @@ Keep all three in sync if the design changes.
 - GUI subsystem: the exe prints NOTHING to a console. Test flags must be run
   with `Start-Process -RedirectStandardError <log> -Wait`, then read the log.
 - Test flags: `--bench <title>` (timed capture, raw PNG to %TEMP%),
+  `--overlay-bench [batched|sequential]` (headless multi-monitor freeze/layer timing),
   `--scroll-test <title>` (+ env `MATTESHOT_SCROLL_DEBUG=1`), `--record-test`,
   `--trim-test`, `--ocr`, `--assets <title> <dir>` (marketing exports),
   `--icon [dir]`, `--settings`, `--tweak`, `--once [--window <t>] [--pick N]`.
