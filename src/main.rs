@@ -1045,6 +1045,45 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Word-box probe for select-text mode: prints each recognized word in
+        // capture coordinates so the overlay geometry can be checked headlessly.
+        Some("--ocr-words") => {
+            require_capture_license()?;
+            let target = args
+                .get(1)
+                .context("--ocr-words needs a title substring or a png path")?;
+            // A path exercises oversized captures (scroll stitches) that no
+            // live window can reach.
+            let img = if std::path::Path::new(target).is_file() {
+                image::open(target).context("open image")?.to_rgba8()
+            } else {
+                let hwnd = window::find_by_title(target)
+                    .with_context(|| format!("no visible window matching {target:?}"))?;
+                let captured = capture::capture_window(hwnd)?;
+                license::record_successful_capture();
+                captured
+            };
+            let words = ocr::recognize_words(&img)?;
+            eprintln!(
+                "--- {} words over {}x{} ---",
+                words.len(),
+                img.width(),
+                img.height()
+            );
+            for word in words.iter() {
+                let (x0, y0, x1, y1) = word.rect;
+                eprintln!(
+                    "line {:>2}  [{:>6.1},{:>6.1} {:>6.1}x{:>5.1}]  {}",
+                    word.line,
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    word.text
+                );
+            }
+            Ok(())
+        }
         // Render sample annotations onto a capture and save raw (testing).
         Some("--annotate-demo") => {
             require_capture_license()?;

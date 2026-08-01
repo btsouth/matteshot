@@ -7,12 +7,13 @@ use image::RgbaImage;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-    HALFTONE, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetStretchBltMode,
-    SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
-    HDC, HFONT, HMONITOR, MONITORINFO, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
+    GetMonitorInfoW, HALFTONE, InvalidateRect, RoundRect, SelectObject, SetBkMode,
+    SetStretchBltMode, SetTextColor, StretchDIBits, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
+    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, PAINTSTRUCT,
+    PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
@@ -21,7 +22,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow,
     SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     IDC_ARROW, MSG, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
@@ -47,6 +49,8 @@ const ASPECTS: [(&str, Option<f32>); 5] = [
 
 /// Posted when the resident PrtScn hotkey fires mid-tweak.
 const WM_RESHOOT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 42;
+/// Posted by the OCR worker with the recognized word boxes.
+const WM_OCR_READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 43;
 const WM_UNICHAR_MESSAGE: u32 = 0x0109;
 const UNICODE_NOCHAR: usize = 0xFFFF;
 
@@ -80,6 +84,29 @@ enum Grab {
     P1,
     /// Rect/Blur corner (0 tl, 1 tr, 2 br, 3 bl) after normalization.
     Corner(u8),
+}
+
+/// Select-text mode: OCR word boxes over the preview, selected like real text.
+struct TextSelect {
+    /// Every recognized word in reading order. Empty while `pending`.
+    words: Vec<crate::ocr::Word>,
+    /// Selection ends, as indices into `words`.
+    anchor: Option<usize>,
+    focus: Option<usize>,
+    /// Recognition is still running on the worker thread.
+    pending: bool,
+    /// Replaces the hint line: progress, copy confirmation, or failure.
+    message: Option<String>,
+    dragging: bool,
+}
+
+impl TextSelect {
+    fn range(&self) -> Option<(usize, usize)> {
+        match (self.anchor, self.focus) {
+            (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -148,6 +175,8 @@ struct State {
     counter_next: u32,
     /// Annotation under the cursor in selector mode (highlight only).
     hover_ann: Option<usize>,
+    /// Select-text mode, when armed. None means normal annotation editing.
+    text_select: Option<TextSelect>,
     size_idx: usize,
     caption_size: f32,
     caption_style: crate::annotate::TextStyle,
@@ -322,6 +351,208 @@ fn ann_bounds(ann: &crate::annotate::Annotation) -> (f32, f32, f32, f32) {
             (pos.0 - r, pos.1 - r, pos.0 + r, pos.1 + r)
         }
     }
+}
+
+fn word_contains(word: &crate::ocr::Word, p: (f32, f32)) -> bool {
+    let (x0, y0, x1, y1) = word.rect;
+    p.0 >= x0 && p.0 <= x1 && p.1 >= y0 && p.1 <= y1
+}
+
+fn line_distance(word: &crate::ocr::Word, y: f32) -> f32 {
+    let (_, y0, _, y1) = word.rect;
+    if y < y0 {
+        y0 - y
+    } else if y > y1 {
+        y - y1
+    } else {
+        0.0
+    }
+}
+
+fn column_distance(word: &crate::ocr::Word, x: f32) -> f32 {
+    let (x0, _, x1, _) = word.rect;
+    if x < x0 {
+        x0 - x
+    } else if x > x1 {
+        x - x1
+    } else {
+        0.0
+    }
+}
+
+/// Nearest word for extending a selection: settle on the closest line band
+/// first, then the closest word within it. Straight point-to-box distance
+/// jumps between lines mid-sweep and feels broken.
+fn nearest_word(words: &[crate::ocr::Word], p: (f32, f32)) -> Option<usize> {
+    let closer = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+    let line = words
+        .iter()
+        .min_by(|a, b| closer(line_distance(a, p.1), line_distance(b, p.1)))?
+        .line;
+    words
+        .iter()
+        .enumerate()
+        .filter(|(_, word)| word.line == line)
+        .min_by(|(_, a), (_, b)| closer(column_distance(a, p.0), column_distance(b, p.0)))
+        .map(|(index, _)| index)
+}
+
+/// Words under a pixelate-redact box are not selectable. OCR reads the raw
+/// capture, so without this the redaction would be decorative: the hidden
+/// text would still highlight and still copy.
+fn redacted(anns: &[crate::annotate::Annotation], word: &crate::ocr::Word) -> bool {
+    let (wx0, wy0, wx1, wy1) = word.rect;
+    let area = ((wx1 - wx0) * (wy1 - wy0)).max(1.0);
+    anns.iter().any(|ann| {
+        let crate::annotate::Shape::Blur { a, b } = &ann.shape else {
+            return false;
+        };
+        let overlap_x = (wx1.min(a.0.max(b.0)) - wx0.max(a.0.min(b.0))).max(0.0);
+        let overlap_y = (wy1.min(a.1.max(b.1)) - wy0.max(a.1.min(b.1))).max(0.0);
+        overlap_x * overlap_y > area * 0.5
+    })
+}
+
+/// First selectable word containing the point, if any.
+fn word_at(state: &State, p: (f32, f32)) -> Option<usize> {
+    let select = state.text_select.as_ref()?;
+    select
+        .words
+        .iter()
+        .position(|word| word_contains(word, p) && !redacted(&state.anns, word))
+}
+
+/// Word to anchor a selection on: the one under the cursor, or the nearest one
+/// within reach so a sweep can start in the margin beside a paragraph rather
+/// than having to land exactly on the first character.
+fn anchor_word(state: &State, p: (f32, f32)) -> Option<usize> {
+    if let Some(index) = word_at(state, p) {
+        return Some(index);
+    }
+    let select = state.text_select.as_ref()?;
+    let index = nearest_word(&select.words, p)?;
+    let word = select.words.get(index)?;
+    if redacted(&state.anns, word) {
+        return None;
+    }
+    let reach = (word.rect.3 - word.rect.1).max(8.0) * 1.5;
+    (line_distance(word, p.1) <= reach && column_distance(word, p.0) <= reach).then_some(index)
+}
+
+/// Words as text: spaces within a line, newlines between them. `skip` drops
+/// words without collapsing the line breaks around them.
+fn join_words(words: &[crate::ocr::Word], skip: impl Fn(&crate::ocr::Word) -> bool) -> String {
+    let mut text = String::new();
+    let mut line: Option<usize> = None;
+    for word in words {
+        if skip(word) {
+            continue;
+        }
+        match line {
+            Some(previous) if previous == word.line => text.push(' '),
+            Some(_) => text.push('\n'),
+            None => {}
+        }
+        text.push_str(&word.text);
+        line = Some(word.line);
+    }
+    text
+}
+
+fn selected_text(state: &State) -> String {
+    let Some(select) = state.text_select.as_ref() else {
+        return String::new();
+    };
+    let Some((start, end)) = select.range() else {
+        return String::new();
+    };
+    let Some(words) = select.words.get(start..=end.min(select.words.len() - 1)) else {
+        return String::new();
+    };
+    join_words(words, |word| redacted(&state.anns, word))
+}
+
+/// Arm select-text mode and kick off recognition. The engine takes a few
+/// hundred milliseconds on a large capture, so it runs off the message loop
+/// and the editor stays live while it works.
+fn enter_text_select(hwnd: HWND, state: &mut State) {
+    commit_editing(state);
+    state.tool = None;
+    state.selected = None;
+    state.hover_ann = None;
+    state.moving = None;
+    state.text_select = Some(TextSelect {
+        words: Vec::new(),
+        anchor: None,
+        focus: None,
+        pending: true,
+        message: None,
+        dragging: false,
+    });
+    rebuild_preview(state);
+
+    let raw = state.raw.clone();
+    let target = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let payload = Box::into_raw(Box::new(
+            crate::ocr::recognize_words(&raw).map_err(|error| format!("{error:#}")),
+        ));
+        if com.is_ok() {
+            unsafe { CoUninitialize() };
+        }
+        unsafe {
+            let hwnd = HWND(target as *mut _);
+            if !crate::window::has_class(hwnd, "matteshot_tweak")
+                || PostMessageW(hwnd, WM_OCR_READY, WPARAM(0), LPARAM(payload as isize)).is_err()
+            {
+                drop(Box::from_raw(payload));
+            }
+        }
+    });
+}
+
+/// Translucent fills over the preview. GDI has no alpha on `Rectangle`, so a
+/// 1x1 solid gets stretched through `AlphaBlend`. The source is built once per
+/// call because select-text repaints hundreds of boxes on every mouse move.
+unsafe fn wash_all(hdc: HDC, color: COLORREF, rects: &[(RECT, u8)]) {
+    if rects.is_empty() {
+        return;
+    }
+    let mem = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, 1, 1);
+    let old = SelectObject(mem, bmp);
+    let brush = CreateSolidBrush(color);
+    FillRect(mem, &RECT { left: 0, top: 0, right: 1, bottom: 1 }, brush);
+    for (r, alpha) in rects {
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if w <= 0 || h <= 0 {
+            continue;
+        }
+        let _ = AlphaBlend(
+            hdc,
+            r.left,
+            r.top,
+            w,
+            h,
+            mem,
+            0,
+            0,
+            1,
+            1,
+            BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: *alpha,
+                AlphaFormat: 0,
+            },
+        );
+    }
+    SelectObject(mem, old);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteObject(brush);
+    let _ = DeleteDC(mem);
 }
 
 fn rebuild_preview(state: &mut State) {
@@ -616,8 +847,44 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
     }
 
+    // Select-text overlay: every recognized word faintly marked so you can
+    // see what is grabbable, the selection filled solid. Screen-space, so a
+    // sweep never recomposes the preview.
+    if let Some(select) = state.text_select.as_ref() {
+        let range = select.range();
+        let boxes: Vec<(RECT, u8)> = select
+            .words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| !redacted(&state.anns, word))
+            .map(|(index, word)| {
+                let (x0, y0, x1, y1) = word.rect;
+                let (sx0, sy0) = raw_to_screen(state, (x0, y0));
+                let (sx1, sy1) = raw_to_screen(state, (x1, y1));
+                let picked = range.is_some_and(|(a, b)| index >= a && index <= b);
+                (
+                    RECT { left: sx0 - 1, top: sy0 - 1, right: sx1 + 1, bottom: sy1 + 1 },
+                    if picked { 96 } else { 26 },
+                )
+            })
+            .collect();
+        wash_all(hdc, state.theme.accent, &boxes);
+    }
+
     // Contextual hint line under the preview.
-    let hint = if state.editing.is_some() {
+    let select_hint = state.text_select.as_ref().map(|select| {
+        if let Some(message) = &select.message {
+            message.clone()
+        } else if select.pending {
+            "reading text\u{2026}".into()
+        } else {
+            "drag to select text   \u{00b7}   double-click a word   \u{00b7}   Ctrl+A all   \u{00b7}   Ctrl+C copy   \u{00b7}   Esc exits"
+                .to_string()
+        }
+    });
+    let hint = if let Some(text) = &select_hint {
+        text.as_str()
+    } else if state.editing.is_some() {
         "type your caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel"
     } else if state.tool.is_some() {
         "drag on the preview to draw   \u{00b7}   tool clears after each add"
@@ -737,7 +1004,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
             ),
             Ctl::Undo => chip(hdc, *r, "Undo", state, false, hot),
             Ctl::Clear => chip(hdc, *r, "Clear", state, false, hot),
-            Ctl::Ocr => chip(hdc, *r, "Copy text (OCR)", state, false, hot),
+            Ctl::Ocr => chip(
+                hdc,
+                *r,
+                "Select text",
+                state,
+                state.text_select.is_some(),
+                hot,
+            ),
             Ctl::Color(n) => {
                 let c = crate::annotate::COLORS[*n];
                 let color = COLORREF((c[2] as u32) << 16 | (c[1] as u32) << 8 | c[0] as u32);
@@ -1095,6 +1369,12 @@ fn translate_ann(ann: &mut crate::annotate::Annotation, d: (f32, f32)) {
 }
 
 unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
+    // Reaching for an annotation tool leaves select-text mode. Matte, padding
+    // and aspect are safe to keep it: word boxes live in capture coordinates,
+    // so the overlay follows the new layout on its own.
+    if matches!(ctl, Ctl::Tool(_) | Ctl::Undo | Ctl::Clear) {
+        state.text_select = None;
+    }
     match ctl {
         Ctl::Tool(n) => {
             commit_editing(state);
@@ -1186,9 +1466,12 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         }
         Ctl::Slider => {}
         Ctl::Ocr => {
-            if let Err(e) = crate::ocr::copy_text(&state.raw) {
-                eprintln!("ocr failed: {e:#}");
+            if state.text_select.is_some() {
+                state.text_select = None;
+            } else {
+                enter_text_select(hwnd, state);
             }
+            let _ = InvalidateRect(hwnd, None, false);
         }
         Ctl::Copy => {
             let img = final_image(state);
@@ -1251,6 +1534,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                if state.text_select.as_ref().is_some_and(|s| s.dragging) {
+                    let focus = to_raw(state, x, y).and_then(|p| {
+                        nearest_word(&state.text_select.as_ref()?.words, p)
+                    });
+                    if let Some(select) = state.text_select.as_mut() {
+                        if focus.is_some() && select.focus != focus {
+                            select.focus = focus;
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(drag) = state.dragging {
                     match drag {
                         SliderDrag::Padding => slider_update(hwnd, state, x),
@@ -1294,7 +1589,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         })
                         .map(|i| i as i32)
                         .unwrap_or(-1);
-                    let hover_ann = if state.tool.is_none() {
+                    let hover_ann = if state.tool.is_none() && state.text_select.is_none() {
                         to_raw(state, x, y).and_then(|p| hit_ann(state, p))
                     } else {
                         None
@@ -1315,6 +1610,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                if state.text_select.is_some() {
+                    // Double-click picks the single word under the cursor.
+                    let hit = to_raw(state, x, y).and_then(|p| word_at(state, p));
+                    if let Some(select) = state.text_select.as_mut() {
+                        if hit.is_some() {
+                            select.anchor = hit;
+                            select.focus = hit;
+                            select.message = None;
+                        }
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
                 if state.tool.is_none() {
                     if let Some(p) = to_raw(state, x, y) {
                         if let Some(i) = hit_ann(state, p) {
@@ -1346,6 +1654,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                if state.text_select.is_some() && in_rect(&state.preview_box, x, y) {
+                    let hit = to_raw(state, x, y).and_then(|p| anchor_word(state, p));
+                    if let Some(select) = state.text_select.as_mut() {
+                        select.anchor = hit;
+                        select.focus = hit;
+                        select.dragging = hit.is_some();
+                        select.message = None;
+                    }
+                    if hit.is_some() {
+                        SetCapture(hwnd);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
                 let grab = RECT {
                     left: state.slider_rect.left - 8,
                     top: state.slider_rect.top - 8,
@@ -1481,6 +1803,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             if let Some(state) = state_of(hwnd) {
+                if state.text_select.as_ref().is_some_and(|s| s.dragging) {
+                    if let Some(select) = state.text_select.as_mut() {
+                        select.dragging = false;
+                    }
+                    let _ = ReleaseCapture();
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
                 if state.dragging.take().is_some() {
                     let _ = ReleaseCapture();
                     return LRESULT(0);
@@ -1604,6 +1934,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let ctrl_down = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
                     windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32,
                 ) < 0;
+                // Select-text mode owns Esc and the clipboard keys while armed;
+                // everything else still falls through to the editor.
+                if state.text_select.is_some() {
+                    let key = wparam.0 as u16;
+                    if key == VK_ESCAPE.0 {
+                        state.text_select = None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if ctrl_down && key == b'A' as u16 {
+                        let last = state
+                            .text_select
+                            .as_ref()
+                            .map(|select| select.words.len())
+                            .unwrap_or(0);
+                        if let Some(select) = state.text_select.as_mut() {
+                            if last > 0 {
+                                select.anchor = Some(0);
+                                select.focus = Some(last - 1);
+                                select.message = None;
+                            }
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if ctrl_down && key == b'C' as u16 {
+                        let text = selected_text(state);
+                        let message = if text.is_empty() {
+                            "select some text first".to_string()
+                        } else {
+                            let count = text.chars().count();
+                            match output::text_to_clipboard(&text) {
+                                Ok(()) => format!("copied {count} characters"),
+                                Err(error) => {
+                                    eprintln!("ocr copy failed: {error:#}");
+                                    "could not copy to the clipboard".to_string()
+                                }
+                            }
+                        };
+                        if let Some(select) = state.text_select.as_mut() {
+                            select.message = Some(message);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                }
                 match wparam.0 as u16 {
                     v if v == VK_ESCAPE.0 => {
                         if let Some(i) = state.editing.take() {
@@ -1671,6 +2047,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // PrtScn mid-tweak: nested overlay; the frozen image includes this
         // window, so it's snippable. Esc there returns here untouched.
+        WM_OCR_READY => {
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
+            let payload = Box::from_raw(
+                lparam.0 as *mut std::result::Result<Vec<crate::ocr::Word>, String>,
+            );
+            if let Some(state) = state_of(hwnd) {
+                if let Some(select) = state.text_select.as_mut() {
+                    // A stale result from a mode the user already left has
+                    // nothing to attach to.
+                    if select.pending {
+                        select.pending = false;
+                        match *payload {
+                            Ok(words) if words.is_empty() => {
+                                select.message = Some("no text found in this capture".into());
+                            }
+                            Ok(words) => select.words = words,
+                            Err(error) => {
+                                eprintln!("ocr failed: {error}");
+                                select.message =
+                                    Some("could not read text from this capture".into());
+                            }
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_RESHOOT => {
             if let Some(state) = state_of(hwnd) {
                 if !state.suspended {
@@ -1703,7 +2109,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = GetCursorPos(&mut pt);
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
                     let raw = to_raw(state, pt.x, pt.y);
-                    let id = if state.tool.is_some() && raw.is_some() {
+                    let id = if state.text_select.is_some() {
+                        if raw.is_some() && in_rect(&state.preview_box, pt.x, pt.y) {
+                            windows::Win32::UI::WindowsAndMessaging::IDC_IBEAM
+                        } else {
+                            ARROW
+                        }
+                    } else if state.tool.is_some() && raw.is_some() {
                         IDC_CROSS
                     } else if let Some((_, _, grab)) = state.moving {
                         // Mid-drag: keep showing what the drag is doing.
@@ -2023,6 +2435,7 @@ pub fn run(
         selected: None,
         counter_next: 1,
         hover_ann: None,
+        text_select: None,
         size_idx: 1,
         caption_size: 1.75,
         caption_style: crate::annotate::TextStyle::Box,
@@ -2125,8 +2538,78 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{annotation_tool_index, apply_text_input, layout_controls, Ctl, TextInput};
-    use crate::annotate::Shape;
+    use super::{
+        annotation_tool_index, apply_text_input, join_words, layout_controls, nearest_word,
+        redacted, Ctl, TextInput,
+    };
+    use crate::annotate::{Annotation, Shape, TextStyle};
+
+    fn word(text: &str, line: usize, rect: (f32, f32, f32, f32)) -> crate::ocr::Word {
+        crate::ocr::Word { text: text.into(), rect, line }
+    }
+
+    fn blur(a: (f32, f32), b: (f32, f32)) -> Annotation {
+        Annotation {
+            shape: Shape::Blur { a, b },
+            color: 0,
+            size: 1.0,
+            text_style: TextStyle::Shadow,
+            text_box_opacity: 1.0,
+        }
+    }
+
+    #[test]
+    fn sweeping_a_selection_stays_on_the_line_under_the_cursor() {
+        let words = [
+            word("alpha", 0, (0.0, 0.0, 50.0, 20.0)),
+            word("beta", 1, (200.0, 100.0, 250.0, 120.0)),
+        ];
+        // The cursor sits inside line 0's band but far to the right, closer to
+        // beta's box by raw distance. Reading order has to win, or a sweep
+        // jumps lines the moment it passes the end of a short line.
+        assert_eq!(nearest_word(&words, (210.0, 12.0)), Some(0));
+        assert_eq!(nearest_word(&words, (210.0, 108.0)), Some(1));
+        assert_eq!(nearest_word(&[], (0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn redaction_removes_the_words_it_covers_and_leaves_the_rest() {
+        let covered = word("secret", 0, (100.0, 100.0, 200.0, 120.0));
+        let anns = [blur((90.0, 90.0), (210.0, 130.0))];
+        assert!(redacted(&anns, &covered));
+
+        // A box that only clips a corner is not redaction.
+        let grazed = [blur((190.0, 110.0), (300.0, 200.0))];
+        assert!(!redacted(&grazed, &covered));
+
+        // Corners given in any order still describe the same box.
+        let reversed = [blur((210.0, 130.0), (90.0, 90.0))];
+        assert!(redacted(&reversed, &covered));
+
+        // Other annotation kinds never hide text.
+        let boxed = [Annotation {
+            shape: Shape::Rect { a: (90.0, 90.0), b: (210.0, 130.0) },
+            ..blur((0.0, 0.0), (0.0, 0.0))
+        }];
+        assert!(!redacted(&boxed, &covered));
+    }
+
+    #[test]
+    fn copied_text_keeps_line_breaks_and_omits_redacted_words() {
+        let words = [
+            word("Hello", 0, (0.0, 0.0, 40.0, 10.0)),
+            word("world", 0, (45.0, 0.0, 90.0, 10.0)),
+            word("second", 1, (0.0, 20.0, 50.0, 30.0)),
+            word("line", 1, (55.0, 20.0, 90.0, 30.0)),
+        ];
+        assert_eq!(join_words(&words, |_| false), "Hello world\nsecond line");
+        // Dropping a word must not weld its neighbours' lines together.
+        assert_eq!(
+            join_words(&words, |w| w.text == "world"),
+            "Hello\nsecond line"
+        );
+        assert_eq!(join_words(&words, |_| true), "");
+    }
 
     #[test]
     fn caption_input_accepts_unicode_without_requiring_enter() {
