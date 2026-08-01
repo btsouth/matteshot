@@ -10,15 +10,15 @@ use image::RgbaImage;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, RoundRect, SelectObject,
+    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
+    EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, RoundRect, SelectObject,
     SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS,
     DT_LEFT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
     VK_SPACE,
@@ -26,13 +26,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
     GetCursorPos, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
-    IDYES, MB_ICONWARNING, MB_YESNO, WM_APP, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW,
-    WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
+    SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, WM_APP, WM_CHAR, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WINDOW_STYLE,
+    WS_CAPTION, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 const WM_EXPORT_PROGRESS: u32 = WM_APP + 20;
+const WM_UNICHAR_MESSAGE: u32 = 0x0109;
+const UNICODE_NOCHAR: usize = 0xFFFF;
 const WM_EXPORT_DONE: u32 = WM_APP + 21;
 const WM_PLAYBACK_FRAME: u32 = WM_APP + 22;
 const WM_PLAYBACK_DONE: u32 = WM_APP + 23;
@@ -108,7 +111,16 @@ enum Drag {
     CaptionSize,
     CaptionOpacity,
     Draw { index: usize, start: (f32, f32) },
-    Move { index: usize, last: (f32, f32) },
+    Move {
+        index: usize,
+        last: (f32, f32),
+        undo_pushed: bool,
+    },
+    Reshape {
+        index: usize,
+        handle: crate::video_edit::ShapeHandle,
+        undo_pushed: bool,
+    },
 }
 
 struct TextEntry {
@@ -152,6 +164,8 @@ struct State {
     // Trim state.
     duration: i64,
     raw_thumbs: Vec<(Vec<u8>, u32, u32)>,
+    scrub_previews: Vec<(Vec<u8>, u32, u32)>,
+    source_size: (u32, u32),
     thumbs: Vec<(Vec<u8>, u32, u32)>,
     preview_raw: Option<(Vec<u8>, u32, u32)>,
     preview: Option<(Vec<u8>, u32, u32)>,
@@ -261,6 +275,11 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 /// Layout for a client size. Rerun on resize.
 fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
+    // Programmatic resizes and bad restored placements are not constrained by
+    // WM_GETMINMAXINFO. Normalize defensively so no rectangle can invert even
+    // for a transient undersized WM_SIZE.
+    let (minimum_w, minimum_h) = minimum_client_size(scale);
+    let (cw, ch) = (cw.max(minimum_w), ch.max(minimum_h));
     let m = sc(24);
     // Keep the recording itself dominant. The previous layout devoted nearly
     // half of a maximized 1080p client to header/controls/timeline, which made
@@ -546,20 +565,31 @@ fn set_playhead(state: &mut State, x: i32) {
 }
 
 fn refresh_preview(state: &mut State) {
-    if state.raw_thumbs.is_empty() {
+    if state.scrub_previews.is_empty() {
         state.preview_raw = None;
         state.preview = None;
         return;
     }
     let index = if state.duration > 0 {
-        ((state.playhead as f64 / state.duration as f64) * state.raw_thumbs.len() as f64)
+        ((state.playhead as f64 / state.duration as f64) * state.scrub_previews.len() as f64)
             .floor()
-            .min((state.raw_thumbs.len() - 1) as f64) as usize
+            .min((state.scrub_previews.len() - 1) as f64) as usize
     } else {
         0
     };
-    state.preview_raw = Some(state.raw_thumbs[index].clone());
+    state.preview_raw = Some(state.scrub_previews[index].clone());
     recompose_preview(state);
+}
+
+fn minimum_client_size(scale: f32) -> (i32, i32) {
+    (
+        (760.0 * scale).round() as i32,
+        (620.0 * scale).round() as i32,
+    )
+}
+
+fn editor_style() -> WINDOW_STYLE {
+    WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME | WS_MAXIMIZEBOX
 }
 
 fn recompose_preview(state: &mut State) {
@@ -603,12 +633,13 @@ fn recompose_preview(state: &mut State) {
         composed
     };
     let skip = state.text_entry.as_ref().and_then(|entry| entry.editing);
-    crate::video_edit::render_at(
+    crate::video_edit::render_preview_at(
         &mut image,
         &state.annotations,
         state.playhead,
         skip,
         content_size,
+        state.source_size,
         content_offset,
     );
     if let Some(entry) = &state.text_entry {
@@ -625,7 +656,15 @@ fn recompose_preview(state: &mut State) {
             caption_style: state.caption_style,
             caption_box_opacity: state.caption_box_opacity,
         };
-        crate::video_edit::render_one_at(&mut image, &draft, content_size, content_offset);
+        crate::video_edit::render_preview_at(
+            &mut image,
+            std::slice::from_ref(&draft),
+            state.playhead,
+            None,
+            content_size,
+            state.source_size,
+            content_offset,
+        );
     }
     state.preview = Some(image_thumb(&image));
 }
@@ -955,11 +994,7 @@ fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
 }
 
 fn annotation_content_size(state: &State) -> (u32, u32) {
-    state
-        .preview_raw
-        .as_ref()
-        .map(|frame| (frame.1.max(1), frame.2.max(1)))
-        .unwrap_or((1920, 1080))
+    (state.source_size.0.max(1), state.source_size.1.max(1))
 }
 
 fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
@@ -974,6 +1009,20 @@ fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
                 && crate::video_edit::hit(item, point, 0.018, content_size)
         })
         .map(|(index, _)| index)
+}
+
+fn hit_annotation_handle(
+    state: &State,
+    point: (f32, f32),
+) -> Option<(usize, crate::video_edit::ShapeHandle)> {
+    let content_size = annotation_content_size(state);
+    let index = state.selected.filter(|index| *index < state.annotations.len())?;
+    let item = &state.annotations[index];
+    if !item.active_at(state.playhead) {
+        return None;
+    }
+    crate::video_edit::hit_handle(item, point, 0.026, content_size)
+        .map(|handle| (index, handle))
 }
 
 fn contains(rect: RECT, x: i32, y: i32) -> bool {
@@ -1067,6 +1116,31 @@ fn commit_text(state: &mut State) {
     state.tool = None;
     state.tools_open = false;
     recompose_preview(state);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptionInput {
+    Changed,
+    Commit,
+    Ignored,
+}
+
+/// Apply one character delivered by WM_CHAR/WM_UNICHAR. Keeping this logic
+/// independent from the window procedure makes caption input regression
+/// testable without synthetic keyboard input or stealing foreground focus.
+fn apply_caption_input(text: &mut String, ch: char) -> CaptionInput {
+    match ch {
+        '\r' => CaptionInput::Commit,
+        '\u{8}' => {
+            text.pop();
+            CaptionInput::Changed
+        }
+        ch if !ch.is_control() && text.chars().count() < 160 => {
+            text.push(ch);
+            CaptionInput::Changed
+        }
+        _ => CaptionInput::Ignored,
+    }
 }
 
 /// Move a trim handle to window x, keeping at least ~0.3s between them.
@@ -1290,6 +1364,28 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 SelectObject(hdc, old_brush);
                 SelectObject(hdc, old_pen);
                 let _ = DeleteObject(pen);
+
+                if let Some(handles) = crate::video_edit::handles(item) {
+                    let handle_pen = CreatePen(PS_SOLID, s(state, 2).max(1), state.theme.accent);
+                    let handle_fill = CreateSolidBrush(state.theme.bg);
+                    let old_pen = SelectObject(hdc, handle_pen);
+                    let old_brush = SelectObject(hdc, handle_fill);
+                    let radius = s(state, 7);
+                    for (_, point) in handles {
+                        let (x, y) = (map_x(point.0), map_y(point.1));
+                        let _ = Ellipse(
+                            hdc,
+                            x - radius,
+                            y - radius,
+                            x + radius + 1,
+                            y + radius + 1,
+                        );
+                    }
+                    SelectObject(hdc, old_brush);
+                    SelectObject(hdc, old_pen);
+                    let _ = DeleteObject(handle_fill);
+                    let _ = DeleteObject(handle_pen);
+                }
             }
         }
     }
@@ -1522,8 +1618,19 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 Tool::Rect => "Drag on the preview to draw a box",
                 Tool::Blur => "Drag over anything sensitive to blur it",
             }
+        } else if let Some(index) = state.selected {
+            match state.annotations.get(index).map(|item| &item.shape) {
+                Some(crate::video_edit::Shape::Arrow { .. }) => {
+                    "Selected   \u{00b7}   drag line to move   \u{00b7}   drag endpoints to redirect"
+                }
+                Some(crate::video_edit::Shape::Rect { .. })
+                | Some(crate::video_edit::Shape::Blur { .. }) => {
+                    "Selected   \u{00b7}   drag to move   \u{00b7}   drag corner handles to resize"
+                }
+                _ => "Selected   \u{00b7}   drag to move   \u{00b7}   + Add for style and timing",
+            }
         } else {
-            "Selected   \u{00b7}   drag to move   \u{00b7}   + Add for style and timing"
+            ""
         };
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, state.theme.text);
@@ -2158,18 +2265,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 recompose_preview(state);
                             }
                         }
-                        Drag::Move { index, last } => {
+                        Drag::Move {
+                            index,
+                            last,
+                            undo_pushed,
+                        } => {
                             if let Some(point) = screen_to_preview(state, x, y) {
+                                let dx = point.0 - last.0;
+                                let dy = point.1 - last.1;
+                                let moved = dx.abs() > f32::EPSILON || dy.abs() > f32::EPSILON;
+                                if moved && !undo_pushed {
+                                    push_undo(state);
+                                }
                                 let content_size = annotation_content_size(state);
                                 if let Some(item) = state.annotations.get_mut(index) {
                                     crate::video_edit::translate(
                                         item,
-                                        point.0 - last.0,
-                                        point.1 - last.1,
+                                        dx,
+                                        dy,
                                         content_size,
                                     );
                                 }
-                                state.dragging = Some(Drag::Move { index, last: point });
+                                state.dragging = Some(Drag::Move {
+                                    index,
+                                    last: point,
+                                    undo_pushed: undo_pushed || moved,
+                                });
+                                recompose_preview(state);
+                            }
+                        }
+                        Drag::Reshape {
+                            index,
+                            handle,
+                            undo_pushed,
+                        } => {
+                            if let Some(point) = screen_to_preview(state, x, y) {
+                                if !undo_pushed {
+                                    push_undo(state);
+                                }
+                                if let Some(item) = state.annotations.get_mut(index) {
+                                    crate::video_edit::set_handle(item, handle, point);
+                                }
+                                state.dragging = Some(Drag::Reshape {
+                                    index,
+                                    handle,
+                                    undo_pushed: true,
+                                });
                                 recompose_preview(state);
                             }
                         }
@@ -2400,11 +2541,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
-                    if let Some(index) = hit_annotation(state, point) {
-                        push_undo(state);
+                    if let Some((index, handle)) = hit_annotation_handle(state, point) {
                         state.selected = Some(index);
                         sync_selected_controls(state, index);
-                        state.dragging = Some(Drag::Move { index, last: point });
+                        state.dragging = Some(Drag::Reshape {
+                            index,
+                            handle,
+                            undo_pushed: false,
+                        });
+                        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                    } else if let Some(index) = hit_annotation(state, point) {
+                        state.selected = Some(index);
+                        sync_selected_controls(state, index);
+                        state.dragging = Some(Drag::Move {
+                            index,
+                            last: point,
+                            undo_pushed: false,
+                        });
                         windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                     } else {
                         state.selected = None;
@@ -2749,27 +2902,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        WM_CHAR => {
+        WM_CHAR | WM_UNICHAR_MESSAGE => {
             if let Some(state) = state_of(hwnd) {
+                if msg == WM_UNICHAR_MESSAGE && wparam.0 == UNICODE_NOCHAR {
+                    // Advertise support for full Unicode code points. Normal
+                    // keyboard input still arrives through WM_CHAR.
+                    return LRESULT(1);
+                }
                 if state.text_entry.is_some() {
                     let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
-                    match ch {
-                        '\r' => commit_text(state),
-                        '\u{8}' => {
-                            if let Some(entry) = &mut state.text_entry {
-                                entry.text.pop();
-                            }
-                            recompose_preview(state);
-                        }
-                        ch if !ch.is_control() => {
-                            if let Some(entry) = &mut state.text_entry {
-                                if entry.text.chars().count() < 160 {
-                                    entry.text.push(ch);
-                                }
-                            }
-                            recompose_preview(state);
-                        }
-                        _ => {}
+                    let action = state
+                        .text_entry
+                        .as_mut()
+                        .map(|entry| apply_caption_input(&mut entry.text, ch))
+                        .unwrap_or(CaptionInput::Ignored);
+                    match action {
+                        CaptionInput::Commit => commit_text(state),
+                        CaptionInput::Changed => recompose_preview(state),
+                        CaptionInput::Ignored => {}
                     }
                     let _ = InvalidateRect(hwnd, None, false);
                 }
@@ -2862,6 +3012,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     ((lparam.0 >> 16) & 0xFFFF) as i32,
                 );
                 if w > 0 && h > 0 {
+                    let (minimum_w, minimum_h) = minimum_client_size(state.scale);
+                    if w < minimum_w || h < minimum_h {
+                        // Track-size limits only constrain mouse resizing. A
+                        // stale restore placement or programmatic resize can
+                        // still deliver a tiny client. Repair it immediately
+                        // instead of painting an inverted preview and a clipped
+                        // filmstrip.
+                        let mut outer = RECT {
+                            left: 0,
+                            top: 0,
+                            right: w.max(minimum_w),
+                            bottom: h.max(minimum_h),
+                        };
+                        let _ = AdjustWindowRectEx(
+                            &mut outer,
+                            editor_style(),
+                            false,
+                            WS_EX_APPWINDOW,
+                        );
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            0,
+                            0,
+                            outer.right - outer.left,
+                            outer.bottom - outer.top,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        return LRESULT(0);
+                    }
                     state.width = w;
                     state.height = h;
                     let next = layout(state.scale, w, h, state.styles.len());
@@ -2889,9 +3069,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         windows::Win32::UI::WindowsAndMessaging::WM_GETMINMAXINFO => {
             let mmi = lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::MINMAXINFO;
             if !mmi.is_null() {
-                let s = GetDpiForSystem() as f32 / 96.0;
-                (*mmi).ptMinTrackSize.x = (760.0 * s) as i32;
-                (*mmi).ptMinTrackSize.y = (560.0 * s) as i32;
+                let s = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                let (minimum_w, minimum_h) = minimum_client_size(s);
+                let mut outer = RECT {
+                    left: 0,
+                    top: 0,
+                    right: minimum_w,
+                    bottom: minimum_h,
+                };
+                let _ = AdjustWindowRectEx(
+                    &mut outer,
+                    editor_style(),
+                    false,
+                    WS_EX_APPWINDOW,
+                );
+                (*mmi).ptMinTrackSize.x = outer.right - outer.left;
+                (*mmi).ptMinTrackSize.y = outer.bottom - outer.top;
             }
             LRESULT(0)
         }
@@ -2994,22 +3187,27 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
     let window_y = monitor_info.rcWork.top + (work_h - ch) / 2;
 
     // Filmstrip: best-effort, never blocks showing the window.
-    let (probe_w, probe_h) = {
+    let (probe_w, probe_h, preview_w, preview_h) = {
         let initial = layout(scale, cw, ch, 7);
         (
             (initial.strip.right - initial.strip.left) as u32,
             (initial.strip.bottom - initial.strip.top) as u32,
+            (initial.preview.right - initial.preview.left).max(2) as u32,
+            (initial.preview.bottom - initial.preview.top).max(2) as u32,
         )
     };
-    let probe = crate::trim::probe(&mp4, probe_w, probe_h)
+    let probe = crate::trim::probe_editor(&mp4, probe_w, probe_h, preview_w, preview_h)
         .context("open the finished recording in the editor")?;
     if probe.duration_100ns <= 0 || probe.thumbs.is_empty() {
         anyhow::bail!("the finished recording has no decodable video frames");
     }
     let duration = probe.duration_100ns;
+    let source_size = probe.source_size;
+    let scrub_previews = probe.previews;
     let raw_thumbs = probe.thumbs;
-    let style_source = raw_thumbs
+    let style_source = scrub_previews
         .first()
+        .or_else(|| raw_thumbs.first())
         .map(|(bytes, w, h)| thumb_image(bytes, *w, *h))
         .unwrap_or_else(|| RgbaImage::from_pixel(1, 1, image::Rgba([42, 46, 58, 255])));
     let styles = crate::style::variants(&style_source);
@@ -3041,6 +3239,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         (initial.preview.bottom - initial.preview.top).max(2) as u32,
     )
     .ok()
+    .or_else(|| scrub_previews.first().cloned())
     .or_else(|| raw_thumbs.first().cloned());
     // Build the opening still through the same cached composition path used
     // by playback frames. Two subtly different paths made the first frame
@@ -3060,6 +3259,8 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         height: ch,
         duration,
         raw_thumbs,
+        scrub_previews,
+        source_size,
         thumbs,
         preview_raw,
         preview: None,
@@ -3126,11 +3327,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         };
         RegisterClassW(&class);
 
-        let style = WS_CAPTION
-            | WS_SYSMENU
-            | WS_VISIBLE
-            | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME
-            | windows::Win32::UI::WindowsAndMessaging::WS_MAXIMIZEBOX;
+        let style = editor_style();
         let mut outer = RECT {
             left: 0,
             top: 0,
@@ -3165,7 +3362,10 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{available_export_path, layout, NEXT_EXPORT_ID};
+    use super::{
+        apply_caption_input, available_export_path, layout, minimum_client_size, CaptionInput,
+        NEXT_EXPORT_ID,
+    };
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -3181,6 +3381,57 @@ mod tests {
         assert!(window.padding_slider.bottom <= window.strip.top - 20);
         assert!(window.caption_size_slider.bottom < window.caption_opacity_slider.top);
         assert!(window.caption_opacity_slider.bottom < window.timing_controls[0].0.top);
+    }
+
+    fn assert_layout_is_usable(scale: f32, requested_w: i32, requested_h: i32) {
+        let (minimum_w, minimum_h) = minimum_client_size(scale);
+        let (width, height) = (requested_w.max(minimum_w), requested_h.max(minimum_h));
+        let window = layout(scale, requested_w, requested_h, 7);
+        let preview_h = window.preview.bottom - window.preview.top;
+        let timeline_h = window.strip.bottom - window.strip.top;
+        assert!(preview_h >= (180.0 * scale) as i32, "preview was {preview_h}px");
+        assert!(timeline_h >= (60.0 * scale) as i32);
+        assert!(window.preview.left >= 0 && window.preview.right <= width);
+        assert!(window.preview.top >= 0 && window.preview.bottom < window.strip.top);
+        assert!(window.padding_slider.bottom < window.strip.top);
+        assert!(window.strip.bottom < window.controls[0].0.top);
+        assert!(window.controls.iter().all(|(rect, ..)| rect.bottom <= height));
+        assert!(window
+            .matte_controls
+            .iter()
+            .all(|(rect, _)| rect.left >= 0 && rect.right <= width));
+        assert!(window
+            .aspect_controls
+            .iter()
+            .all(|(rect, _)| rect.left >= 0 && rect.right <= width));
+    }
+
+    #[test]
+    fn minimum_and_transient_tiny_layouts_never_collapse() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let (minimum_w, minimum_h) = minimum_client_size(scale);
+            assert_layout_is_usable(scale, minimum_w, minimum_h);
+            // A bad restored placement can briefly send a tiny WM_SIZE. The
+            // layout must remain valid while the window self-repairs.
+            assert_layout_is_usable(scale, 320, 180);
+        }
+    }
+
+    #[test]
+    fn caption_input_accepts_typing_without_requiring_enter() {
+        let mut text = String::new();
+        for ch in "Smooth caption 👍".chars() {
+            assert_eq!(apply_caption_input(&mut text, ch), CaptionInput::Changed);
+        }
+        assert_eq!(text, "Smooth caption 👍");
+        assert_eq!(apply_caption_input(&mut text, '\u{8}'), CaptionInput::Changed);
+        assert_eq!(text, "Smooth caption ");
+        assert_eq!(apply_caption_input(&mut text, '\r'), CaptionInput::Commit);
+        assert_eq!(apply_caption_input(&mut text, '\n'), CaptionInput::Ignored);
+
+        let mut capped = "x".repeat(160);
+        assert_eq!(apply_caption_input(&mut capped, 'y'), CaptionInput::Ignored);
+        assert_eq!(capped.chars().count(), 160);
     }
 
     #[test]

@@ -17,6 +17,15 @@ pub enum Shape {
     Text { pos: (f32, f32), text: String },
 }
 
+/// Direct-manipulation handles shared by arrows and rectangular annotations.
+/// `First` is the arrow tail / first box corner and `Second` is the arrow head /
+/// opposite box corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeHandle {
+    First,
+    Second,
+}
+
 #[derive(Clone, Debug)]
 pub struct Item {
     pub shape: Shape,
@@ -82,6 +91,46 @@ pub fn render_at(
     }
 }
 
+/// Render a downscaled editor preview using the source video's annotation
+/// metrics. This avoids the minimum-size clamp making captions and strokes
+/// jump larger when the playhead switches to a cached scrub frame.
+pub fn render_preview_at(
+    image: &mut RgbaImage,
+    items: &[Item],
+    time: i64,
+    skip: Option<usize>,
+    preview_content_size: (u32, u32),
+    source_content_size: (u32, u32),
+    offset: (f32, f32),
+) {
+    let effective_metric = preview_metric_scale(preview_content_size, source_content_size);
+    for (index, item) in items.iter().enumerate() {
+        if Some(index) != skip && item.active_at(time) {
+            render_one_with_metric(
+                image,
+                item,
+                preview_content_size,
+                offset,
+                effective_metric,
+            );
+        }
+    }
+}
+
+fn preview_metric_scale(
+    preview_content_size: (u32, u32),
+    source_content_size: (u32, u32),
+) -> f32 {
+    let source_scale = metric_scale(source_content_size);
+    let preview_scale = (preview_content_size.0.max(1) as f32
+        / source_content_size.0.max(1) as f32)
+        .min(
+            preview_content_size.1.max(1) as f32
+                / source_content_size.1.max(1) as f32,
+        );
+    source_scale * preview_scale
+}
+
 fn metric_scale(content_size: (u32, u32)) -> f32 {
     (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0)
 }
@@ -92,7 +141,16 @@ pub fn render_one_at(
     content_size: (u32, u32),
     offset: (f32, f32),
 ) {
-    let metric_scale = metric_scale(content_size);
+    render_one_with_metric(image, item, content_size, offset, metric_scale(content_size));
+}
+
+fn render_one_with_metric(
+    image: &mut RgbaImage,
+    item: &Item,
+    content_size: (u32, u32),
+    offset: (f32, f32),
+    metric_scale: f32,
+) {
     if let Shape::Text { pos, text } = &item.shape {
         crate::annotate::render_caption(
             image,
@@ -217,9 +275,56 @@ pub fn translate(item: &mut Item, dx: f32, dy: f32, content_size: (u32, u32)) {
     }
 }
 
+pub fn handles(item: &Item) -> Option<[(ShapeHandle, (f32, f32)); 2]> {
+    match &item.shape {
+        Shape::Arrow { from, to } => Some([
+            (ShapeHandle::First, *from),
+            (ShapeHandle::Second, *to),
+        ]),
+        Shape::Rect { a, b } | Shape::Blur { a, b } => Some([
+            (ShapeHandle::First, *a),
+            (ShapeHandle::Second, *b),
+        ]),
+        Shape::Text { .. } => None,
+    }
+}
+
+/// Hit-test a direct manipulation handle in content-aware pixel space. This
+/// keeps the grab target circular on both wide videos and portrait captures.
+pub fn hit_handle(
+    item: &Item,
+    point: (f32, f32),
+    radius: f32,
+    content_size: (u32, u32),
+) -> Option<ShapeHandle> {
+    let (width, height) = (content_size.0.max(1) as f32, content_size.1.max(1) as f32);
+    let radius_px = radius * width.min(height);
+    handles(item)?.into_iter().find_map(|(handle, candidate)| {
+        let dx = (point.0 - candidate.0) * width;
+        let dy = (point.1 - candidate.1) * height;
+        (dx.hypot(dy) <= radius_px).then_some(handle)
+    })
+}
+
+pub fn set_handle(item: &mut Item, handle: ShapeHandle, point: (f32, f32)) {
+    let point = (point.0.clamp(0.0, 1.0), point.1.clamp(0.0, 1.0));
+    match (&mut item.shape, handle) {
+        (Shape::Arrow { from, .. }, ShapeHandle::First)
+        | (Shape::Rect { a: from, .. }, ShapeHandle::First)
+        | (Shape::Blur { a: from, .. }, ShapeHandle::First) => *from = point,
+        (Shape::Arrow { to, .. }, ShapeHandle::Second)
+        | (Shape::Rect { b: to, .. }, ShapeHandle::Second)
+        | (Shape::Blur { b: to, .. }, ShapeHandle::Second) => *to = point,
+        (Shape::Text { .. }, _) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bounds, hit, metric_scale, render_at, translate, CaptionStyle, Item, Shape};
+    use super::{
+        bounds, handles, hit, hit_handle, metric_scale, preview_metric_scale, render_at,
+        set_handle, translate, CaptionStyle, Item, Shape, ShapeHandle,
+    };
     use image::{Rgba, RgbaImage};
 
     fn arrow() -> Item {
@@ -256,6 +361,64 @@ mod tests {
         for (actual, expected) in [x0, y0, x1, y1].into_iter().zip([0.6, 0.6, 1.0, 1.0]) {
             assert!((actual - expected).abs() < 0.00001);
         }
+    }
+
+    #[test]
+    fn arrow_endpoints_can_be_redirected_without_moving_the_other_end() {
+        let mut item = arrow();
+        assert_eq!(
+            hit_handle(&item, (0.102, 0.202), 0.025, (1920, 1080)),
+            Some(ShapeHandle::First)
+        );
+        assert_eq!(
+            hit_handle(&item, (0.498, 0.598), 0.025, (1920, 1080)),
+            Some(ShapeHandle::Second)
+        );
+        assert_eq!(handles(&item).unwrap()[1].1, (0.5, 0.6));
+
+        set_handle(&mut item, ShapeHandle::First, (0.8, -0.2));
+        let Shape::Arrow { from, to } = item.shape else {
+            panic!("expected arrow");
+        };
+        assert_eq!(from, (0.8, 0.0));
+        assert_eq!(to, (0.5, 0.6));
+    }
+
+    #[test]
+    fn box_and_blur_corner_handles_resize_in_place() {
+        for shape in [
+            Shape::Rect {
+                a: (0.2, 0.3),
+                b: (0.6, 0.7),
+            },
+            Shape::Blur {
+                a: (0.2, 0.3),
+                b: (0.6, 0.7),
+            },
+        ] {
+            let mut item = Item {
+                shape,
+                start: 0,
+                end: 10,
+                color: 0,
+                size: 1.0,
+                caption_style: CaptionStyle::Shadow,
+                caption_box_opacity: 0.68,
+            };
+            set_handle(&mut item, ShapeHandle::Second, (0.9, 0.1));
+            assert_eq!(handles(&item).unwrap()[0].1, (0.2, 0.3));
+            assert_eq!(handles(&item).unwrap()[1].1, (0.9, 0.1));
+        }
+    }
+
+    #[test]
+    fn scrub_preview_metrics_scale_from_the_source_without_a_thumbnail_floor() {
+        let source = (1920, 1080);
+        let half = preview_metric_scale((960, 540), source);
+        let thumbnail = preview_metric_scale((160, 90), source);
+        assert!((half - 0.75).abs() < 0.0001);
+        assert!((thumbnail - 0.125).abs() < 0.0001);
+        assert!((half / 960.0 - thumbnail / 160.0).abs() < 0.0001);
     }
 
     #[test]
