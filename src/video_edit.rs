@@ -8,7 +8,12 @@ pub use crate::annotate::TextStyle as CaptionStyle;
 #[derive(Clone, Debug)]
 pub enum Shape {
     Arrow { from: (f32, f32), to: (f32, f32) },
+    Line { from: (f32, f32), to: (f32, f32) },
+    Freehand { points: Vec<(f32, f32)> },
     Rect { a: (f32, f32), b: (f32, f32) },
+    Ellipse { a: (f32, f32), b: (f32, f32) },
+    Highlight { a: (f32, f32), b: (f32, f32) },
+    Counter { pos: (f32, f32), n: u32 },
     Blur { a: (f32, f32), b: (f32, f32) },
     Text { pos: (f32, f32), text: String },
 }
@@ -50,9 +55,28 @@ fn annotation(item: &Item, w: u32, h: u32) -> crate::annotate::Annotation {
             from: point(*from, wf, hf),
             to: point(*to, wf, hf),
         },
+        Shape::Line { from, to } => crate::annotate::Shape::Line {
+            from: point(*from, wf, hf),
+            to: point(*to, wf, hf),
+        },
+        Shape::Freehand { points } => crate::annotate::Shape::Freehand {
+            points: points.iter().map(|point_| point(*point_, wf, hf)).collect(),
+        },
         Shape::Rect { a, b } => crate::annotate::Shape::Rect {
             a: point(*a, wf, hf),
             b: point(*b, wf, hf),
+        },
+        Shape::Ellipse { a, b } => crate::annotate::Shape::Ellipse {
+            a: point(*a, wf, hf),
+            b: point(*b, wf, hf),
+        },
+        Shape::Highlight { a, b } => crate::annotate::Shape::Highlight {
+            a: point(*a, wf, hf),
+            b: point(*b, wf, hf),
+        },
+        Shape::Counter { pos, n } => crate::annotate::Shape::Counter {
+            pos: point(*pos, wf, hf),
+            n: *n,
         },
         Shape::Blur { a, b } => crate::annotate::Shape::Blur {
             a: point(*a, wf, hf),
@@ -177,14 +201,34 @@ fn render_one_with_metric(
 
 pub fn bounds(item: &Item, content_size: (u32, u32)) -> (f32, f32, f32, f32) {
     match &item.shape {
-        Shape::Arrow { from, to } => (
+        Shape::Arrow { from, to } | Shape::Line { from, to } => (
             from.0.min(to.0),
             from.1.min(to.1),
             from.0.max(to.0),
             from.1.max(to.1),
         ),
-        Shape::Rect { a, b } | Shape::Blur { a, b } => {
+        Shape::Freehand { points } => points.iter().fold(
+            (1.0, 1.0, 0.0, 0.0),
+            |(x0, y0, x1, y1), point| {
+                (x0.min(point.0), y0.min(point.1), x1.max(point.0), y1.max(point.1))
+            },
+        ),
+        Shape::Rect { a, b }
+        | Shape::Ellipse { a, b }
+        | Shape::Highlight { a, b }
+        | Shape::Blur { a, b } => {
             (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
+        }
+        Shape::Counter { pos, .. } => {
+            let radius = (14.0 * metric_scale(content_size) * item.size).max(9.0);
+            let rx = radius / content_size.0.max(1) as f32;
+            let ry = radius / content_size.1.max(1) as f32;
+            (
+                (pos.0 - rx).max(0.0),
+                (pos.1 - ry).max(0.0),
+                (pos.0 + rx).min(1.0),
+                (pos.1 + ry).min(1.0),
+            )
         }
         Shape::Text { pos, text } => {
             let (width, height) = crate::annotate::caption_text_size(
@@ -228,8 +272,13 @@ pub fn hit(
     content_size: (u32, u32),
 ) -> bool {
     match &item.shape {
-        Shape::Arrow { from, to } => distance_to_segment(point, *from, *to) <= tolerance,
-        Shape::Blur { .. } | Shape::Text { .. } => {
+        Shape::Arrow { from, to } | Shape::Line { from, to } => {
+            distance_to_segment(point, *from, *to) <= tolerance
+        }
+        Shape::Freehand { points } => points
+            .windows(2)
+            .any(|segment| distance_to_segment(point, segment[0], segment[1]) <= tolerance),
+        Shape::Blur { .. } | Shape::Highlight { .. } | Shape::Text { .. } => {
             let (x0, y0, x1, y1) = bounds(item, content_size);
             point.0 >= x0 - tolerance
                 && point.0 <= x1 + tolerance
@@ -249,6 +298,22 @@ pub fn hit(
                 .min((point.1 - y1).abs());
             inside && edge <= tolerance * 1.5
         }
+        Shape::Ellipse { a, b } => {
+            let (cx, cy) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+            let (rx, ry) = (
+                ((a.0 - b.0) / 2.0).abs().max(f32::EPSILON),
+                ((a.1 - b.1) / 2.0).abs().max(f32::EPSILON),
+            );
+            let value = (((point.0 - cx) / rx).powi(2) + ((point.1 - cy) / ry).powi(2)).sqrt();
+            (value - 1.0).abs() * rx.min(ry) <= tolerance * 1.5
+        }
+        Shape::Counter { pos, .. } => {
+            let (width, height) = (content_size.0.max(1) as f32, content_size.1.max(1) as f32);
+            let radius = (14.0 * metric_scale(content_size) * item.size).max(9.0);
+            let dx = (point.0 - pos.0) * width;
+            let dy = (point.1 - pos.1) * height;
+            dx.hypot(dy) <= radius + tolerance * width.min(height)
+        }
     }
 }
 
@@ -261,29 +326,36 @@ pub fn translate(item: &mut Item, dx: f32, dy: f32, content_size: (u32, u32)) {
         point.1 += dy;
     };
     match &mut item.shape {
-        Shape::Arrow { from, to } => {
+        Shape::Arrow { from, to } | Shape::Line { from, to } => {
             move_point(from);
             move_point(to);
         }
-        Shape::Rect { a, b } | Shape::Blur { a, b } => {
+        Shape::Freehand { points } => points.iter_mut().for_each(move_point),
+        Shape::Rect { a, b }
+        | Shape::Ellipse { a, b }
+        | Shape::Highlight { a, b }
+        | Shape::Blur { a, b } => {
             move_point(a);
             move_point(b);
         }
-        Shape::Text { pos, .. } => move_point(pos),
+        Shape::Counter { pos, .. } | Shape::Text { pos, .. } => move_point(pos),
     }
 }
 
 pub fn handles(item: &Item) -> Option<[(ShapeHandle, (f32, f32)); 2]> {
     match &item.shape {
-        Shape::Arrow { from, to } => Some([
+        Shape::Arrow { from, to } | Shape::Line { from, to } => Some([
             (ShapeHandle::First, *from),
             (ShapeHandle::Second, *to),
         ]),
-        Shape::Rect { a, b } | Shape::Blur { a, b } => Some([
+        Shape::Rect { a, b }
+        | Shape::Ellipse { a, b }
+        | Shape::Highlight { a, b }
+        | Shape::Blur { a, b } => Some([
             (ShapeHandle::First, *a),
             (ShapeHandle::Second, *b),
         ]),
-        Shape::Text { .. } => None,
+        Shape::Freehand { .. } | Shape::Counter { .. } | Shape::Text { .. } => None,
     }
 }
 
@@ -308,12 +380,18 @@ pub fn set_handle(item: &mut Item, handle: ShapeHandle, point: (f32, f32)) {
     let point = (point.0.clamp(0.0, 1.0), point.1.clamp(0.0, 1.0));
     match (&mut item.shape, handle) {
         (Shape::Arrow { from, .. }, ShapeHandle::First)
+        | (Shape::Line { from, .. }, ShapeHandle::First)
         | (Shape::Rect { a: from, .. }, ShapeHandle::First)
+        | (Shape::Ellipse { a: from, .. }, ShapeHandle::First)
+        | (Shape::Highlight { a: from, .. }, ShapeHandle::First)
         | (Shape::Blur { a: from, .. }, ShapeHandle::First) => *from = point,
         (Shape::Arrow { to, .. }, ShapeHandle::Second)
+        | (Shape::Line { to, .. }, ShapeHandle::Second)
         | (Shape::Rect { b: to, .. }, ShapeHandle::Second)
+        | (Shape::Ellipse { b: to, .. }, ShapeHandle::Second)
+        | (Shape::Highlight { b: to, .. }, ShapeHandle::Second)
         | (Shape::Blur { b: to, .. }, ShapeHandle::Second) => *to = point,
-        (Shape::Text { .. }, _) => {}
+        (Shape::Freehand { .. } | Shape::Counter { .. } | Shape::Text { .. }, _) => {}
     }
 }
 
@@ -347,6 +425,95 @@ mod tests {
         assert!(item.active_at(10));
         assert!(item.active_at(19));
         assert!(!item.active_at(20));
+    }
+
+    #[test]
+    fn added_video_shapes_render_and_hit_test_through_the_shared_renderer() {
+        let shapes = [
+            (
+                Shape::Line {
+                    from: (0.15, 0.2),
+                    to: (0.85, 0.8),
+                },
+                (0.5, 0.5),
+            ),
+            (
+                Shape::Freehand {
+                    points: vec![(0.15, 0.2), (0.5, 0.75), (0.85, 0.2)],
+                },
+                (0.5, 0.75),
+            ),
+            (
+                Shape::Ellipse {
+                    a: (0.2, 0.2),
+                    b: (0.8, 0.8),
+                },
+                (0.5, 0.2),
+            ),
+            (
+                Shape::Highlight {
+                    a: (0.2, 0.2),
+                    b: (0.8, 0.8),
+                },
+                (0.5, 0.5),
+            ),
+            (
+                Shape::Counter {
+                    pos: (0.5, 0.5),
+                    n: 3,
+                },
+                (0.5, 0.5),
+            ),
+        ];
+
+        for (shape, hit_point) in shapes {
+            let item = Item {
+                shape,
+                start: 0,
+                end: 20,
+                color: 0,
+                size: 1.0,
+                caption_style: CaptionStyle::Shadow,
+                caption_box_opacity: 0.68,
+            };
+            let mut image = RgbaImage::from_pixel(320, 180, Rgba([0, 0, 0, 255]));
+            render_at(
+                &mut image,
+                std::slice::from_ref(&item),
+                10,
+                None,
+                (320, 180),
+                (0.0, 0.0),
+            );
+            assert!(image.pixels().any(|pixel| pixel[0] > 0));
+            assert!(hit(&item, hit_point, 0.03, (320, 180)));
+        }
+    }
+
+    #[test]
+    fn freehand_paths_move_as_one_annotation() {
+        let mut item = Item {
+            shape: Shape::Freehand {
+                points: vec![(0.1, 0.2), (0.3, 0.4), (0.5, 0.2)],
+            },
+            start: 0,
+            end: 20,
+            color: 0,
+            size: 1.0,
+            caption_style: CaptionStyle::Shadow,
+            caption_box_opacity: 0.68,
+        };
+        translate(&mut item, 0.2, 0.3, (1920, 1080));
+        let Shape::Freehand { points } = item.shape else {
+            panic!("expected freehand path");
+        };
+        for (actual, expected) in points
+            .iter()
+            .zip([(0.3, 0.5), (0.5, 0.7), (0.7, 0.5)])
+        {
+            assert!((actual.0 - expected.0).abs() < 1e-6);
+            assert!((actual.1 - expected.1).abs() < 1e-6);
+        }
     }
 
     #[test]
