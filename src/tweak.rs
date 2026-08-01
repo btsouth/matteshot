@@ -43,10 +43,11 @@ use crate::style::Style;
 
 const PAD_MIN: f32 = 0.04;
 const PAD_MAX: f32 = 0.18;
-const ASPECTS: [(&str, Option<f32>); 5] = [
+const ASPECTS: [(&str, Option<f32>); 6] = [
     ("Auto", None),
     ("1:1", Some(1.0)),
     ("4:3", Some(4.0 / 3.0)),
+    ("3:2", Some(3.0 / 2.0)),
     ("16:9", Some(16.0 / 9.0)),
     ("Social", Some(1.91)),
 ];
@@ -78,8 +79,9 @@ enum Ctl {
     Edit,
 }
 
-const TOOLS: [&str; 8] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step"];
+const TOOLS: [&str; 9] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"];
 const SIZES: [f32; 3] = [0.7, 1.0, 1.4];
+const PEN_TOOL: usize = 8;
 
 /// What part of an annotation a selector-mode drag grabbed.
 #[derive(Clone, Copy, PartialEq)]
@@ -312,7 +314,12 @@ fn annotation_tool_index(shape: &crate::annotate::Shape) -> usize {
         crate::annotate::Shape::Text { .. } => 5,
         crate::annotate::Shape::Blur { .. } => 6,
         crate::annotate::Shape::Counter { .. } => 7,
+        crate::annotate::Shape::Freehand { .. } => PEN_TOOL,
     }
+}
+
+fn tool_stays_active_after_use(tool: usize) -> bool {
+    tool == PEN_TOOL
 }
 
 fn text_context(state: &State) -> bool {
@@ -457,6 +464,29 @@ fn raw_to_screen(state: &State, p: (f32, f32)) -> (i32, i32) {
     )
 }
 
+fn freehand_bounds(points: &[(f32, f32)]) -> (f32, f32, f32, f32) {
+    let Some(first) = points.first().copied() else {
+        return (0.0, 0.0, 0.0, 0.0);
+    };
+    points.iter().copied().skip(1).fold(
+        (first.0, first.1, first.0, first.1),
+        |(x0, y0, x1, y1), point| {
+            (x0.min(point.0), y0.min(point.1), x1.max(point.0), y1.max(point.1))
+        },
+    )
+}
+
+fn freehand_length(points: &[(f32, f32)]) -> f32 {
+    points
+        .windows(2)
+        .map(|segment| {
+            let dx = segment[1].0 - segment[0].0;
+            let dy = segment[1].1 - segment[0].1;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .sum()
+}
+
 /// Raw-space bounding box of an annotation (for the selection overlay).
 fn ann_bounds(ann: &crate::annotate::Annotation) -> (f32, f32, f32, f32) {
     match &ann.shape {
@@ -466,6 +496,7 @@ fn ann_bounds(ann: &crate::annotate::Annotation) -> (f32, f32, f32, f32) {
             from.0.max(to.0),
             from.1.max(to.1),
         ),
+        crate::annotate::Shape::Freehand { points } => freehand_bounds(points),
         crate::annotate::Shape::Rect { a, b }
         | crate::annotate::Shape::Ellipse { a, b }
         | crate::annotate::Shape::Highlight { a, b }
@@ -1022,7 +1053,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
                         vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
                     }
                     crate::annotate::Shape::Text { .. }
-                    | crate::annotate::Shape::Counter { .. } => Vec::new(),
+                    | crate::annotate::Shape::Counter { .. }
+                    | crate::annotate::Shape::Freehand { .. } => Vec::new(),
                 };
                 if !pts.is_empty() {
                     let fill = CreateSolidBrush(state.theme.accent);
@@ -1481,6 +1513,9 @@ fn hit_ann(state: &State, p: (f32, f32)) -> Option<usize> {
         let hit = match &ann.shape {
             crate::annotate::Shape::Arrow { from, to }
             | crate::annotate::Shape::Line { from, to } => dist_seg(p, *from, *to) <= tol,
+            crate::annotate::Shape::Freehand { points } => points
+                .windows(2)
+                .any(|segment| dist_seg(p, segment[0], segment[1]) <= tol),
             crate::annotate::Shape::Ellipse { a, b } => {
                 let (cx, cy) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
                 let (rx, ry) = (((a.0 - b.0) / 2.0).abs().max(1.0), ((a.1 - b.1) / 2.0).abs().max(1.0));
@@ -1555,7 +1590,9 @@ fn grab_probe(ann: &crate::annotate::Annotation, p: (f32, f32), tol: f32) -> Gra
             }
             Grab::Whole
         }
-        crate::annotate::Shape::Text { .. } | crate::annotate::Shape::Counter { .. } => {
+        crate::annotate::Shape::Text { .. }
+        | crate::annotate::Shape::Counter { .. }
+        | crate::annotate::Shape::Freehand { .. } => {
             Grab::Whole
         }
     }
@@ -1650,6 +1687,7 @@ fn translate_ann(ann: &mut crate::annotate::Annotation, d: (f32, f32)) {
         crate::annotate::Shape::Text { pos, .. } | crate::annotate::Shape::Counter { pos, .. } => {
             shift(pos)
         }
+        crate::annotate::Shape::Freehand { points } => points.iter_mut().for_each(shift),
     }
 }
 
@@ -1865,6 +1903,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             | crate::annotate::Shape::Ellipse { b, .. }
                             | crate::annotate::Shape::Highlight { b, .. }
                             | crate::annotate::Shape::Blur { b, .. } => *b = p,
+                            crate::annotate::Shape::Freehand { points } => {
+                                let far_enough = points.last().is_none_or(|last| {
+                                    let dx = p.0 - last.0;
+                                    let dy = p.1 - last.1;
+                                    dx * dx + dy * dy >= 2.25
+                                });
+                                if far_enough {
+                                    points.push(p);
+                                }
+                            }
                             _ => {}
                         }
                         // Annotation stamping is cheap now; near-frame-rate.
@@ -2048,6 +2096,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         3 => Some(Shape::Ellipse { a: p, b: p }),
                         4 => Some(Shape::Highlight { a: p, b: p }),
                         6 => Some(Shape::Blur { a: p, b: p }),
+                        PEN_TOOL => Some(Shape::Freehand { points: vec![p] }),
                         _ => None,
                     };
                     if let Some(shape) = drag_shape {
@@ -2153,14 +2202,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         | Some(crate::annotate::Shape::Blur { a, b }) => {
                             (a.0 - b.0).abs() < 3.0 && (a.1 - b.1).abs() < 3.0
                         }
+                        Some(crate::annotate::Shape::Freehand { points }) => {
+                            freehand_length(points) < 3.0
+                        }
                         _ => false,
                     };
                     if degenerate {
                         state.doc_mut().anns.pop();
                     } else {
-                        // One-shot tools: a successful add returns to the
-                        // selector so the next drag moves instead of drawing.
-                        state.tool = None;
+                        // Shapes are one-shot, but Pen stays armed so lifting
+                        // the mouse does not interrupt handwriting or a
+                        // multi-stroke drawing.
+                        if !state.tool.is_some_and(tool_stays_active_after_use) {
+                            state.tool = None;
+                        }
                         state.doc_mut().selected = Some(state.doc_mut().anns.len() - 1);
                     }
                     rebuild_preview(state);
@@ -2368,6 +2423,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.tool = None;
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
+                        } else if state.tool.take().is_some() {
+                            // Esc leaves an armed tool first. A second Esc can
+                            // close the tab, which is especially important for
+                            // the persistent Pen mode.
+                            let _ = InvalidateRect(hwnd, None, false);
                         } else {
                             let active = state.active;
                             close_tab(hwnd, state, active);
@@ -2402,11 +2462,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                     }
-                    // Tool shortcuts (A/R/T/B) and colors (1-4).
+                    // Tool shortcuts (A/R/T/B/P) and colors (1-4).
                     0x41 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(0)), // Arrow
                     0x52 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(2)), // Rectangle
                     0x54 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(5)), // Text
                     0x42 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(6)), // Blur
+                    0x50 if state.doc_mut().editing.is_none() => activate(
+                        hwnd,
+                        state,
+                        Ctl::Tool(PEN_TOOL),
+                    ), // Pen
                     v @ 0x31..=0x34 if state.doc_mut().editing.is_none() => {
                         activate(hwnd, state, Ctl::Color((v - 0x31) as usize))
                     }
@@ -2566,11 +2631,16 @@ fn layout_controls(
     for i in 0..n_styles {
         let row = i as i32 / 2;
         let colm = i as i32 % 2;
+        let x = if n_styles % 2 == 1 && i + 1 == n_styles {
+            col_x + sc(56)
+        } else {
+            col_x + colm * sc(112)
+        };
         controls.push((
             RECT {
-                left: col_x + colm * sc(112),
+                left: x,
                 top: y + row * sc(38),
-                right: col_x + colm * sc(112) + sc(104),
+                right: x + sc(104),
                 bottom: y + row * sc(38) + sc(30),
             },
             Ctl::Matte(i),
@@ -3019,9 +3089,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        active_after_close, annotation_tool_index, apply_text_input, join_words, layout_controls,
-        nearest_word, persist_and_copy_with, preview_draw_geometry, redacted, tab_for_digit, Ctl,
-        FinishError, TextInput,
+        active_after_close, ann_bounds, annotation_tool_index, apply_text_input, freehand_length,
+        join_words, layout_controls, nearest_word, persist_and_copy_with, preview_draw_geometry,
+        redacted, tab_for_digit, tool_stays_active_after_use, translate_ann, Ctl, FinishError,
+        TextInput, ASPECTS, PEN_TOOL, TOOLS,
     };
     use windows::Win32::Foundation::RECT;
 
@@ -3225,6 +3296,73 @@ mod tests {
             6
         );
         assert_eq!(annotation_tool_index(&Shape::Counter { pos: (0.0, 0.0), n: 1 }), 7);
+        assert_eq!(
+            annotation_tool_index(&Shape::Freehand { points: vec![(0.0, 0.0), (1.0, 1.0)] }),
+            8
+        );
+    }
+
+    #[test]
+    fn pen_is_the_only_tool_that_stays_armed_after_a_stroke() {
+        for tool in 0..TOOLS.len() {
+            assert_eq!(tool_stays_active_after_use(tool), tool == PEN_TOOL);
+        }
+    }
+
+    #[test]
+    fn freehand_annotations_keep_their_path_when_moved() {
+        let mut annotation = Annotation {
+            shape: Shape::Freehand {
+                points: vec![(4.0, 8.0), (10.0, 16.0), (20.0, 12.0)],
+            },
+            color: 0,
+            size: 1.0,
+            text_style: TextStyle::Shadow,
+            text_box_opacity: 1.0,
+        };
+
+        assert_eq!(ann_bounds(&annotation), (4.0, 8.0, 20.0, 16.0));
+        assert!(freehand_length(&[(0.0, 0.0), (3.0, 4.0)]) == 5.0);
+
+        translate_ann(&mut annotation, (5.0, -3.0));
+        let Shape::Freehand { points } = annotation.shape else {
+            panic!("freehand shape changed while moving");
+        };
+        assert_eq!(points, vec![(9.0, 5.0), (15.0, 13.0), (25.0, 9.0)]);
+    }
+
+    #[test]
+    fn editor_choice_groups_are_visually_balanced() {
+        let layout = layout_controls(1.0, 1180, 760, 7);
+        let rect_for = |control| {
+            layout
+                .controls
+                .iter()
+                .find(|(_, candidate)| *candidate == control)
+                .map(|(rect, _)| *rect)
+                .unwrap()
+        };
+
+        let first = rect_for(Ctl::Matte(0));
+        let second = rect_for(Ctl::Matte(1));
+        let none = rect_for(Ctl::Matte(6));
+        assert_eq!(none.left + none.right, first.left + second.right);
+
+        let aspects: Vec<_> = layout
+            .controls
+            .iter()
+            .filter(|(_, control)| matches!(control, Ctl::Aspect(_)))
+            .collect();
+        let tools: Vec<_> = layout
+            .controls
+            .iter()
+            .filter(|(_, control)| matches!(control, Ctl::Tool(_)))
+            .collect();
+        assert_eq!(aspects.len(), ASPECTS.len());
+        assert_eq!(tools.len(), TOOLS.len());
+        assert_eq!(aspects.iter().filter(|(rect, _)| rect.top == aspects[0].0.top).count(), 3);
+        assert_eq!(tools.iter().filter(|(rect, _)| rect.top == tools[0].0.top).count(), 3);
+        assert_eq!(tools.iter().filter(|(rect, _)| rect.top == tools[8].0.top).count(), 3);
     }
 
     #[test]

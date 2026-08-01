@@ -1,4 +1,5 @@
-//! Annotation rendering: arrows, boxes, text, pixelate-redaction, drawn on
+//! Annotation rendering: arrows, freehand strokes, boxes, text, and
+//! pixelate-redaction, drawn on
 //! the content layer in raw-image coordinates so they survive framing
 //! changes and export at any scale.
 
@@ -23,6 +24,7 @@ pub const COLORS: [[u8; 3]; 4] = [
 pub enum Shape {
     Arrow { from: (f32, f32), to: (f32, f32) },
     Line { from: (f32, f32), to: (f32, f32) },
+    Freehand { points: Vec<(f32, f32)> },
     Rect { a: (f32, f32), b: (f32, f32) },
     Ellipse { a: (f32, f32), b: (f32, f32) },
     /// Translucent marker fill.
@@ -441,6 +443,11 @@ pub fn render_with_metric(
             Shape::Line { from, to } => {
                 line(img, s(*from), s(*to), stroke, color);
             }
+            Shape::Freehand { points } => {
+                for segment in points.windows(2) {
+                    line(img, s(segment[0]), s(segment[1]), stroke, color);
+                }
+            }
             Shape::Rect { a, b } => {
                 let (pa, pb) = (s(*a), s(*b));
                 let (x0, y0) = (pa.0.min(pb.0), pa.1.min(pb.1));
@@ -530,5 +537,31 @@ pub fn render_with_metric(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{Rgba, RgbaImage};
+
+    use super::{render, Annotation, Shape, TextStyle};
+
+    #[test]
+    fn freehand_strokes_render_every_segment() {
+        let mut image = RgbaImage::from_pixel(64, 64, Rgba([0, 0, 0, 255]));
+        let annotation = Annotation {
+            shape: Shape::Freehand {
+                points: vec![(8.0, 8.0), (32.0, 8.0), (32.0, 40.0)],
+            },
+            color: 0,
+            size: 1.0,
+            text_style: TextStyle::Shadow,
+            text_box_opacity: 1.0,
+        };
+
+        render(&mut image, &[annotation], 1.0, (0.0, 0.0), None);
+
+        assert!(image.get_pixel(20, 8)[0] > 0);
+        assert!(image.get_pixel(32, 28)[0] > 0);
     }
 }
