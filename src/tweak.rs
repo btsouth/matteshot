@@ -1693,10 +1693,20 @@ fn preview_custom_size(state: &mut State) {
     }
 }
 
+fn output_max_edge_after_custom_size_cancel(
+    edit: Option<&CustomSizeEdit>,
+    current: u32,
+) -> u32 {
+    edit.map_or(current, |edit| edit.original_max_edge)
+}
+
 fn cancel_custom_size(state: &mut State) {
-    if let Some(edit) = state.custom_size_edit.take() {
-        state.doc_mut().output_max_edge = edit.original_max_edge;
-    }
+    let restored = output_max_edge_after_custom_size_cancel(
+        state.custom_size_edit.as_ref(),
+        state.doc().output_max_edge,
+    );
+    state.custom_size_edit = None;
+    state.doc_mut().output_max_edge = restored;
 }
 
 fn commit_custom_size(state: &mut State) -> bool {
@@ -1945,7 +1955,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             Ctl::CustomSizeField | Ctl::CustomSizeDone | Ctl::CustomSizeCancel
         )
     {
-        state.custom_size_edit = None;
+        cancel_custom_size(state);
     }
     // Reaching for an annotation tool leaves select-text mode. Matte, padding
     // and aspect are safe to keep it: word boxes live in capture coordinates,
@@ -2289,7 +2299,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         ) && in_rect(rect, x, y)
                     });
                     if !inside_inline_editor {
-                        state.custom_size_edit = None;
+                        cancel_custom_size(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
@@ -3216,10 +3226,10 @@ unsafe fn activate_tab(hwnd: HWND, state: &mut State, index: usize) {
     if index >= state.docs.len() || index == state.active {
         return;
     }
+    cancel_custom_size(state);
     release_inactive(state);
     state.active = index;
     state.tool = None;
-    state.custom_size_edit = None;
     rebuild_preview(state);
     let _ = InvalidateRect(hwnd, None, false);
 }
@@ -3253,6 +3263,7 @@ unsafe fn close_tab(hwnd: HWND, state: &mut State, index: usize) {
     if index >= state.docs.len() {
         return;
     }
+    cancel_custom_size(state);
     state.docs.remove(index);
     if state.docs.is_empty() {
         let _ = DestroyWindow(hwnd);
@@ -3260,7 +3271,6 @@ unsafe fn close_tab(hwnd: HWND, state: &mut State, index: usize) {
     }
     state.active = active_after_close(state.active, index, state.docs.len());
     state.tool = None;
-    state.custom_size_edit = None;
     rebuild_preview(state);
     let _ = InvalidateRect(hwnd, None, false);
 }
@@ -3299,11 +3309,11 @@ pub fn open(
             if let Some(state) = state_of(existing) {
                 // A further capture joins the window as its own tab rather
                 // than replacing what is already being edited.
+                cancel_custom_size(state);
                 release_inactive(state);
                 state.docs.push(document);
                 state.active = state.docs.len() - 1;
                 state.tool = None;
-                state.custom_size_edit = None;
                 rebuild_preview(state);
                 let _ = InvalidateRect(existing, None, false);
             }
@@ -3440,7 +3450,8 @@ mod tests {
         active_after_close, ann_bounds, annotation_tool_index, apply_custom_size_input,
         apply_text_input, custom_size_axis, custom_size_bounds, custom_size_result,
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
-        output_size_summary, preview_draw_geometry, redacted, tab_for_digit,
+        output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
+        redacted, tab_for_digit,
         tool_stays_active_after_use,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
         PEN_TOOL, TOOLS,
@@ -3657,6 +3668,22 @@ mod tests {
         assert_eq!(edit.input, "192");
         assert_eq!(apply_custom_size_input(&mut edit, 'x'), CustomInput::Ignored);
         assert_eq!(apply_custom_size_input(&mut edit, '\r'), CustomInput::Commit);
+    }
+
+    #[test]
+    fn abandoning_custom_size_restores_the_size_from_before_live_preview() {
+        let edit = CustomSizeEdit {
+            input: "1200".into(),
+            replace_on_type: false,
+            invalid: false,
+            original_max_edge: 2712,
+        };
+
+        assert_eq!(
+            output_max_edge_after_custom_size_cancel(Some(&edit), 1200),
+            2712
+        );
+        assert_eq!(output_max_edge_after_custom_size_cancel(None, 1920), 1920);
     }
 
     #[test]
