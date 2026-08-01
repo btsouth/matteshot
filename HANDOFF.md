@@ -5,7 +5,7 @@ Owner: Brandon Tyler South, who goes by **Tyler** (the code-signing certificate
 reads `CN=Brandon South`, which is the legal name and is deliberate — the
 updater pins that exact string). Works in IT/cybersecurity; this is his
 commercial side project. Repo: `tsouth89/matteshot` (private). Everything below
-is current as of v0.11.1.
+is current as of v0.12.0.
 
 ## What this is
 
@@ -40,11 +40,14 @@ Read `README.md` for the full feature map and architecture — it is accurate.
 2. Commit, push, `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. CI produces the signed installer on the GitHub release. Verify locally:
    `Get-AuthenticodeSignature` must be `Valid`, signer `CN=Brandon South`.
-4. Until Brandon adds the `CLOUDFLARE_R2_API_TOKEN` secret to the repo's
-   `release` environment (same token cubby-clipboard uses), upload to R2
-   manually with the wrangler command above — BOTH `MatteshotSetup-X.Y.Z.exe`
-   and the stable `MatteshotSetup.exe`.
-5. Update `public/version.json` in the site repo, deploy, purge zone cache.
+4. R2 publishing is automatic — the `CLOUDFLARE_R2_API_TOKEN` secret exists in
+   the `release` environment. CI uploads both `MatteshotSetup-X.Y.Z.exe` and
+   the stable `MatteshotSetup.exe`, then re-downloads the public URLs and fails
+   the release if an installer and its checksum disagree.
+5. Update `public/version.json` in the site repo and deploy. **`download` must
+   point at the VERSIONED installer**: the stable name is mutable and can be
+   momentarily out of step with its checksum, which would fail every client's
+   hash gate. The custom domain can lag a Pages deploy by ~15s.
 
 **v0.12.0 is fully shipped**: signed, uploaded to R2 (versioned + stable, verified matching its published checksum on the public URL), version.json bumped to 0.12.0 pointing at the versioned installer. Nothing in flight.
 
