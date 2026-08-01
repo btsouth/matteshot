@@ -20,7 +20,8 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT, VK_SPACE,
+    GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
+    VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
@@ -257,8 +258,11 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
     let m = sc(24);
-    let timeline_h = (ch / 6).clamp(sc(88), sc(126));
-    let strip_bottom = ch - sc(112);
+    // Keep the recording itself dominant. The previous layout devoted nearly
+    // half of a maximized 1080p client to header/controls/timeline, which made
+    // precise caption placement needlessly difficult at common DPI scales.
+    let timeline_h = (ch / 9).clamp(sc(64), sc(80));
+    let strip_bottom = ch - sc(80);
     let strip = RECT {
         left: m,
         top: strip_bottom - timeline_h,
@@ -267,9 +271,9 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     };
     let preview = RECT {
         left: m,
-        top: sc(96),
+        top: sc(74),
         right: cw - m,
-        bottom: strip.top - sc(92),
+        bottom: strip.top - sc(76),
     };
     let mut matte_controls = Vec::new();
     if style_count > 0 {
@@ -277,7 +281,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         let gap = sc(7);
         let available = (cw - m - start - gap * (style_count as i32 - 1)).max(style_count as i32);
         let chip_w = available / style_count as i32;
-        let chip_top = preview.bottom + sc(8);
+        let chip_top = preview.bottom + sc(4);
         for i in 0..style_count {
             let left = start + i as i32 * (chip_w + gap);
             matte_controls.push((
@@ -291,7 +295,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
             ));
         }
     }
-    let settings_top = preview.bottom + sc(40);
+    let settings_top = preview.bottom + sc(32);
     let padding_slider = RECT {
         left: m + sc(68),
         top: settings_top,
@@ -1164,9 +1168,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let mut t = wide("Recording editor");
     let mut rc = RECT {
         left: m,
-        top: s(state, 14),
+        top: s(state, 6),
         right: state.width - m,
-        bottom: s(state, 42),
+        bottom: s(state, 28),
     };
     DrawTextW(hdc, &mut t, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
@@ -1175,9 +1179,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let mut sum = wide(&state.summary);
     let mut rc2 = RECT {
         left: m,
-        top: s(state, 44),
+        top: s(state, 28),
         right: state.width - m,
-        bottom: s(state, 66),
+        bottom: s(state, 48),
     };
     DrawTextW(
         hdc,
@@ -1190,9 +1194,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let mut p = wide(&state.mp4.display().to_string());
     let mut rc3 = RECT {
         left: m,
-        top: s(state, 66),
+        top: s(state, 48),
         right: state.width - m,
-        bottom: s(state, 88),
+        bottom: s(state, 68),
     };
     DrawTextW(
         hdc,
@@ -1601,9 +1605,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let mut timeline = wide("TIMELINE");
         let mut timeline_rect = RECT {
             left: strip.left,
-            top: strip.top - s(state, 24),
+            top: strip.top - s(state, 16),
             right: strip.right,
-            bottom: strip.top - s(state, 4),
+            bottom: strip.top - s(state, 2),
         };
         DrawTextW(
             hdc,
@@ -2077,6 +2081,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN => {
             if let Some(state) = state_of(hwnd) {
+                // The editor owns all keyboard-driven caption entry. Restore
+                // focus explicitly on every click so tray/recording teardown
+                // or another foreground transition cannot leave a visible
+                // insertion caret that receives no characters.
+                let _ = SetFocus(hwnd);
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -2578,6 +2587,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDBLCLK => {
             if let Some(state) = state_of(hwnd) {
+                let _ = SetFocus(hwnd);
                 state.dragging = None;
                 let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                 let (x, y) = (
@@ -3011,6 +3021,7 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
             Ok(hwnd) => {
                 crate::theme::apply_titlebar(hwnd, &(*state).theme);
                 let _ = SetForegroundWindow(hwnd);
+                let _ = SetFocus(hwnd);
             }
             Err(_) => drop(Box::from_raw(state)),
         }
@@ -3020,8 +3031,21 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{available_export_path, NEXT_EXPORT_ID};
+    use super::{available_export_path, layout, NEXT_EXPORT_ID};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn maximized_1080p_layout_keeps_the_preview_dominant() {
+        // A 1920x1080 display at 125% scaling leaves roughly a 1000px client
+        // after the title bar/taskbar. Caption placement should still get the
+        // majority of that height rather than a postage-stamp preview.
+        let window = layout(1.25, 1920, 1000, 7);
+        let preview_h = window.preview.bottom - window.preview.top;
+        let timeline_h = window.strip.bottom - window.strip.top;
+        assert!(preview_h >= 600, "preview was only {preview_h}px tall");
+        assert!(preview_h >= timeline_h * 6);
+        assert!(window.padding_slider.bottom <= window.strip.top - 20);
+    }
 
     #[test]
     fn exports_never_overwrite_an_existing_edit() {
