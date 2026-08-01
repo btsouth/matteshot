@@ -168,16 +168,23 @@ fn previews_for(raw: &RgbaImage, styles: &[style::Style]) -> Vec<RgbaImage> {
 fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Result<()> {
     // Loaded fresh each capture so settings changes apply immediately.
     let cfg = Config::load();
+    // Names the editor tab, so it is taken before the pixels are.
+    let mut capture_title;
     let raw = match source {
         Source::Window(hwnd) => {
-            eprintln!("capturing: {}", window::title_of(hwnd));
+            capture_title = window::title_of(hwnd);
+            eprintln!("capturing: {capture_title}");
             capture::capture_window(hwnd).context("capture failed")?
         }
         Source::Image(img) => {
+            capture_title = format!("Region {}\u{00d7}{}", img.width(), img.height());
             eprintln!("capturing: region {}x{}", img.width(), img.height());
             img
         }
     };
+    if capture_title.trim().is_empty() {
+        capture_title = format!("Capture {}\u{00d7}{}", raw.width(), raw.height());
+    }
     // A successful window or region capture starts the trial regardless of
     // which picker action follows. This includes the zero-touch auto-copy
     // path, Esc (where auto-copy stands), OCR, pinning, and the tweak editor.
@@ -280,7 +287,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             // while it is open is now just another capture: the hotkey reaches
             // the resident's loop as normal instead of tearing down the
             // editor and replaying a reshoot through here.
-            return tweak::open(raw, styles, i, monitor);
+            return tweak::open(raw, styles, i, monitor, capture_title);
         }
         PickAction::Reshoot(sel, mon) => {
             // PrtScn mid-pick: the user re-snipped; replace the pending shot
@@ -732,7 +739,8 @@ fn main() -> Result<()> {
                 let raw = capture::capture_window(hwnd).context("capture failed")?;
                 license::record_successful_capture();
                 let styles = style::variants(&raw);
-                tweak::open(raw, styles, 0, mon)?;
+                let title = window::title_of(hwnd);
+                tweak::open(raw, styles, 0, mon, title)?;
                 // The editor no longer owns a loop of its own, so this
                 // standalone probe has to pump one until the window closes.
                 pump_until_closed(tweak::is_open);
@@ -741,6 +749,28 @@ fn main() -> Result<()> {
                 let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
                 shoot(Source::Window(hwnd), mon, pick_override)
             }
+        }
+        // Open several captures as tabs in one editor (testing). Each argument
+        // is a window title substring.
+        Some("--tweak-tabs-test") => {
+            require_capture_license()?;
+            let needles: Vec<&String> = args[1..].iter().collect();
+            if needles.is_empty() {
+                bail!("--tweak-tabs-test needs one or more window title substrings");
+            }
+            for needle in needles {
+                let hwnd = window::find_by_title(needle)
+                    .with_context(|| format!("no visible window matching {needle:?}"))?;
+                let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
+                let raw = capture::capture_window(hwnd).context("capture failed")?;
+                license::record_successful_capture();
+                let styles = style::variants(&raw);
+                let title = window::title_of(hwnd);
+                eprintln!("tab: {title}");
+                tweak::open(raw, styles, 0, mon, title)?;
+            }
+            pump_until_closed(tweak::is_open);
+            Ok(())
         }
         // Warm-path capture benchmark: same window three times in-process.
         Some("--bench") => {
