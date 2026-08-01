@@ -106,6 +106,7 @@ enum Drag {
     Playhead,
     Padding,
     CaptionSize,
+    CaptionOpacity,
     Draw { index: usize, start: (f32, f32) },
     Move { index: usize, last: (f32, f32) },
 }
@@ -126,6 +127,7 @@ struct WindowLayout {
     color_controls: Vec<(RECT, usize)>,
     size_controls: Vec<(RECT, usize)>,
     caption_size_slider: RECT,
+    caption_opacity_slider: RECT,
     caption_style_controls: Vec<(RECT, crate::video_edit::CaptionStyle)>,
     timing_controls: Vec<(RECT, TimingChoice)>,
     undo_control: RECT,
@@ -176,12 +178,14 @@ struct State {
     size_idx: usize,
     caption_size: f32,
     caption_style: crate::video_edit::CaptionStyle,
+    caption_box_opacity: f32,
     text_entry: Option<TextEntry>,
     add_control: RECT,
     tool_controls: Vec<(RECT, Tool, &'static str)>,
     color_controls: Vec<(RECT, usize)>,
     size_controls: Vec<(RECT, usize)>,
     caption_size_slider: RECT,
+    caption_opacity_slider: RECT,
     caption_style_controls: Vec<(RECT, crate::video_edit::CaptionStyle)>,
     timing_controls: Vec<(RECT, TimingChoice)>,
     undo_control: RECT,
@@ -406,6 +410,12 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         right: panel_left + sc(190),
         bottom: panel_top + sc(114),
     };
+    let caption_opacity_slider = RECT {
+        left: panel_left + sc(92),
+        top: panel_top + sc(122),
+        right: panel_left + sc(190),
+        bottom: panel_top + sc(148),
+    };
     let caption_style_controls = vec![
         (
             RECT {
@@ -430,18 +440,18 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         (
             RECT {
                 left: panel_left + sc(90),
-                top: panel_top + sc(124),
+                top: panel_top + sc(158),
                 right: panel_left + sc(214),
-                bottom: panel_top + sc(152),
+                bottom: panel_top + sc(186),
             },
             TimingChoice::WholeVideo,
         ),
         (
             RECT {
                 left: panel_left + sc(222),
-                top: panel_top + sc(124),
+                top: panel_top + sc(158),
                 right: panel_left + sc(372),
-                bottom: panel_top + sc(152),
+                bottom: panel_top + sc(186),
             },
             TimingChoice::ThreeSeconds,
         ),
@@ -468,6 +478,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         color_controls,
         size_controls,
         caption_size_slider,
+        caption_opacity_slider,
         caption_style_controls,
         timing_controls,
         undo_control,
@@ -612,6 +623,7 @@ fn recompose_preview(state: &mut State) {
             color: state.color_idx,
             size: state.caption_size,
             caption_style: state.caption_style,
+            caption_box_opacity: state.caption_box_opacity,
         };
         crate::video_edit::render_one_at(&mut image, &draft, content_size, content_offset);
     }
@@ -822,6 +834,27 @@ fn update_caption_size(state: &mut State, x: i32) {
     recompose_preview(state);
 }
 
+fn update_caption_opacity(state: &mut State, x: i32) {
+    let slider = state.caption_opacity_slider;
+    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32)
+        .clamp(0.0, 1.0);
+    // Keep the plate useful at the low end while still offering a light,
+    // glassy treatment. Zero opacity is already available via Shadow style.
+    state.caption_box_opacity = 0.20 + t * 0.75;
+    if let Some(index) = state
+        .selected
+        .filter(|index| *index < state.annotations.len())
+    {
+        if matches!(
+            state.annotations[index].shape,
+            crate::video_edit::Shape::Text { .. }
+        ) {
+            state.annotations[index].caption_box_opacity = state.caption_box_opacity;
+        }
+    }
+    recompose_preview(state);
+}
+
 fn sync_selected_controls(state: &mut State, index: usize) {
     let Some(item) = state.annotations.get(index) else {
         return;
@@ -830,6 +863,7 @@ fn sync_selected_controls(state: &mut State, index: usize) {
     if matches!(item.shape, crate::video_edit::Shape::Text { .. }) {
         state.caption_size = item.size;
         state.caption_style = item.caption_style;
+        state.caption_box_opacity = item.caption_box_opacity;
     } else {
         state.size_idx = if item.size < 0.91 {
             0
@@ -920,14 +954,24 @@ fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
     ))
 }
 
+fn annotation_content_size(state: &State) -> (u32, u32) {
+    state
+        .preview_raw
+        .as_ref()
+        .map(|frame| (frame.1.max(1), frame.2.max(1)))
+        .unwrap_or((1920, 1080))
+}
+
 fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
+    let content_size = annotation_content_size(state);
     state
         .annotations
         .iter()
         .enumerate()
         .rev()
         .find(|(_, item)| {
-            item.active_at(state.playhead) && crate::video_edit::hit(item, point, 0.018)
+            item.active_at(state.playhead)
+                && crate::video_edit::hit(item, point, 0.018, content_size)
         })
         .map(|(index, _)| index)
 }
@@ -944,7 +988,7 @@ fn tool_panel(state: &State) -> RECT {
         .unwrap_or(state.add_control.bottom);
     let mut bottom = state.delete_control.bottom + s(state, 10);
     if caption_controls_active(state) {
-        bottom = bottom.max(state.caption_size_slider.bottom + s(state, 10));
+        bottom = bottom.max(state.caption_opacity_slider.bottom + s(state, 10));
     }
     if state.selected.is_some() {
         bottom = bottom.max(
@@ -1008,6 +1052,7 @@ fn commit_text(state: &mut State) {
         color: state.color_idx,
         size: state.caption_size,
         caption_style: state.caption_style,
+        caption_box_opacity: state.caption_box_opacity,
     };
     if let Some(index) = entry
         .editing
@@ -1216,7 +1261,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
             if item.active_at(state.playhead) {
                 let image_rect = preview_content_rect(state)
                     .unwrap_or_else(|| preview_image_rect(state, frame));
-                let (x0, y0, x1, y1) = crate::video_edit::bounds(item);
+                let (x0, y0, x1, y1) =
+                    crate::video_edit::bounds(item, annotation_content_size(state));
                 let map_x = |x: f32| {
                     image_rect.left
                         + (x.clamp(0.0, 1.0) * (image_rect.right - image_rect.left) as f32) as i32
@@ -1364,6 +1410,68 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     state,
                 );
             }
+
+            let opacity_active = state.caption_style == crate::video_edit::CaptionStyle::Box;
+            SetTextColor(
+                hdc,
+                if opacity_active {
+                    state.theme.muted
+                } else {
+                    state.theme.faint
+                },
+            );
+            let mut opacity_label = wide(&format!(
+                "Box {}%",
+                (state.caption_box_opacity * 100.0).round() as i32
+            ));
+            let mut opacity_rect = RECT {
+                left: tool_panel(state).left + s(state, 12),
+                top: state.caption_opacity_slider.top,
+                right: state.caption_opacity_slider.left - s(state, 6),
+                bottom: state.caption_opacity_slider.bottom,
+            };
+            DrawTextW(
+                hdc,
+                &mut opacity_label,
+                &mut opacity_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+            let slider = state.caption_opacity_slider;
+            let cy = (slider.top + slider.bottom) / 2;
+            let track = CreateSolidBrush(state.theme.track);
+            FillRect(
+                hdc,
+                &RECT {
+                    left: slider.left,
+                    top: cy - s(state, 2),
+                    right: slider.right,
+                    bottom: cy + s(state, 2),
+                },
+                track,
+            );
+            let _ = DeleteObject(track);
+            let t = ((state.caption_box_opacity - 0.20) / 0.75).clamp(0.0, 1.0);
+            let thumb_x = slider.left + ((slider.right - slider.left) as f32 * t) as i32;
+            let fill = CreateSolidBrush(if opacity_active {
+                state.theme.accent
+            } else {
+                state.theme.chip_line
+            });
+            FillRect(
+                hdc,
+                &RECT {
+                    left: slider.left,
+                    top: cy - s(state, 2),
+                    right: thumb_x,
+                    bottom: cy + s(state, 2),
+                },
+                fill,
+            );
+            let old = SelectObject(hdc, fill);
+            let r = s(state, 6);
+            let _ = RoundRect(hdc, thumb_x - r, cy - r, thumb_x + r, cy + r, r * 2, r * 2);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(fill);
         } else {
             for (rect, index) in &state.size_controls {
                 paint_chip(
@@ -2027,6 +2135,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Drag::Playhead => set_playhead(state, x),
                         Drag::Padding => update_padding(state, x),
                         Drag::CaptionSize => update_caption_size(state, x),
+                        Drag::CaptionOpacity => update_caption_opacity(state, x),
                         Drag::Draw { index, start } => {
                             if let Some(point) = screen_to_preview(state, x, y) {
                                 if let Some(item) = state.annotations.get_mut(index) {
@@ -2051,11 +2160,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         Drag::Move { index, last } => {
                             if let Some(point) = screen_to_preview(state, x, y) {
+                                let content_size = annotation_content_size(state);
                                 if let Some(item) = state.annotations.get_mut(index) {
                                     crate::video_edit::translate(
                                         item,
                                         point.0 - last.0,
                                         point.1 - last.1,
+                                        content_size,
                                     );
                                 }
                                 state.dragging = Some(Drag::Move { index, last: point });
@@ -2164,6 +2275,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
+                    if caption_controls_active(state)
+                        && state.caption_style == crate::video_edit::CaptionStyle::Box
+                        && contains(state.caption_opacity_slider, x, y)
+                    {
+                        stop_playback(state);
+                        if state.selected.is_some() {
+                            push_undo(state);
+                        }
+                        state.dragging = Some(Drag::CaptionOpacity);
+                        update_caption_opacity(state, x);
+                        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
                     if caption_controls_active(state) {
                         if let Some((_, style)) = state
                             .caption_style_controls
@@ -2259,6 +2384,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 color: state.color_idx,
                                 size: current_size(state),
                                 caption_style: crate::video_edit::CaptionStyle::Shadow,
+                                caption_box_opacity: state.caption_box_opacity,
                             });
                             let index = state.annotations.len() - 1;
                             state.selected = Some(index);
@@ -2349,7 +2475,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         if let Drag::Draw { index, .. } = drag {
                             if let Some(item) = state.annotations.get(index) {
-                                let (x0, y0, x1, y1) = crate::video_edit::bounds(item);
+                                let (x0, y0, x1, y1) = crate::video_edit::bounds(
+                                    item,
+                                    annotation_content_size(state),
+                                );
                                 if (x1 - x0).hypot(y1 - y0) < 0.008 {
                                     state.annotations.remove(index);
                                     state.selected = None;
@@ -2604,6 +2733,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.color_idx = state.annotations[index].color;
                             state.caption_size = state.annotations[index].size;
                             state.caption_style = state.annotations[index].caption_style;
+                            state.caption_box_opacity =
+                                state.annotations[index].caption_box_opacity;
                             state.selected = Some(index);
                             state.text_entry = Some(TextEntry {
                                 pos,
@@ -2743,6 +2874,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.color_controls = next.color_controls;
                     state.size_controls = next.size_controls;
                     state.caption_size_slider = next.caption_size_slider;
+                    state.caption_opacity_slider = next.caption_opacity_slider;
                     state.caption_style_controls = next.caption_style_controls;
                     state.timing_controls = next.timing_controls;
                     state.undo_control = next.undo_control;
@@ -2954,12 +3086,14 @@ pub fn show(mp4: PathBuf, gif: Option<PathBuf>, frames: u32, secs: u64) -> Resul
         size_idx: 1,
         caption_size: 1.75,
         caption_style: crate::video_edit::CaptionStyle::Box,
+        caption_box_opacity: 0.68,
         text_entry: None,
         add_control: initial.add_control,
         tool_controls: initial.tool_controls,
         color_controls: initial.color_controls,
         size_controls: initial.size_controls,
         caption_size_slider: initial.caption_size_slider,
+        caption_opacity_slider: initial.caption_opacity_slider,
         caption_style_controls: initial.caption_style_controls,
         timing_controls: initial.timing_controls,
         undo_control: initial.undo_control,
@@ -3045,6 +3179,8 @@ mod tests {
         assert!(preview_h >= 600, "preview was only {preview_h}px tall");
         assert!(preview_h >= timeline_h * 6);
         assert!(window.padding_slider.bottom <= window.strip.top - 20);
+        assert!(window.caption_size_slider.bottom < window.caption_opacity_slider.top);
+        assert!(window.caption_opacity_slider.bottom < window.timing_controls[0].0.top);
     }
 
     #[test]

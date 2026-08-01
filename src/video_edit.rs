@@ -25,6 +25,7 @@ pub struct Item {
     pub color: usize,
     pub size: f32,
     pub caption_style: CaptionStyle,
+    pub caption_box_opacity: f32,
 }
 
 impl Item {
@@ -81,13 +82,17 @@ pub fn render_at(
     }
 }
 
+fn metric_scale(content_size: (u32, u32)) -> f32 {
+    (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0)
+}
+
 pub fn render_one_at(
     image: &mut RgbaImage,
     item: &Item,
     content_size: (u32, u32),
     offset: (f32, f32),
 ) {
-    let metric_scale = (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0);
+    let metric_scale = metric_scale(content_size);
     if let Shape::Text { pos, text } = &item.shape {
         crate::annotate::render_caption(
             image,
@@ -99,6 +104,7 @@ pub fn render_one_at(
                 metric_scale,
                 offset,
                 boxed: item.caption_style == CaptionStyle::Box,
+                box_opacity: item.caption_box_opacity,
             },
         );
         return;
@@ -113,7 +119,7 @@ pub fn render_one_at(
     );
 }
 
-pub fn bounds(item: &Item) -> (f32, f32, f32, f32) {
+pub fn bounds(item: &Item, content_size: (u32, u32)) -> (f32, f32, f32, f32) {
     match &item.shape {
         Shape::Arrow { from, to } => (
             from.0.min(to.0),
@@ -125,22 +131,23 @@ pub fn bounds(item: &Item) -> (f32, f32, f32, f32) {
             (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
         }
         Shape::Text { pos, text } => {
-            // Caption glyphs are sized from video height. The earlier generic
-            // estimate treated every character as a percentage of video
-            // width, producing selection boxes several times wider than the
-            // rendered caption on landscape footage.
-            let width = (text.chars().count() as f32 * 0.0055 * item.size).clamp(0.04, 0.62);
-            let height = 0.035 * item.size;
-            let pad = if item.caption_style == CaptionStyle::Box {
-                0.006 * item.size
-            } else {
-                0.003 * item.size
-            };
+            let (width, height) = crate::annotate::caption_text_size(
+                text,
+                item.size,
+                metric_scale(content_size),
+            )
+            .map(|(width, height)| {
+                (
+                    width as f32 / content_size.0.max(1) as f32,
+                    height as f32 / content_size.1.max(1) as f32,
+                )
+            })
+            .unwrap_or((0.04, 0.035 * item.size));
             (
-                (pos.0 - pad).max(0.0),
-                (pos.1 - pad).max(0.0),
-                (pos.0 + width + pad).min(1.0),
-                (pos.1 + height + pad).min(1.0),
+                pos.0.max(0.0),
+                pos.1.max(0.0),
+                (pos.0 + width).min(1.0),
+                (pos.1 + height).min(1.0),
             )
         }
     }
@@ -158,18 +165,23 @@ fn distance_to_segment(point: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     ((point.0 - nearest.0).powi(2) + (point.1 - nearest.1).powi(2)).sqrt()
 }
 
-pub fn hit(item: &Item, point: (f32, f32), tolerance: f32) -> bool {
+pub fn hit(
+    item: &Item,
+    point: (f32, f32),
+    tolerance: f32,
+    content_size: (u32, u32),
+) -> bool {
     match &item.shape {
         Shape::Arrow { from, to } => distance_to_segment(point, *from, *to) <= tolerance,
         Shape::Blur { .. } | Shape::Text { .. } => {
-            let (x0, y0, x1, y1) = bounds(item);
+            let (x0, y0, x1, y1) = bounds(item, content_size);
             point.0 >= x0 - tolerance
                 && point.0 <= x1 + tolerance
                 && point.1 >= y0 - tolerance
                 && point.1 <= y1 + tolerance
         }
         Shape::Rect { .. } => {
-            let (x0, y0, x1, y1) = bounds(item);
+            let (x0, y0, x1, y1) = bounds(item, content_size);
             let inside = point.0 >= x0 - tolerance
                 && point.0 <= x1 + tolerance
                 && point.1 >= y0 - tolerance
@@ -184,8 +196,8 @@ pub fn hit(item: &Item, point: (f32, f32), tolerance: f32) -> bool {
     }
 }
 
-pub fn translate(item: &mut Item, dx: f32, dy: f32) {
-    let (x0, y0, x1, y1) = bounds(item);
+pub fn translate(item: &mut Item, dx: f32, dy: f32, content_size: (u32, u32)) {
+    let (x0, y0, x1, y1) = bounds(item, content_size);
     let dx = dx.clamp(-x0, 1.0 - x1);
     let dy = dy.clamp(-y0, 1.0 - y1);
     let move_point = |point: &mut (f32, f32)| {
@@ -207,7 +219,7 @@ pub fn translate(item: &mut Item, dx: f32, dy: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounds, hit, render_at, translate, CaptionStyle, Item, Shape};
+    use super::{bounds, hit, metric_scale, render_at, translate, CaptionStyle, Item, Shape};
     use image::{Rgba, RgbaImage};
 
     fn arrow() -> Item {
@@ -221,6 +233,7 @@ mod tests {
             color: 0,
             size: 1.0,
             caption_style: CaptionStyle::Shadow,
+            caption_box_opacity: 0.68,
         }
     }
 
@@ -236,10 +249,10 @@ mod tests {
     #[test]
     fn arrow_hit_testing_and_translation_use_normalized_space() {
         let mut item = arrow();
-        assert!(hit(&item, (0.3, 0.4), 0.01));
-        assert!(!hit(&item, (0.8, 0.2), 0.01));
-        translate(&mut item, 0.7, 0.7);
-        let (x0, y0, x1, y1) = bounds(&item);
+        assert!(hit(&item, (0.3, 0.4), 0.01, (1920, 1080)));
+        assert!(!hit(&item, (0.8, 0.2), 0.01, (1920, 1080)));
+        translate(&mut item, 0.7, 0.7, (1920, 1080));
+        let (x0, y0, x1, y1) = bounds(&item, (1920, 1080));
         for (actual, expected) in [x0, y0, x1, y1].into_iter().zip([0.6, 0.6, 1.0, 1.0]) {
             assert!((actual - expected).abs() < 0.00001);
         }
@@ -257,6 +270,7 @@ mod tests {
             color: 0,
             size: 1.0,
             caption_style: CaptionStyle::Shadow,
+            caption_box_opacity: 0.68,
         };
         let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
         render_at(&mut image, &[item], 10, None, (100, 100), (50.0, 50.0));
@@ -284,6 +298,7 @@ mod tests {
             color: 0,
             size: 1.0,
             caption_style: CaptionStyle::Shadow,
+            caption_box_opacity: 0.68,
         };
         let mut image = RgbaImage::from_pixel(1200, 600, Rgba([0, 0, 0, 255]));
         render_at(
@@ -320,6 +335,7 @@ mod tests {
             color: 3,
             size: 2.0,
             caption_style: CaptionStyle::Box,
+            caption_box_opacity: 0.68,
         };
         render_at(
             &mut boxed,
@@ -338,6 +354,64 @@ mod tests {
     }
 
     #[test]
+    fn caption_selection_bounds_match_the_rendered_text_metrics() {
+        let content_size = (1920, 1036);
+        let item = Item {
+            shape: Shape::Text {
+                pos: (0.15, 0.2),
+                text: "BATTLE".into(),
+            },
+            start: 0,
+            end: 20,
+            color: 3,
+            size: 3.4,
+            caption_style: CaptionStyle::Box,
+            caption_box_opacity: 0.68,
+        };
+        let (x0, y0, x1, y1) = bounds(&item, content_size);
+        let (text_w, text_h) = crate::annotate::caption_text_size(
+            "BATTLE",
+            item.size,
+            metric_scale(content_size),
+        )
+        .expect("caption metrics");
+        assert!(((x1 - x0) * content_size.0 as f32 - text_w as f32).abs() < 1.0);
+        assert!(((y1 - y0) * content_size.1 as f32 - text_h as f32).abs() < 1.0);
+    }
+
+    #[test]
+    fn caption_box_opacity_changes_only_the_plate_strength() {
+        let background = RgbaImage::from_pixel(400, 200, Rgba([230, 230, 230, 255]));
+        let mut light = background.clone();
+        let mut solid = background;
+        let mut item = Item {
+            shape: Shape::Text {
+                pos: (0.25, 0.25),
+                text: "Caption".into(),
+            },
+            start: 0,
+            end: 20,
+            color: 3,
+            size: 2.0,
+            caption_style: CaptionStyle::Box,
+            caption_box_opacity: 0.25,
+        };
+        render_at(
+            &mut light,
+            std::slice::from_ref(&item),
+            10,
+            None,
+            (400, 200),
+            (0.0, 0.0),
+        );
+        item.caption_box_opacity = 0.90;
+        render_at(&mut solid, &[item], 10, None, (400, 200), (0.0, 0.0));
+
+        // This pixel sits on the plate padding, outside the caption glyphs.
+        assert!(solid.get_pixel(95, 52)[0] < light.get_pixel(95, 52)[0]);
+    }
+
+    #[test]
     fn caption_can_be_moved_repeatedly_without_losing_its_position() {
         let mut item = Item {
             shape: Shape::Text {
@@ -349,9 +423,10 @@ mod tests {
             color: 3,
             size: 1.75,
             caption_style: CaptionStyle::Box,
+            caption_box_opacity: 0.68,
         };
-        translate(&mut item, 0.15, 0.1);
-        translate(&mut item, 0.1, 0.2);
+        translate(&mut item, 0.15, 0.1, (1920, 1080));
+        translate(&mut item, 0.1, 0.2, (1920, 1080));
         let Shape::Text { pos, .. } = item.shape else {
             panic!("caption changed shape");
         };

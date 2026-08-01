@@ -251,6 +251,21 @@ pub fn render(
     render_with_metric(img, anns, scale, scale, offset, caret);
 }
 
+/// Return the exact pixel box produced by the caption rasterizer. Selection,
+/// hit testing, and rendering all use this measurement so the editor outline
+/// cannot drift away from the text it represents.
+pub(crate) fn caption_text_size(
+    text: &str,
+    size: f32,
+    metric_scale: f32,
+) -> Option<(i32, i32)> {
+    if text.is_empty() {
+        return None;
+    }
+    let px_h = (24.0 * metric_scale * size).max(12.0) as i32;
+    raster_text(text, px_h).map(|(_, width, height)| (width, height))
+}
+
 fn rounded_plate(
     img: &mut RgbaImage,
     left: i32,
@@ -258,6 +273,7 @@ fn rounded_plate(
     right: i32,
     bottom: i32,
     radius: f32,
+    opacity: f32,
 ) {
     let width = (right - left).max(1) as f32;
     let height = (bottom - top).max(1) as f32;
@@ -272,7 +288,13 @@ fn rounded_plate(
                 + qx.max(qy).min(0.0)
                 - radius;
             let coverage = (0.5 - distance).clamp(0.0, 1.0);
-            blend(img, x, y, [12, 14, 20], coverage * 0.82);
+            blend(
+                img,
+                x,
+                y,
+                [12, 14, 20],
+                coverage * opacity.clamp(0.0, 1.0),
+            );
         }
     }
 }
@@ -286,6 +308,7 @@ pub struct CaptionOptions {
     pub metric_scale: f32,
     pub offset: (f32, f32),
     pub boxed: bool,
+    pub box_opacity: f32,
 }
 
 pub fn render_caption(
@@ -305,32 +328,53 @@ pub fn render_caption(
     let ox = (pos.0 + options.offset.0) as i32;
     let oy = (pos.1 + options.offset.1) as i32;
     if options.boxed {
-        let pad_x = (px_h as f32 * 0.42).round() as i32;
-        let pad_y = (px_h as f32 * 0.24).round() as i32;
+        // A compact plate reads like modern UI instead of a large subtitle
+        // banner. Opacity is user-controlled by the video editor.
+        let pad_x = (px_h as f32 * 0.30).round() as i32;
+        let pad_y = (px_h as f32 * 0.16).round() as i32;
         rounded_plate(
             img,
             ox - pad_x,
             oy - pad_y,
             ox + tw + pad_x,
             oy + th + pad_y,
-            px_h as f32 * 0.34,
+            px_h as f32 * 0.24,
+            options.box_opacity,
         );
     }
-    let shadow = (options.metric_scale * options.size * 2.0)
-        .round()
-        .clamp(1.0, 5.0) as i32;
+    let shadow = if options.boxed {
+        (options.metric_scale * options.size)
+            .round()
+            .clamp(1.0, 3.0) as i32
+    } else {
+        (options.metric_scale * options.size * 2.0)
+            .round()
+            .clamp(1.0, 5.0) as i32
+    };
+    let shadow_offsets: &[(i32, i32)] = if options.boxed {
+        &[(0, shadow), (shadow / 2, shadow)]
+    } else {
+        &[
+            (-shadow, 0),
+            (shadow, 0),
+            (0, -shadow),
+            (0, shadow),
+            (shadow, shadow),
+        ]
+    };
+    let shadow_alpha = if options.boxed { 0.46 } else { 0.72 };
     for y in 0..th {
         for x in 0..tw {
             let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
             if a > 0.0 {
-                for (nx, ny) in [
-                    (-shadow, 0),
-                    (shadow, 0),
-                    (0, -shadow),
-                    (0, shadow),
-                    (shadow, shadow),
-                ] {
-                    blend(img, ox + x + nx, oy + y + ny, [8, 9, 13], a * 0.72);
+                for (nx, ny) in shadow_offsets {
+                    blend(
+                        img,
+                        ox + x + *nx,
+                        oy + y + *ny,
+                        [8, 9, 13],
+                        a * shadow_alpha,
+                    );
                 }
             }
         }
