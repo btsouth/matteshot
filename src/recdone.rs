@@ -94,11 +94,28 @@ enum Handle {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Tool {
-    Text,
     Arrow,
+    Line,
     Rect,
+    Ellipse,
+    Highlight,
+    Text,
     Blur,
+    Counter,
+    Pen,
 }
+
+const VIDEO_TOOLS: [(Tool, &str); 9] = [
+    (Tool::Arrow, "Arrow"),
+    (Tool::Line, "Line"),
+    (Tool::Rect, "Box"),
+    (Tool::Ellipse, "Oval"),
+    (Tool::Highlight, "Mark"),
+    (Tool::Text, "Text"),
+    (Tool::Blur, "Blur"),
+    (Tool::Counter, "Step"),
+    (Tool::Pen, "Pen"),
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum TimingChoice {
@@ -113,7 +130,11 @@ enum Drag {
     Padding,
     CaptionSize,
     CaptionOpacity,
-    Draw { index: usize, start: (f32, f32) },
+    Draw {
+        index: usize,
+        start: (f32, f32),
+        tool: Tool,
+    },
     Move {
         index: usize,
         last: (f32, f32),
@@ -395,22 +416,17 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     let panel_left = preview.right - sc(382);
     let panel_top = add_control.bottom + sc(8);
     let mut tool_controls = Vec::new();
-    for (index, (tool, label)) in [
-        (Tool::Text, "Text"),
-        (Tool::Arrow, "Arrow"),
-        (Tool::Rect, "Box"),
-        (Tool::Blur, "Blur"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let left = panel_left + sc(10) + index as i32 * sc(76);
+    for (index, (tool, label)) in VIDEO_TOOLS.into_iter().enumerate() {
+        let column = index as i32 % 3;
+        let row = index as i32 / 3;
+        let left = panel_left + sc(10) + column * sc(122);
+        let top = panel_top + sc(10) + row * sc(34);
         tool_controls.push((
             RECT {
                 left,
-                top: panel_top + sc(10),
-                right: left + sc(68),
-                bottom: panel_top + sc(38),
+                top,
+                right: left + sc(114),
+                bottom: top + sc(28),
             },
             tool,
             label,
@@ -422,9 +438,9 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         color_controls.push((
             RECT {
                 left,
-                top: panel_top + sc(52),
+                top: panel_top + sc(116),
                 right: left + sc(22),
-                bottom: panel_top + sc(74),
+                bottom: panel_top + sc(138),
             },
             index,
         ));
@@ -435,41 +451,41 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         size_controls.push((
             RECT {
                 left,
-                top: panel_top + sc(50),
+                top: panel_top + sc(114),
                 right: left + sc(28),
-                bottom: panel_top + sc(76),
+                bottom: panel_top + sc(140),
             },
             index,
         ));
     }
     let caption_size_slider = RECT {
         left: panel_left + sc(58),
-        top: panel_top + sc(88),
+        top: panel_top + sc(152),
         right: panel_left + sc(190),
-        bottom: panel_top + sc(114),
+        bottom: panel_top + sc(178),
     };
     let caption_opacity_slider = RECT {
         left: panel_left + sc(92),
-        top: panel_top + sc(122),
+        top: panel_top + sc(186),
         right: panel_left + sc(190),
-        bottom: panel_top + sc(148),
+        bottom: panel_top + sc(212),
     };
     let caption_style_controls = vec![
         (
             RECT {
                 left: panel_left + sc(206),
-                top: panel_top + sc(88),
+                top: panel_top + sc(152),
                 right: panel_left + sc(278),
-                bottom: panel_top + sc(114),
+                bottom: panel_top + sc(178),
             },
             crate::video_edit::CaptionStyle::Shadow,
         ),
         (
             RECT {
                 left: panel_left + sc(286),
-                top: panel_top + sc(88),
+                top: panel_top + sc(152),
                 right: panel_left + sc(372),
-                bottom: panel_top + sc(114),
+                bottom: panel_top + sc(178),
             },
             crate::video_edit::CaptionStyle::Box,
         ),
@@ -478,33 +494,33 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         (
             RECT {
                 left: panel_left + sc(90),
-                top: panel_top + sc(158),
+                top: panel_top + sc(222),
                 right: panel_left + sc(214),
-                bottom: panel_top + sc(186),
+                bottom: panel_top + sc(250),
             },
             TimingChoice::WholeVideo,
         ),
         (
             RECT {
                 left: panel_left + sc(222),
-                top: panel_top + sc(158),
+                top: panel_top + sc(222),
                 right: panel_left + sc(372),
-                bottom: panel_top + sc(186),
+                bottom: panel_top + sc(250),
             },
             TimingChoice::ThreeSeconds,
         ),
     ];
     let undo_control = RECT {
         left: panel_left + sc(254),
-        top: panel_top + sc(50),
+        top: panel_top + sc(114),
         right: panel_left + sc(308),
-        bottom: panel_top + sc(76),
+        bottom: panel_top + sc(140),
     };
     let delete_control = RECT {
         left: panel_left + sc(314),
-        top: panel_top + sc(50),
+        top: panel_top + sc(114),
         right: panel_left + sc(372),
-        bottom: panel_top + sc(76),
+        bottom: panel_top + sc(140),
     };
     WindowLayout {
         controls,
@@ -1149,9 +1165,103 @@ fn shape_for_tool(tool: Tool, start: (f32, f32)) -> crate::video_edit::Shape {
             from: start,
             to: start,
         },
+        Tool::Line => crate::video_edit::Shape::Line {
+            from: start,
+            to: start,
+        },
         Tool::Rect => crate::video_edit::Shape::Rect { a: start, b: start },
+        Tool::Ellipse => crate::video_edit::Shape::Ellipse { a: start, b: start },
+        Tool::Highlight => crate::video_edit::Shape::Highlight { a: start, b: start },
         Tool::Blur => crate::video_edit::Shape::Blur { a: start, b: start },
-        Tool::Text => unreachable!("text uses direct entry"),
+        Tool::Pen => crate::video_edit::Shape::Freehand {
+            points: vec![start],
+        },
+        Tool::Text | Tool::Counter => unreachable!("click tools use direct placement"),
+    }
+}
+
+fn update_draw_shape(
+    shape: &mut crate::video_edit::Shape,
+    start: (f32, f32),
+    point: (f32, f32),
+) {
+    match shape {
+        crate::video_edit::Shape::Arrow { from, to }
+        | crate::video_edit::Shape::Line { from, to } => {
+            *from = start;
+            *to = point;
+        }
+        crate::video_edit::Shape::Rect { a, b }
+        | crate::video_edit::Shape::Ellipse { a, b }
+        | crate::video_edit::Shape::Highlight { a, b }
+        | crate::video_edit::Shape::Blur { a, b } => {
+            *a = start;
+            *b = point;
+        }
+        crate::video_edit::Shape::Freehand { points } => {
+            if points.last().is_none_or(|last| {
+                (last.0 - point.0).hypot(last.1 - point.1) >= 0.001
+            }) {
+                points.push(point);
+            }
+        }
+        crate::video_edit::Shape::Counter { .. } | crate::video_edit::Shape::Text { .. } => {}
+    }
+}
+
+fn draw_shape_is_degenerate(shape: &crate::video_edit::Shape) -> bool {
+    match shape {
+        crate::video_edit::Shape::Arrow { from, to }
+        | crate::video_edit::Shape::Line { from, to } => {
+            (from.0 - to.0).hypot(from.1 - to.1) < 0.008
+        }
+        crate::video_edit::Shape::Rect { a, b }
+        | crate::video_edit::Shape::Ellipse { a, b }
+        | crate::video_edit::Shape::Highlight { a, b }
+        | crate::video_edit::Shape::Blur { a, b } => {
+            (a.0 - b.0).hypot(a.1 - b.1) < 0.008
+        }
+        crate::video_edit::Shape::Freehand { points } => {
+            points
+                .windows(2)
+                .map(|segment| {
+                    (segment[0].0 - segment[1].0).hypot(segment[0].1 - segment[1].1)
+                })
+                .sum::<f32>()
+                < 0.008
+        }
+        crate::video_edit::Shape::Counter { .. } | crate::video_edit::Shape::Text { .. } => false,
+    }
+}
+
+fn next_counter_number(annotations: &[crate::video_edit::Item]) -> u32 {
+    annotations
+        .iter()
+        .filter_map(|item| match &item.shape {
+            crate::video_edit::Shape::Counter { n, .. } => Some(*n),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn tool_stays_active_after_use(tool: Tool) -> bool {
+    tool == Tool::Pen
+}
+
+fn select_annotation_tool(state: &mut State, tool: Tool) {
+    stop_playback(state);
+    state.text_entry = None;
+    if state.tool == Some(tool) {
+        state.tool = None;
+        return;
+    }
+    state.tool = Some(tool);
+    state.selected = None;
+    if tool == Tool::Text {
+        state.color_idx = 3;
+        state.caption_style = crate::video_edit::CaptionStyle::Box;
     }
 }
 
@@ -1205,7 +1315,12 @@ fn tool_for_shape(shape: &crate::video_edit::Shape) -> Tool {
     match shape {
         crate::video_edit::Shape::Text { .. } => Tool::Text,
         crate::video_edit::Shape::Arrow { .. } => Tool::Arrow,
+        crate::video_edit::Shape::Line { .. } => Tool::Line,
+        crate::video_edit::Shape::Freehand { .. } => Tool::Pen,
         crate::video_edit::Shape::Rect { .. } => Tool::Rect,
+        crate::video_edit::Shape::Ellipse { .. } => Tool::Ellipse,
+        crate::video_edit::Shape::Highlight { .. } => Tool::Highlight,
+        crate::video_edit::Shape::Counter { .. } => Tool::Counter,
         crate::video_edit::Shape::Blur { .. } => Tool::Blur,
     }
 }
@@ -1725,15 +1840,23 @@ unsafe fn paint(hdc: HDC, state: &State) {
             match tool {
                 Tool::Text => "Click the preview to place a caption",
                 Tool::Arrow => "Drag on the preview to draw an arrow",
+                Tool::Line => "Drag on the preview to draw a line",
                 Tool::Rect => "Drag on the preview to draw a box",
+                Tool::Ellipse => "Drag on the preview to draw an oval",
+                Tool::Highlight => "Drag on the preview to mark an area",
                 Tool::Blur => "Drag over anything sensitive to blur it",
+                Tool::Counter => "Click the preview to place the next step",
+                Tool::Pen => "Draw on the preview   \u{00b7}   Pen stays active   \u{00b7}   Esc exits",
             }
         } else if let Some(index) = state.selected {
             match state.annotations.get(index).map(|item| &item.shape) {
-                Some(crate::video_edit::Shape::Arrow { .. }) => {
+                Some(crate::video_edit::Shape::Arrow { .. })
+                | Some(crate::video_edit::Shape::Line { .. }) => {
                     "Selected   \u{00b7}   drag line to move   \u{00b7}   drag endpoints to redirect   \u{00b7}   right-click for properties"
                 }
                 Some(crate::video_edit::Shape::Rect { .. })
+                | Some(crate::video_edit::Shape::Ellipse { .. })
+                | Some(crate::video_edit::Shape::Highlight { .. })
                 | Some(crate::video_edit::Shape::Blur { .. }) => {
                     "Selected   \u{00b7}   drag to move   \u{00b7}   drag corner handles to resize   \u{00b7}   right-click for properties"
                 }
@@ -2406,24 +2529,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Drag::Padding => update_padding(state, x),
                         Drag::CaptionSize => update_caption_size(state, x),
                         Drag::CaptionOpacity => update_caption_opacity(state, x),
-                        Drag::Draw { index, start } => {
+                        Drag::Draw {
+                            index,
+                            start,
+                            tool: _,
+                        } => {
                             if let Some(point) = screen_to_preview(state, x, y) {
                                 if let Some(item) = state.annotations.get_mut(index) {
-                                    item.shape = match item.shape {
-                                        crate::video_edit::Shape::Arrow { .. } => {
-                                            crate::video_edit::Shape::Arrow {
-                                                from: start,
-                                                to: point,
-                                            }
-                                        }
-                                        crate::video_edit::Shape::Rect { .. } => {
-                                            crate::video_edit::Shape::Rect { a: start, b: point }
-                                        }
-                                        crate::video_edit::Shape::Blur { .. } => {
-                                            crate::video_edit::Shape::Blur { a: start, b: point }
-                                        }
-                                        crate::video_edit::Shape::Text { .. } => item.shape.clone(),
-                                    };
+                                    update_draw_shape(&mut item.shape, start, point);
                                 }
                                 recompose_preview(state);
                             }
@@ -2536,14 +2649,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .find(|(rect, ..)| contains(*rect, x, y))
                         .copied()
                     {
-                        stop_playback(state);
-                        state.tool = Some(tool);
-                        state.selected = None;
-                        state.text_entry = None;
-                        if tool == Tool::Text {
-                            state.color_idx = 3;
-                            state.caption_style = crate::video_edit::CaptionStyle::Box;
-                        }
+                        select_annotation_tool(state, tool);
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
@@ -2678,6 +2784,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.tools_open = false;
                             state.selected = None;
                             recompose_preview(state);
+                        } else if tool == Tool::Counter {
+                            push_undo(state);
+                            let (start, end) = default_range(state);
+                            let n = next_counter_number(&state.annotations);
+                            state.annotations.push(crate::video_edit::Item {
+                                shape: crate::video_edit::Shape::Counter { pos: point, n },
+                                start,
+                                end,
+                                color: state.color_idx,
+                                size: current_size(state),
+                                caption_style: crate::video_edit::CaptionStyle::Shadow,
+                                caption_box_opacity: state.caption_box_opacity,
+                            });
+                            state.selected = Some(state.annotations.len() - 1);
+                            state.tool = None;
+                            state.tools_open = false;
+                            recompose_preview(state);
                         } else {
                             push_undo(state);
                             let (start, end) = default_range(state);
@@ -2692,11 +2815,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             });
                             let index = state.annotations.len() - 1;
                             state.selected = Some(index);
-                            state.tool = None;
+                            state.tool = tool_stays_active_after_use(tool).then_some(tool);
                             state.tools_open = false;
                             state.dragging = Some(Drag::Draw {
                                 index,
                                 start: point,
+                                tool,
                             });
                             windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                             recompose_preview(state);
@@ -2820,15 +2944,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // at full resolution.
                             recompose_preview(state);
                         }
-                        if let Drag::Draw { index, .. } = drag {
+                        if let Drag::Draw { index, tool, .. } = drag {
                             if let Some(item) = state.annotations.get(index) {
-                                let (x0, y0, x1, y1) = crate::video_edit::bounds(
-                                    item,
-                                    annotation_content_size(state),
-                                );
-                                if (x1 - x0).hypot(y1 - y0) < 0.008 {
+                                if draw_shape_is_degenerate(&item.shape) {
                                     state.annotations.remove(index);
                                     state.selected = None;
+                                } else if tool_stays_active_after_use(tool) {
+                                    state.tool = Some(tool);
                                 }
                             }
                         }
@@ -3164,6 +3286,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     0x5A if GetKeyState(VK_CONTROL.0 as i32) < 0 => {
                         stop_playback(state);
                         undo(state);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    0x41 if state.text_entry.is_none() => {
+                        state.tools_open = true;
+                        select_annotation_tool(state, Tool::Arrow);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    0x52 if state.text_entry.is_none() => {
+                        state.tools_open = true;
+                        select_annotation_tool(state, Tool::Rect);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    0x54 if state.text_entry.is_none() => {
+                        state.tools_open = true;
+                        select_annotation_tool(state, Tool::Text);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    0x42 if state.text_entry.is_none() => {
+                        state.tools_open = true;
+                        select_annotation_tool(state, Tool::Blur);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    0x50 if state.text_entry.is_none() => {
+                        state.tools_open = true;
+                        select_annotation_tool(state, Tool::Pen);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     key if key == VK_LEFT.0 => {
@@ -3650,7 +3797,8 @@ pub fn show(
 mod tests {
     use super::{
         annotation_preview_time, apply_caption_input, available_export_path, layout,
-        minimum_client_size, CaptionInput, NEXT_EXPORT_ID,
+        minimum_client_size, next_counter_number, tool_stays_active_after_use, CaptionInput,
+        NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
     use std::sync::atomic::Ordering;
 
@@ -3695,6 +3843,13 @@ mod tests {
                 <= window.aspect_controls[0].0.top
         );
         assert!(window.padding_slider.bottom < window.strip.top);
+        assert!(window
+            .tool_controls
+            .iter()
+            .all(|(rect, ..)| rect.left >= window.preview.left && rect.right <= window.preview.right));
+        assert!(window.timing_controls.iter().all(|(rect, _)| {
+            rect.top >= window.preview.top && rect.bottom <= window.preview.bottom
+        }));
         assert!(window.strip.bottom < window.controls[0].0.top);
         assert!(window.controls.iter().all(|(rect, ..)| rect.bottom <= height));
         assert!(window
@@ -3772,10 +3927,49 @@ mod tests {
     fn every_annotation_shape_opens_the_matching_property_tool() {
         use crate::video_edit::Shape;
 
-        assert_eq!(super::tool_for_shape(&Shape::Text { pos: (0.0, 0.0), text: String::new() }), super::Tool::Text);
         assert_eq!(super::tool_for_shape(&Shape::Arrow { from: (0.0, 0.0), to: (1.0, 1.0) }), super::Tool::Arrow);
+        assert_eq!(super::tool_for_shape(&Shape::Line { from: (0.0, 0.0), to: (1.0, 1.0) }), super::Tool::Line);
         assert_eq!(super::tool_for_shape(&Shape::Rect { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Rect);
+        assert_eq!(super::tool_for_shape(&Shape::Ellipse { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Ellipse);
+        assert_eq!(super::tool_for_shape(&Shape::Highlight { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Highlight);
+        assert_eq!(super::tool_for_shape(&Shape::Text { pos: (0.0, 0.0), text: String::new() }), super::Tool::Text);
         assert_eq!(super::tool_for_shape(&Shape::Blur { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Blur);
+        assert_eq!(super::tool_for_shape(&Shape::Counter { pos: (0.0, 0.0), n: 1 }), super::Tool::Counter);
+        assert_eq!(super::tool_for_shape(&Shape::Freehand { points: vec![(0.0, 0.0), (1.0, 1.0)] }), super::Tool::Pen);
+    }
+
+    #[test]
+    fn video_editor_exposes_the_same_nine_annotation_tools_as_photo() {
+        assert_eq!(
+            VIDEO_TOOLS.map(|(_, label)| label),
+            ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"]
+        );
+        let controls = layout(1.0, 1280, 720, 7).tool_controls;
+        assert_eq!(controls.len(), VIDEO_TOOLS.len());
+        for row in controls.chunks(3) {
+            assert_eq!(row.len(), 3);
+            assert!(row.windows(2).all(|pair| pair[0].0.right < pair[1].0.left));
+        }
+        assert!(controls.windows(4).all(|window| window[0].0.bottom < window[3].0.top));
+        assert!(tool_stays_active_after_use(super::Tool::Pen));
+        assert!(!tool_stays_active_after_use(super::Tool::Arrow));
+    }
+
+    #[test]
+    fn video_steps_continue_from_the_highest_visible_number() {
+        use crate::video_edit::{CaptionStyle, Item, Shape};
+
+        let item = |n| Item {
+            shape: Shape::Counter { pos: (0.5, 0.5), n },
+            start: 0,
+            end: 10,
+            color: 0,
+            size: 1.0,
+            caption_style: CaptionStyle::Shadow,
+            caption_box_opacity: 0.68,
+        };
+        assert_eq!(next_counter_number(&[]), 1);
+        assert_eq!(next_counter_number(&[item(1), item(4), item(2)]), 5);
     }
 
     #[test]
