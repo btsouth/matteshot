@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Matteshot Demo Workspace</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: #172033;
+      background: #edf2f8;
+    }
+    .app { display: grid; grid-template-columns: 224px 1fr; height: 100vh; }
+    aside {
+      background: #111827;
+      color: #dbe4f3;
+      padding: 26px 18px;
+      display: flex;
+      flex-direction: column;
+    }
+    .brand { display: flex; align-items: center; gap: 11px; margin: 0 8px 30px; }
+    .brand-mark {
+      width: 34px; height: 34px; border-radius: 10px;
+      background: linear-gradient(135deg, #52c9c3, #7188e8 52%, #b85cdc);
+      position: relative;
+    }
+    .brand-mark::after {
+      content: ""; position: absolute; inset: 8px; border-radius: 5px;
+      background: white; box-shadow: 0 7px 12px #04091555;
+    }
+    .brand strong { display: block; font-size: 16px; color: white; }
+    .brand span { display: block; margin-top: 2px; font-size: 11px; color: #8fa0b8; }
+    nav { display: grid; gap: 6px; }
+    nav div {
+      padding: 11px 12px; border-radius: 9px; font-size: 13px; color: #aebbd0;
+      display: flex; align-items: center; gap: 10px;
+    }
+    nav div::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #506079; }
+    nav .active { background: #202c40; color: white; font-weight: 600; }
+    nav .active::before { background: #66d5ca; box-shadow: 0 0 0 4px #66d5ca20; }
+    .sidebar-note {
+      margin-top: auto; padding: 14px; border: 1px solid #2a3950; border-radius: 12px;
+      background: #182338; color: #aebbd0; font-size: 12px; line-height: 1.45;
+    }
+    .sidebar-note strong { color: #fff; display: block; margin-bottom: 3px; }
+    main { padding: 26px 30px; overflow: hidden; }
+    header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
+    h1 { margin: 0; font-size: 26px; letter-spacing: -0.6px; }
+    .subtitle { margin-top: 5px; color: #738096; font-size: 13px; }
+    .header-actions { display: flex; gap: 9px; }
+    .button { padding: 10px 14px; border-radius: 9px; font-size: 12px; font-weight: 600; background: white; border: 1px solid #d8e0ec; }
+    .button.primary { background: #596fe4; color: white; border-color: #596fe4; box-shadow: 0 6px 14px #596fe42d; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 17px; }
+    .stat { background: white; border: 1px solid #dfe6f0; border-radius: 14px; padding: 16px 17px; box-shadow: 0 5px 16px #1d293914; }
+    .stat small { color: #7c899d; font-size: 11px; text-transform: uppercase; letter-spacing: .6px; font-weight: 700; }
+    .stat b { display: block; font-size: 25px; margin: 8px 0 4px; letter-spacing: -.5px; }
+    .stat span { color: #17a581; font-size: 11px; font-weight: 600; }
+    .content { display: grid; grid-template-columns: 1.28fr .72fr; gap: 17px; height: calc(100vh - 203px); }
+    .panel { background: white; border: 1px solid #dfe6f0; border-radius: 15px; box-shadow: 0 5px 16px #1d293914; overflow: hidden; }
+    .panel-head { padding: 16px 18px; border-bottom: 1px solid #e6ebf2; display: flex; align-items: center; justify-content: space-between; }
+    .panel-head strong { font-size: 14px; }
+    .panel-head span { color: #7f8ba0; font-size: 11px; }
+    .ticket { display: grid; grid-template-columns: 34px 1fr auto; gap: 11px; padding: 14px 18px; border-bottom: 1px solid #eef2f7; align-items: center; }
+    .ticket:last-child { border-bottom: 0; }
+    .avatar { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; color: white; font-weight: 700; font-size: 12px; }
+    .avatar.a { background: #5c76e7; } .avatar.b { background: #36a995; } .avatar.c { background: #be6db9; } .avatar.d { background: #e49a4b; }
+    .ticket b { display: block; font-size: 12px; margin-bottom: 3px; }
+    .ticket p { margin: 0; color: #7f8ba0; font-size: 11px; }
+    .pill { padding: 5px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; }
+    .pill.high { color: #b33b54; background: #ffe7ec; }
+    .pill.normal { color: #3d669f; background: #e8f1ff; }
+    .pill.done { color: #15785f; background: #e4f7f1; }
+    .activity { padding: 18px; }
+    .chart { height: 132px; display: flex; align-items: end; gap: 9px; padding: 8px 4px 0; border-bottom: 1px solid #e7edf5; }
+    .chart i { flex: 1; display: block; border-radius: 5px 5px 0 0; background: linear-gradient(#7f8feb, #596fe4); min-height: 22px; }
+    .chart i:nth-child(2n) { background: linear-gradient(#76d4ca, #37a99c); }
+    .legend { display: flex; justify-content: space-between; color: #8390a3; font-size: 10px; margin: 8px 4px 20px; }
+    .feed { display: grid; gap: 12px; }
+    .feed div { display: grid; grid-template-columns: 8px 1fr; gap: 10px; font-size: 11px; color: #657187; line-height: 1.35; }
+    .feed div::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #64c7bc; margin-top: 3px; box-shadow: 0 0 0 4px #64c7bc1c; }
+    .feed b { color: #273247; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand"><div class="brand-mark"></div><div><strong>Northstar</strong><span>Support workspace</span></div></div>
+      <nav>
+        <div class="active">Overview</div>
+        <div>Inbox</div>
+        <div>Customers</div>
+        <div>Reports</div>
+        <div>Knowledge base</div>
+      </nav>
+      <div class="sidebar-note"><strong>Everything on track</strong>First response time improved 18% this week.</div>
+    </aside>
+    <main>
+      <header>
+        <div><h1>Good morning, Maya</h1><div class="subtitle">Here is what is happening across support today.</div></div>
+        <div class="header-actions"><div class="button">Export report</div><div class="button primary">New ticket</div></div>
+      </header>
+      <section class="stats">
+        <div class="stat"><small>Open tickets</small><b>24</b><span>↓ 8% this week</span></div>
+        <div class="stat"><small>First response</small><b>18m</b><span>↓ 4 minutes</span></div>
+        <div class="stat"><small>Resolution rate</small><b>94%</b><span>↑ 6% this month</span></div>
+        <div class="stat"><small>Customer score</small><b>4.8</b><span>↑ 0.3 points</span></div>
+      </section>
+      <section class="content">
+        <div class="panel">
+          <div class="panel-head"><strong>Priority conversations</strong><span>Updated just now</span></div>
+          <div class="ticket"><div class="avatar a">AL</div><div><b>Alex Liu</b><p>Unable to invite a new teammate</p></div><span class="pill high">High</span></div>
+          <div class="ticket"><div class="avatar b">SR</div><div><b>Sam Rivera</b><p>Question about the annual plan</p></div><span class="pill normal">Normal</span></div>
+          <div class="ticket"><div class="avatar c">KP</div><div><b>Kim Patel</b><p>Dashboard totals do not match export</p></div><span class="pill high">High</span></div>
+          <div class="ticket"><div class="avatar d">TW</div><div><b>Taylor Wong</b><p>Thanks for the quick resolution</p></div><span class="pill done">Resolved</span></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><strong>Weekly activity</strong><span>Last 7 days</span></div>
+          <div class="activity">
+            <div class="chart"><i style="height:44%"></i><i style="height:58%"></i><i style="height:51%"></i><i style="height:74%"></i><i style="height:68%"></i><i style="height:88%"></i><i style="height:78%"></i></div>
+            <div class="legend"><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span></div>
+            <div class="feed">
+              <div><span><b>Maya</b> resolved the Northstar export issue.</span></div>
+              <div><span><b>Jordan</b> published a billing guide update.</span></div>
+              <div><span><b>Alex</b> left a five-star support rating.</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
