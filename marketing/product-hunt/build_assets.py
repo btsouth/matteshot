@@ -115,6 +115,12 @@ def pill(draw: ImageDraw.ImageDraw, xy, label: str, accent=(108, 209, 198), font
     right_padding = 18
     width = text_left + text_width + right_padding
     x, y = xy
+    dot_y = y + height // 2
+    actual_text_bounds = draw.textbbox(
+        (x + text_left, dot_y), label, font=f, anchor="lm"
+    )
+    if actual_text_bounds[2] > x + width - right_padding:
+        raise RuntimeError(f"Feature chip is too narrow for {label!r}")
     draw.rounded_rectangle(
         (x, y, x + width, y + height),
         radius=height // 2,
@@ -122,11 +128,8 @@ def pill(draw: ImageDraw.ImageDraw, xy, label: str, accent=(108, 209, 198), font
         outline=(88, 105, 154, 255),
         width=1,
     )
-    dot_y = y + height // 2
     draw.ellipse((x + 14, dot_y - 4, x + 22, dot_y + 4), fill=accent)
     draw.text((x + text_left, dot_y), label, font=f, fill=(235, 240, 255), anchor="lm")
-    if x + text_left + text_width > x + width - right_padding + 1:
-        raise RuntimeError(f"Feature chip is too narrow for {label!r}")
     return width
 
 
@@ -204,8 +207,12 @@ SELECT_TEXT_BUTTON = (1927, 1125, 2142, 1154)
 
 def map_source_rect(rect, source: Image.Image, pasted):
     x, y, width, height = pasted
-    sx, sy = width / source.width, height / source.height
     left, top, right, bottom = rect
+    if not (0 <= left < right <= source.width and 0 <= top < bottom <= source.height):
+        raise RuntimeError(
+            f"Source rect {rect} is outside the {source.width}x{source.height} capture"
+        )
+    sx, sy = width / source.width, height / source.height
     return (
         round(x + left * sx),
         round(y + top * sy),
@@ -450,7 +457,7 @@ def smoothstep(value: float) -> float:
     return value * value * (3 - 2 * value)
 
 
-def demo_frame(time_s: float) -> Image.Image:
+def demo_frame(time_s: float, fps: int = 30) -> Image.Image:
     elapsed = 0.0
     transition = 0.32
     for index, (duration, renderer) in enumerate(PHASES):
@@ -458,7 +465,8 @@ def demo_frame(time_s: float) -> Image.Image:
         if local < duration or index == len(PHASES) - 1:
             frame = renderer()
             if index < len(PHASES) - 1 and local > duration - transition:
-                progress = (local - (duration - transition)) / transition
+                sampled_span = max(transition - 1 / fps, 1e-6)
+                progress = min(1.0, (local - (duration - transition)) / sampled_span)
                 if progress < 0.5:
                     frame = Image.blend(frame, phase_bridge(), smoothstep(progress * 2))
                 else:
@@ -476,20 +484,22 @@ def demo_video():
     fps = 30
     duration = sum(duration for duration, _ in PHASES)
     mp4 = OUT / "matteshot-product-hunt-demo.mp4"
-    # Lossless H.264 avoids block artifacts around small UI text while keeping
-    # the browser-compatible 4:2:0 pixel format and a compact static-scene file.
+    # High-quality standard-profile H.264 preserves small UI text while staying
+    # compatible with browser and hardware decoders.
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
         "-r", str(fps), "-i", "-", "-an", "-c:v", "libx264", "-preset", "medium",
-        "-crf", "0", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
+        "-tune", "stillimage", "-crf", "8", "-profile:v", "high", "-level", "4.1",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
     ]
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, bufsize=0)
     if proc.stdin is None:
         raise RuntimeError("ffmpeg did not expose a frame input stream")
+    pipe_error = None
     try:
         for i in range(round(duration * fps)):
-            frame = demo_frame(i / fps)
+            frame = demo_frame(i / fps, fps)
             payload = frame.tobytes()
             expected_bytes = W * H * 3
             if frame.mode != "RGB" or frame.size != (W, H) or len(payload) != expected_bytes:
@@ -503,14 +513,18 @@ def demo_video():
                     raise BrokenPipeError("ffmpeg stopped accepting raw frame data")
                 remaining = remaining[written:]
     except BrokenPipeError as error:
+        pipe_error = error
+    finally:
         try:
-            proc.stdin.close()
+            if not proc.stdin.closed:
+                proc.stdin.close()
         except BrokenPipeError:
             pass
         code = proc.wait()
-        raise RuntimeError(f"ffmpeg stopped while encoding frames (exit code {code})") from error
-    proc.stdin.close()
-    code = proc.wait()
+    if pipe_error is not None:
+        raise RuntimeError(
+            f"ffmpeg stopped while encoding frames (exit code {code})"
+        ) from pipe_error
     if code != 0:
         raise RuntimeError(f"ffmpeg failed to encode the demo (exit code {code})")
 
