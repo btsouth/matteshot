@@ -120,9 +120,6 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     let previous = LAST_DOWN_TICK.swap(now, Ordering::SeqCst);
                     let latched = KEY_DOWN.swap(true, Ordering::SeqCst);
                     if should_fire(latched, now.saturating_sub(previous)) {
-                        if latched {
-                            RECOVERED_PRESSES.fetch_add(1, Ordering::SeqCst);
-                        }
                         let posted = PostThreadMessageW(
                             TARGET_THREAD.load(Ordering::SeqCst),
                             windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY,
@@ -133,6 +130,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                         if !posted {
                             KEY_DOWN.store(false, Ordering::SeqCst);
                             return CallNextHookEx(None, code, wparam, lparam);
+                        }
+                        // Counted only once the capture is genuinely on its
+                        // way. This number exists to answer "were key-ups
+                        // being missed?", so a press that went nowhere must
+                        // not inflate it.
+                        if latched {
+                            RECOVERED_PRESSES.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                     return LRESULT(1);
@@ -316,6 +320,18 @@ pub fn acquire(id: i32, interactive: bool) -> Acquire {
 #[cfg(test)]
 mod tests {
     use super::{should_fire, REPEAT_CEILING_MS};
+
+    #[test]
+    fn the_repeat_ceiling_clears_the_slowest_windows_key_repeat() {
+        // Load-bearing value, not a free parameter. Windows allows a repeat
+        // delay of up to a second before the first repeat of a held key, so a
+        // ceiling at or below that would let a held PrtScn fire twice. Pinned
+        // so lowering it has to be a deliberate act.
+        assert_eq!(REPEAT_CEILING_MS, 1_500);
+        // Stated through the behaviour rather than the number: a held key
+        // whose first repeat lands a full second later stays suppressed.
+        assert!(!should_fire(true, 1_000));
+    }
 
     #[test]
     fn a_missed_key_up_cannot_swallow_the_next_press() {
