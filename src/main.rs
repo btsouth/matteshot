@@ -1157,11 +1157,18 @@ fn main() -> Result<()> {
         }
         // Word-box probe for select-text mode: prints each recognized word in
         // capture coordinates so the overlay geometry can be checked headlessly.
+        // With a destination path, writes the word boxes as JSON instead of
+        // printing them. matteshot.app's demo editor ships that file so its
+        // select-text is this engine's real output over the sample capture
+        // rather than a mock.
         Some("--ocr-words") => {
             require_capture_license()?;
+            if args.len() > 3 {
+                bail!("--ocr-words <title|png> [out.json]");
+            }
             let target = args
                 .get(1)
-                .context("--ocr-words needs a title substring or a png path")?;
+                .context("--ocr-words <title|png> [out.json]")?;
             // A path exercises oversized captures (scroll stitches) that no
             // live window can reach.
             let img = if std::path::Path::new(target).is_file() {
@@ -1174,6 +1181,35 @@ fn main() -> Result<()> {
                 captured
             };
             let words = ocr::recognize_words(&img)?;
+            if let Some(out) = args.get(2) {
+                let round = |value: f32| (value * 10.0).round() / 10.0;
+                let payload = serde_json::json!({
+                    "width": img.width(),
+                    "height": img.height(),
+                    "words": words
+                        .iter()
+                        .map(|word| {
+                            let (x0, y0, x1, y1) = word.rect;
+                            serde_json::json!({
+                                "text": word.text,
+                                "line": word.line,
+                                "rect": [round(x0), round(y0), round(x1), round(y1)],
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                });
+                // Compact: a generated asset a browser downloads, not
+                // something anyone hand-edits.
+                std::fs::write(out, serde_json::to_string(&payload)?)
+                    .with_context(|| format!("write {out}"))?;
+                eprintln!(
+                    "{} words over {}x{} -> {out}",
+                    words.len(),
+                    img.width(),
+                    img.height()
+                );
+                return Ok(());
+            }
             eprintln!(
                 "--- {} words over {}x{} ---",
                 words.len(),
