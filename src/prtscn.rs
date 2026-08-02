@@ -50,26 +50,44 @@ static LAST_DOWN_TICK: AtomicU64 = AtomicU64::new(0);
 /// non-zero value means key-ups are being missed on this machine.
 static RECOVERED_PRESSES: AtomicU32 = AtomicU32::new(0);
 
-/// Windows repeats a held key at 2.5-30 per second after an initial delay of at
-/// most a second, so consecutive key-downs from a held key are never more than
-/// about a second apart. A longer gap is a fresh press, whatever the latch says.
-const REPEAT_CEILING_MS: u64 = 1500;
+/// Auto-repeat arrives as a continuous stream at the system repeat rate, which
+/// tops out around 30 per second. Nobody presses a key twice inside this window
+/// on purpose, so it separates a held key from a deliberate second press.
+const REPEAT_WINDOW_MS: u64 = 300;
 
 /// Whether a key-down should fire a capture.
 ///
-/// The latch alone was not enough. It is only cleared by a key-up, and a
-/// low-level hook does miss those: Windows stops calling a hook whose thread did
-/// not answer within `LowLevelHooksTimeout`, and the machine is at its busiest
-/// in the moment right after PrtScn, because the freeze overlay is capturing
-/// every monitor. One missed key-up left the latch set, so the next press was
-/// swallowed and you had to press again.
-fn should_fire(latched: bool, millis_since_last_down: u64) -> bool {
-    !latched || millis_since_last_down >= REPEAT_CEILING_MS
+/// Purely a function of time since the previous key-down, with no latch to get
+/// stuck. Field data forced this: over one session the hook saw 37 key-downs
+/// and only 26 key-ups, so a latch cleared solely by key-up spends much of its
+/// life wrongly set. Windows stops calling a low-level hook whose thread did not
+/// answer within `LowLevelHooksTimeout`, and the busiest instant on the machine
+/// is right after PrtScn, when the freeze overlay is capturing every monitor.
+///
+/// A key-up, when one does arrive, zeroes the timestamp so the next press always
+/// fires regardless of how quickly it follows.
+fn should_fire(millis_since_last_down: u64) -> bool {
+    millis_since_last_down >= REPEAT_WINDOW_MS
 }
 
-/// Presses recovered from a stuck latch since start.
-pub fn recovered_presses() -> u32 {
-    RECOVERED_PRESSES.load(Ordering::SeqCst)
+// Health counters. Incrementing an atomic is cheap enough for a low-level hook;
+// anything touching a file or a lock in there would cause the very timeouts
+// these exist to reveal.
+static DOWNS_SEEN: AtomicU32 = AtomicU32::new(0);
+static UPS_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// Key-downs and key-ups the hook saw, and presses that fired while the latch
+/// was still set from an earlier press.
+///
+/// Key-ups trailing key-downs is the signature of a machine where Windows is
+/// dropping hook calls, which is what made PrtScn feel unreliable. Every one of
+/// those recovered presses would have been swallowed by the old latch.
+pub fn hook_health() -> (u32, u32, u32) {
+    (
+        DOWNS_SEEN.load(Ordering::SeqCst),
+        UPS_SEEN.load(Ordering::SeqCst),
+        RECOVERED_PRESSES.load(Ordering::SeqCst),
+    )
 }
 
 struct HookRuntime {
@@ -116,10 +134,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     // Nothing here may be slow: a hook that overruns
                     // LowLevelHooksTimeout stops being called at all, which is
                     // what causes the missed key-ups this guards against.
+                    DOWNS_SEEN.fetch_add(1, Ordering::SeqCst);
                     let now = GetTickCount64();
                     let previous = LAST_DOWN_TICK.swap(now, Ordering::SeqCst);
-                    let latched = KEY_DOWN.swap(true, Ordering::SeqCst);
-                    if should_fire(latched, now.saturating_sub(previous)) {
+                    let stale = KEY_DOWN.swap(true, Ordering::SeqCst);
+                    if should_fire(now.saturating_sub(previous)) {
                         let posted = PostThreadMessageW(
                             TARGET_THREAD.load(Ordering::SeqCst),
                             windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY,
@@ -135,14 +154,20 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                         // way. This number exists to answer "were key-ups
                         // being missed?", so a press that went nowhere must
                         // not inflate it.
-                        if latched {
+                        if stale {
                             RECOVERED_PRESSES.fetch_add(1, Ordering::SeqCst);
                         }
                     }
                     return LRESULT(1);
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
+                    UPS_SEEN.fetch_add(1, Ordering::SeqCst);
                     KEY_DOWN.store(false, Ordering::SeqCst);
+                    // The press finished, so whatever comes next is a new one.
+                    // Zeroing this makes a press-release-press sequence fire
+                    // however fast it is, and costs nothing when the key-up is
+                    // the one that goes missing.
+                    LAST_DOWN_TICK.store(0, Ordering::SeqCst);
                     return LRESULT(1);
                 }
                 _ => {}
@@ -319,38 +344,35 @@ pub fn acquire(id: i32, interactive: bool) -> Acquire {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_fire, REPEAT_CEILING_MS};
+    use super::{should_fire, REPEAT_WINDOW_MS};
 
     #[test]
-    fn the_repeat_ceiling_clears_the_slowest_windows_key_repeat() {
-        // Load-bearing value, not a free parameter. Windows allows a repeat
-        // delay of up to a second before the first repeat of a held key, so a
-        // ceiling at or below that would let a held PrtScn fire twice. Pinned
-        // so lowering it has to be a deliberate act.
-        assert_eq!(REPEAT_CEILING_MS, 1_500);
-        // Stated through the behaviour rather than the number: a held key
-        // whose first repeat lands a full second later stays suppressed.
-        assert!(!should_fire(true, 1_000));
+    fn holding_the_key_still_only_captures_once() {
+        // Windows repeats a held key at up to ~30/sec, so repeats land ~33ms
+        // apart and must be swallowed.
+        assert!(!should_fire(0));
+        assert!(!should_fire(33));
+        assert!(!should_fire(120));
+        assert!(!should_fire(REPEAT_WINDOW_MS - 1));
     }
 
     #[test]
-    fn a_missed_key_up_cannot_swallow_the_next_press() {
-        // Normal press: nothing latched, fires.
-        assert!(should_fire(false, 0));
-        assert!(should_fire(false, 50_000));
+    fn pressing_again_after_a_dead_press_is_never_treated_as_repeat() {
+        // The bug this replaces: the window was 1500ms, so pressing again
+        // after nothing happened was read as auto-repeat and eaten too. Field
+        // data showed every miss landing here. Nobody re-presses inside 300ms,
+        // so anything past it has to fire.
+        assert!(should_fire(REPEAT_WINDOW_MS));
+        assert!(should_fire(400));
+        assert!(should_fire(1_000));
+        assert!(should_fire(60_000));
+    }
 
-        // Auto-repeat while the key is held. Even the slowest Windows repeat
-        // settings keep consecutive downs about a second apart, so these must
-        // stay suppressed or holding PrtScn would capture over and over.
-        assert!(!should_fire(true, 33));
-        assert!(!should_fire(true, 400));
-        assert!(!should_fire(true, 1_000));
-
-        // A latch left set by a key-up the hook never received. A real person
-        // pressing again is always well past the repeat ceiling, so the press
-        // has to get through instead of being eaten.
-        assert!(should_fire(true, REPEAT_CEILING_MS));
-        assert!(should_fire(true, 3_000));
-        assert!(should_fire(true, 60_000));
+    #[test]
+    fn a_completed_press_lets_the_next_one_through_immediately() {
+        // A key-up zeroes the timestamp, so the gap becomes the full tick
+        // count and even a fast press-release-press fires both times.
+        let ticks_since_boot = 900_000u64;
+        assert!(should_fire(ticks_since_boot.saturating_sub(0)));
     }
 }
