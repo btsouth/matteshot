@@ -28,7 +28,13 @@ FONT_BOLD = Path(r"C:\Windows\Fonts\segoeuib.ttf")
 
 def font(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
     path = {"regular": FONT_REGULAR, "semibold": FONT_SEMIBOLD, "bold": FONT_BOLD}[weight]
-    return ImageFont.truetype(str(path), size)
+    try:
+        return ImageFont.truetype(str(path), size)
+    except OSError as error:
+        raise RuntimeError(
+            "Matteshot launch assets require the Windows Segoe UI regular, "
+            "semibold, and bold font files under C:\\Windows\\Fonts."
+        ) from error
 
 
 def gradient(size=(W, H), left=(25, 32, 71), right=(39, 37, 99)) -> Image.Image:
@@ -38,7 +44,6 @@ def gradient(size=(W, H), left=(25, 32, 71), right=(39, 37, 99)) -> Image.Image:
     for x in range(w):
         t = x / max(1, w - 1)
         for y in range(h):
-            v = y / max(1, h - 1)
             glow = max(0.0, 1.0 - math.hypot((x - w * .83) / (w * .65), (y - h * .1) / (h * .8)))
             r = int(left[0] * (1 - t) + right[0] * t + 17 * glow)
             g = int(left[1] * (1 - t) + right[1] * t + 13 * glow)
@@ -59,7 +64,8 @@ def cached_gradient(size=(W, H), left=(25, 32, 71), right=(39, 37, 99)) -> Image
 
 @lru_cache(maxsize=16)
 def cached_image(path: str) -> Image.Image:
-    return Image.open(path).convert("RGBA")
+    with Image.open(path) as image:
+        return image.convert("RGBA").copy()
 
 
 def rounded(image: Image.Image, radius: int) -> Image.Image:
@@ -118,14 +124,15 @@ def pill(draw: ImageDraw.ImageDraw, xy, label: str, accent=(108, 209, 198)):
     return width
 
 
-def brand(draw: ImageDraw.ImageDraw, xy=(64, 44), dark=False):
-    icon = Image.open(ROOT.parents[1] / "assets" / "icon-256.png").convert("RGBA").resize((44, 44), Image.Resampling.LANCZOS)
+def brand(xy=(64, 44), dark=False):
+    icon_path = ROOT.parents[1] / "assets" / "icon-256.png"
+    icon = cached_image(str(icon_path)).resize((44, 44), Image.Resampling.LANCZOS)
     return icon, (xy[0] + 58, xy[1] + 7), (20, 27, 43) if dark else (255, 255, 255)
 
 
 def add_brand(canvas: Image.Image, xy=(64, 40), label="MATTESHOT"):
     draw = ImageDraw.Draw(canvas)
-    icon, tx, color = brand(draw, xy)
+    icon, tx, color = brand(xy)
     canvas.alpha_composite(icon, xy)
     draw.text(tx, label, font=font(18, "bold"), fill=color)
 
@@ -425,12 +432,22 @@ def demo_video():
         "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
     ]
     proc = subprocess.Popen(command, stdin=subprocess.PIPE)
-    assert proc.stdin is not None
-    for i in range(round(duration * fps)):
-        proc.stdin.write(demo_frame(i / fps).tobytes())
+    if proc.stdin is None:
+        raise RuntimeError("ffmpeg did not expose a frame input stream")
+    try:
+        for i in range(round(duration * fps)):
+            proc.stdin.write(demo_frame(i / fps).tobytes())
+    except BrokenPipeError as error:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        code = proc.wait()
+        raise RuntimeError(f"ffmpeg stopped while encoding frames (exit code {code})") from error
     proc.stdin.close()
-    if proc.wait() != 0:
-        raise RuntimeError("ffmpeg failed to encode the demo")
+    code = proc.wait()
+    if code != 0:
+        raise RuntimeError(f"ffmpeg failed to encode the demo (exit code {code})")
 
     palette = OUT / "demo-palette.png"
     gif = OUT / "matteshot-product-hunt-demo.gif"
