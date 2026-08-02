@@ -106,21 +106,27 @@ def text(draw: ImageDraw.ImageDraw, xy, value, size, fill=(255, 255, 255), weigh
     draw.multiline_text(xy, value, font=font(size, weight), fill=fill, anchor=anchor, spacing=spacing)
 
 
-def pill(draw: ImageDraw.ImageDraw, xy, label: str, accent=(108, 209, 198)):
-    f = font(16, "semibold")
+def pill(draw: ImageDraw.ImageDraw, xy, label: str, accent=(108, 209, 198), font_size=16):
+    f = font(font_size, "semibold")
     bbox = draw.textbbox((0, 0), label, font=f)
-    width = bbox[2] - bbox[0] + 28
-    height = 38
+    text_width = bbox[2] - bbox[0]
+    height = 36 if font_size <= 14 else 42
+    text_left = 34
+    right_padding = 18
+    width = text_left + text_width + right_padding
     x, y = xy
     draw.rounded_rectangle(
         (x, y, x + width, y + height),
-        radius=19,
+        radius=height // 2,
         fill=(32, 41, 77, 255),
         outline=(88, 105, 154, 255),
         width=1,
     )
-    draw.ellipse((x + 12, y + 15, x + 20, y + 23), fill=accent)
-    draw.text((x + 27, y + 9), label, font=f, fill=(235, 240, 255))
+    dot_y = y + height // 2
+    draw.ellipse((x + 14, dot_y - 4, x + 22, dot_y + 4), fill=accent)
+    draw.text((x + text_left, dot_y), label, font=f, fill=(235, 240, 255), anchor="lm")
+    if x + text_left + text_width > x + width - right_padding + 1:
+        raise RuntimeError(f"Feature chip is too narrow for {label!r}")
     return width
 
 
@@ -131,9 +137,9 @@ def brand(xy=(64, 44), dark=False):
 
 
 def add_brand(canvas: Image.Image, xy=(64, 40), label="MATTESHOT"):
-    draw = ImageDraw.Draw(canvas)
     icon, tx, color = brand(xy)
     canvas.alpha_composite(icon, xy)
+    draw = ImageDraw.Draw(canvas)
     draw.text(tx, label, font=font(18, "bold"), fill=color)
 
 
@@ -149,8 +155,10 @@ def slide_hero():
     text(draw, (69, 355), "Six polished results before\nan editor ever opens.", 24, fill=(197, 206, 231), spacing=7)
     x = 67
     for label in ("Native Windows", "Local processing", "$19 once"):
-        x += pill(draw, (x, 486), label) + 10
-    aurora = Image.open(CAPTURES / "demo" / "matte-aurora.png")
+        x += pill(draw, (x, 486), label, font_size=14) + 8
+    if x - 8 >= 505:
+        raise RuntimeError("Hero feature chips overlap the product screenshot")
+    aurora = cached_image(str(CAPTURES / "demo" / "matte-aurora.png"))
     paste_card(canvas, aurora, (515, 95), (690, 530), radius=19, shadow=26)
     draw.rounded_rectangle((815, 638, 1118, 688), radius=25, fill=(72, 189, 158))
     text(draw, (966, 663), "Copied. Ready to paste.", 17, weight="semibold", anchor="mm")
@@ -168,7 +176,7 @@ def slide_styles():
     for i, (name, file) in enumerate(zip(names, files)):
         col, row = i % 3, i // 3
         x, y = 64 + col * 398, 220 + row * 245
-        img = Image.open(CAPTURES / "demo" / file)
+        img = cached_image(str(CAPTURES / "demo" / file))
         card = fit(img, (360, 198), contain=True)
         paste_card(canvas, card, (x, y), (360, 198), radius=13, shadow=14)
         draw.rounded_rectangle((x + 14, y + 168, x + 124, y + 202), radius=17, fill=(15, 20, 42, 220))
@@ -186,39 +194,39 @@ def slide_editor():
     for label in ("9 annotation tools", "Precise redaction", "Live output sizing", "Fast matte controls"):
         pill(draw, (66, y), label)
         y += 50
-    editor = Image.open(CAPTURES / "editor" / "raw.png")
+    editor = cached_image(str(CAPTURES / "editor" / "raw.png"))
     paste_card(canvas, editor, (375, 76), (845, 620), radius=16, shadow=22)
     save(canvas, "03-photo-editor.jpg")
 
 
-@lru_cache(maxsize=1)
-def ocr_editor_preview() -> Image.Image:
-    editor = Image.open(CAPTURES / "editor" / "raw.png").convert("RGBA")
-    overlay = Image.new("RGBA", editor.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    # Match Matteshot's select-text treatment: recognized word boxes are faint,
-    # while the words included in the current drag selection are more visible.
-    word_boxes = [
-        (502, 224, 644, 254), (655, 224, 776, 254), (502, 265, 557, 285),
-        (566, 265, 580, 285), (587, 265, 675, 285), (682, 265, 757, 285),
-        (765, 265, 832, 285), (839, 265, 915, 285), (922, 265, 966, 285),
-        (521, 329, 604, 347), (521, 363, 555, 397),
-        (787, 329, 900, 347), (787, 363, 854, 397),
-        (1058, 329, 1179, 347), (1058, 363, 1127, 397),
-        (1327, 329, 1435, 347), (1327, 363, 1374, 397),
-        (570, 672, 637, 690), (648, 672, 697, 690), (708, 672, 777, 690),
-        (570, 699, 660, 717), (668, 699, 711, 717), (720, 699, 744, 717),
-        (752, 699, 810, 717), (818, 699, 872, 717),
-    ]
-    for rect in word_boxes:
-        draw.rounded_rectangle(rect, radius=4, fill=(78, 149, 236, 34), outline=(102, 174, 255, 80), width=1)
-    selected = [(570, 672, 637, 690), (648, 672, 697, 690), (708, 672, 777, 690),
-                (570, 699, 660, 717), (668, 699, 711, 717), (720, 699, 744, 717),
-                (752, 699, 810, 717), (818, 699, 872, 717)]
-    for rect in selected:
-        draw.rounded_rectangle(rect, radius=4, fill=(60, 132, 231, 105), outline=(110, 193, 255, 220), width=2)
-    editor.alpha_composite(overlay)
-    return editor
+SELECT_TEXT_BUTTON = (1927, 1125, 2142, 1154)
+
+
+def map_source_rect(rect, source: Image.Image, pasted):
+    x, y, width, height = pasted
+    sx, sy = width / source.width, height / source.height
+    left, top, right, bottom = rect
+    return (
+        round(x + left * sx),
+        round(y + top * sy),
+        round(x + right * sx),
+        round(y + bottom * sy),
+    )
+
+
+def select_text_callout(draw: ImageDraw.ImageDraw, source: Image.Image, pasted, label_xy):
+    button = map_source_rect(SELECT_TEXT_BUTTON, source, pasted)
+    draw.rounded_rectangle(button, radius=7, outline=(104, 220, 201), width=3)
+    lx, ly = label_xy
+    draw.rounded_rectangle(
+        (lx, ly, lx + 218, ly + 40),
+        radius=20,
+        fill=(69, 181, 155),
+        outline=(126, 231, 211),
+        width=1,
+    )
+    text(draw, (lx + 109, ly + 20), "1. Click Select text", 15, weight="semibold", anchor="mm")
+    draw.line((lx + 190, ly, button[2] - 8, button[3]), fill=(104, 220, 201), width=3)
 
 
 def slide_ocr():
@@ -227,21 +235,22 @@ def slide_ocr():
     add_brand(canvas)
     text(draw, (64, 123), "Select text.\nSkip retyping.", 45, weight="bold", spacing=2)
     text(draw, (66, 242), "Drag over words in the screenshot\nlike they were normal text.", 21, fill=(193, 204, 229), spacing=7)
-    y = 345
+    y = 335
     for label in ("Offline Windows OCR", "Copy only what you need", "Redacted text stays blocked"):
         pill(draw, (66, y), label, accent=(104, 205, 190))
-        y += 52
-    draw.rounded_rectangle((66, 526, 350, 652), radius=18, fill=(31, 42, 76), outline=(83, 105, 151), width=1)
-    text(draw, (87, 546), "COPIED TEXT", 13, fill=(111, 214, 199), weight="bold")
-    text(draw, (87, 579), "Kim Patel\nDashboard totals do not\nmatch export", 16, fill=(229, 235, 249), spacing=5)
-    editor = ocr_editor_preview()
-    paste_card(canvas, editor, (382, 89), (840, 610), radius=16, shadow=22)
+        y += 50
+    draw.rounded_rectangle((66, 510, 350, 658), radius=18, fill=(31, 42, 76), outline=(83, 105, 151), width=1)
+    text(draw, (87, 532), "2. COPIED TEXT", 13, fill=(111, 214, 199), weight="bold")
+    text(draw, (87, 566), "Kim Patel\nDashboard totals do not\nmatch export", 16, fill=(229, 235, 249), spacing=6)
+    editor = cached_image(str(CAPTURES / "editor" / "raw.png"))
+    pasted = paste_card(canvas, editor, (382, 82), (840, 600), radius=16, shadow=22)
+    select_text_callout(draw, editor, pasted, (972, 646))
     save(canvas, "04-select-text.jpg")
 
 
 @lru_cache(maxsize=1)
 def video_annotation_preview() -> Image.Image:
-    video = Image.open(CAPTURES / "video-annotations" / "matte-none.png").convert("RGBA")
+    video = cached_image(str(CAPTURES / "video-annotations" / "matte-none.png")).copy()
     layer = Image.new("RGBA", video.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
     red = (255, 77, 73, 255)
@@ -297,12 +306,12 @@ def slide_capture_more():
             yy = top + 76 + i * 34
             sd.ellipse((52, yy + 2, 64, yy + 14), fill=(83, 188, 169))
             text(sd, (78, yy - 3), row, 15, fill=(76, 89, 111))
-    scroll_h = round(scroll.height * 350 / scroll.width)
-    scroll = scroll.resize((350, scroll_h), Image.Resampling.LANCZOS).crop((0, 0, 350, 575))
-    paste_card(canvas, scroll, (826, 89), (350, 575), radius=18, shadow=20, contain=False)
-    adaptive = Image.open(CAPTURES / "demo" / "matte-adaptive.png")
+    scroll_h = round(scroll.height * 290 / scroll.width)
+    scroll = scroll.resize((290, scroll_h), Image.Resampling.LANCZOS).crop((0, 0, 290, 575))
+    paste_card(canvas, scroll, (930, 89), (290, 575), radius=18, shadow=20, contain=False)
+    adaptive = cached_image(str(CAPTURES / "demo" / "matte-adaptive.png"))
     paste_card(canvas, adaptive, (390, 182), (520, 330), radius=15, shadow=18)
-    picker = Image.open(CAPTURES / "picker" / "raw.png")
+    picker = cached_image(str(CAPTURES / "picker" / "raw.png"))
     picker = fit(picker, (610, 150), contain=True)
     paste_card(canvas, picker, (365, 522), (610, 150), radius=13, shadow=16)
     save(canvas, "06-capture-more.jpg")
@@ -333,7 +342,7 @@ def slide_trust():
 
 def thumbnail():
     image = gradient((240, 240), left=(52, 60, 145), right=(114, 68, 164))
-    icon = Image.open(ROOT.parents[1] / "assets" / "icon-256.png").convert("RGBA").resize((142, 142), Image.Resampling.LANCZOS)
+    icon = cached_image(str(ROOT.parents[1] / "assets" / "icon-256.png")).resize((142, 142), Image.Resampling.LANCZOS)
     shadow = Image.new("RGBA", image.size, (0, 0, 0, 0))
     ImageDraw.Draw(shadow).ellipse((50, 66, 190, 206), fill=(0, 0, 0, 100))
     shadow = shadow.filter(ImageFilter.GaussianBlur(22))
@@ -344,99 +353,155 @@ def thumbnail():
     image.convert("RGB").save(OUT / "thumbnail-240.png")
 
 
-def ease(t: float) -> float:
-    t = max(0.0, min(1.0, t))
-    return t * t * (3 - 2 * t)
+def video_canvas(title: str, subtitle: str):
+    canvas = cached_gradient(left=(18, 25, 57), right=(42, 37, 96)).copy()
+    add_brand(canvas, (52, 35))
+    draw = ImageDraw.Draw(canvas)
+    text(draw, (635, 93), title, 43, weight="bold", anchor="mm")
+    text(draw, (635, 143), subtitle, 19, fill=(198, 208, 232), anchor="mm")
+    del draw
+    return canvas
 
 
-def cursor(draw: ImageDraw.ImageDraw, x: float, y: float, click=0.0):
-    if click > 0:
-        r = 13 + click * 25
-        a = int(180 * (1 - click))
-        draw.ellipse((x - r, y - r, x + r, y + r), outline=(104, 220, 201, a), width=4)
-    points = [(x, y), (x + 3, y + 31), (x + 12, y + 23), (x + 20, y + 40), (x + 28, y + 36), (x + 20, y + 19), (x + 32, y + 17)]
-    draw.polygon(points, fill=(255, 255, 255), outline=(14, 18, 35))
+@lru_cache(maxsize=1)
+def phase_capture() -> Image.Image:
+    canvas = video_canvas("Press PrtScn", "Click a window or drag a region.")
+    raw = cached_image(str(CAPTURES / "demo" / "raw.png"))
+    pasted = paste_card(canvas, raw, (150, 183), (970, 535), radius=17, shadow=20)
+    draw = ImageDraw.Draw(canvas)
+    x, y, width, _ = pasted
+    draw.rounded_rectangle((x + width - 196, y + 20, x + width - 20, y + 58), radius=19, fill=(31, 42, 76, 235))
+    text(draw, (x + width - 108, y + 39), "WINDOW CAPTURE", 13, fill=(111, 214, 199), weight="bold", anchor="mm")
+    return canvas.convert("RGB")
+
+
+@lru_cache(maxsize=1)
+def phase_picker() -> Image.Image:
+    canvas = video_canvas("Pick a finished look", "The first result is already copied.")
+    picker_img = cached_image(str(CAPTURES / "picker" / "raw.png"))
+    picker = fit(picker_img, (1170, 250), contain=True)
+    paste_card(canvas, picker, (50, 238), (1170, 250), radius=16, shadow=18)
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle((455, 580, 815, 635), radius=27, fill=(67, 178, 151))
+    text(draw, (635, 607), "Six styles. One click.", 20, weight="semibold", anchor="mm")
+    return canvas.convert("RGB")
+
+
+@lru_cache(maxsize=1)
+def phase_ocr() -> Image.Image:
+    canvas = video_canvas("Select text from the screenshot", "Offline OCR. Copy only what you need.")
+    editor = cached_image(str(CAPTURES / "editor" / "raw.png"))
+    pasted = paste_card(canvas, editor, (105, 165), (1060, 460), radius=16, shadow=22)
+    draw = ImageDraw.Draw(canvas)
+    button = map_source_rect(SELECT_TEXT_BUTTON, editor, pasted)
+    draw.rounded_rectangle(button, radius=6, outline=(104, 220, 201), width=3)
+    draw.line((button[0] + 8, button[1], 850, 645), fill=(104, 220, 201), width=3)
+    draw.rounded_rectangle((842, 628, 1138, 714), radius=18, fill=(31, 42, 76), outline=(104, 205, 190), width=2)
+    text(draw, (862, 642), "COPIED TEXT", 12, fill=(111, 214, 199), weight="bold")
+    text(draw, (862, 667), "Dashboard totals do not\nmatch export", 15, fill=(232, 237, 249), spacing=2)
+    return canvas.convert("RGB")
+
+
+@lru_cache(maxsize=1)
+def phase_video() -> Image.Image:
+    canvas = video_canvas("Annotate video, too", "Nine tools, precise timing and audio-preserving export.")
+    paste_card(canvas, video_annotation_preview(), (100, 172), (1070, 530), radius=16, shadow=22)
+    return canvas.convert("RGB")
+
+
+@lru_cache(maxsize=1)
+def phase_paste() -> Image.Image:
+    canvas = video_canvas("Paste anywhere.", "Email, chat, docs or your next launch.")
+    aurora = cached_image(str(CAPTURES / "demo" / "matte-aurora.png"))
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle((145, 183, 1125, 702), radius=22, fill=(244, 246, 250), outline=(255, 255, 255, 40), width=1)
+    draw.rectangle((145, 183, 1125, 243), fill=(35, 39, 50))
+    text(draw, (178, 213), "New message", 18, weight="semibold", anchor="lm")
+    text(draw, (181, 273), "To:  Product team", 16, fill=(60, 68, 84))
+    draw.line((180, 305, 1090, 305), fill=(210, 216, 227), width=1)
+    text(draw, (181, 331), "The support dashboard is ready for review.", 17, fill=(47, 54, 70))
+    del draw
+    image = fit(aurora, (660, 305), contain=True)
+    canvas.alpha_composite(image, ((W - image.width) // 2, 370))
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle((902, 648, 1080, 686), radius=19, fill=(92, 113, 228))
+    text(draw, (991, 667), "Send", 16, weight="semibold", anchor="mm")
+    return canvas.convert("RGB")
+
+
+PHASES = (
+    (2.6, phase_capture),
+    (2.6, phase_picker),
+    (3.0, phase_ocr),
+    (3.0, phase_video),
+    (2.8, phase_paste),
+)
+
+
+@lru_cache(maxsize=1)
+def phase_bridge() -> Image.Image:
+    canvas = cached_gradient(left=(18, 25, 57), right=(42, 37, 96)).copy()
+    add_brand(canvas, (52, 35))
+    return canvas.convert("RGB")
+
+
+def smoothstep(value: float) -> float:
+    value = max(0.0, min(1.0, value))
+    return value * value * (3 - 2 * value)
 
 
 def demo_frame(time_s: float) -> Image.Image:
-    canvas = cached_gradient(left=(18, 25, 57), right=(42, 37, 96)).copy()
-    draw = ImageDraw.Draw(canvas)
-    add_brand(canvas, (52, 35))
-    raw = cached_image(str(CAPTURES / "demo" / "raw.png"))
-    picker_img = cached_image(str(CAPTURES / "picker" / "raw.png"))
-    aurora = cached_image(str(CAPTURES / "demo" / "matte-aurora.png"))
-    ocr_editor = ocr_editor_preview()
-    video_editor = video_annotation_preview()
-
-    if time_s < 2.4:
-        text(draw, (635, 116), "Press PrtScn", 47, weight="bold", anchor="mm")
-        text(draw, (635, 169), "Click a window or drag a region.", 20, fill=(198, 208, 232), anchor="mm")
-        scale = 0.94 + ease(time_s / 2.4) * 0.035
-        box = (round(920 * scale), round(548 * scale))
-        pos = ((W - box[0]) // 2, 200 + (548 - box[1]) // 2)
-        x, y, iw, ih = paste_card(canvas, raw, pos, box, radius=17, shadow=20)
-        cursor(draw, x + iw * .82, y + ih * .18)
-    elif time_s < 4.8:
-        local = time_s - 2.4
-        text(draw, (635, 116), "Pick a finished look", 45, weight="bold", anchor="mm")
-        text(draw, (635, 169), "The first result is already copied.", 20, fill=(198, 208, 232), anchor="mm")
-        p = fit(picker_img, (1170, 250), contain=True)
-        paste_card(canvas, p, (50, 250), (1170, 250), radius=16, shadow=18)
-        start, end = (335, 390), (620, 390)
-        m = ease(local / 1.6)
-        cx = start[0] + (end[0] - start[0]) * m
-        cy = start[1] + (end[1] - start[1]) * m
-        click = max(0.0, min(1.0, (local - 1.65) / .65)) if local > 1.65 else 0.0
-        cursor(draw, cx, cy, click)
-        draw.rounded_rectangle((455, 586, 815, 641), radius=27, fill=(67, 178, 151))
-        text(draw, (635, 613), "Six styles. One click.", 20, weight="semibold", anchor="mm")
-    elif time_s < 7.3:
-        text(draw, (635, 92), "Select text from the screenshot", 43, weight="bold", anchor="mm")
-        text(draw, (635, 143), "Offline OCR. Drag, copy and keep moving.", 20, fill=(198, 208, 232), anchor="mm")
-        paste_card(canvas, ocr_editor, (105, 180), (1060, 500), radius=16, shadow=22)
-        draw.rounded_rectangle((879, 631, 1120, 702), radius=18, fill=(31, 42, 76), outline=(104, 205, 190), width=2)
-        text(draw, (899, 644), "COPIED", 12, fill=(111, 214, 199), weight="bold")
-        text(draw, (899, 668), "Dashboard totals do not match export", 14, fill=(232, 237, 249))
-    elif time_s < 10.3:
-        text(draw, (635, 89), "Annotate video, too", 44, weight="bold", anchor="mm")
-        text(draw, (635, 140), "Nine tools, precise timing and audio-preserving export.", 20, fill=(198, 208, 232), anchor="mm")
-        paste_card(canvas, video_editor, (100, 178), (1070, 530), radius=16, shadow=22)
-    else:
-        local = time_s - 10.3
-        text(draw, (635, 92), "Paste anywhere.", 45, weight="bold", anchor="mm")
-        text(draw, (635, 143), "Email, chat, docs or your next launch.", 20, fill=(198, 208, 232), anchor="mm")
-        draw.rounded_rectangle((145, 187, 1125, 700), radius=22, fill=(244, 246, 250), outline=(255, 255, 255, 40), width=1)
-        draw.rectangle((145, 187, 1125, 247), fill=(35, 39, 50))
-        text(draw, (178, 217), "New message", 18, weight="semibold", anchor="lm")
-        text(draw, (181, 277), "To:  Product team", 16, fill=(60, 68, 84))
-        draw.line((180, 305, 1090, 305), fill=(210, 216, 227), width=1)
-        text(draw, (181, 335), "The support dashboard is ready for review.", 17, fill=(47, 54, 70))
-        pasted = fit(aurora, (660, 305), contain=True)
-        y = 372 + round(15 * (1 - ease(local / 1.2)))
-        alpha = int(255 * ease(local / .8))
-        pasted.putalpha(alpha)
-        canvas.alpha_composite(pasted, ((W - pasted.width) // 2, y))
-        draw.rounded_rectangle((902, 646, 1080, 684), radius=19, fill=(92, 113, 228))
-        text(draw, (991, 665), "Send", 16, weight="semibold", anchor="mm")
-    return canvas.convert("RGB")
+    elapsed = 0.0
+    transition = 0.32
+    for index, (duration, renderer) in enumerate(PHASES):
+        local = time_s - elapsed
+        if local < duration or index == len(PHASES) - 1:
+            frame = renderer()
+            if index < len(PHASES) - 1 and local > duration - transition:
+                progress = (local - (duration - transition)) / transition
+                if progress < 0.5:
+                    frame = Image.blend(frame, phase_bridge(), smoothstep(progress * 2))
+                else:
+                    frame = Image.blend(
+                        phase_bridge(),
+                        PHASES[index + 1][1](),
+                        smoothstep((progress - 0.5) * 2),
+                    )
+            return frame
+        elapsed += duration
+    return PHASES[-1][1]()
 
 
 def demo_video():
     fps = 30
-    duration = 13.8
+    duration = sum(duration for duration, _ in PHASES)
     mp4 = OUT / "matteshot-product-hunt-demo.mp4"
+    # Lossless H.264 avoids block artifacts around small UI text while keeping
+    # the browser-compatible 4:2:0 pixel format and a compact static-scene file.
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
         "-r", str(fps), "-i", "-", "-an", "-c:v", "libx264", "-preset", "medium",
-        "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
+        "-crf", "0", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
     ]
-    proc = subprocess.Popen(command, stdin=subprocess.PIPE)
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, bufsize=0)
     if proc.stdin is None:
         raise RuntimeError("ffmpeg did not expose a frame input stream")
     try:
         for i in range(round(duration * fps)):
-            proc.stdin.write(demo_frame(i / fps).tobytes())
+            frame = demo_frame(i / fps)
+            payload = frame.tobytes()
+            expected_bytes = W * H * 3
+            if frame.mode != "RGB" or frame.size != (W, H) or len(payload) != expected_bytes:
+                raise RuntimeError(
+                    f"Invalid raw frame {i}: mode={frame.mode}, size={frame.size}, bytes={len(payload)}"
+                )
+            remaining = memoryview(payload)
+            while remaining:
+                written = proc.stdin.write(remaining)
+                if written is None or written <= 0:
+                    raise BrokenPipeError("ffmpeg stopped accepting raw frame data")
+                remaining = remaining[written:]
     except BrokenPipeError as error:
         try:
             proc.stdin.close()
