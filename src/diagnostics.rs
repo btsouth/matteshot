@@ -116,6 +116,7 @@ pub fn report() -> String {
          License: {}\r\n\
          PrtScn preferred: {}\r\n\
          PrtScn owned: {}\r\n\
+         PrtScn presses recovered from a missed key-up: {}\r\n\
          Capture folder: {}\r\n\
          Video folder: {}\r\n\
          Recording audio: {}\r\n\
@@ -127,6 +128,7 @@ pub fn report() -> String {
         crate::license::status().tray_label(),
         crate::prtscn::preferred(),
         crate::prtscn::owns_key(),
+        crate::prtscn::recovered_presses(),
         save_location,
         video_location,
         config.record_audio,

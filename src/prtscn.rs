@@ -7,7 +7,7 @@
 //! owns the key, ask the user (one MessageBox) and flip the setting the same
 //! way the Settings app does, then retry.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, HOT_KEY_MODIFIERS, VK_SNAPSHOT,
@@ -43,6 +44,33 @@ static TARGET_ID: AtomicU32 = AtomicU32::new(0);
 static KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static FALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static PREFERRED: AtomicBool = AtomicBool::new(true);
+/// Tick of the last PrtScn key-down the hook saw, for the staleness check.
+static LAST_DOWN_TICK: AtomicU64 = AtomicU64::new(0);
+/// How many presses the staleness check rescued. Surfaced in diagnostics; a
+/// non-zero value means key-ups are being missed on this machine.
+static RECOVERED_PRESSES: AtomicU32 = AtomicU32::new(0);
+
+/// Windows repeats a held key at 2.5-30 per second after an initial delay of at
+/// most a second, so consecutive key-downs from a held key are never more than
+/// about a second apart. A longer gap is a fresh press, whatever the latch says.
+const REPEAT_CEILING_MS: u64 = 1500;
+
+/// Whether a key-down should fire a capture.
+///
+/// The latch alone was not enough. It is only cleared by a key-up, and a
+/// low-level hook does miss those: Windows stops calling a hook whose thread did
+/// not answer within `LowLevelHooksTimeout`, and the machine is at its busiest
+/// in the moment right after PrtScn, because the freeze overlay is capturing
+/// every monitor. One missed key-up left the latch set, so the next press was
+/// swallowed and you had to press again.
+fn should_fire(latched: bool, millis_since_last_down: u64) -> bool {
+    !latched || millis_since_last_down >= REPEAT_CEILING_MS
+}
+
+/// Presses recovered from a stuck latch since start.
+pub fn recovered_presses() -> u32 {
+    RECOVERED_PRESSES.load(Ordering::SeqCst)
+}
 
 struct HookRuntime {
     thread_id: u32,
@@ -85,7 +113,16 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         if key.vkCode == VK_SNAPSHOT.0 as u32 {
             match wparam.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    if !KEY_DOWN.swap(true, Ordering::SeqCst) {
+                    // Nothing here may be slow: a hook that overruns
+                    // LowLevelHooksTimeout stops being called at all, which is
+                    // what causes the missed key-ups this guards against.
+                    let now = GetTickCount64();
+                    let previous = LAST_DOWN_TICK.swap(now, Ordering::SeqCst);
+                    let latched = KEY_DOWN.swap(true, Ordering::SeqCst);
+                    if should_fire(latched, now.saturating_sub(previous)) {
+                        if latched {
+                            RECOVERED_PRESSES.fetch_add(1, Ordering::SeqCst);
+                        }
                         let posted = PostThreadMessageW(
                             TARGET_THREAD.load(Ordering::SeqCst),
                             windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY,
@@ -274,4 +311,30 @@ pub fn acquire(id: i32, interactive: bool) -> Acquire {
         }
     }
     Acquire::ShellStillOwns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_fire, REPEAT_CEILING_MS};
+
+    #[test]
+    fn a_missed_key_up_cannot_swallow_the_next_press() {
+        // Normal press: nothing latched, fires.
+        assert!(should_fire(false, 0));
+        assert!(should_fire(false, 50_000));
+
+        // Auto-repeat while the key is held. Even the slowest Windows repeat
+        // settings keep consecutive downs about a second apart, so these must
+        // stay suppressed or holding PrtScn would capture over and over.
+        assert!(!should_fire(true, 33));
+        assert!(!should_fire(true, 400));
+        assert!(!should_fire(true, 1_000));
+
+        // A latch left set by a key-up the hook never received. A real person
+        // pressing again is always well past the repeat ceiling, so the press
+        // has to get through instead of being eaten.
+        assert!(should_fire(true, REPEAT_CEILING_MS));
+        assert!(should_fire(true, 3_000));
+        assert!(should_fire(true, 60_000));
+    }
 }
