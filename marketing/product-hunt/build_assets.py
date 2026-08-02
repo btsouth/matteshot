@@ -125,7 +125,8 @@ def pill(draw: ImageDraw.ImageDraw, xy, label: str, accent=(108, 209, 198)):
 
 
 def brand(xy=(64, 44), dark=False):
-    icon = Image.open(ROOT.parents[1] / "assets" / "icon-256.png").convert("RGBA").resize((44, 44), Image.Resampling.LANCZOS)
+    icon_path = ROOT.parents[1] / "assets" / "icon-256.png"
+    icon = cached_image(str(icon_path)).resize((44, 44), Image.Resampling.LANCZOS)
     return icon, (xy[0] + 58, xy[1] + 7), (20, 27, 43) if dark else (255, 255, 255)
 
 
