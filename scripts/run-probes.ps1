@@ -47,7 +47,10 @@ param(
     [string]$SignedFile,
     # Turn every SKIP into a failure. CI runs strict: a probe that quietly did
     # not run is how --video-edit-test stayed broken for weeks.
-    [switch]$Strict
+    [switch]$Strict,
+    # Leave the capture and OCR probes out of the run entirely. They need a
+    # visible window, which a GitHub-hosted runner does not have.
+    [switch]$NoCapture
 )
 
 $ErrorActionPreference = 'Stop'
@@ -99,7 +102,13 @@ function Invoke-Probe {
 }
 
 # ---------------------------------------------------------------- capture ---
-if (-not $WindowTitle) {
+# -NoCapture puts these out of scope rather than skipping them, so -Strict keeps
+# meaning "every probe this run promised actually ran". A GitHub-hosted runner
+# has a desktop you can record, but no genuinely visible top-level window:
+# PowerShell reports a MainWindowTitle for a console started there and
+# find_by_title still cannot see it. Capture and OCR stay in the local run and
+# in INTERACTIVE-REGRESSION.md.
+if (-not $NoCapture -and -not $WindowTitle) {
     # Size matters: plenty of apps keep tiny hidden helper windows, and
     # capturing a 16x16 one makes the OCR probe "fail" for no real reason.
     Add-Type -Name ProbeWin -Namespace Matteshot -MemberDefinition @'
@@ -116,10 +125,12 @@ public struct RECT { public int L, T, R, B; }
         Select-Object -First 1 -ExpandProperty MainWindowTitle
 }
 
-# Report this rather than throwing: a bare terminating error loses the table
-# for the probes that did run, and -Strict is what decides whether an absent
-# capture target is acceptable.
-if (-not $WindowTitle) {
+# Report an absent target rather than throwing: a bare terminating error loses
+# the table for the probes that did run, and -Strict is what decides whether it
+# was acceptable.
+if ($NoCapture) {
+    Write-Host 'Capture probes excluded by -NoCapture.' -ForegroundColor DarkGray
+} elseif (-not $WindowTitle) {
     $results += [pscustomobject]@{
         Probe = 'capture probes'; Result = 'SKIP'; Seconds = 0
         Detail = 'no window big enough to capture; pass -WindowTitle'

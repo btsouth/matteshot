@@ -86,7 +86,10 @@ Keep all three in sync if the design changes.
   auto-update trust gates) and fails loudly. It is safe mid-work: no clipboard,
   no injected input, no windows. Two silent breakages got shipped for want of
   this — `--video-edit-test` was broken for weeks, and clippy was red through a
-  release. `reliability-soak.ps1` covers the static side (test, clippy, audit);
+  release. `release-candidate.yml` now runs it too, with `-Strict` (a skipped
+  probe fails the run) and `-SignedFile` pointed at the installer it just
+  signed, so a candidate proves it passes its own auto-update gate before
+  anyone can download it. `reliability-soak.ps1` covers the static side (test, clippy, audit);
   **CI gates on `cargo clippy -- -D warnings`, so build+test passing locally is
   not enough.** `.\scripts\verify-code.ps1` is the shared code gate used by CI,
   signed-candidate builds, and tagged releases: all tests, strict Clippy, then a

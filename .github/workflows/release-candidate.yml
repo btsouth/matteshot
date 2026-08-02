@@ -108,24 +108,13 @@ jobs:
             Set-Content -Encoding ascii -NoNewline $checksum
           "checksum=$checksum" >> $env:GITHUB_OUTPUT
 
-      # The probes need something to capture and something to decode. The
-      # runner has neither, so make both here rather than committing a fixture:
-      # recording one exercises the capture and encode path as a side effect.
-      - name: Stage a capture target and a video fixture
+      # The video probes need something to decode. Record it here rather than
+      # committing a fixture: the recording and encode path gets exercised as a
+      # side effect, and the runner can do this even though it cannot offer a
+      # window to capture.
+      - name: Record a video fixture
         shell: pwsh
         run: |
-          Start-Process cmd.exe -ArgumentList '/k title Matteshot-Probe'
-          $deadline = (Get-Date).AddSeconds(20)
-          do {
-            Start-Sleep -Milliseconds 250
-            $window = Get-Process -ErrorAction SilentlyContinue |
-              Where-Object { $_.MainWindowTitle -like '*Matteshot-Probe*' } |
-              Select-Object -First 1
-          } while (-not $window -and (Get-Date) -lt $deadline)
-          if (-not $window) {
-            Write-Error 'The probe capture target never appeared.'
-            exit 1
-          }
           & '${{ github.workspace }}\target\release\matteshot.exe' --record-test 3
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -133,15 +122,17 @@ jobs:
         shell: pwsh
         # -Offline on purpose: the network probes check the *published* release,
         # so leaving them in would fail this candidate whenever production is
-        # having a bad day. -Strict because a probe that silently did not run is
-        # what let a broken --video-edit-test ship for weeks.
+        # having a bad day. -NoCapture because a GitHub-hosted runner has no
+        # visible window for --bench and --ocr to find. -Strict because a probe
+        # that silently did not run is what let a broken --video-edit-test ship
+        # for weeks.
         run: |
           .\scripts\run-probes.ps1 `
             -Strict `
             -Offline `
+            -NoCapture `
             -Exe '${{ github.workspace }}\target\release\matteshot.exe' `
-            -SignedFile '${{ steps.installer.outputs.path }}' `
-            -WindowTitle 'Matteshot-Probe'
+            -SignedFile '${{ steps.installer.outputs.path }}'
 
       - name: Upload private signed candidate
         uses: actions/upload-artifact@v4
