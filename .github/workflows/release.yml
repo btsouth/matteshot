@@ -157,18 +157,21 @@ jobs:
         id: purge
         shell: pwsh
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_CACHE_PURGE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
         run: |
           # Writing a new object does not evict what the edge already holds.
           # Without this the stable URL keeps serving the PREVIOUS installer
           # next to the new checksum until its TTL expires.
-          # Purging needs Zone > Cache Purge, which the R2 token may not carry.
-          # Without it the stable URL still corrects itself once the cached
-          # entry expires, so a missing permission is a warning, not a failed
+          # Use a separate least-privilege Zone > Cache Purge token. Without
+          # it the stable URL still corrects itself once the cached entry
+          # expires, so a missing permission is a warning, not a failed
           # release. It does mean the strict check below cannot be enforced.
           $ok = $false
-          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_ZONE_ID)) {
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_API_TOKEN)) {
+            Write-Warning "CLOUDFLARE_CACHE_PURGE_API_TOKEN is not set; skipping the edge purge."
+          } elseif ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_ZONE_ID)) {
             Write-Warning "CLOUDFLARE_ZONE_ID is not set; skipping the edge purge."
           } else {
             $body = @{ files = @(
@@ -179,11 +182,11 @@ jobs:
           # made a failing purge indistinguishable from a missing permission.
           try {
             $token = Invoke-RestMethod -Method Get `
-              -Uri "https://api.cloudflare.com/client/v4/user/tokens/verify" `
+              -Uri "https://api.cloudflare.com/client/v4/accounts/$env:CLOUDFLARE_ACCOUNT_ID/tokens/verify" `
               -Headers @{ Authorization = "Bearer $env:CLOUDFLARE_API_TOKEN" }
-            Write-Host "Release token status: $($token.result.status)"
+            Write-Host "Cache purge token status: $($token.result.status)"
           } catch {
-            Write-Host "Could not verify the release token: $_"
+            Write-Host "Could not verify the cache purge token: $_"
           }
             try {
               $purge = Invoke-RestMethod -Method Post `
@@ -203,7 +206,7 @@ jobs:
             if ($ok) {
               Write-Host "Purged the stable installer and checksum from the edge."
             } else {
-              Write-Warning "Cache purge was refused. The release token needs Zone > Cache Purge on zone $env:CLOUDFLARE_ZONE_ID. Uploads set a 60s TTL, so the stable URL still corrects itself shortly; this only removes the wait."
+              Write-Warning "Cache purge was refused. CLOUDFLARE_CACHE_PURGE_API_TOKEN needs Zone > Cache Purge on zone $env:CLOUDFLARE_ZONE_ID. Uploads set a 60s TTL, so the stable URL still corrects itself shortly; this only removes the wait."
             }
           }
           "purged=$($ok.ToString().ToLower())" >> $env:GITHUB_OUTPUT
