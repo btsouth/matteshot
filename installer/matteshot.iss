@@ -2,7 +2,7 @@
 ; Build: ISCC.exe installer\matteshot.iss   (from the repo root)
 
 #ifndef AppVersion
-  #define AppVersion "0.13.0"
+  #define AppVersion "0.13.1"
 #endif
 
 [Setup]
