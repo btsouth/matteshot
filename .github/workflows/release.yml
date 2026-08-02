@@ -158,7 +158,6 @@ jobs:
         shell: pwsh
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_CACHE_PURGE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
         run: |
           # Writing a new object does not evict what the edge already holds.
@@ -182,7 +181,7 @@ jobs:
           # made a failing purge indistinguishable from a missing permission.
           try {
             $token = Invoke-RestMethod -Method Get `
-              -Uri "https://api.cloudflare.com/client/v4/accounts/$env:CLOUDFLARE_ACCOUNT_ID/tokens/verify" `
+              -Uri "https://api.cloudflare.com/client/v4/user/tokens/verify" `
               -Headers @{ Authorization = "Bearer $env:CLOUDFLARE_API_TOKEN" }
             Write-Host "Cache purge token status: $($token.result.status)"
           } catch {
