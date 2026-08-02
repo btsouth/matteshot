@@ -7,7 +7,7 @@
 //! owns the key, ask the user (one MessageBox) and flip the setting the same
 //! way the Settings app does, then retry.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, HOT_KEY_MODIFIERS, VK_SNAPSHOT,
@@ -43,6 +44,51 @@ static TARGET_ID: AtomicU32 = AtomicU32::new(0);
 static KEY_DOWN: AtomicBool = AtomicBool::new(false);
 static FALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static PREFERRED: AtomicBool = AtomicBool::new(true);
+/// Tick of the last PrtScn key-down the hook saw, for the staleness check.
+static LAST_DOWN_TICK: AtomicU64 = AtomicU64::new(0);
+/// How many presses the staleness check rescued. Surfaced in diagnostics; a
+/// non-zero value means key-ups are being missed on this machine.
+static RECOVERED_PRESSES: AtomicU32 = AtomicU32::new(0);
+
+/// Auto-repeat arrives as a continuous stream at the system repeat rate, which
+/// tops out around 30 per second. Nobody presses a key twice inside this window
+/// on purpose, so it separates a held key from a deliberate second press.
+const REPEAT_WINDOW_MS: u64 = 300;
+
+/// Whether a key-down should fire a capture.
+///
+/// Purely a function of time since the previous key-down, with no latch to get
+/// stuck. Field data forced this: over one session the hook saw 37 key-downs
+/// and only 26 key-ups, so a latch cleared solely by key-up spends much of its
+/// life wrongly set. Windows stops calling a low-level hook whose thread did not
+/// answer within `LowLevelHooksTimeout`, and the busiest instant on the machine
+/// is right after PrtScn, when the freeze overlay is capturing every monitor.
+///
+/// A key-up, when one does arrive, zeroes the timestamp so the next press always
+/// fires regardless of how quickly it follows.
+fn should_fire(millis_since_last_down: u64) -> bool {
+    millis_since_last_down >= REPEAT_WINDOW_MS
+}
+
+// Health counters. Incrementing an atomic is cheap enough for a low-level hook;
+// anything touching a file or a lock in there would cause the very timeouts
+// these exist to reveal.
+static DOWNS_SEEN: AtomicU32 = AtomicU32::new(0);
+static UPS_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// Key-downs and key-ups the hook saw, and presses that fired while the latch
+/// was still set from an earlier press.
+///
+/// Key-ups trailing key-downs is the signature of a machine where Windows is
+/// dropping hook calls, which is what made PrtScn feel unreliable. Every one of
+/// those recovered presses would have been swallowed by the old latch.
+pub fn hook_health() -> (u32, u32, u32) {
+    (
+        DOWNS_SEEN.load(Ordering::SeqCst),
+        UPS_SEEN.load(Ordering::SeqCst),
+        RECOVERED_PRESSES.load(Ordering::SeqCst),
+    )
+}
 
 struct HookRuntime {
     thread_id: u32,
@@ -85,7 +131,14 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         if key.vkCode == VK_SNAPSHOT.0 as u32 {
             match wparam.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    if !KEY_DOWN.swap(true, Ordering::SeqCst) {
+                    // Nothing here may be slow: a hook that overruns
+                    // LowLevelHooksTimeout stops being called at all, which is
+                    // what causes the missed key-ups this guards against.
+                    DOWNS_SEEN.fetch_add(1, Ordering::SeqCst);
+                    let now = GetTickCount64();
+                    let previous = LAST_DOWN_TICK.swap(now, Ordering::SeqCst);
+                    let stale = KEY_DOWN.swap(true, Ordering::SeqCst);
+                    if should_fire(now.saturating_sub(previous)) {
                         let posted = PostThreadMessageW(
                             TARGET_THREAD.load(Ordering::SeqCst),
                             windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY,
@@ -97,11 +150,24 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                             KEY_DOWN.store(false, Ordering::SeqCst);
                             return CallNextHookEx(None, code, wparam, lparam);
                         }
+                        // Counted only once the capture is genuinely on its
+                        // way. This number exists to answer "were key-ups
+                        // being missed?", so a press that went nowhere must
+                        // not inflate it.
+                        if stale {
+                            RECOVERED_PRESSES.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                     return LRESULT(1);
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
+                    UPS_SEEN.fetch_add(1, Ordering::SeqCst);
                     KEY_DOWN.store(false, Ordering::SeqCst);
+                    // The press finished, so whatever comes next is a new one.
+                    // Zeroing this makes a press-release-press sequence fire
+                    // however fast it is, and costs nothing when the key-up is
+                    // the one that goes missing.
+                    LAST_DOWN_TICK.store(0, Ordering::SeqCst);
                     return LRESULT(1);
                 }
                 _ => {}
@@ -274,4 +340,39 @@ pub fn acquire(id: i32, interactive: bool) -> Acquire {
         }
     }
     Acquire::ShellStillOwns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_fire, REPEAT_WINDOW_MS};
+
+    #[test]
+    fn holding_the_key_still_only_captures_once() {
+        // Windows repeats a held key at up to ~30/sec, so repeats land ~33ms
+        // apart and must be swallowed.
+        assert!(!should_fire(0));
+        assert!(!should_fire(33));
+        assert!(!should_fire(120));
+        assert!(!should_fire(REPEAT_WINDOW_MS - 1));
+    }
+
+    #[test]
+    fn pressing_again_after_a_dead_press_is_never_treated_as_repeat() {
+        // The bug this replaces: the window was 1500ms, so pressing again
+        // after nothing happened was read as auto-repeat and eaten too. Field
+        // data showed every miss landing here. Nobody re-presses inside 300ms,
+        // so anything past it has to fire.
+        assert!(should_fire(REPEAT_WINDOW_MS));
+        assert!(should_fire(400));
+        assert!(should_fire(1_000));
+        assert!(should_fire(60_000));
+    }
+
+    #[test]
+    fn a_completed_press_lets_the_next_one_through_immediately() {
+        // A key-up zeroes the timestamp, so the gap becomes the full tick
+        // count and even a fast press-release-press fires both times.
+        let ticks_since_boot = 900_000u64;
+        assert!(should_fire(ticks_since_boot.saturating_sub(0)));
+    }
 }

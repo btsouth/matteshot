@@ -109,6 +109,7 @@ pub fn report() -> String {
     } else {
         "default"
     };
+    let (downs, ups, saved) = crate::prtscn::hook_health();
     format!(
         "Matteshot diagnostics\r\n\
          Version: {}\r\n\
@@ -116,6 +117,7 @@ pub fn report() -> String {
          License: {}\r\n\
          PrtScn preferred: {}\r\n\
          PrtScn owned: {}\r\n\
+         PrtScn hook: {} down / {} up seen, {} presses saved from a lost key-up\r\n\
          Capture folder: {}\r\n\
          Video folder: {}\r\n\
          Recording audio: {}\r\n\
@@ -127,6 +129,9 @@ pub fn report() -> String {
         crate::license::status().tray_label(),
         crate::prtscn::preferred(),
         crate::prtscn::owns_key(),
+        downs,
+        ups,
+        saved,
         save_location,
         video_location,
         config.record_audio,
