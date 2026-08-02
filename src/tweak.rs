@@ -179,6 +179,9 @@ struct Document {
     /// Annotation being dragged in selector mode: (index, last raw point,
     /// grabbed part).
     moving: Option<(usize, (f32, f32), Grab)>,
+    /// Whether the current selector drag actually moved anything. A click that
+    /// only selects must not leave an empty step on the undo stack.
+    moved: bool,
     /// Clicked annotation — Delete / color / size act on it.
     selected: Option<usize>,
     /// Next step-badge number.
@@ -187,7 +190,78 @@ struct Document {
     hover_ann: Option<usize>,
     /// Select-text mode, when armed. None means normal annotation editing.
     text_select: Option<TextSelect>,
+    history: History,
     last_rebuild: std::time::Instant,
+}
+
+/// One undo step. The badge counter travels with the annotations because
+/// restoring a removed step badge has to restore the number it would hand out
+/// next, or the following badge duplicates it.
+#[derive(Clone)]
+struct Snapshot {
+    anns: Vec<crate::annotate::Annotation>,
+    counter_next: u32,
+}
+
+/// How many edits back you can go. Deep enough that nobody hits the wall in a
+/// real session, shallow enough that the clones stay cheap.
+const HISTORY_LIMIT: usize = 40;
+
+/// Bounded undo stack. Each entry is the annotation state as it was
+/// immediately before one edit, so an edit records its own "before" and undo
+/// is a restore rather than an inverse operation.
+#[derive(Default)]
+struct History {
+    steps: Vec<Snapshot>,
+}
+
+impl History {
+    fn push(&mut self, anns: &[crate::annotate::Annotation], counter_next: u32) {
+        self.steps.push(Snapshot { anns: anns.to_vec(), counter_next });
+        if self.steps.len() > HISTORY_LIMIT {
+            self.steps.remove(0);
+        }
+    }
+
+    /// Drop the most recent step without applying it, for an edit that turned
+    /// out not to be one (a stray click that drew nothing).
+    fn discard(&mut self) {
+        self.steps.pop();
+    }
+
+    fn undo(&mut self) -> Option<Snapshot> {
+        self.steps.pop()
+    }
+
+    #[cfg(test)]
+    fn depth(&self) -> usize {
+        self.steps.len()
+    }
+}
+
+impl Document {
+    /// Record the current annotations as an undo point. Call before mutating.
+    fn push_history(&mut self) {
+        self.history.push(&self.anns, self.counter_next);
+    }
+
+    fn discard_history(&mut self) {
+        self.history.discard();
+    }
+
+    /// Step back one edit. False when there is nothing left to undo.
+    fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.history.undo() else {
+            return false;
+        };
+        self.anns = snapshot.anns;
+        self.counter_next = snapshot.counter_next;
+        self.selected = None;
+        self.hover_ann = None;
+        self.editing = None;
+        self.editing_original = None;
+        true
+    }
 }
 
 /// The editor window: chrome, layout, and the tool palette shared across every
@@ -1653,6 +1727,8 @@ fn commit_editing(state: &mut State) -> bool {
         if empty {
             state.doc_mut().anns.remove(i);
             state.doc_mut().editing_original = None;
+            // Nothing was typed, so nothing happened worth undoing.
+            state.doc_mut().discard_history();
             return false;
         }
         // One-shot tools: a successful add returns to the selector.
@@ -1985,6 +2061,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             // Recolor whatever is selected or being typed.
             let target = state.doc_mut().editing.or(state.doc_mut().selected);
             if let Some(i) = target {
+                state.doc_mut().push_history();
                 if let Some(ann) = state.doc_mut().anns.get_mut(i) {
                     ann.color = n;
                 }
@@ -1997,6 +2074,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             state.size_idx = n;
             let target = state.doc_mut().editing.or(state.doc_mut().selected);
             if let Some(i) = target {
+                state.doc_mut().push_history();
                 if let Some(ann) = state.doc_mut().anns.get_mut(i) {
                     ann.size = SIZES[n];
                 }
@@ -2007,18 +2085,16 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         }
         Ctl::Undo => {
             commit_editing(state);
-            if let Some(ann) = state.doc_mut().anns.pop() {
-                if matches!(ann.shape, crate::annotate::Shape::Counter { .. }) {
-                    state.doc_mut().counter_next = state.doc_mut().counter_next.saturating_sub(1).max(1);
-                }
+            if state.doc_mut().undo() {
+                rebuild_preview(state);
+                let _ = InvalidateRect(hwnd, None, false);
             }
-            state.doc_mut().selected = None;
-            state.doc_mut().hover_ann = None;
-            rebuild_preview(state);
-            let _ = InvalidateRect(hwnd, None, false);
             return;
         }
         Ctl::Clear => {
+            if !state.doc().anns.is_empty() {
+                state.doc_mut().push_history();
+            }
             state.doc_mut().editing = None;
             state.doc_mut().editing_original = None;
             state.doc_mut().anns.clear();
@@ -2164,6 +2240,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 } else if let Some((i, last, grab)) = state.doc_mut().moving {
                     if let Some(p) = to_raw(state, x, y) {
+                        if p != last {
+                            state.doc_mut().moved = true;
+                        }
                         if let Some(ann) = state.doc_mut().anns.get_mut(i) {
                             apply_grab(ann, grab, p, (p.0 - last.0, p.1 - last.1));
                         }
@@ -2250,7 +2329,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 &state.doc_mut().anns[i].shape
                             {
                                 let original = text.clone();
-                                // Re-edit an existing caption.
+                                // Re-edit an existing caption. The click that
+                                // opened it was a plain selection, so its undo
+                                // step was already discarded on button-up;
+                                // this edit needs one of its own.
+                                state.doc_mut().push_history();
                                 state.doc_mut().moving = None;
                                 let _ = ReleaseCapture();
                                 state.doc_mut().editing_original = Some(original);
@@ -2324,6 +2407,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     bottom: state.slider_rect.bottom + 8,
                 };
                 if text_context(state) && in_rect(&state.caption_size_slider, x, y) {
+                    // One undo step per drag, not per mouse move.
+                    if state.doc().selected.is_some() && state.doc().editing.is_none() {
+                        state.doc_mut().push_history();
+                    }
                     state.dragging = Some(SliderDrag::CaptionSize);
                     SetCapture(hwnd);
                     caption_size_update(hwnd, state, x);
@@ -2333,6 +2420,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     && state.caption_style == crate::annotate::TextStyle::Box
                     && in_rect(&state.caption_opacity_slider, x, y)
                 {
+                    if state.doc().selected.is_some() && state.doc().editing.is_none() {
+                        state.doc_mut().push_history();
+                    }
                     state.dragging = Some(SliderDrag::CaptionOpacity);
                     SetCapture(hwnd);
                     caption_opacity_update(hwnd, state, x);
@@ -2347,6 +2437,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     {
                         state.caption_style = style;
                         if let Some(index) = state.doc_mut().editing.or(state.doc_mut().selected) {
+                            state.doc_mut().push_history();
                             if let Some(ann) = state.doc_mut().anns.get_mut(index) {
                                 if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
                                     ann.text_style = style;
@@ -2393,6 +2484,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         _ => None,
                     };
                     if let Some(shape) = drag_shape {
+                        state.doc_mut().push_history();
                         state.doc_mut().anns.push(crate::annotate::Annotation {
                             shape,
                             color,
@@ -2404,6 +2496,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         SetCapture(hwnd);
                     } else if tool == 7 {
                         // Step badge: click places, auto-numbered, one-shot.
+                        state.doc_mut().push_history();
                         let n = state.doc_mut().counter_next;
                         state.doc_mut().counter_next += 1;
                         state.doc_mut().anns.push(crate::annotate::Annotation {
@@ -2419,6 +2512,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = InvalidateRect(hwnd, None, false);
                     } else {
                         // Text: click places, then type.
+                        state.doc_mut().push_history();
                         state.doc_mut().anns.push(crate::annotate::Annotation {
                             shape: Shape::Text { pos: p, text: String::new() },
                             color: 3,
@@ -2444,11 +2538,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(p) = to_raw(state, x, y) {
                         if let Some(i) = hit_ann(state, p) {
                             let tol = (8.0 / state.doc_mut().preview_metric).max(6.0);
+                            // The whole move/reshape drag is one undo step, so
+                            // the snapshot is taken here rather than per move.
+                            state.doc_mut().push_history();
                             normalize_rect(&mut state.doc_mut().anns[i]);
                             let grab = grab_probe(&state.doc_mut().anns[i], p, tol);
                             state.doc_mut().selected = Some(i);
                             sync_annotation_controls(state, i);
                             state.doc_mut().moving = Some((i, p, grab));
+                            state.doc_mut().moved = false;
                             SetCapture(hwnd);
                             let _ = InvalidateRect(hwnd, None, false);
                         } else if state.doc_mut().selected.take().is_some() {
@@ -2476,6 +2574,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if state.doc_mut().moving.take().is_some() {
                     let _ = ReleaseCapture();
+                    // A click that only selected something is not an edit.
+                    if !state.doc_mut().moved {
+                        state.doc_mut().discard_history();
+                    }
                     rebuild_preview(state);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
@@ -2502,6 +2604,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     };
                     if degenerate {
                         state.doc_mut().anns.pop();
+                        state.doc_mut().discard_history();
                     } else {
                         // Shapes are one-shot, but Pen stays armed so lifting
                         // the mouse does not interrupt handwriting or a
@@ -2747,6 +2850,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 state.doc_mut().anns.remove(i);
                                 state.doc_mut().selected = None;
                             }
+                            // Cancelling put the caption back the way it was,
+                            // so its undo step no longer describes an edit.
+                            state.doc_mut().discard_history();
                             state.tool = None;
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
@@ -2772,16 +2878,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     0x5A if ctrl_down => {
                         // Ctrl+Z
                         commit_editing(state);
-                        state.doc_mut().anns.pop();
-                        state.doc_mut().selected = None;
-                        state.doc_mut().hover_ann = None;
-                        rebuild_preview(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        if state.doc_mut().undo() {
+                            rebuild_preview(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
                     }
                     // Delete removes the selected annotation.
                     0x2E if state.doc_mut().editing.is_none() => {
                         if let Some(i) = state.doc_mut().selected.take() {
                             if i < state.doc_mut().anns.len() {
+                                state.doc_mut().push_history();
                                 state.doc_mut().anns.remove(i);
                             }
                             state.doc_mut().hover_ann = None;
@@ -3196,10 +3302,12 @@ fn build_document(
         editing: None,
         editing_original: None,
         moving: None,
+        moved: false,
         selected: None,
         counter_next: 1,
         hover_ann: None,
         text_select: None,
+        history: History::default(),
         last_rebuild: std::time::Instant::now(),
     }
 }
@@ -3452,7 +3560,7 @@ mod tests {
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
         output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
         redacted, tab_for_digit,
-        tool_stays_active_after_use,
+        tool_stays_active_after_use, History, HISTORY_LIMIT,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
         PEN_TOOL, TOOLS,
     };
@@ -3549,6 +3657,57 @@ mod tests {
 
     fn word(text: &str, line: usize, rect: (f32, f32, f32, f32)) -> crate::ocr::Word {
         crate::ocr::Word { text: text.into(), rect, line }
+    }
+
+    #[test]
+    fn undo_restores_the_state_from_before_each_edit() {
+        let mut history = History::default();
+        let one = vec![blur((0.0, 0.0), (10.0, 10.0))];
+        let two = vec![blur((0.0, 0.0), (10.0, 10.0)), blur((5.0, 5.0), (20.0, 20.0))];
+
+        history.push(&[], 1);
+        history.push(&one, 1);
+        history.push(&two, 3);
+        assert_eq!(history.depth(), 3);
+
+        // Each undo hands back the state recorded before that edit, newest
+        // first, and the badge counter travels with it.
+        let step = history.undo().unwrap();
+        assert_eq!(step.anns.len(), 2);
+        assert_eq!(step.counter_next, 3);
+        assert_eq!(history.undo().unwrap().anns.len(), 1);
+        assert_eq!(history.undo().unwrap().anns.len(), 0);
+        assert!(history.undo().is_none());
+    }
+
+    #[test]
+    fn a_discarded_step_is_not_undoable() {
+        let mut history = History::default();
+        history.push(&[], 1);
+        // A click that drew nothing pushes, then takes it back.
+        history.push(&[blur((0.0, 0.0), (1.0, 1.0))], 1);
+        history.discard();
+        assert_eq!(history.depth(), 1);
+        assert_eq!(history.undo().unwrap().anns.len(), 0);
+        assert!(history.undo().is_none());
+        // Discarding an empty stack is a no-op, not a panic.
+        history.discard();
+    }
+
+    #[test]
+    fn history_forgets_the_oldest_steps_past_the_limit() {
+        let mut history = History::default();
+        for n in 0..HISTORY_LIMIT + 10 {
+            history.push(&vec![blur((0.0, 0.0), (1.0, 1.0)); n], 1);
+        }
+        assert_eq!(history.depth(), HISTORY_LIMIT);
+        // The newest step survives; the oldest reachable one is the tenth.
+        assert_eq!(history.undo().unwrap().anns.len(), HISTORY_LIMIT + 9);
+        let mut last = 0;
+        while let Some(step) = history.undo() {
+            last = step.anns.len();
+        }
+        assert_eq!(last, 10);
     }
 
     fn blur(a: (f32, f32), b: (f32, f32)) -> Annotation {

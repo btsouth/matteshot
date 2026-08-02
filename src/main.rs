@@ -824,6 +824,50 @@ fn main() -> Result<()> {
             let outdir = std::path::PathBuf::from(args.get(1).map(String::as_str).unwrap_or("assets"));
             icon::generate(&outdir)
         }
+        // Site asset generator: run the shipping OCR engine over an image and
+        // write the word boxes as JSON, so matteshot.app's demo editor can
+        // offer real select-text over its fixed sample capture instead of a
+        // mock. Coordinates are in the source image's own pixels.
+        Some("--ocr-dump") => {
+            let source = std::path::PathBuf::from(
+                args.get(1).context("--ocr-dump <image> <out.json>")?,
+            );
+            let out = std::path::PathBuf::from(
+                args.get(2).context("--ocr-dump <image> <out.json>")?,
+            );
+            let img = image::open(&source)
+                .with_context(|| format!("open {}", source.display()))?
+                .to_rgba8();
+            let words = ocr::recognize_words(&img)?;
+            let round = |v: f32| (v * 10.0).round() / 10.0;
+            let payload = serde_json::json!({
+                "width": img.width(),
+                "height": img.height(),
+                "words": words
+                    .iter()
+                    .map(|word| {
+                        let (x0, y0, x1, y1) = word.rect;
+                        serde_json::json!({
+                            "text": word.text,
+                            "line": word.line,
+                            "rect": [round(x0), round(y0), round(x1), round(y1)],
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            // Compact: this is a generated asset the browser downloads, not
+            // something anyone hand-edits.
+            std::fs::write(&out, serde_json::to_string(&payload)?)
+                .with_context(|| format!("write {}", out.display()))?;
+            eprintln!(
+                "ocr-dump: {} words from {}x{} -> {}",
+                words.len(),
+                img.width(),
+                img.height(),
+                out.display()
+            );
+            Ok(())
+        }
         // Marketing/site asset generator: capture a window and export every
         // matte style as a PNG into a directory.
         Some("--assets") => {
