@@ -50,7 +50,7 @@
     h1 { margin: 0; font-size: 26px; letter-spacing: -0.6px; }
     .subtitle { margin-top: 5px; color: #738096; font-size: 13px; }
     .header-actions { display: flex; gap: 9px; }
-    .button { padding: 10px 14px; border-radius: 9px; font-size: 12px; font-weight: 600; background: white; border: 1px solid #d8e0ec; }
+    .button { padding: 10px 14px; border-radius: 9px; font: 600 12px "Segoe UI", system-ui, sans-serif; color: #172033; background: white; border: 1px solid #d8e0ec; cursor: pointer; }
     .button.primary { background: #596fe4; color: white; border-color: #596fe4; box-shadow: 0 6px 14px #596fe42d; }
     .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 17px; }
     .stat { background: white; border: 1px solid #dfe6f0; border-radius: 14px; padding: 16px 17px; box-shadow: 0 5px 16px #1d293914; }
@@ -99,7 +99,7 @@
     <main>
       <header>
         <div><h1>Good morning, Maya</h1><div class="subtitle">Here is what is happening across support today.</div></div>
-        <div class="header-actions"><div class="button">Export report</div><div class="button primary">New ticket</div></div>
+        <div class="header-actions"><button type="button" class="button">Export report</button><button type="button" class="button primary">New ticket</button></div>
       </header>
       <section class="stats">
         <div class="stat"><small>Open tickets</small><b>24</b><span>↓ 8% this week</span></div>
