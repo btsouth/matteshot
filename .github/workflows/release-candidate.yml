@@ -108,6 +108,32 @@ jobs:
             Set-Content -Encoding ascii -NoNewline $checksum
           "checksum=$checksum" >> $env:GITHUB_OUTPUT
 
+      # The video probes need something to decode. Record it here rather than
+      # committing a fixture: the recording and encode path gets exercised as a
+      # side effect, and the runner can do this even though it cannot offer a
+      # window to capture.
+      - name: Record a video fixture
+        shell: pwsh
+        run: |
+          & '${{ github.workspace }}\target\release\matteshot.exe' --record-test 3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Probe the signed candidate
+        shell: pwsh
+        # -Offline on purpose: the network probes check the *published* release,
+        # so leaving them in would fail this candidate whenever production is
+        # having a bad day. -NoCapture because a GitHub-hosted runner has no
+        # visible window for --bench and --ocr to find. -Strict because a probe
+        # that silently did not run is what let a broken --video-edit-test ship
+        # for weeks.
+        run: |
+          .\scripts\run-probes.ps1 `
+            -Strict `
+            -Offline `
+            -NoCapture `
+            -Exe '${{ github.workspace }}\target\release\matteshot.exe' `
+            -SignedFile '${{ steps.installer.outputs.path }}'
+
       - name: Upload private signed candidate
         uses: actions/upload-artifact@v4
         with:

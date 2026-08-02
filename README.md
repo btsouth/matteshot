@@ -113,6 +113,8 @@ Run every headless probe at once and fail loudly if one breaks:
 
 Covers capture, OCR, playback, all three export paths, and the auto-update trust gates (ours accepted, a foreign signature and a tampered copy both refused). Safe to run while working: it writes no clipboard, injects no input (`--scroll-test` is opt-in behind `-IncludeScroll`), and opens no window unless it has to record a fixture. `-Offline` skips the network checks. The interactive surfaces — picker, editors, overlay — still need a human.
 
+`release-candidate.yml` runs the video and signature probes against every signed candidate, so the artifact proves it would pass its own auto-update gate before it can be downloaded. Three flags exist for that: `-SignedFile` aims the Authenticode check at a chosen file (the freshly signed installer in CI, the installed build by default, since a local `cargo build` is unsigned); `-Strict` fails the run on a skipped probe, because a SKIP that quietly passes is the same hole as never running the probe; and `-NoCapture` drops `--bench` and `--ocr`, which need a visible window that a GitHub-hosted runner does not have — it records its own fixture instead, and capture and OCR stay in the local run.
+
 Use [`INTERACTIVE-REGRESSION.md`](INTERACTIVE-REGRESSION.md) for the release-blocking human pass over those surfaces.
 
 Run the same static code gate used by CI, signed candidates, and releases:

@@ -18,10 +18,15 @@
     trust gates. The interactive parts (picker, editors, overlay) cannot be
     driven safely from a script and still need a human.
 
+    release-candidate.yml runs this against the signed candidate with -Strict,
+    so a probe that cannot run is a red build rather than a quiet SKIP.
+
 .EXAMPLE
     .\scripts\run-probes.ps1
 .EXAMPLE
     .\scripts\run-probes.ps1 -WindowTitle Calculator -IncludeScroll
+.EXAMPLE
+    .\scripts\run-probes.ps1 -Strict -Offline -SignedFile .\MatteshotSetup-1.0.0.exe
 #>
 param(
     # Window to capture from. Defaults to any suitable visible window.
@@ -34,7 +39,18 @@ param(
     [switch]$IncludeScroll,
     # Skip the probes that need the network.
     [switch]$Offline,
-    [string]$Exe = "target\release\matteshot.exe"
+    [string]$Exe = "target\release\matteshot.exe",
+    # File the Authenticode gate must accept. Defaults to the installed build,
+    # because a local cargo build is unsigned. Release CI points this at the
+    # signed installer it just produced, which is the artifact auto-update
+    # actually downloads and runs.
+    [string]$SignedFile,
+    # Turn every SKIP into a failure. CI runs strict: a probe that quietly did
+    # not run is how --video-edit-test stayed broken for weeks.
+    [switch]$Strict,
+    # Leave the capture and OCR probes out of the run entirely. They need a
+    # visible window, which a GitHub-hosted runner does not have.
+    [switch]$NoCapture
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,7 +102,13 @@ function Invoke-Probe {
 }
 
 # ---------------------------------------------------------------- capture ---
-if (-not $WindowTitle) {
+# -NoCapture puts these out of scope rather than skipping them, so -Strict keeps
+# meaning "every probe this run promised actually ran". A GitHub-hosted runner
+# has a desktop you can record, but no genuinely visible top-level window:
+# PowerShell reports a MainWindowTitle for a console started there and
+# find_by_title still cannot see it. Capture and OCR stay in the local run and
+# in INTERACTIVE-REGRESSION.md.
+if (-not $NoCapture -and -not $WindowTitle) {
     # Size matters: plenty of apps keep tiny hidden helper windows, and
     # capturing a 16x16 one makes the OCR probe "fail" for no real reason.
     Add-Type -Name ProbeWin -Namespace Matteshot -MemberDefinition @'
@@ -101,20 +123,32 @@ public struct RECT { public int L, T, R, B; }
             ($r.R - $r.L) -ge 600 -and ($r.B - $r.T) -ge 400
         } |
         Select-Object -First 1 -ExpandProperty MainWindowTitle
-    if (-not $WindowTitle) { throw 'No window big enough to capture; pass -WindowTitle.' }
-}
-Write-Host "Capturing from: $WindowTitle" -ForegroundColor DarkGray
-
-Invoke-Probe -Name 'capture (--bench)' -ProbeArgs @('--bench', $WindowTitle) -Expect 'bench 3:' | Out-Null
-Invoke-Probe -Name 'ocr text' -ProbeArgs @('--ocr', $WindowTitle) -Expect 'chars' | Out-Null
-
-$benchPng = Join-Path ([System.IO.Path]::GetTempPath()) 'matteshot-bench.png'
-if (Test-Path $benchPng) {
-    Invoke-Probe -Name 'ocr word boxes' -ProbeArgs @('--ocr-words', $benchPng) -Expect 'words over' | Out-Null
 }
 
-if ($IncludeScroll) {
-    Invoke-Probe -Name 'scrolling capture' -ProbeArgs @('--scroll-test', $WindowTitle) | Out-Null
+# Report an absent target rather than throwing: a bare terminating error loses
+# the table for the probes that did run, and -Strict is what decides whether it
+# was acceptable.
+if ($NoCapture) {
+    Write-Host 'Capture probes excluded by -NoCapture.' -ForegroundColor DarkGray
+} elseif (-not $WindowTitle) {
+    $results += [pscustomobject]@{
+        Probe = 'capture probes'; Result = 'SKIP'; Seconds = 0
+        Detail = 'no window big enough to capture; pass -WindowTitle'
+    }
+} else {
+    Write-Host "Capturing from: $WindowTitle" -ForegroundColor DarkGray
+
+    Invoke-Probe -Name 'capture (--bench)' -ProbeArgs @('--bench', $WindowTitle) -Expect 'bench 3:' | Out-Null
+    Invoke-Probe -Name 'ocr text' -ProbeArgs @('--ocr', $WindowTitle) -Expect 'chars' | Out-Null
+
+    $benchPng = Join-Path ([System.IO.Path]::GetTempPath()) 'matteshot-bench.png'
+    if (Test-Path $benchPng) {
+        Invoke-Probe -Name 'ocr word boxes' -ProbeArgs @('--ocr-words', $benchPng) -Expect 'words over' | Out-Null
+    }
+
+    if ($IncludeScroll) {
+        Invoke-Probe -Name 'scrolling capture' -ProbeArgs @('--scroll-test', $WindowTitle) | Out-Null
+    }
 }
 
 # ------------------------------------------------- recording and exporting ---
@@ -159,9 +193,16 @@ if ($Fixture -and (Test-Path $Fixture)) {
 #
 # It has to run against a signed binary, and only CI-built releases are signed
 # — a local cargo build is not, and would be rejected for the right reason but
-# the wrong test.
-$signed = Join-Path $env:LOCALAPPDATA 'Programs\Matteshot\matteshot.exe'
+# the wrong test. Locally that means the installed build; in release CI it is
+# the freshly signed installer, so the candidate proves it would pass its own
+# auto-update gate before anyone can download it.
+$signed = if ($SignedFile) {
+    $SignedFile
+} else {
+    Join-Path $env:LOCALAPPDATA 'Programs\Matteshot\matteshot.exe'
+}
 if (Test-Path $signed) {
+    Write-Host "Signature gate target: $signed" -ForegroundColor DarkGray
     Invoke-Probe -Name 'signature accepts ours' -ProbeArgs @('--verify-signature-test', $signed) -Expect 'ACCEPT' | Out-Null
 
     $tampered = Join-Path $work 'tampered.exe'
@@ -196,8 +237,16 @@ Write-Host ''
 $results | Format-Table -AutoSize
 
 $failed = @($results | Where-Object Result -eq 'FAIL')
+$skipped = @($results | Where-Object Result -eq 'SKIP')
 if ($failed.Count -gt 0) {
     Write-Host ("{0} probe(s) failed." -f $failed.Count) -ForegroundColor Red
+    exit 1
+}
+if ($Strict -and $skipped.Count -gt 0) {
+    Write-Host (
+        "{0} probe(s) skipped and -Strict was requested: {1}" -f
+        $skipped.Count, (($skipped | ForEach-Object { $_.Probe }) -join ', ')
+    ) -ForegroundColor Red
     exit 1
 }
 Write-Host ("All {0} probes passed." -f @($results | Where-Object Result -eq 'PASS').Count) -ForegroundColor Green
