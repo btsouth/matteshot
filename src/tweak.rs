@@ -251,6 +251,13 @@ impl Document {
 
     /// Step back one edit. False when there is nothing left to undo.
     fn undo(&mut self) -> bool {
+        // A live drag holds an index into `anns`. Ctrl+Z is not blocked by
+        // mouse capture the way the Undo chip is, so swapping the vector out
+        // mid-drag would leave the next mouse move editing whichever
+        // annotation happened to land at that index.
+        if self.drawing || self.moving.is_some() {
+            return false;
+        }
         let Some(snapshot) = self.history.undo() else {
             return false;
         };
@@ -1725,10 +1732,14 @@ fn commit_editing(state: &mut State) -> bool {
             Some(crate::annotate::Shape::Text { text, .. }) if text.is_empty()
         );
         if empty {
+            // Emptying an existing caption to delete it is a real edit and
+            // stays undoable. A brand-new one that never held any text is not.
+            let was_new = state.doc_mut().editing_original.is_none();
             state.doc_mut().anns.remove(i);
             state.doc_mut().editing_original = None;
-            // Nothing was typed, so nothing happened worth undoing.
-            state.doc_mut().discard_history();
+            if was_new {
+                state.doc_mut().discard_history();
+            }
             return false;
         }
         // One-shot tools: a successful add returns to the selector.
@@ -2061,7 +2072,11 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             // Recolor whatever is selected or being typed.
             let target = state.doc_mut().editing.or(state.doc_mut().selected);
             if let Some(i) = target {
-                state.doc_mut().push_history();
+                // Mid-caption, this belongs to that edit's single step — the
+                // same way the caption sliders treat it.
+                if state.doc().editing.is_none() {
+                    state.doc_mut().push_history();
+                }
                 if let Some(ann) = state.doc_mut().anns.get_mut(i) {
                     ann.color = n;
                 }
@@ -2074,7 +2089,9 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             state.size_idx = n;
             let target = state.doc_mut().editing.or(state.doc_mut().selected);
             if let Some(i) = target {
-                state.doc_mut().push_history();
+                if state.doc().editing.is_none() {
+                    state.doc_mut().push_history();
+                }
                 if let Some(ann) = state.doc_mut().anns.get_mut(i) {
                     ann.size = SIZES[n];
                 }
@@ -2437,7 +2454,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     {
                         state.caption_style = style;
                         if let Some(index) = state.doc_mut().editing.or(state.doc_mut().selected) {
-                            state.doc_mut().push_history();
+                            if state.doc().editing.is_none() {
+                                state.doc_mut().push_history();
+                            }
                             if let Some(ann) = state.doc_mut().anns.get_mut(index) {
                                 if matches!(ann.shape, crate::annotate::Shape::Text { .. }) {
                                     ann.text_style = style;
@@ -2838,21 +2857,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 match wparam.0 as u16 {
                     v if v == VK_ESCAPE.0 => {
                         if let Some(i) = state.doc_mut().editing.take() {
-                            if let Some(original) = state.doc_mut().editing_original.take() {
-                                if let Some(crate::annotate::Shape::Text { text, .. }) =
-                                    state.doc_mut().anns.get_mut(i).map(|ann| &mut ann.shape)
-                                {
-                                    *text = original;
-                                }
+                            let reedit = state.doc_mut().editing_original.take().is_some();
+                            // Cancel puts the caption back the way it was —
+                            // not just its text. Colour, size and the caption
+                            // style controls all retarget the annotation while
+                            // it is being typed, so the whole pre-edit state
+                            // has to come back. The step pushed when the edit
+                            // began holds exactly that.
+                            state.doc_mut().undo();
+                            if reedit && i < state.doc_mut().anns.len() {
                                 state.doc_mut().selected = Some(i);
-                            } else if i < state.doc_mut().anns.len() {
-                                // A brand-new empty caption is discarded.
-                                state.doc_mut().anns.remove(i);
-                                state.doc_mut().selected = None;
                             }
-                            // Cancelling put the caption back the way it was,
-                            // so its undo step no longer describes an edit.
-                            state.doc_mut().discard_history();
                             state.tool = None;
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
@@ -2875,8 +2890,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             activate(hwnd, state, Ctl::Copy);
                         }
                     }
-                    0x5A if ctrl_down => {
-                        // Ctrl+Z
+                    // Ctrl+Z. A slider drag lives on State rather than the
+                    // document, so it is guarded here instead of in undo().
+                    0x5A if ctrl_down && state.dragging.is_none() => {
                         commit_editing(state);
                         if state.doc_mut().undo() {
                             rebuild_preview(state);
