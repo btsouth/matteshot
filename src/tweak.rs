@@ -301,6 +301,10 @@ struct State {
     caption_box_opacity: f32,
     /// Inline numeric editor for a per-capture output width or height.
     custom_size_edit: Option<CustomSizeEdit>,
+    /// Transient "copied" confirmation shown in the hint line after Copy.
+    /// Copy keeps the tab open, so the confirmation replaces the old cue of
+    /// the tab closing.
+    copy_hint: Option<(String, std::time::Instant)>,
     /// Caret blink phase while editing; one timer serves the window.
     caret_on: bool,
     font: HFONT,
@@ -1313,7 +1317,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
     });
     // Only say something when there is something to say. A fresh editor with
     // no annotations does not need a list of things you cannot do yet.
-    let hint: Option<&str> = if let Some(text) = &select_hint {
+    let copy_feedback = state.copy_hint.as_ref().and_then(|(message, at)| {
+        (at.elapsed() < std::time::Duration::from_secs(2)).then_some(message.as_str())
+    });
+    let hint: Option<&str> = if let Some(message) = copy_feedback {
+        Some(message)
+    } else if let Some(text) = &select_hint {
         Some(text.as_str())
     } else if state.custom_size_edit.is_some() {
         Some("type a size to preview it live   \u{00b7}   the other dimension adjusts automatically   \u{00b7}   Enter finishes   \u{00b7}   Esc restores")
@@ -1621,10 +1630,11 @@ unsafe fn show_output_error(hwnd: HWND, summary: &str, error: &Error, save_faile
     );
 }
 
-/// Save the edited result, put it on the clipboard, and close. Shared by the
-/// Copy chip and Ctrl+C so the keyboard can never do something subtly
-/// different from the button.
-unsafe fn copy_and_finish(hwnd: HWND, state: &mut State) {
+/// Save the edited result and put it on the clipboard, then confirm. The tab
+/// stays open so the capture can keep being refined; Save and Editor remain
+/// the "I'm done" actions. Shared by the Copy chip and Ctrl+C so the keyboard
+/// can never do something subtly different from the button.
+unsafe fn copy_image(hwnd: HWND, state: &mut State) {
     commit_editing(state);
     let img = final_image(state);
     let cfg = Config::load();
@@ -1635,8 +1645,8 @@ unsafe fn copy_and_finish(hwnd: HWND, state: &mut State) {
     ) {
         Ok(_) => {
             Config::update(|cfg| cfg.last_style = state.doc_mut().sel);
-            let active = state.active;
-            close_tab(hwnd, state, active);
+            state.copy_hint = Some(("copied".into(), std::time::Instant::now()));
+            let _ = InvalidateRect(hwnd, None, false);
         }
         Err(FinishError::Save(error)) => show_output_error(
             hwnd,
@@ -2171,7 +2181,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             }
             let _ = InvalidateRect(hwnd, None, false);
         }
-        Ctl::Copy => copy_and_finish(hwnd, state),
+        Ctl::Copy => copy_image(hwnd, state),
         Ctl::Save => {
             let img = final_image(state);
             let cfg = Config::load();
@@ -2825,7 +2835,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Ctrl+C copies the finished image, exactly as the Copy chip
                 // does. Not while typing a caption, where it means the text.
                 if ctrl_down && wparam.0 as u16 == b'C' as u16 && state.doc().editing.is_none() {
-                    copy_and_finish(hwnd, state);
+                    copy_image(hwnd, state);
                     return LRESULT(0);
                 }
                 if ctrl_down {
@@ -3492,6 +3502,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         caption_style: crate::annotate::TextStyle::Box,
         caption_box_opacity: 0.68,
         custom_size_edit: None,
+        copy_hint: None,
         font: unsafe { make_font(-sc(14), 400) },
         font_small: unsafe { make_font(-sc(12), 400) },
         scale: dpi_scale,
