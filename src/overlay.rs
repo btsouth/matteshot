@@ -615,12 +615,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 return LRESULT(0);
                             }
                             match state.windows[i].hwnd {
-                                Some(target) => {
+                                Some(target)
+                                    if crate::capture::wgc_window_supported(target) =>
+                                {
                                     finish(hwnd, state, Some(Selection::Window(target)))
                                 }
-                                None => {
-                                    // Shell surface or bare desktop: crop the
-                                    // frozen image — exactly what was on screen.
+                                Some(_) | None => {
+                                    // Shell surface, bare desktop, or a window
+                                    // WGC rejects (hosted taskbar widgets, some
+                                    // layered surfaces): crop the frozen image —
+                                    // exactly what was on screen.
                                     let r = state.windows[i].rect;
                                     let crop = image::imageops::crop_imm(
                                         &state.frozen,

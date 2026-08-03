@@ -10,14 +10,18 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
@@ -109,10 +113,101 @@ pub fn device_pair() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     create_d3d_device()
 }
 
-pub fn capture_window(hwnd: HWND) -> Result<RgbaImage> {
+/// True when Windows.Graphics.Capture can produce a non-empty item for `hwnd`.
+///
+/// Child/hosted surfaces (Ceiling's native taskbar widget is the motivating
+/// case) often accept `CreateForWindow` but return a 0x0 item; the frame pool
+/// then fails with `E_INVALIDARG` (0x80070057). Overlay selection uses this to
+/// fall back to a frozen crop of what the user is looking at.
+pub fn wgc_window_supported(hwnd: HWND) -> bool {
+    (|| -> Result<()> {
+        let interop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
+        let size = item.Size()?;
+        if size.Width <= 0 || size.Height <= 0 {
+            bail!("WGC item has empty size");
+        }
+        Ok(())
+    })()
+    .is_ok()
+}
+
+fn window_frame_bounds(hwnd: HWND) -> Result<RECT> {
+    let mut rect = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .context("DWM window bounds")?;
+    }
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        bail!(
+            "window has empty bounds ({}x{})",
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        );
+    }
+    Ok(rect)
+}
+
+/// Capture a window by screenshotting its monitor and cropping to the DWM
+/// frame. Used when WGC rejects the HWND (shell-hosted widgets, protected
+/// surfaces, empty capture items).
+fn capture_window_monitor_crop(hwnd: HWND) -> Result<RgbaImage> {
+    let bounds = window_frame_bounds(hwnd)?;
+    let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        GetMonitorInfoW(mon, &mut mi)
+            .ok()
+            .context("monitor info for window crop")?;
+    }
+    let full = capture_monitor(mon)?;
+    let x = (bounds.left - mi.rcMonitor.left).max(0) as u32;
+    let y = (bounds.top - mi.rcMonitor.top).max(0) as u32;
+    let w = ((bounds.right - bounds.left) as u32)
+        .min(full.width().saturating_sub(x))
+        .max(1);
+    let h = ((bounds.bottom - bounds.top) as u32)
+        .min(full.height().saturating_sub(y))
+        .max(1);
+    if x >= full.width() || y >= full.height() {
+        bail!("window bounds are outside the monitor capture");
+    }
+    Ok(image::imageops::crop_imm(&full, x, y, w, h).to_image())
+}
+
+fn capture_window_wgc(hwnd: HWND) -> Result<RgbaImage> {
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
+    // Empty items pass CreateForWindow on some hosted/layered surfaces and
+    // only blow up later in CreateFreeThreaded with E_INVALIDARG.
+    let size = item.Size()?;
+    if size.Width <= 0 || size.Height <= 0 {
+        bail!(
+            "Could not capture the given window (empty WGC item {}x{})",
+            size.Width,
+            size.Height
+        );
+    }
     capture_item(item)
+}
+
+pub fn capture_window(hwnd: HWND) -> Result<RgbaImage> {
+    match capture_window_wgc(hwnd) {
+        Ok(img) => Ok(img),
+        Err(wgc_err) => {
+            eprintln!("WGC window capture failed ({wgc_err:#}); falling back to monitor crop");
+            capture_window_monitor_crop(hwnd).with_context(|| format!("WGC failed: {wgc_err:#}"))
+        }
+    }
 }
 
 pub fn capture_monitor(hmonitor: windows::Win32::Graphics::Gdi::HMONITOR) -> Result<RgbaImage> {
