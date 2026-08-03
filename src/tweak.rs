@@ -77,7 +77,6 @@ enum Ctl {
     Ocr,
     Copy,
     Save,
-    Edit,
 }
 
 const TOOLS: [&str; 9] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"];
@@ -1463,7 +1462,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::CustomSizeCancel => chip(hdc, *r, "Cancel", state, false, hot),
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
-            Ctl::Edit => chip(hdc, *r, "Editor", state, false, hot),
             Ctl::Tool(n) => {
                 let property_tool = if state.tool.is_none() {
                     state.doc()
@@ -1632,9 +1630,9 @@ unsafe fn show_output_error(hwnd: HWND, summary: &str, error: &Error, save_faile
 
 /// Save the edited result and put it on the clipboard, then either confirm and
 /// keep the tab open (the default, so the capture can keep being refined) or
-/// close it when the Settings toggle is off. Save and Editor remain the "I'm
-/// done" actions. Shared by the Copy chip and Ctrl+C so the keyboard can never
-/// do something subtly different from the button.
+/// close it when the Settings toggle is off. Save remains the "I'm done"
+/// action. Shared by the Copy chip and Ctrl+C so the keyboard can never do
+/// something subtly different from the button.
 unsafe fn copy_image(hwnd: HWND, state: &mut State) {
     commit_editing(state);
     let img = final_image(state);
@@ -2199,23 +2197,6 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 Err(error) => show_output_error(
                     hwnd,
                     "The edited screenshot could not be saved. Your tab is still open.",
-                    &error,
-                    true,
-                ),
-            }
-        }
-        Ctl::Edit => {
-            let img = final_image(state);
-            let cfg = Config::load();
-            match output::save_png(&img, state.doc().styles[state.doc().sel].name, &cfg.save_dir()) {
-                Ok(path) => {
-                    output::open_in_editor(&path);
-                    let active = state.active;
-                    close_tab(hwnd, state, active);
-                }
-                Err(error) => show_output_error(
-                    hwnd,
-                    "The edited screenshot could not be saved or opened. Your tab is still open.",
                     &error,
                     true,
                 ),
@@ -3273,10 +3254,6 @@ fn layout_controls(
         RECT { left: col_x + sc(72), top: by, right: col_x + sc(136), bottom: by + sc(30) },
         Ctl::Save,
     ));
-    controls.push((
-        RECT { left: col_x + sc(144), top: by, right: col_x + sc(216), bottom: by + sc(30) },
-        Ctl::Edit,
-    ));
     WindowLayout {
         controls,
         tab_strip,
@@ -4032,7 +4009,7 @@ mod tests {
             let action_top = layout
                 .controls
                 .iter()
-                .filter(|(_, control)| matches!(control, Ctl::Copy | Ctl::Save | Ctl::Edit))
+                .filter(|(_, control)| matches!(control, Ctl::Copy | Ctl::Save))
                 .map(|(rect, _)| rect.top)
                 .min()
                 .unwrap();

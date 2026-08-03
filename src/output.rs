@@ -257,20 +257,6 @@ pub fn text_to_clipboard(text: &str) -> Result<()> {
     unsafe { put_bytes(CF_UNICODETEXT, &wide) }
 }
 
-/// Hand the finished PNG to the system default editor/viewer.
-pub fn open_in_editor(path: &Path) {
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(HSTRING::from(path.as_os_str()).as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-    }
-}
-
 /// Reveal a file in Explorer, selected.
 pub fn reveal_in_explorer(path: &Path) {
     let args = format!("/select,\"{}\"", path.display());
