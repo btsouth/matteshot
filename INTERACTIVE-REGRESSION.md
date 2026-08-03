@@ -24,6 +24,7 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] P pins the raw capture; C copies recognized text; both leave the picker cleanly.
 - [ ] Esc keeps the successful background auto-copy, and paste matches the preselected matte.
 - [ ] A second PrtScn can capture the picker itself; cancelling the new overlay returns to the picker.
+- [ ] A wide capture (the taskbar) stacks the variants into rows and stays inside one monitor.
 
 ## Screenshot editor
 

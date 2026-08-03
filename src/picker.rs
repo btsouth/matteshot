@@ -33,6 +33,11 @@ const GAP: i32 = 12;
 const THUMB_H: i32 = 168;
 const LABEL_H: i32 = 22;
 const HINT_H: i32 = 20;
+/// Gap between the strip and the bottom of the work area.
+const BOTTOM_INSET: i32 = 28;
+/// Above this mean aspect a side-by-side strip cannot stay legible (a taskbar
+/// grab is ~20:1), so the variants stack instead.
+const STACK_ASPECT: f32 = 3.0;
 const VK_E: u16 = 0x45;
 /// Posted to the strip when the resident PrtScn hotkey fires mid-pick.
 const WM_RETAKE: u32 = WM_USER + 41;
@@ -105,6 +110,98 @@ struct Thumb {
     h: i32,
     x: i32,
     y: i32,
+}
+
+/// Where one variant sits inside the strip. Paint and hit-testing work off
+/// these directly, so the layout is free to arrange them any way it likes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cell {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+#[derive(Debug)]
+struct Layout {
+    cells: Vec<Cell>,
+    width: i32,
+    height: i32,
+}
+
+/// Arrange `aspects` (width / height per variant) inside the work area.
+///
+/// The result never exceeds the work area — a wide capture like the taskbar
+/// used to compute a strip several monitors long and spill off screen. Wide
+/// content stacks into rows instead, where each variant gets the full width.
+fn layout(aspects: &[f32], work_w: i32, work_h: i32) -> Layout {
+    let n = aspects.len() as i32;
+    if n == 0 {
+        return Layout { cells: Vec::new(), width: MARGIN * 2, height: MARGIN * 2 };
+    }
+    // Sanitize: a degenerate preview must not poison the whole layout.
+    let aspects: Vec<f32> = aspects
+        .iter()
+        .map(|a| if a.is_finite() && *a > 0.0 { a.clamp(0.01, 100.0) } else { 1.0 })
+        .collect();
+    let sum_aspect: f32 = aspects.iter().sum();
+    let max_aspect = aspects.iter().cloned().fold(0.01f32, f32::max);
+
+    let chrome_h = MARGIN * 2 + HINT_H + 8 + BOTTOM_INSET;
+    let stacked = n > 1 && sum_aspect / n as f32 > STACK_ASPECT;
+
+    // Fit against both axes. Whatever height falls out is the height: a floor
+    // here would be a constraint violation, not a nicer picture.
+    let cells: Vec<Cell> = if stacked {
+        let avail_w = (work_w - MARGIN * 2 - 24).max(80) as f32;
+        let avail_h = (work_h - chrome_h - GAP * (n - 1)).max(n * 8);
+        let row_h = (avail_h / n - LABEL_H).max(4);
+        let thumb_h = THUMB_H.min((avail_w / max_aspect) as i32).min(row_h).max(1);
+        let widest = aspects
+            .iter()
+            .map(|a| (a * thumb_h as f32) as i32)
+            .fold(1, i32::max);
+        let cells = aspects
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let w = ((a * thumb_h as f32) as i32).max(1);
+                Cell {
+                    x: MARGIN + (widest - w) / 2,
+                    y: MARGIN + i as i32 * (thumb_h + LABEL_H + GAP),
+                    w,
+                    h: thumb_h,
+                }
+            })
+            .collect();
+        cells
+    } else {
+        let avail_w = (work_w - MARGIN * 2 - GAP * (n - 1) - 24).max(80) as f32;
+        let avail_h = (work_h - chrome_h - LABEL_H).max(4);
+        let thumb_h = THUMB_H.min((avail_w / sum_aspect) as i32).min(avail_h).max(1);
+        let mut x = MARGIN;
+        let cells = aspects
+            .iter()
+            .map(|a| {
+                let w = ((a * thumb_h as f32) as i32).max(1);
+                let cell = Cell { x, y: MARGIN, w, h: thumb_h };
+                x += w + GAP;
+                cell
+            })
+            .collect();
+        cells
+    };
+
+    let right = cells.iter().map(|c| c.x + c.w).max().unwrap_or(MARGIN);
+    let bottom = cells.iter().map(|c| c.y + c.h).max().unwrap_or(MARGIN);
+
+    // Belt and braces: whatever the arithmetic above produced, the window is
+    // never allowed off the monitor it was asked to appear on.
+    Layout {
+        cells,
+        width: (right + MARGIN).min(work_w - 16).max(120),
+        height: (bottom + LABEL_H + HINT_H + 8).min(work_h - 16).max(80),
+    }
 }
 
 struct State {
@@ -408,41 +505,37 @@ pub fn pick(
     let work_w = mi.rcWork.right - mi.rcWork.left;
     let work_h = mi.rcWork.bottom - mi.rcWork.top;
 
-    // Fit the strip inside the work area no matter how wide the content is —
+    // Fit the strip inside the work area no matter what shape the content is —
     // a taskbar capture must not spill onto other monitors.
-    let n = previews.len() as i32;
-    let sum_aspect: f32 = previews
+    let aspects: Vec<f32> = previews
         .iter()
-        .map(|p| p.width() as f32 / p.height() as f32)
-        .sum();
-    let avail = (work_w - MARGIN * 2 - GAP * (n - 1) - 24).max(120) as f32;
-    let thumb_h = THUMB_H.min((avail / sum_aspect) as i32).max(24);
+        .map(|p| p.width() as f32 / p.height().max(1) as f32)
+        .collect();
+    let plan = layout(&aspects, work_w, work_h);
 
     let mut thumbs = Vec::new();
-    let mut x = MARGIN;
     for (i, p) in previews.iter().enumerate() {
-        let tw = (p.width() as f32 * thumb_h as f32 / p.height() as f32) as i32;
+        let cell = plan.cells[i];
         let resized = image::imageops::resize(
             p,
-            tw as u32,
-            thumb_h as u32,
+            cell.w as u32,
+            cell.h as u32,
             image::imageops::FilterType::Triangle,
         );
         thumbs.push(Thumb {
             bgra: to_bgra(&resized),
             label: wide(&format!("{}  {}", i + 1, names.get(i).unwrap_or(&""))),
-            w: tw,
-            h: thumb_h,
-            x,
-            y: MARGIN,
+            w: cell.w,
+            h: cell.h,
+            x: cell.x,
+            y: cell.y,
         });
-        x += tw + GAP;
     }
-    let total_w = x - GAP + MARGIN;
-    let total_h = MARGIN + thumb_h + LABEL_H + HINT_H + 8;
+    let (total_w, total_h) = (plan.width, plan.height);
 
-    let win_x = (mi.rcWork.left + (work_w - total_w) / 2).max(mi.rcWork.left + 8);
-    let win_y = mi.rcWork.top + work_h - total_h - 28;
+    let win_x = (mi.rcWork.left + (work_w - total_w) / 2)
+        .clamp(mi.rcWork.left + 8, (mi.rcWork.right - total_w - 8).max(mi.rcWork.left + 8));
+    let win_y = (mi.rcWork.top + work_h - total_h - BOTTOM_INSET).max(mi.rcWork.top + 8);
 
     let (font, font_small) = unsafe { (make_font(-14), make_font(-12)) };
     let mut state = Box::new(State {
@@ -510,7 +603,7 @@ pub fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::{key_action, should_cancel_on_deactivate, KeyAction, VK_E};
+    use super::{key_action, layout, should_cancel_on_deactivate, KeyAction, VK_E, THUMB_H};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
     };
@@ -540,6 +633,63 @@ mod tests {
         assert_eq!(key_action(0x38, 0, 7), None);
         assert_eq!(key_action(VK_RETURN.0, 0, 0), None);
         assert_eq!(key_action(VK_RIGHT.0, 0, 0), None);
+    }
+
+    /// Every cell inside the window, and the window inside the work area.
+    fn assert_contained(aspects: &[f32], work_w: i32, work_h: i32) {
+        let plan = layout(aspects, work_w, work_h);
+        assert_eq!(plan.cells.len(), aspects.len());
+        assert!(
+            plan.width <= work_w && plan.height <= work_h,
+            "window {}x{} exceeds work area {}x{}",
+            plan.width,
+            plan.height,
+            work_w,
+            work_h
+        );
+        for (i, c) in plan.cells.iter().enumerate() {
+            assert!(c.w >= 1 && c.h >= 1, "cell {i} is degenerate: {c:?}");
+            assert!(
+                c.x >= 0 && c.y >= 0 && c.x + c.w <= plan.width && c.y + c.h <= plan.height,
+                "cell {i} {c:?} escapes the {}x{} window",
+                plan.width,
+                plan.height
+            );
+        }
+    }
+
+    #[test]
+    fn a_taskbar_capture_stays_on_one_monitor() {
+        // 2560x48 plus matte padding: the shape that used to run off screen.
+        assert_contained(&[20.0; 7], 2560, 1392);
+        assert_contained(&[20.0; 7], 1280, 680);
+        // Stacked rows, so each variant is wider than the old strip allowed.
+        let plan = layout(&[20.0; 7], 2560, 1392);
+        assert!(plan.cells[0].w > 1000, "stacked rows should use the width");
+        assert!(plan.cells[1].y > plan.cells[0].y, "variants should stack");
+    }
+
+    #[test]
+    fn extreme_aspects_never_overflow_the_work_area() {
+        for aspects in [
+            vec![100.0; 7],  // a one-pixel-tall sliver
+            vec![0.01; 7],   // a full-page scroll capture
+            vec![1.0; 7],
+            vec![0.5; 1],
+            vec![f32::NAN, f32::INFINITY, 0.0, -3.0],
+        ] {
+            assert_contained(&aspects, 2560, 1392);
+            assert_contained(&aspects, 1366, 728);
+        }
+        assert_contained(&[], 2560, 1392);
+    }
+
+    #[test]
+    fn ordinary_captures_keep_the_horizontal_strip() {
+        let plan = layout(&[1.6; 7], 2560, 1392);
+        assert!(plan.cells.iter().all(|c| c.y == plan.cells[0].y), "one row");
+        assert_eq!(plan.cells[0].h, THUMB_H, "and full-size thumbs");
+        assert!(plan.cells[1].x > plan.cells[0].x);
     }
 
     #[test]
