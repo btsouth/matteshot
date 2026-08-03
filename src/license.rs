@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
@@ -29,8 +31,13 @@ const LICENSE_HOST: &str = "license.matteshot.app";
 const LICENSE_PATH_ACTIVATE: &str = "/v1/license/activate";
 const LICENSE_PATH_REFRESH: &str = "/v1/license/refresh";
 const LICENSE_PATH_DEACTIVATE: &str = "/v1/license/deactivate";
+const LICENSE_PATH_TRIAL_START: &str = "/v1/trial/start";
+const LICENSE_PATH_TRIAL_STATUS: &str = "/v1/trial/status";
 const PUBLIC_KEY_BASE64: &str = "JSooNvlMugs9h9gRkeF7MruQswJnzAjHVrRNf/cXhqA=";
 const TRIAL_SECONDS: i64 = 14 * 24 * 60 * 60;
+/// How often a device with no server-recorded trial re-syncs its start date,
+/// so a wiped state regains the authoritative clock quickly.
+const TRIAL_SYNC_EVERY: Duration = Duration::from_secs(60 * 60);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const REGISTRY_KEY: &str = r"Software\Southbound Software\Matteshot";
 const REGISTRY_TRIAL_START: &str = "TrialStartedAt";
@@ -80,6 +87,10 @@ struct State {
     last_seen_at: Option<i64>,
     #[serde(default)]
     license: Option<StoredLicense>,
+    /// Server-issued trial certificate. Present once the start date has been
+    /// recorded on license.matteshot.app; the signed start never changes.
+    #[serde(default)]
+    trial: Option<StoredTrial>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,6 +98,21 @@ struct StoredLicense {
     certificate: String,
     signature: String,
     refresh_token: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredTrial {
+    certificate: String,
+    signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrialCertificate {
+    version: u32,
+    kind: String,
+    device_id: String,
+    started_at: String,
+    issued_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +153,28 @@ struct ActivationResponse {
 #[derive(Deserialize)]
 struct ErrorResponse {
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TrialStatusRequest {
+    device_id: String,
+    app_version: &'static str,
+}
+
+#[derive(Serialize)]
+struct TrialStartRequest {
+    device_id: String,
+    device_name: String,
+    app_version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TrialResponse {
+    certificate: Option<String>,
+    signature: Option<String>,
+    trial: Option<String>,
 }
 
 struct InternetHandle(*mut c_void);
@@ -255,6 +303,26 @@ pub fn status() -> Status {
         let _ = save_state(&state);
     }
 
+    // A server-issued trial certificate is the authoritative clock. The start
+    // date is signed by license.matteshot.app, so local state can never move
+    // it; a wipe just forces the next sync to restore the same certificate.
+    if let Some(stored) = state.trial.as_ref() {
+        if let Ok(certificate) = verify_trial(stored, &device) {
+            let started = DateTime::parse_from_rfc3339(&certificate.started_at)
+                .map(|value| value.timestamp())
+                .unwrap_or_else(|_| Utc::now().timestamp());
+            let now = Utc::now().timestamp();
+            let previous_seen = latest(state.last_seen_at, registry_time(REGISTRY_LAST_SEEN));
+            let effective_now = now.max(previous_seen.unwrap_or(now));
+            state.last_seen_at = Some(effective_now);
+            set_registry_time(REGISTRY_LAST_SEEN, effective_now);
+            let _ = save_state(&state);
+            return trial_status_at(Some(started), previous_seen, now);
+        }
+        state.trial = None;
+        let _ = save_state(&state);
+    }
+
     let now = Utc::now().timestamp();
     let started = earliest(state.trial_started_at, registry_time(REGISTRY_TRIAL_START));
     let previous_seen = latest(state.last_seen_at, registry_time(REGISTRY_LAST_SEEN));
@@ -268,12 +336,16 @@ pub fn status() -> Status {
 
 /// Begin the trial after the first completed capture. Calling this again never
 /// moves the start date forward.
+static TRIAL_SYNC_SPAWNED: AtomicBool = AtomicBool::new(false);
+
 pub fn record_successful_capture() {
     if matches!(status(), Status::Licensed { .. }) {
         return;
     }
     let _guard = crate::state_lock::lock(LICENSE_MUTEX).ok();
     let mut state = load_state();
+    let has_server_trial = state.trial.is_some();
+    let began_now = state.trial_started_at.is_none() && registry_time(REGISTRY_TRIAL_START).is_none();
     let now = Utc::now().timestamp();
     let started =
         earliest(state.trial_started_at, registry_time(REGISTRY_TRIAL_START)).unwrap_or(now);
@@ -282,6 +354,17 @@ pub fn record_successful_capture() {
     set_registry_time(REGISTRY_TRIAL_START, started);
     set_registry_time(REGISTRY_LAST_SEEN, state.last_seen_at.unwrap_or(now));
     let _ = save_state(&state);
+    crate::telemetry::report("matteshot_capture");
+    if began_now {
+        crate::telemetry::report("matteshot_trial_started");
+    }
+    // Lock the start date in server-side now that the trial exists, so a
+    // wiped state can be recovered. At most one spawned sync per launch.
+    if !has_server_trial && !TRIAL_SYNC_SPAWNED.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(|| {
+            let _ = sync_trial_once();
+        });
+    }
 }
 
 pub fn activate(license_key: &str) -> Result<Status> {
@@ -321,6 +404,7 @@ pub fn activate(license_key: &str) -> Result<Status> {
     close_trial_after_activation(&mut state, Utc::now().timestamp());
     state.license = Some(stored);
     save_state(&state)?;
+    crate::telemetry::report("matteshot_license_activated");
     Ok(Status::Licensed {
         customer_email: certificate.customer_email,
         updates_until: certificate.updates_until,
@@ -379,12 +463,99 @@ pub fn refresh_once() -> Result<Status> {
     })
 }
 
-pub fn start_background_refresh() {
-    if !matches!(status(), Status::Licensed { .. }) {
-        return;
+/// The earliest local time that suggests the trial has begun, if any. Absent
+/// on a machine that has never completed a capture.
+fn trial_grace_start() -> Option<i64> {
+    let state = load_state();
+    earliest(state.trial_started_at, registry_time(REGISTRY_TRIAL_START))
+}
+
+fn store_trial_certificate(stored: StoredTrial, device: &str) -> Result<()> {
+    verify_trial(&stored, device).context("verify server trial certificate")?;
+    let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
+    let mut state = load_state();
+    state.trial = Some(stored);
+    save_state(&state)
+}
+
+/// Recover or record the server-authoritative trial start for this device.
+///
+/// When license.matteshot.app already knows this device it returns the
+/// original signed start, undoing a local state wipe. When the device is
+/// unknown but a capture has already happened, the local start is sent up and
+/// locked in. Machines that have never captured keep the trial unstarted.
+fn sync_trial_once() -> Result<()> {
+    let device = device_id();
+    let request = TrialStatusRequest {
+        device_id: device.clone(),
+        app_version: env!("CARGO_PKG_VERSION"),
+    };
+    let (status_code, body) =
+        post_json(LICENSE_PATH_TRIAL_STATUS, &serde_json::to_vec(&request)?)?;
+    if status_code != 200 {
+        bail!("trial status returned HTTP {status_code}");
     }
-    std::thread::spawn(|| {
-        let _ = refresh_once();
+    let response: TrialResponse = serde_json::from_slice(&body).context("read trial status")?;
+    if let (Some(certificate), Some(signature)) = (response.certificate, response.signature) {
+        return store_trial_certificate(
+            StoredTrial {
+                certificate,
+                signature,
+            },
+            &device,
+        );
+    }
+    if response.trial.as_deref() == Some("none") {
+        let Some(started) = trial_grace_start() else {
+            return Ok(());
+        };
+        let started_at = DateTime::from_timestamp(started, 0)
+            .context("trial start is out of range")?
+            .to_rfc3339();
+        let request = TrialStartRequest {
+            device_id: device.clone(),
+            device_name: device_name(),
+            app_version: env!("CARGO_PKG_VERSION"),
+            started_at: Some(started_at),
+        };
+        let (status_code, body) =
+            post_json(LICENSE_PATH_TRIAL_START, &serde_json::to_vec(&request)?)?;
+        if status_code != 200 {
+            bail!("trial start returned HTTP {status_code}");
+        }
+        let response: TrialResponse =
+            serde_json::from_slice(&body).context("read trial start response")?;
+        let stored = StoredTrial {
+            certificate: response
+                .certificate
+                .context("trial start response has no certificate")?,
+            signature: response
+                .signature
+                .context("trial start response has no signature")?,
+        };
+        store_trial_certificate(stored, &device)?;
+    }
+    Ok(())
+}
+
+pub fn start_background_refresh() {
+    let licensed = matches!(status(), Status::Licensed { .. });
+    std::thread::spawn(move || {
+        if licensed {
+            let _ = refresh_once();
+            return;
+        }
+        // Keep the server trial record in step until the device is licensed:
+        // sync immediately, then hourly. A wipe is corrected on the very next
+        // tick; the hourly cadence bounds how long a wiped machine can keep a
+        // fresh grace if it stays running across the wipe.
+        loop {
+            let _ = sync_trial_once();
+            if matches!(status(), Status::Licensed { .. }) {
+                break;
+            }
+            std::thread::sleep(TRIAL_SYNC_EVERY);
+        }
     });
 }
 
@@ -455,7 +626,43 @@ fn verify(stored: &StoredLicense, expected_device: &str) -> Result<Certificate> 
     Ok(certificate)
 }
 
-fn device_id() -> String {
+fn verify_trial(stored: &StoredTrial, expected_device: &str) -> Result<TrialCertificate> {
+    let public_bytes = STANDARD
+        .decode(PUBLIC_KEY_BASE64)
+        .context("decode Matteshot license public key")?;
+    let public_array: [u8; 32] = public_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid Matteshot license public key"))?;
+    let key = VerifyingKey::from_bytes(&public_array).context("read license public key")?;
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(&stored.signature)
+        .context("decode trial signature")?;
+    let signature = Signature::from_slice(&signature_bytes).context("read trial signature")?;
+    key.verify(stored.certificate.as_bytes(), &signature)
+        .context("trial signature is invalid")?;
+
+    let body = URL_SAFE_NO_PAD
+        .decode(&stored.certificate)
+        .context("decode trial certificate")?;
+    let certificate: TrialCertificate =
+        serde_json::from_slice(&body).context("read trial certificate")?;
+    if certificate.version != 1 || certificate.kind != "trial" {
+        bail!("unsupported trial certificate");
+    }
+    if certificate.device_id != expected_device {
+        bail!("trial belongs to a different device");
+    }
+    DateTime::parse_from_rfc3339(&certificate.started_at)
+        .context("trial start date is invalid")?;
+    DateTime::parse_from_rfc3339(&certificate.issued_at)
+        .context("trial issue date is invalid")?;
+    Ok(certificate)
+}
+
+/// Stable anonymous device identity: SHA-256 of the machine GUID. The same id
+/// powers licensing and telemetry, so an install can be joined to a purchase
+/// without ever exposing a machine name or email.
+pub fn device_id() -> String {
     let machine_guid = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(
             r"SOFTWARE\Microsoft\Cryptography",
@@ -623,5 +830,14 @@ mod tests {
             trial_status_at(Some(1_000), Some(1_000 + TRIAL_SECONDS), 1_000 + 86_400),
             Status::Expired
         );
+    }
+
+    #[test]
+    fn tampered_or_wrong_device_trial_certificate_is_rejected() {
+        let stored = StoredTrial {
+            certificate: "not-a-certificate".into(),
+            signature: "not-a-signature".into(),
+        };
+        assert!(verify_trial(&stored, "device").is_err());
     }
 }

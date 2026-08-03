@@ -34,6 +34,35 @@ Read `README.md` for the full feature map and architecture — it is accurate.
 | Release CI | `.github/workflows/release.yml` | push tag `v*` → build → sign exe → Inno installer (version from tag) → sign installer → verify → GitHub release → R2 publish (skips itself until the `CLOUDFLARE_R2_API_TOKEN` secret exists — see TODO). Signing config lives in GitHub **environment `release`** variables (not repo vars). |
 | Version endpoint | https://matteshot.app/version.json | `{version, url, download, notes}` — for the future in-app update check |
 
+## Trial licensing (server-authoritative, client done)
+
+The trial clock is authoritative on the server so deleting local state cannot
+reset it. The client (src/license.rs) already implements this; the Cloudflare
+Worker (TODO #5) needs two endpoints using the **same Ed25519 keypair** that
+signs license certs (client verifies both with the embedded `PUBLIC_KEY_BASE64`).
+
+- `POST /v1/trial/status` — `{device_id, app_version}`. If a record exists
+  return `{certificate, signature}` (the signed start, **never** refreshed
+  forward); else `{trial: "none"}`.
+- `POST /v1/trial/start` — `{device_id, device_name, app_version,
+  started_at?}`. Idempotent: if the device is known return the **existing**
+  start; otherwise record `started_at` (client-supplied or server now) and
+  return a signed cert. Never moves an existing start forward.
+- Trial cert JSON (base64url, Ed25519-signed over the exact bytes, same schema
+  shape as license certs): `{"version":1,"kind":"trial","device_id":…,
+  "started_at":"RFC3339","issued_at":"RFC3339"}`.
+- KV key by `device_id` (same namespace as license activations), stored
+  forever. This is what defeats the wipe: device_id is machine-bound
+  (MachineGuid), so it survives reinstall/uninstall.
+- Residual hole (accepted, document in code): a machine that used the trial
+  fully offline and wiped local state **before the server ever saw it** can
+  still reset once; anything that ever contacted the server is pinned. Trial
+  start stays "first capture", not "first launch" — that is a product decision.
+- Client behavior: first capture kicks an immediate sync; unlicensed devices
+  re-sync hourly while running; a wiped cert is restored from the server on
+  the next sync, so a wipe buys at most the hours until the next tick.
+
+
 ## Release process
 
 1. Bump `version` in `Cargo.toml` and the fallback in `installer/matteshot.iss`.
@@ -139,7 +168,9 @@ must SetWindowPos topmost→notopmost to surface); AdjustWindowRectEx always.
    Cloudflare Worker → generate license key (signed token), email via Resend
    (Brandon has a 10-domain Resend account; see his memory notes), validate
    offline in-app (ed25519 signature check). Keep the beta free until he says
-   launch.
+   launch. **The same Worker must add `POST /v1/trial/start` and
+   `POST /v1/trial/status` (see "Trial licensing" above) for the
+   server-authoritative trial to work.**
 6. **Marketing prep** (task #14): demo GIF/video of the core loop, PH launch
    kit, beta wave. Marketing asset library: `marketing/` in this repo (matte
    exports, UI shots, scroll captures — all generated via `--assets`).

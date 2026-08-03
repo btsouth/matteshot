@@ -33,6 +33,7 @@ mod update;
 mod video_edit;
 mod welcome;
 mod window;
+mod telemetry;
 
 use anyhow::{bail, Context, Result};
 use image::RgbaImage;
@@ -288,6 +289,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             if let Some(p) = cancel_auto() {
                 let _ = std::fs::remove_file(p);
             }
+            telemetry::report("matteshot_ocr_used");
             return ocr::copy_text(&raw);
         }
         PickAction::Tweak(i) => {
@@ -301,6 +303,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             // while it is open is now just another capture: the hotkey reaches
             // the resident's loop as normal instead of tearing down the
             // editor and replaying a reshoot through here.
+            telemetry::report("matteshot_editor_opened");
             return tweak::open(raw, styles, i, monitor, capture_title);
         }
         PickAction::Reshoot(sel, mon) => {
@@ -385,6 +388,7 @@ fn shoot_overlay() -> Result<()> {
                 record::session(record::Target::window(hwnd), Config::load().record_gif);
             if result.is_ok() {
                 license::record_successful_capture();
+                telemetry::report("matteshot_record_completed");
             }
             result
         }
@@ -393,15 +397,18 @@ fn shoot_overlay() -> Result<()> {
                 record::session(record::Target::region(r, mon), Config::load().record_gif);
             if result.is_ok() {
                 license::record_successful_capture();
+                telemetry::report("matteshot_record_completed");
             }
             result
         }
         Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
             let img = scroll::capture(scroll::Target::Window(h, anchor))?;
+            telemetry::report("matteshot_scroll_capture");
             shoot(Source::Image(img), mon, None)
         }
         Some((overlay::Selection::ScrollRegion(r, m, anchor), mon)) => {
             let img = scroll::capture(scroll::Target::Region(r, m, anchor))?;
+            telemetry::report("matteshot_scroll_capture");
             shoot(Source::Image(img), mon, None)
         }
         None => {
@@ -499,6 +506,8 @@ fn run_app() -> Result<()> {
         diagnostics::log("duplicate launch routed to resident");
         return Ok(());
     };
+    telemetry::init();
+    telemetry::report("matteshot_launch");
     let cleaned = output::cleanup_stale_video_partials(&Config::load().video_dir());
     if cleaned > 0 {
         diagnostics::log(&format!("recovered stale partials count={cleaned}"));

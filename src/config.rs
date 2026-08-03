@@ -30,6 +30,9 @@ pub struct Config {
     pub video_dir: Option<PathBuf>,
     /// Install updates in the background instead of only announcing them.
     pub auto_update: bool,
+    /// Send anonymous usage telemetry to PostHog. Opt-out by default: the
+    /// Settings window can switch it off, and events never carry content.
+    pub telemetry: bool,
 }
 
 impl Default for Config {
@@ -45,6 +48,7 @@ impl Default for Config {
             record_audio: "off".into(),
             video_dir: None,
             auto_update: true,
+            telemetry: true,
         }
     }
 }
