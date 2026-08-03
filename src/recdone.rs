@@ -1247,7 +1247,7 @@ fn next_counter_number(annotations: &[crate::video_edit::Item]) -> u32 {
 }
 
 fn tool_stays_active_after_use(tool: Tool) -> bool {
-    tool == Tool::Pen
+    tool == Tool::Pen || tool == Tool::Counter
 }
 
 fn select_annotation_tool(state: &mut State, tool: Tool) {
@@ -1845,7 +1845,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 Tool::Ellipse => "Drag on the preview to draw an oval",
                 Tool::Highlight => "Drag on the preview to mark an area",
                 Tool::Blur => "Drag over anything sensitive to blur it",
-                Tool::Counter => "Click the preview to place the next step",
+                Tool::Counter => "Click the preview to place the next step   \u{00b7}   Step stays active   \u{00b7}   Esc exits",
                 Tool::Pen => "Draw on the preview   \u{00b7}   Pen stays active   \u{00b7}   Esc exits",
             }
         } else if let Some(index) = state.selected {
@@ -2798,7 +2798,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 caption_box_opacity: state.caption_box_opacity,
                             });
                             state.selected = Some(state.annotations.len() - 1);
-                            state.tool = None;
+                            state.tool = tool_stays_active_after_use(tool).then_some(tool);
                             state.tools_open = false;
                             recompose_preview(state);
                         } else {
@@ -3952,6 +3952,7 @@ mod tests {
         }
         assert!(controls.windows(4).all(|window| window[0].0.bottom < window[3].0.top));
         assert!(tool_stays_active_after_use(super::Tool::Pen));
+        assert!(tool_stays_active_after_use(super::Tool::Counter));
         assert!(!tool_stays_active_after_use(super::Tool::Arrow));
     }
 

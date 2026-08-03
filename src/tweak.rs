@@ -82,6 +82,7 @@ enum Ctl {
 
 const TOOLS: [&str; 9] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"];
 const SIZES: [f32; 3] = [0.7, 1.0, 1.4];
+const STEP_TOOL: usize = 7;
 const PEN_TOOL: usize = 8;
 
 /// What part of an annotation a selector-mode drag grabbed.
@@ -411,7 +412,7 @@ fn annotation_tool_index(shape: &crate::annotate::Shape) -> usize {
 }
 
 fn tool_stays_active_after_use(tool: usize) -> bool {
-    tool == PEN_TOOL
+    tool == PEN_TOOL || tool == STEP_TOOL
 }
 
 fn text_context(state: &State) -> bool {
@@ -1320,6 +1321,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
         Some("type your caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel")
     } else if state.tool == Some(PEN_TOOL) {
         Some("drag on the preview to draw   \u{00b7}   Pen stays active   \u{00b7}   P or Esc exits")
+    } else if state.tool == Some(STEP_TOOL) {
+        Some("click the preview to place the next step   \u{00b7}   Step stays active   \u{00b7}   Esc exits")
     } else if state.tool.is_some() {
         Some("drag on the preview to draw   \u{00b7}   tool clears after each add")
     } else if !state.doc().anns.is_empty() {
@@ -2513,8 +2516,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         });
                         state.doc_mut().drawing = true;
                         SetCapture(hwnd);
-                    } else if tool == 7 {
-                        // Step badge: click places, auto-numbered, one-shot.
+                    } else if tool == STEP_TOOL {
+                        // Step badge: click places, auto-numbered. It stays
+                        // armed so consecutive clicks drop 1, 2, 3, 4 without
+                        // re-picking the tool.
                         state.doc_mut().push_history();
                         let n = state.doc_mut().counter_next;
                         state.doc_mut().counter_next += 1;
@@ -2526,7 +2531,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             text_box_opacity: box_opacity,
                         });
                         state.doc_mut().selected = Some(state.doc_mut().anns.len() - 1);
-                        state.tool = None;
+                        state.tool = tool_stays_active_after_use(tool).then_some(tool);
                         rebuild_preview(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     } else {
@@ -3578,7 +3583,7 @@ mod tests {
         redacted, tab_for_digit,
         tool_stays_active_after_use, History, HISTORY_LIMIT,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
-        PEN_TOOL, TOOLS,
+        PEN_TOOL, STEP_TOOL, TOOLS,
     };
     use windows::Win32::Foundation::RECT;
 
@@ -3899,9 +3904,12 @@ mod tests {
     }
 
     #[test]
-    fn pen_is_the_only_tool_that_stays_armed_after_a_stroke() {
+    fn pen_and_step_stay_armed_after_a_stroke() {
         for tool in 0..TOOLS.len() {
-            assert_eq!(tool_stays_active_after_use(tool), tool == PEN_TOOL);
+            assert_eq!(
+                tool_stays_active_after_use(tool),
+                tool == PEN_TOOL || tool == STEP_TOOL
+            );
         }
     }
 

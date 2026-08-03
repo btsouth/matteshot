@@ -42,7 +42,7 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Off, System, and Mic modes produce a playable file with the expected audio.
 - [ ] Play/Pause, Space, keyboard seeks, timeline scrubbing, and trim handles stay synchronized.
 - [ ] Matte, padding, aspect, and annotations remain responsive during playback.
-- [ ] The + Add drawer shows Arrow, Line, Box, Oval, Mark, Text, Blur, Step, and Pen in a balanced 3x3 grid; each renders in preview and export, Step numbers advance, and Pen stays active across strokes until toggled or Escaped.
+- [ ] The + Add drawer shows Arrow, Line, Box, Oval, Mark, Text, Blur, Step, and Pen in a balanced 3x3 grid; each renders in preview and export, Step numbers advance on consecutive clicks without re-picking, and Pen stays active across strokes until toggled or Escaped.
 - [ ] Existing and newly added annotations remain visible and editable on the terminal frame.
 - [ ] Export progress advances; cancellation keeps the original and removes incomplete output.
 - [ ] Successful export preserves audio, never overwrites an earlier edit, and copies the edit.
