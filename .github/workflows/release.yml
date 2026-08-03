@@ -82,7 +82,12 @@ jobs:
         id: installer
         shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
+          # Pinned: the ISCC path below is version-specific, and Inno Setup 7
+          # is already out upstream. An unpinned install breaks this step the
+          # day the Chocolatey package moves to it, after the app binary has
+          # been signed but before anything is published. 6.7.1 is the newest
+          # the Chocolatey feed carries.
+          choco install innosetup --version=6.7.1 -y --no-progress
           $version = '${{ steps.release.outputs.version }}'
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\matteshot.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

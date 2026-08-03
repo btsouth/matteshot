@@ -66,7 +66,10 @@ jobs:
         id: installer
         shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
+          # Pinned to match release.yml: the ISCC path below is version
+          # specific, and a candidate built on a different compiler than the
+          # real release is not much of a rehearsal.
+          choco install innosetup --version=6.7.1 -y --no-progress
           $version = '${{ steps.package.outputs.version }}'
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\matteshot.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
