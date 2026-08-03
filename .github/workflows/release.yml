@@ -283,4 +283,5 @@ jobs:
             '${{ steps.checksums.outputs.versioned }}' `
             --title "Matteshot $version" `
             --notes $notes `
+            --draft `
             --verify-tag
