@@ -103,7 +103,7 @@ src/telemetry.rs). No event ever carries an email or device name.
    momentarily out of step with its checksum, which would fail every client's
    hash gate. The custom domain can lag a Pages deploy by ~15s.
 
-**v0.14.1 is fully shipped**: signed, uploaded to R2 (versioned + stable, verified matching its published checksum on the public URL), version.json bumped to 0.14.1 pointing at the versioned installer. It is a single fix on top of 0.14.0 — the picker strip no longer runs off the monitor after a very wide capture such as the taskbar, which stacks its variants into rows instead. 0.14.0 brought editor undo, the server-authoritative trial, and the opt-out PostHog telemetry, which means installs/DAU/feature events now flow from the field. Nothing in flight.
+**v0.14.2 is fully shipped**: signed, uploaded to R2 (versioned + stable, verified matching its published checksum on the public URL), GitHub release published, version.json bumped to 0.14.2 pointing at the versioned installer. It brings two editor-parity changes: the Step tool stays armed after each badge (consecutive clicks drop 1, 2, 3, 4 without re-picking, in both editors and the website demo), and Copy keeps the tweak editor open with a brief "copied" confirmation so the capture can keep being refined — with a Settings toggle, "Keep the editor open after Copy", to restore the old close-after-copy behavior. Note: releases are now created as GitHub drafts (`--draft` in release.yml); publishing a draft is a manual `gh release edit vX.Y.Z --draft=false`. Nothing in flight.
 
 **The app updates itself.** `installer.rs` downloads the signed installer,
 requires the published SHA-256 to match and Authenticode to be valid with the
