@@ -34,12 +34,13 @@ Read `README.md` for the full feature map and architecture — it is accurate.
 | Release CI | `.github/workflows/release.yml` | push tag `v*` → build → sign exe → Inno installer (version from tag) → sign installer → verify → GitHub release → R2 publish (skips itself until the `CLOUDFLARE_R2_API_TOKEN` secret exists — see TODO). Signing config lives in GitHub **environment `release`** variables (not repo vars). |
 | Version endpoint | https://matteshot.app/version.json | `{version, url, download, notes}` — for the future in-app update check |
 
-## Trial licensing (server-authoritative, client done)
+## Trial licensing (server-authoritative, done both sides)
 
 The trial clock is authoritative on the server so deleting local state cannot
 reset it. The client (src/license.rs) already implements this; the Cloudflare
-Worker (TODO #5) needs two endpoints using the **same Ed25519 keypair** that
-signs license certs (client verifies both with the embedded `PUBLIC_KEY_BASE64`).
+Worker in `matteshot-site/license-worker` implements it too, using the **same
+Ed25519 keypair** that signs license certs (client verifies both with the
+embedded `PUBLIC_KEY_BASE64`).
 
 - `POST /v1/trial/status` — `{device_id, app_version}`. If a record exists
   return `{certificate, signature}` (the signed start, **never** refreshed
@@ -61,6 +62,30 @@ signs license certs (client verifies both with the embedded `PUBLIC_KEY_BASE64`)
 - Client behavior: first capture kicks an immediate sync; unlicensed devices
   re-sync hourly while running; a wiped cert is restored from the server on
   the next sync, so a wipe buys at most the hours until the next tick.
+
+## Analytics (one PostHog project, three sources)
+
+Everything lands in one PostHog project so a visitor can be followed from the
+site through purchase into daily app use. Every event is tagged
+`product: "matteshot"` and filtered in the "Matteshot" dashboard.
+
+- **Site** (`matteshot-site/public/index.html`): official PostHog snippet
+  (pageviews + autocapture) plus manual events `matteshot_signup`,
+  `matteshot_demo_played`, `matteshot_scroll_capture_demo`,
+  `matteshot_editor_demo_opened`.
+- **Purchases** (`matteshot-site/license-worker`): the Lemon Squeezy
+  `order_created` webhook forwards `matteshot_purchase` (order id, amounts,
+  license key) to PostHog, deduplicated by order id in KV.
+- **GitHub downloads** (`matteshot-site/license-worker`): a daily 13:00 UTC
+  cron posts `matteshot_github_downloads` with per-asset and total counts.
+- **App** (src/telemetry.rs): launch, capture, trial start, license
+  activation, OCR, editor, recording, scroll capture. `distinct_id` is the
+  SHA-256 machine GUID (same id as licensing) and the Settings window can
+  opt out; it defaults on.
+
+PostHog API key: `phc_piwT9huE46Hn8gZxs9X4SvjAHzgQVZGT9QipDWSq7cUx` (publishable;
+embedded in the site snippet, `license-worker/wrangler.toml` vars, and
+src/telemetry.rs). No event ever carries an email or device name.
 
 
 ## Release process
@@ -168,9 +193,10 @@ must SetWindowPos topmost→notopmost to surface); AdjustWindowRectEx always.
    Cloudflare Worker → generate license key (signed token), email via Resend
    (Brandon has a 10-domain Resend account; see his memory notes), validate
    offline in-app (ed25519 signature check). Keep the beta free until he says
-   launch. **The same Worker must add `POST /v1/trial/start` and
-   `POST /v1/trial/status` (see "Trial licensing" above) for the
-   server-authoritative trial to work.**
+   launch. **The trial endpoints `POST /v1/trial/start` and
+   `POST /v1/trial/status` are already implemented in the Worker (see "Trial
+   licensing" above); Lemon Squeezy checkout integration and the buy button on
+   the site are what remains.**
 6. **Marketing prep** (task #14): demo GIF/video of the core loop, PH launch
    kit, beta wave. Marketing asset library: `marketing/` in this repo (matte
    exports, UI shots, scroll captures — all generated via `--assets`).
