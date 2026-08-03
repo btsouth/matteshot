@@ -453,6 +453,29 @@ fn disable_capture_hotkeys(restore_windows_prtscn: bool) {
     }
 }
 
+/// Confirm and deactivate this machine's license. Lives here rather than in the
+/// Settings window because disabling capture needs the resident's hotkey
+/// ownership (the Ctrl+Alt+S registration, the PrtScn hook, and handing PrtScn
+/// back to Windows). Called when Settings' Deactivate button is clicked.
+pub(crate) fn deactivate_license() -> Result<()> {
+    let answer = unsafe {
+        MessageBoxW(
+            None,
+            w!("Deactivate Matteshot on this PC? This frees one of your three device slots."),
+            w!("Matteshot"),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    if answer == IDYES {
+        license::deactivate()?;
+        settings::refresh();
+        if !license::status().can_capture() {
+            disable_capture_hotkeys(true);
+        }
+    }
+    Ok(())
+}
+
 fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
     if license::status().can_capture() {
         if !*hotkeys_active {
@@ -638,6 +661,10 @@ fn run_app() -> Result<()> {
                         output::open_folder(&Config::load().save_dir());
                         Ok(())
                     }
+                    tray::Action::OpenVideos => {
+                        output::open_folder(&Config::load().video_dir());
+                        Ok(())
+                    }
                     tray::Action::Settings => settings::open(),
                     tray::Action::ToggleAutostart => {
                         tray::set_autostart(!tray::autostart_enabled())
@@ -688,26 +715,14 @@ fn run_app() -> Result<()> {
                         settings::refresh();
                         Ok(())
                     }
+                    // Reached from Settings' Deactivate button via the tray
+                    // window; routing here keeps `hotkeys_active` in sync when
+                    // the loop hands the capture hotkeys back.
                     tray::Action::Deactivate => {
-                        let answer = MessageBoxW(
-                            None,
-                            w!("Deactivate Matteshot on this PC? This frees one of your three device slots."),
-                            w!("Matteshot"),
-                            MB_YESNO | MB_ICONWARNING,
-                        );
-                        if answer == IDYES {
-                            license::deactivate()?;
-                            settings::refresh();
-                            if !license::status().can_capture() {
-                                disable_capture_hotkeys(true);
-                                hotkeys_active = false;
-                            }
+                        deactivate_license()?;
+                        if !license::status().can_capture() {
+                            hotkeys_active = false;
                         }
-                        Ok(())
-                    }
-                    tray::Action::Diagnostics => {
-                        diagnostics::copy_report()?;
-                        tray.notify("Matteshot diagnostics", "Copied a privacy-safe support report.");
                         Ok(())
                     }
                     tray::Action::Quit => {

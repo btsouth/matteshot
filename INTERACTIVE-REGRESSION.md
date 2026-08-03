@@ -55,6 +55,7 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Light/dark changes repaint every open surface, popup, and title bar.
 - [ ] 100%, 125%, 150%, and mixed-DPI layouts keep controls visible and captures sharp.
 - [ ] Duplicate launch opens Settings on the resident; quitting restores PrtScn to Windows.
+- [ ] Tray menu is slim: capture, active window, open captures/videos folders, license, Settings. Deactivate and Copy diagnostics appear only in Settings, and Deactivate frees the license slot with the confirmation and hotkey teardown.
 - [ ] Sleep/resume and display connect/disconnect leave the resident responsive.
 - [ ] An available update defers while a capture, recording, editor, or export is active.
 

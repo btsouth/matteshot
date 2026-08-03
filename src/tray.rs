@@ -47,8 +47,7 @@ const CMD_SETTINGS: usize = 107;
 const CMD_UPDATE: usize = 108;
 const CMD_BUY: usize = 109;
 const CMD_ACTIVATE: usize = 110;
-const CMD_DEACTIVATE: usize = 111;
-const CMD_DIAGNOSTICS: usize = 112;
+const CMD_OPEN_VIDEOS: usize = 113;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Matteshot";
@@ -58,6 +57,7 @@ pub enum Action {
     Capture,
     CaptureActive,
     OpenFolder,
+    OpenVideos,
     Settings,
     ToggleAutostart,
     TogglePrtscn,
@@ -65,7 +65,6 @@ pub enum Action {
     Buy,
     Activate,
     Deactivate,
-    Diagnostics,
     Quit,
 }
 
@@ -286,6 +285,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         w!("Capture active window\tCtrl+Alt+S"),
     );
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_FOLDER, w!("Open captures folder"));
+    let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_VIDEOS, w!("Open videos folder"));
     if let Some(update) = &state.update {
         // A staged installer is already downloaded and verified, so the menu
         // promises an install rather than a trip to the browser.
@@ -311,14 +311,9 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         PCWSTR(license_label.as_ptr()),
     );
     match license {
-        crate::license::Status::Licensed { .. } => {
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                CMD_DEACTIVATE,
-                w!("Deactivate this PC\u{2026}"),
-            );
-        }
+        // Deactivation and diagnostics now live in Settings, so a licensed
+        // user's license section is just the status line above.
+        crate::license::Status::Licensed { .. } => {}
         _ => {
             let _ = AppendMenuW(menu, MF_STRING, CMD_BUY, w!("Buy Matteshot\u{2026}"));
             let _ = AppendMenuW(
@@ -347,7 +342,6 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
             w!("Take over PrtScn")
         },
     );
-    let _ = AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS, w!("Copy diagnostics"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit Matteshot"));
 
@@ -379,14 +373,13 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         CMD_CAPTURE => Some(Action::Capture),
         CMD_CAPTURE_ACTIVE => Some(Action::CaptureActive),
         CMD_OPEN_FOLDER => Some(Action::OpenFolder),
+        CMD_OPEN_VIDEOS => Some(Action::OpenVideos),
         CMD_SETTINGS => Some(Action::Settings),
         CMD_AUTOSTART => Some(Action::ToggleAutostart),
         CMD_PRTSCN => Some(Action::TogglePrtscn),
         CMD_UPDATE => Some(Action::OpenUpdate),
         CMD_BUY => Some(Action::Buy),
         CMD_ACTIVATE => Some(Action::Activate),
-        CMD_DEACTIVATE => Some(Action::Deactivate),
-        CMD_DIAGNOSTICS => Some(Action::Diagnostics),
         CMD_QUIT => Some(Action::Quit),
         _ => None,
     };
@@ -401,6 +394,19 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
 }
 
 pub fn request_existing_settings() -> bool {
+    post_action(Action::Settings)
+}
+
+/// Ask the resident's loop to deactivate this machine's license. Routing
+/// through the loop lets it hand the capture hotkeys back to Windows and keep
+/// its own hotkey state in sync, which a direct call from the Settings window
+/// cannot. False when there is no resident (standalone `--settings` mode), so
+/// the caller can fall back to a direct deactivation.
+pub fn request_deactivate() -> bool {
+    post_action(Action::Deactivate)
+}
+
+fn post_action(action: Action) -> bool {
     let Some(hwnd) = crate::window::find_by_class("matteshot_tray") else {
         return false;
     };
@@ -408,7 +414,7 @@ pub fn request_existing_settings() -> bool {
         windows::Win32::UI::WindowsAndMessaging::PostMessageW(
             hwnd,
             WM_TRAY_ACTION,
-            WPARAM(Action::Settings as usize),
+            WPARAM(action as usize),
             LPARAM(0),
         )
         .is_ok()
@@ -486,6 +492,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x if x == Action::Capture as usize => Some(Action::Capture),
                     x if x == Action::CaptureActive as usize => Some(Action::CaptureActive),
                     x if x == Action::OpenFolder as usize => Some(Action::OpenFolder),
+                    x if x == Action::OpenVideos as usize => Some(Action::OpenVideos),
                     x if x == Action::Settings as usize => Some(Action::Settings),
                     x if x == Action::ToggleAutostart as usize => Some(Action::ToggleAutostart),
                     x if x == Action::TogglePrtscn as usize => Some(Action::TogglePrtscn),
@@ -493,7 +500,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x if x == Action::Buy as usize => Some(Action::Buy),
                     x if x == Action::Activate as usize => Some(Action::Activate),
                     x if x == Action::Deactivate as usize => Some(Action::Deactivate),
-                    x if x == Action::Diagnostics as usize => Some(Action::Diagnostics),
                     x if x == Action::Quit as usize => Some(Action::Quit),
                     _ => None,
                 };

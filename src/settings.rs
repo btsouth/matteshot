@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use anyhow::{Context, Result};
-use windows::core::w;
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
@@ -21,10 +21,10 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, LoadCursorW,
-    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_ERASEBKGND,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION,
-    WS_SYSMENU, WS_VISIBLE,
+    MessageBoxW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
+    SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -50,6 +50,8 @@ enum Ctrl {
     Telemetry,
     KeepEditorOpen,
     Audio(&'static str),
+    Diagnostics,
+    Deactivate,
 }
 
 struct State {
@@ -348,6 +350,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 state.cfg.record_audio == *mode,
                 hot,
             ),
+            Ctrl::Diagnostics => draw_chip_button(hdc, *r, "Copy diagnostics", state, false, hot),
+            Ctrl::Deactivate => {
+                let licensed = matches!(state.license, crate::license::Status::Licensed { .. });
+                if licensed {
+                    draw_chip_button(hdc, *r, "Deactivate this PC\u{2026}", state, false, hot);
+                }
+            }
         }
     }
 
@@ -489,6 +498,47 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
         Ctrl::Audio(mode) => {
             state.cfg = Config::update(|cfg| cfg.record_audio = mode.to_string());
         }
+        Ctrl::Diagnostics => match crate::diagnostics::copy_report() {
+            Ok(()) => {
+                let _ = MessageBoxW(
+                    None,
+                    w!("Copied a privacy-safe support report."),
+                    w!("Matteshot"),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+            Err(error) => {
+                eprintln!("diagnostics copy failed: {error:#}");
+                let text = format!("Could not copy diagnostics:\n\n{error:#}");
+                let _ = MessageBoxW(
+                    None,
+                    PCWSTR(HSTRING::from(text).as_ptr()),
+                    w!("Matteshot"),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        },
+        Ctrl::Deactivate => {
+            // A running resident owns the capture hotkeys, so route through its
+            // loop: it hands PrtScn back to Windows and keeps its own hotkey
+            // state in sync. Standalone --settings mode has no resident, so a
+            // direct deactivation is all there is to do there.
+            let result = if crate::tray::request_deactivate() {
+                Ok(())
+            } else {
+                crate::deactivate_license()
+            };
+            if let Err(error) = result {
+                eprintln!("deactivate failed: {error:#}");
+                let text = format!("Deactivation failed:\n\n{error:#}");
+                let _ = MessageBoxW(
+                    None,
+                    PCWSTR(HSTRING::from(text).as_ptr()),
+                    w!("Matteshot"),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
     }
     let _ = InvalidateRect(hwnd, None, false);
 }
@@ -598,7 +648,7 @@ pub fn open() -> Result<()> {
 
         let scale = GetDpiForSystem() as f32 / 96.0;
         let sc = |v: i32| (v as f32 * scale) as i32;
-        let (cw, ch) = (sc(500), sc(554));
+        let (cw, ch) = (sc(500), sc(580));
 
         let font = make_font(-sc(15));
         let font_small = make_font(-sc(12));
@@ -680,6 +730,16 @@ pub fn open() -> Result<()> {
         controls.push((
             RECT { left: m, top: sc(478), right: cw - m, bottom: sc(506) },
             Ctrl::Telemetry,
+        ));
+        // Support and license actions, above the footer. Deactivate is hidden
+        // for anyone without a license to give up.
+        controls.push((
+            RECT { left: m, top: sc(512), right: m + sc(190), bottom: sc(542) },
+            Ctrl::Diagnostics,
+        ));
+        controls.push((
+            RECT { left: m + sc(198), top: sc(512), right: m + sc(388), bottom: sc(542) },
+            Ctrl::Deactivate,
         ));
 
         let state = Box::new(State {
