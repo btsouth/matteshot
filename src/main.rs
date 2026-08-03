@@ -666,22 +666,6 @@ fn run_app() -> Result<()> {
                         Ok(())
                     }
                     tray::Action::Settings => settings::open(),
-                    tray::Action::ToggleAutostart => {
-                        tray::set_autostart(!tray::autostart_enabled())
-                    }
-                    tray::Action::TogglePrtscn => {
-                        if license::status().can_capture() {
-                            let enabled = !prtscn::preferred();
-                            prtscn::set_preferred(enabled);
-                            Config::update(|cfg| cfg.capture_prtscn = enabled);
-                            if enabled {
-                                let _ = prtscn::take(HOTKEY_ID_PRTSCN);
-                            } else {
-                                prtscn::release(HOTKEY_ID_PRTSCN);
-                            }
-                        }
-                        Ok(())
-                    }
                     tray::Action::OpenUpdate => {
                         // Prefer an installer we have already downloaded and
                         // proved is ours; the download page is the fallback

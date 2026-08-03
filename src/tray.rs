@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, GetCursorPos, GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA,
-    HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
+    HICON, ICONINFO, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, WM_CLOSE, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER,
     WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
@@ -40,8 +40,6 @@ const WM_TRAY_ACTION: u32 = 0x8003; // defer until the native popup is fully dis
 const CMD_CAPTURE: usize = 101;
 const CMD_CAPTURE_ACTIVE: usize = 102;
 const CMD_OPEN_FOLDER: usize = 103;
-const CMD_AUTOSTART: usize = 104;
-const CMD_PRTSCN: usize = 105;
 const CMD_QUIT: usize = 106;
 const CMD_SETTINGS: usize = 107;
 const CMD_UPDATE: usize = 108;
@@ -59,8 +57,6 @@ pub enum Action {
     OpenFolder,
     OpenVideos,
     Settings,
-    ToggleAutostart,
-    TogglePrtscn,
     OpenUpdate,
     Buy,
     Activate,
@@ -270,7 +266,6 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     }
 
     let menu = CreatePopupMenu().expect("menu");
-    let check = |on: bool| if on { MF_CHECKED } else { Default::default() };
     let license = crate::license::status();
     let capture_flags = if license.can_capture() {
         MF_STRING
@@ -326,22 +321,6 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Settings\u{2026}"));
-    let _ = AppendMenuW(
-        menu,
-        MF_STRING | check(autostart_enabled()),
-        CMD_AUTOSTART,
-        w!("Start with Windows"),
-    );
-    let _ = AppendMenuW(
-        menu,
-        capture_flags,
-        CMD_PRTSCN,
-        if crate::prtscn::preferred() {
-            w!("Give PrtScn back to Snipping Tool")
-        } else {
-            w!("Take over PrtScn")
-        },
-    );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit Matteshot"));
 
@@ -375,8 +354,6 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         CMD_OPEN_FOLDER => Some(Action::OpenFolder),
         CMD_OPEN_VIDEOS => Some(Action::OpenVideos),
         CMD_SETTINGS => Some(Action::Settings),
-        CMD_AUTOSTART => Some(Action::ToggleAutostart),
-        CMD_PRTSCN => Some(Action::TogglePrtscn),
         CMD_UPDATE => Some(Action::OpenUpdate),
         CMD_BUY => Some(Action::Buy),
         CMD_ACTIVATE => Some(Action::Activate),
@@ -494,8 +471,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x if x == Action::OpenFolder as usize => Some(Action::OpenFolder),
                     x if x == Action::OpenVideos as usize => Some(Action::OpenVideos),
                     x if x == Action::Settings as usize => Some(Action::Settings),
-                    x if x == Action::ToggleAutostart as usize => Some(Action::ToggleAutostart),
-                    x if x == Action::TogglePrtscn as usize => Some(Action::TogglePrtscn),
                     x if x == Action::OpenUpdate as usize => Some(Action::OpenUpdate),
                     x if x == Action::Buy as usize => Some(Action::Buy),
                     x if x == Action::Activate as usize => Some(Action::Activate),
