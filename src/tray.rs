@@ -2,16 +2,23 @@
 //! right-click menu. The tray window shares the main thread's message loop;
 //! menu picks surface as `Action`s the main loop polls after dispatch.
 
-use anyhow::Result;
-use windows::core::{w, PCWSTR};
+use std::ffi::c_void;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use windows::core::{w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    SHGetKnownFolderPath, ShellLink, Shell_NotifyIconW, FOLDERID_Startup, IShellLinkW,
+    KF_FLAG_DEFAULT, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -74,22 +81,90 @@ pub struct Tray {
     _icon: HICON,
 }
 
+/// Where the autostart shortcut lives. A Startup-folder `.lnk` reaches the same
+/// end as an HKCU\...\Run value, but writing a Run key is the single strongest
+/// feature in Defender's Behavior:Win32/Persistence family, and a freshly
+/// downloaded installer doing it got Matteshot quarantined in the field.
+fn autostart_link() -> Result<PathBuf> {
+    unsafe {
+        let raw = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, None)
+            .context("locate the Startup folder")?;
+        let path = PathBuf::from(raw.to_string().context("Startup folder path is not UTF-16")?);
+        CoTaskMemFree(Some(raw.0 as *const c_void));
+        Ok(path.join("Matteshot.lnk"))
+    }
+}
+
 pub fn autostart_enabled() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(RUN_KEY, KEY_READ)
-        .and_then(|k| k.get_value::<String, _>(RUN_VALUE))
-        .is_ok()
+    autostart_link().is_ok_and(|link| link.is_file())
 }
 
 pub fn set_autostart(enabled: bool) -> Result<()> {
-    let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
-    if enabled {
-        let exe = std::env::current_exe()?;
-        key.set_value(RUN_VALUE, &format!("\"{}\"", exe.display()))?;
-    } else {
-        let _ = key.delete_value(RUN_VALUE);
+    let link = autostart_link()?;
+    if !enabled {
+        // Absent is the off state, so a missing file is success, not an error.
+        match std::fs::remove_file(&link) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).context("remove the autostart shortcut")
+            }
+            _ => return Ok(()),
+        }
+    }
+
+    write_shortcut(&link, &std::env::current_exe()?)
+}
+
+/// Write a `.lnk` at `link` pointing at `target`. Split out from
+/// `set_autostart` so it can be exercised somewhere other than the real
+/// Startup folder. The caller's thread must already be an STA, which the main
+/// thread is (see main.rs).
+fn write_shortcut(link: &Path, target: &Path) -> Result<()> {
+    unsafe {
+        let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+            .context("create the shell link object")?;
+        shell_link
+            .SetPath(&HSTRING::from(target.as_os_str()))
+            .context("set the shortcut target")?;
+        if let Some(dir) = target.parent() {
+            shell_link
+                .SetWorkingDirectory(&HSTRING::from(dir.as_os_str()))
+                .context("set the shortcut working directory")?;
+        }
+        shell_link
+            .SetDescription(w!("Matteshot"))
+            .context("set the shortcut description")?;
+        let file: IPersistFile = shell_link.cast().context("cast the shell link to a file")?;
+        file.Save(&HSTRING::from(link.as_os_str()), true)
+            .context("write the autostart shortcut")?;
     }
     Ok(())
+}
+
+/// Move anyone who installed before 0.13.2 off the Run key. The value is the
+/// old source of truth, so its presence means autostart was on: recreate it as
+/// a shortcut and delete the value. Idempotent, and a no-op for new installs.
+pub fn migrate_autostart_from_run_key() {
+    let had_run_value = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(RUN_KEY, KEY_READ)
+        .and_then(|k| k.get_value::<String, _>(RUN_VALUE))
+        .is_ok();
+    if !had_run_value {
+        return;
+    }
+    // Only claim the migration once the shortcut is actually on disk; dropping
+    // the Run value after a failed write would silently disable autostart.
+    if !autostart_enabled() {
+        if let Err(error) = set_autostart(true) {
+            crate::diagnostics::log("autostart migration could not write the shortcut");
+            eprintln!("autostart migration failed: {error:#}");
+            return;
+        }
+    }
+    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
+    {
+        let _ = key.delete_value(RUN_VALUE);
+    }
+    crate::diagnostics::log("autostart migrated from the Run key to a Startup shortcut");
 }
 
 /// The embedded app icon (assets\matteshot.ico via build.rs), falling back to
@@ -535,5 +610,59 @@ impl Tray {
 
     pub fn quit() {
         unsafe { PostQuitMessage(0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, STGM_READ};
+
+    /// The autostart shortcut is the whole persistence mechanism now, so prove
+    /// the shell can read back what we wrote rather than trusting that a file
+    /// of some kind landed on disk.
+    #[test]
+    fn autostart_shortcut_resolves_to_its_target() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let dir = std::env::temp_dir().join("matteshot-autostart-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("Matteshot.lnk");
+        let _ = std::fs::remove_file(&link);
+        let target = std::env::current_exe().unwrap();
+
+        write_shortcut(&link, &target).expect("write the shortcut");
+        assert!(link.is_file(), "no shortcut was created");
+
+        let resolved = unsafe {
+            let shell_link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            let file: IPersistFile = shell_link.cast().unwrap();
+            file.Load(&HSTRING::from(link.as_os_str()), STGM_READ).unwrap();
+            let mut buffer = [0u16; 260];
+            shell_link.GetPath(&mut buffer, std::ptr::null_mut(), 0).unwrap();
+            String::from_utf16_lossy(&buffer)
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(
+            resolved.to_lowercase(),
+            target.to_string_lossy().to_lowercase(),
+            "the shortcut does not point at its target"
+        );
+
+        let _ = std::fs::remove_file(&link);
+    }
+
+    /// The Startup folder is per-user and must never resolve to a machine-wide
+    /// location; a shortcut written there would need elevation we do not have.
+    #[test]
+    fn autostart_link_is_a_per_user_startup_path() {
+        let link = autostart_link().expect("resolve the Startup folder");
+        assert_eq!(link.file_name().unwrap(), "Matteshot.lnk");
+        let text = link.to_string_lossy().to_lowercase();
+        assert!(text.contains("startup"), "not a Startup folder path: {text}");
+        assert!(!text.contains("programdata"), "resolved machine-wide: {text}");
     }
 }
