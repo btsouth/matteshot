@@ -388,9 +388,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
         state.theme.text,
         RECT {
             left: m,
-            top: s(state, 486),
+            top: s(state, 414),
             right: m + s(state, 145),
-            bottom: s(state, 514),
+            bottom: s(state, 442),
         },
         "Recording audio",
         0,
@@ -647,7 +647,8 @@ pub fn open() -> Result<()> {
                 ctrl,
             ));
         }
-        // Checkboxes.
+        // Checkboxes, grouped: app and editor behavior, then recording,
+        // then updates, with privacy last.
         controls.push((
             RECT { left: m, top: sc(286), right: cw - m, bottom: sc(314) },
             Ctrl::Autostart,
@@ -658,28 +659,28 @@ pub fn open() -> Result<()> {
         ));
         controls.push((
             RECT { left: m, top: sc(350), right: cw - m, bottom: sc(378) },
-            Ctrl::RecordGif,
+            Ctrl::KeepEditorOpen,
         ));
         controls.push((
             RECT { left: m, top: sc(382), right: cw - m, bottom: sc(410) },
-            Ctrl::AutoUpdate,
+            Ctrl::RecordGif,
         ));
-        controls.push((
-            RECT { left: m, top: sc(414), right: cw - m, bottom: sc(442) },
-            Ctrl::Telemetry,
-        ));
-        controls.push((
-            RECT { left: m, top: sc(446), right: cw - m, bottom: sc(474) },
-            Ctrl::KeepEditorOpen,
-        ));
-        // Recording audio segmented control.
+        // Recording audio segmented control, next to the GIF toggle.
         for (i, mode) in ["off", "system", "mic"].iter().enumerate() {
             let x = m + sc(150) + i as i32 * sc(78);
             controls.push((
-                RECT { left: x, top: sc(486), right: x + sc(70), bottom: sc(514) },
+                RECT { left: x, top: sc(414), right: x + sc(70), bottom: sc(442) },
                 Ctrl::Audio(mode),
             ));
         }
+        controls.push((
+            RECT { left: m, top: sc(446), right: cw - m, bottom: sc(474) },
+            Ctrl::AutoUpdate,
+        ));
+        controls.push((
+            RECT { left: m, top: sc(478), right: cw - m, bottom: sc(506) },
+            Ctrl::Telemetry,
+        ));
 
         let state = Box::new(State {
             cfg: Config::load(),
