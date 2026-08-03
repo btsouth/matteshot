@@ -261,9 +261,8 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         st.path.take()
     };
 
-    let (chosen, open_editor) = match action {
-        PickAction::Choose(i) => (i, false),
-        PickAction::Edit(i) => (i, true),
+    let chosen = match action {
+        PickAction::Choose(i) => i,
         PickAction::Cancel => {
             // Esc keeps the auto-copy: the no-touch flow — PrtScn, select,
             // Esc, paste. Wait for the background attempt so a failed save or
@@ -278,7 +277,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 return Ok(());
             }
             eprintln!("background auto-copy failed; retrying synchronously");
-            (preselect, false)
+            preselect
         }
         PickAction::Pin => {
             return pin::show(raw, monitor);
@@ -340,9 +339,6 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     if chosen == preselect {
         if let Some(path) = &auto_path {
             Config::update(|cfg| cfg.last_style = chosen);
-            if open_editor {
-                output::open_in_editor(path);
-            }
             eprintln!("done [{}] (auto-copy reused): {}", styles[chosen].name, path.display());
             return Ok(());
         }
@@ -365,9 +361,6 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         }
     }
     Config::update(|cfg| cfg.last_style = chosen);
-    if open_editor {
-        output::open_in_editor(&path);
-    }
     eprintln!(
         "done [{}]: {}x{} -> clipboard + {}",
         styles[chosen].name,

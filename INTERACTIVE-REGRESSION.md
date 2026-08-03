@@ -20,7 +20,7 @@ layout/DPI, theme, and audio mode with the result.
 
 - [ ] The preselected matte is saved and already on the clipboard when the picker appears.
 - [ ] Click, 1-7, Left/Right wrapping, and Enter all choose the displayed variant.
-- [ ] T opens the selected variant in the tweak editor; E saves and opens it externally.
+- [ ] T opens the selected variant in the tweak editor.
 - [ ] P pins the raw capture; C copies recognized text; both leave the picker cleanly.
 - [ ] Esc keeps the successful background auto-copy, and paste matches the preselected matte.
 - [ ] A second PrtScn can capture the picker itself; cancelling the new overlay returns to the picker.

@@ -1,6 +1,6 @@
 //! Native contact-strip picker: a borderless topmost window showing the
-//! styled variants. Click / 1-7 / arrows+Enter chooses, E opens the result
-//! in the default editor, Esc cancels. Plain Win32 + GDI, double-buffered.
+//! styled variants. Click / 1-7 / arrows+Enter chooses, T opens the tweak
+//! editor, Esc cancels. Plain Win32 + GDI, double-buffered.
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
@@ -38,14 +38,12 @@ const BOTTOM_INSET: i32 = 28;
 /// Above this mean aspect a side-by-side strip cannot stay legible (a taskbar
 /// grab is ~20:1), so the variants stack instead.
 const STACK_ASPECT: f32 = 3.0;
-const VK_E: u16 = 0x45;
 /// Posted to the strip when the resident PrtScn hotkey fires mid-pick.
 const WM_RETAKE: u32 = WM_USER + 41;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyAction {
     Choose(usize),
-    Edit(usize),
     Tweak(usize),
     Pin,
     CopyText,
@@ -58,7 +56,6 @@ fn key_action(vk: u16, hover: i32, count: usize) -> Option<KeyAction> {
     match vk {
         v if v == VK_ESCAPE.0 => Some(KeyAction::Cancel),
         v if v == VK_RETURN.0 => selected.map(KeyAction::Choose),
-        v if v == VK_E => selected.map(KeyAction::Edit),
         0x54 => selected.map(KeyAction::Tweak), // T
         0x50 => Some(KeyAction::Pin),           // P
         0x43 => Some(KeyAction::CopyText),      // C
@@ -89,8 +86,6 @@ fn should_cancel_on_deactivate(
 pub enum PickAction {
     /// Copy + save this variant.
     Choose(usize),
-    /// Copy + save + open in the default editor.
-    Edit(usize),
     Cancel,
     /// Open the tweak panel on this variant.
     Tweak(usize),
@@ -339,7 +334,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.faint);
     let mut hint = wide(
-        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   E edit   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
+        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
     );
     let mut hint_rect = RECT {
         left: 0,
@@ -454,7 +449,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     Some(KeyAction::Choose(index)) => {
                         finish(hwnd, state, PickAction::Choose(index))
                     }
-                    Some(KeyAction::Edit(index)) => finish(hwnd, state, PickAction::Edit(index)),
                     Some(KeyAction::Tweak(index)) => finish(hwnd, state, PickAction::Tweak(index)),
                     Some(KeyAction::Pin) => finish(hwnd, state, PickAction::Pin),
                     Some(KeyAction::CopyText) => finish(hwnd, state, PickAction::CopyText),
@@ -603,7 +597,7 @@ pub fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::{key_action, layout, should_cancel_on_deactivate, KeyAction, VK_E, THUMB_H};
+    use super::{key_action, layout, should_cancel_on_deactivate, KeyAction, THUMB_H};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
     };
@@ -611,7 +605,6 @@ mod tests {
     #[test]
     fn picker_shortcuts_choose_the_visible_variant() {
         assert_eq!(key_action(VK_RETURN.0, 3, 7), Some(KeyAction::Choose(3)));
-        assert_eq!(key_action(VK_E, 3, 7), Some(KeyAction::Edit(3)));
         assert_eq!(key_action(0x54, 3, 7), Some(KeyAction::Tweak(3)));
         assert_eq!(key_action(0x50, 3, 7), Some(KeyAction::Pin));
         assert_eq!(key_action(0x43, 3, 7), Some(KeyAction::CopyText));
