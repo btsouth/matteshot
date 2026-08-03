@@ -522,12 +522,22 @@ fn run_app() -> Result<()> {
         disable_capture_hotkeys(true);
         false
     };
+    diagnostics::log(if prtscn_ours {
+        "prtscn acquired at startup"
+    } else {
+        "prtscn NOT acquired at startup; see the tray menu"
+    });
 
     let mut tray = tray::Tray::create()?;
     // Cheap and idempotent, but it has to run before anything reads the
     // autostart state, or the tray menu shows the box unchecked for someone
     // whose old Run value is still the thing starting Matteshot.
     tray::migrate_autostart_from_run_key();
+    diagnostics::log(if tray::autostart_enabled() {
+        "autostart enabled at startup"
+    } else {
+        "autostart disabled at startup"
+    });
     eprintln!(
         "matteshot: ready — PrtScn {} | Ctrl+Alt+S = active window",
         if prtscn_ours { "= capture overlay" } else { "not held (see tray menu)" }
