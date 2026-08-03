@@ -33,7 +33,7 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Text accepts Unicode, can be re-edited, and preserves its style after matte/aspect changes.
 - [ ] OCR selection tracks words after matte, padding, aspect, and window-size changes.
 - [ ] Pixelated words cannot be selected or copied through the redaction.
-- [ ] Copy keeps the active tab open with a brief confirmation; Save and Editor close only the active tab after output succeeds.
+- [ ] Copy keeps the active tab open with a brief confirmation (or closes it when the Settings toggle is off); Save and Editor close only the active tab after output succeeds.
 - [ ] If saving or clipboard copy fails, the error is visible and the active tab remains open.
 
 ## Recording and video editor

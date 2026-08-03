@@ -48,6 +48,7 @@ enum Ctrl {
     RecordGif,
     AutoUpdate,
     Telemetry,
+    KeepEditorOpen,
     Audio(&'static str),
 }
 
@@ -327,6 +328,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 state.cfg.telemetry,
                 hot,
             ),
+            Ctrl::KeepEditorOpen => draw_checkbox(
+                hdc,
+                *r,
+                "Keep the editor open after Copy",
+                state,
+                state.cfg.keep_editor_open,
+                hot,
+            ),
             Ctrl::Audio(mode) => draw_chip_button(
                 hdc,
                 *r,
@@ -379,9 +388,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
         state.theme.text,
         RECT {
             left: m,
-            top: s(state, 462),
+            top: s(state, 486),
             right: m + s(state, 145),
-            bottom: s(state, 490),
+            bottom: s(state, 514),
         },
         "Recording audio",
         0,
@@ -472,6 +481,10 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             let enabled = !state.cfg.telemetry;
             state.cfg = Config::update(|cfg| cfg.telemetry = enabled);
             crate::telemetry::set_enabled(enabled);
+        }
+        Ctrl::KeepEditorOpen => {
+            let enabled = !state.cfg.keep_editor_open;
+            state.cfg = Config::update(|cfg| cfg.keep_editor_open = enabled);
         }
         Ctrl::Audio(mode) => {
             state.cfg = Config::update(|cfg| cfg.record_audio = mode.to_string());
@@ -585,7 +598,7 @@ pub fn open() -> Result<()> {
 
         let scale = GetDpiForSystem() as f32 / 96.0;
         let sc = |v: i32| (v as f32 * scale) as i32;
-        let (cw, ch) = (sc(500), sc(534));
+        let (cw, ch) = (sc(500), sc(554));
 
         let font = make_font(-sc(15));
         let font_small = make_font(-sc(12));
@@ -655,11 +668,15 @@ pub fn open() -> Result<()> {
             RECT { left: m, top: sc(414), right: cw - m, bottom: sc(442) },
             Ctrl::Telemetry,
         ));
+        controls.push((
+            RECT { left: m, top: sc(446), right: cw - m, bottom: sc(474) },
+            Ctrl::KeepEditorOpen,
+        ));
         // Recording audio segmented control.
         for (i, mode) in ["off", "system", "mic"].iter().enumerate() {
             let x = m + sc(150) + i as i32 * sc(78);
             controls.push((
-                RECT { left: x, top: sc(462), right: x + sc(70), bottom: sc(490) },
+                RECT { left: x, top: sc(486), right: x + sc(70), bottom: sc(514) },
                 Ctrl::Audio(mode),
             ));
         }

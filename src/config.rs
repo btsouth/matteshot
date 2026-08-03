@@ -33,6 +33,9 @@ pub struct Config {
     /// Send anonymous usage telemetry to PostHog. Opt-out by default: the
     /// Settings window can switch it off, and events never carry content.
     pub telemetry: bool,
+    /// Keep the tweak editor's tab open after Copy so the capture can keep
+    /// being refined. Off restores the old close-after-copy behavior.
+    pub keep_editor_open: bool,
 }
 
 impl Default for Config {
@@ -49,6 +52,7 @@ impl Default for Config {
             video_dir: None,
             auto_update: true,
             telemetry: true,
+            keep_editor_open: true,
         }
     }
 }
