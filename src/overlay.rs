@@ -98,7 +98,12 @@ unsafe extern "system" fn overlay_keyboard_hook(
 }
 
 pub enum Selection {
-    Window(HWND),
+    /// Live WGC of `hwnd` when possible; `frozen` is the freeze-frame crop
+    /// under the highlight and is used whenever WGC rejects the window.
+    Window {
+        hwnd: HWND,
+        frozen: RgbaImage,
+    },
     Region(RgbaImage),
     /// Record instead of capture — carries virtual-screen geometry.
     RecordWindow(HWND),
@@ -107,6 +112,17 @@ pub enum Selection {
     /// wheel target in virtual-screen coordinates.
     ScrollWindow(HWND, POINT),
     ScrollRegion(RECT, HMONITOR, POINT),
+}
+
+fn crop_frozen(frozen: &RgbaImage, r: RECT) -> RgbaImage {
+    image::imageops::crop_imm(
+        frozen,
+        r.left.max(0) as u32,
+        r.top.max(0) as u32,
+        (r.right - r.left).max(1) as u32,
+        (r.bottom - r.top).max(1) as u32,
+    )
+    .to_image()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -615,25 +631,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 return LRESULT(0);
                             }
                             match state.windows[i].hwnd {
-                                Some(target)
-                                    if crate::capture::wgc_window_supported(target) =>
-                                {
-                                    finish(hwnd, state, Some(Selection::Window(target)))
-                                }
-                                Some(_) | None => {
-                                    // Shell surface, bare desktop, or a window
-                                    // WGC rejects (hosted taskbar widgets, some
-                                    // layered surfaces): crop the frozen image —
-                                    // exactly what was on screen.
-                                    let r = state.windows[i].rect;
-                                    let crop = image::imageops::crop_imm(
-                                        &state.frozen,
-                                        r.left.max(0) as u32,
-                                        r.top.max(0) as u32,
-                                        (r.right - r.left).max(1) as u32,
-                                        (r.bottom - r.top).max(1) as u32,
+                                Some(target) => {
+                                    // Always keep the freeze-frame crop. WGC is
+                                    // preferred later for a clean window, but
+                                    // hosted/layered surfaces (and anything
+                                    // CreateForWindow rejects) must not error.
+                                    let frozen =
+                                        crop_frozen(&state.frozen, state.windows[i].rect);
+                                    finish(
+                                        hwnd,
+                                        state,
+                                        Some(Selection::Window {
+                                            hwnd: target,
+                                            frozen,
+                                        }),
                                     )
-                                    .to_image();
+                                }
+                                None => {
+                                    // Shell surface or bare desktop: crop the
+                                    // frozen image — exactly what was on screen.
+                                    let crop =
+                                        crop_frozen(&state.frozen, state.windows[i].rect);
                                     finish(hwnd, state, Some(Selection::Region(crop)));
                                 }
                             }

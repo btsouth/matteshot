@@ -113,26 +113,6 @@ pub fn device_pair() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     create_d3d_device()
 }
 
-/// True when Windows.Graphics.Capture can produce a non-empty item for `hwnd`.
-///
-/// Child/hosted surfaces (Ceiling's native taskbar widget is the motivating
-/// case) often accept `CreateForWindow` but return a 0x0 item; the frame pool
-/// then fails with `E_INVALIDARG` (0x80070057). Overlay selection uses this to
-/// fall back to a frozen crop of what the user is looking at.
-pub fn wgc_window_supported(hwnd: HWND) -> bool {
-    (|| -> Result<()> {
-        let interop =
-            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
-        let size = item.Size()?;
-        if size.Width <= 0 || size.Height <= 0 {
-            bail!("WGC item has empty size");
-        }
-        Ok(())
-    })()
-    .is_ok()
-}
-
 fn window_frame_bounds(hwnd: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
     unsafe {

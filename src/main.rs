@@ -103,7 +103,13 @@ fn request_graceful_shutdown() -> Result<()> {
 }
 
 enum Source {
-    Window(HWND),
+    /// Capture `hwnd` via WGC (with monitor-crop fallback). When `frozen` is
+    /// set (overlay window pick), any live-capture failure uses those pixels
+    /// instead of erroring out.
+    Window {
+        hwnd: HWND,
+        frozen: Option<RgbaImage>,
+    },
     Image(RgbaImage),
 }
 
@@ -172,10 +178,21 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     // Names the editor tab, so it is taken before the pixels are.
     let mut capture_title;
     let raw = match source {
-        Source::Window(hwnd) => {
+        Source::Window { hwnd, frozen } => {
             capture_title = window::title_of(hwnd);
             eprintln!("capturing: {capture_title}");
-            capture::capture_window(hwnd).context("capture failed")?
+            match capture::capture_window(hwnd) {
+                Ok(img) => img,
+                Err(e) => match frozen {
+                    Some(img) => {
+                        eprintln!(
+                            "live window capture failed ({e:#}); using freeze-frame crop"
+                        );
+                        img
+                    }
+                    None => return Err(e).context("capture failed"),
+                },
+            }
         }
         Source::Image(img) => {
             capture_title = format!("Region {}\u{00d7}{}", img.width(), img.height());
@@ -313,7 +330,14 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             }
             eprintln!("reshoot: replacing the pending capture");
             return match sel {
-                overlay::Selection::Window(hwnd) => shoot(Source::Window(hwnd), mon, None),
+                overlay::Selection::Window { hwnd, frozen } => shoot(
+                    Source::Window {
+                        hwnd,
+                        frozen: Some(frozen),
+                    },
+                    mon,
+                    None,
+                ),
                 overlay::Selection::Region(img) => shoot(Source::Image(img), mon, None),
                 overlay::Selection::RecordWindow(h) => {
                     record::session(record::Target::window(h), cfg.record_gif)
@@ -374,7 +398,14 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
 /// PrtScn / tray-click flow: freeze-frame overlay, then the picker.
 fn shoot_overlay() -> Result<()> {
     match overlay::select()? {
-        Some((overlay::Selection::Window(hwnd), mon)) => shoot(Source::Window(hwnd), mon, None),
+        Some((overlay::Selection::Window { hwnd, frozen }, mon)) => shoot(
+            Source::Window {
+                hwnd,
+                frozen: Some(frozen),
+            },
+            mon,
+            None,
+        ),
         Some((overlay::Selection::Region(img), mon)) => shoot(Source::Image(img), mon, None),
         Some((overlay::Selection::RecordWindow(hwnd), _)) => {
             let result =
@@ -419,7 +450,14 @@ fn shoot_active() -> Result<()> {
 
 fn shoot_active_window(fg: HWND) -> Result<()> {
     let mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY) };
-    shoot(Source::Window(fg), mon, None)
+    shoot(
+        Source::Window {
+            hwnd: fg,
+            frozen: None,
+        },
+        mon,
+        None,
+    )
 }
 
 fn enable_capture_hotkeys() -> Result<bool> {
@@ -776,7 +814,14 @@ fn main() -> Result<()> {
                 Ok(())
             } else {
                 let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
-                shoot(Source::Window(hwnd), mon, pick_override)
+                shoot(
+                    Source::Window {
+                        hwnd,
+                        frozen: None,
+                    },
+                    mon,
+                    pick_override,
+                )
             }
         }
         // Open several captures as tabs in one editor (testing). Each argument
