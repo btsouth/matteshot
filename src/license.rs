@@ -304,9 +304,10 @@ pub fn status() -> Status {
         let _ = save_state(&state);
     }
 
-    // A server-issued trial certificate is the authoritative clock. The start
-    // date is signed by license.matteshot.app, so local state can never move
-    // it; a wipe just forces the next sync to restore the same certificate.
+    // A server-issued trial certificate carries the clock, and both halves of
+    // it only ever move against the user. The signed start survives a local
+    // wipe, and local state can pull it earlier but never later, so time a
+    // spent trial has already used cannot be handed back.
     //
     // The certificate is re-signed on every sync, so its issue date is a server
     // timestamp the machine cannot forge. Folding it into the seen-at floor is
