@@ -63,9 +63,23 @@ layout/DPI, theme, and audio mode with the result.
 
 Every machine that has tested Matteshot so far has been licensed, so this path
 has never run end to end. Build with `cargo build --release --features
-debug-license` and set `MATTESHOT_LICENSE_OVERRIDE` per row; it changes only
-what the app reports, never what is stored, so there is nothing to undo. Unset
-it and confirm `--license-status` reports the real state before closing out.
+debug-license --target-dir target/debug-license`, so the override build never
+replaces the binary a release was cut from, then set
+`MATTESHOT_LICENSE_OVERRIDE` per row. Unset it and confirm `--license-status`
+reports the real state before closing out.
+
+Two things to know before running these:
+
+- **The override has side effects, even though it stores nothing itself.**
+  Everything downstream branches on what `status()` reports, so `expired` sends
+  the background sync down the trial branch and registers a trial record for
+  the device on the server. On a licensed machine that record is already past
+  its 14 days, so it is harmless, but it outlives the test.
+- **Launch without redirecting stderr.** `Start-Process -RedirectStandardError`
+  forces `UseShellExecute=false`, and the activation window then reports
+  `IsWindowVisible=false` and never paints. That is the harness, not a bug, and
+  it looks exactly like a broken window if you are not expecting it. Redirect
+  only for the console-output test flags.
 
 - [ ] `not-started`: capture works and the tray reads "14-day trial ready".
 - [ ] `trial:3`: the tray reads "Trial: 3 days left" and capture is unaffected.
