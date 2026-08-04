@@ -498,7 +498,10 @@ pub(crate) fn deactivate_license() -> Result<()> {
     let answer = unsafe {
         MessageBoxW(
             None,
-            w!("Deactivate Matteshot on this PC? This frees one of your three device slots."),
+            // No device count: the limit lives on the license and can be
+            // raised per key, and the certificate does not carry it, so any
+            // number here is a guess the customer can see is wrong.
+            w!("Deactivate Matteshot on this PC? This frees one of your device slots."),
             w!("Matteshot"),
             MB_YESNO | MB_ICONWARNING,
         )
