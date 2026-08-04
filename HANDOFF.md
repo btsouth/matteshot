@@ -103,7 +103,16 @@ src/telemetry.rs). No event ever carries an email or device name.
    momentarily out of step with its checksum, which would fail every client's
    hash gate. The custom domain can lag a Pages deploy by ~15s.
 
-**v0.14.4 is fully shipped**: signed, uploaded to R2 (versioned + stable, verified matching its published checksum on the public URL), GitHub release published, version.json bumped to 0.14.4 pointing at the versioned installer. Capture fix for Ceiling's hosted taskbar surfaces: the layered taskbar widget (a child of `Shell_TrayWnd`, WGC gives a 0x0 item / DWM gives empty bounds) now captures via a `GetWindowRect` monitor-crop fallback, and overlay window picks use the freeze-frame crop when a live capture rejects the window so the auto-dismissing hover flyout is captured as the user highlighted it. Note: releases are still created as GitHub drafts (`--draft` in release.yml); publishing a draft is a manual `gh release edit vX.Y.Z --draft=false`. Nothing in flight.
+**v0.14.5 is fully shipped**: signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped to 0.14.5 pointing at the versioned installer. Verified independently: the published SHA-256 matches the downloaded installer, Authenticode is `Valid` under `CN=Brandon South`, and `run-probes.ps1 -Strict -SignedFile` accepts that exact artifact through the app's own auto-update trust gate. Trial and licensing hardening, both halves live (worker deployed, client released):
+
+- The trial certificate is re-signed on every `trial/status`, so its `issued_at` is a server timestamp the machine cannot forge. The client folds it into the seen-at floor, which is what stops a rolled-back clock from buying trial days.
+- `status()` takes the *earliest* of the signed start and local state, so a certificate can never hand back time a spent trial already used. The worker no longer clamps an old `started_at` to now, which is what created that hole after a refund.
+- `refresh` distinguishes "Lemon Squeezy said no" from "no answer": outages map to 502/429 rather than the 403 that makes the app delete an activation. Background refresh now runs all session instead of once at launch.
+- The unauthenticated endpoints and `/v1/license/activate` are rate limited per address; bad input answers 4xx instead of 500.
+
+Note: releases are still created as GitHub drafts (`--draft` in release.yml); publishing a draft is a manual `gh release edit vX.Y.Z --draft=false`. Nothing in flight.
+
+**Before taking real money**, the Lemon Squeezy store is still in test mode and `activation_status: "in_review"`. `LEMON_PRODUCT_ID` (1258447), `LEMON_VARIANT_ID` (1966803), and `LEMON_WEBHOOK_SECRET` in `license-worker/wrangler.toml` are all **test-mode** objects and will need re-pointing at the live equivalents once approval lands, or `validateProduct` rejects every real purchase. Tester keys minted in test mode will not survive the switch.
 
 **The app updates itself.** `installer.rs` downloads the signed installer,
 requires the published SHA-256 to match and Authenticode to be valid with the
