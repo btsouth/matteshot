@@ -296,9 +296,16 @@ fn trial_status_at(started: Option<i64>, last_seen: Option<i64>, now: i64) -> St
 /// licensed | licensed:<email>`. Anything else is ignored, so a typo fails
 /// safe by reporting the machine's real state.
 ///
-/// This only changes what is reported. Nothing on disk or in the registry is
-/// written, so there is no test state to undo afterwards and the background
-/// sync keeps operating on the machine's real record.
+/// This function writes nothing itself, but do not read that as "the override
+/// has no side effects". Everything downstream branches on what `status()`
+/// reports, so forcing a state steers real behaviour: running `expired` makes
+/// `start_background_refresh` take the trial branch, and `sync_trial_once`
+/// will then register a trial record for this device on the server. That is
+/// harmless on a licensed machine, because `close_trial_after_activation`
+/// already backdated the local start past its 14 days, so what gets pinned is
+/// an already-spent trial. It is still a server-side write that outlives the
+/// test, so use `licensed` rather than `expired` when you only need the app to
+/// stop nagging.
 ///
 /// Compiled only under the `debug-license` feature, which no shipped binary
 /// has: `verify-code.ps1` lints and tests with `--all-features` to keep this
