@@ -35,9 +35,10 @@ const LICENSE_PATH_TRIAL_START: &str = "/v1/trial/start";
 const LICENSE_PATH_TRIAL_STATUS: &str = "/v1/trial/status";
 const PUBLIC_KEY_BASE64: &str = "JSooNvlMugs9h9gRkeF7MruQswJnzAjHVrRNf/cXhqA=";
 const TRIAL_SECONDS: i64 = 14 * 24 * 60 * 60;
-/// How often a device with no server-recorded trial re-syncs its start date,
-/// so a wiped state regains the authoritative clock quickly.
-const TRIAL_SYNC_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How often the app talks to license.matteshot.app: a trial re-syncs its
+/// signed start date and server timestamp, and a licensed device re-validates
+/// so refunds and revocations propagate without waiting for a restart.
+const SYNC_EVERY: Duration = Duration::from_secs(60 * 60);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const REGISTRY_KEY: &str = r"Software\Southbound Software\Matteshot";
 const REGISTRY_TRIAL_START: &str = "TrialStartedAt";
@@ -306,13 +307,24 @@ pub fn status() -> Status {
     // A server-issued trial certificate is the authoritative clock. The start
     // date is signed by license.matteshot.app, so local state can never move
     // it; a wipe just forces the next sync to restore the same certificate.
+    //
+    // The certificate is re-signed on every sync, so its issue date is a server
+    // timestamp the machine cannot forge. Folding it into the seen-at floor is
+    // what stops a rolled-back system clock from buying trial days: wiping the
+    // local floor only replaces it with the server's on the next sync.
     if let Some(stored) = state.trial.as_ref() {
         if let Ok(certificate) = verify_trial(stored, &device) {
             let started = DateTime::parse_from_rfc3339(&certificate.started_at)
                 .map(|value| value.timestamp())
                 .unwrap_or_else(|_| Utc::now().timestamp());
+            let issued = DateTime::parse_from_rfc3339(&certificate.issued_at)
+                .map(|value| value.timestamp())
+                .ok();
             let now = Utc::now().timestamp();
-            let previous_seen = latest(state.last_seen_at, registry_time(REGISTRY_LAST_SEEN));
+            let previous_seen = latest(
+                latest(state.last_seen_at, registry_time(REGISTRY_LAST_SEEN)),
+                issued,
+            );
             let effective_now = now.max(previous_seen.unwrap_or(now));
             state.last_seen_at = Some(effective_now);
             set_registry_time(REGISTRY_LAST_SEEN, effective_now);
@@ -539,23 +551,19 @@ fn sync_trial_once() -> Result<()> {
 }
 
 pub fn start_background_refresh() {
-    let licensed = matches!(status(), Status::Licensed { .. });
-    std::thread::spawn(move || {
-        if licensed {
+    // Sync immediately, then hourly, for the whole run. A licensed device
+    // re-validates so a refund or revocation lands within the hour instead of
+    // waiting for the next launch; an unlicensed one keeps its trial record in
+    // step, so a wipe is corrected on the very next tick. Network failures are
+    // deliberately ignored: only an explicit 403 from the server drops an
+    // activation, so an offline machine is never stranded.
+    std::thread::spawn(move || loop {
+        if matches!(status(), Status::Licensed { .. }) {
             let _ = refresh_once();
-            return;
-        }
-        // Keep the server trial record in step until the device is licensed:
-        // sync immediately, then hourly. A wipe is corrected on the very next
-        // tick; the hourly cadence bounds how long a wiped machine can keep a
-        // fresh grace if it stays running across the wipe.
-        loop {
+        } else {
             let _ = sync_trial_once();
-            if matches!(status(), Status::Licensed { .. }) {
-                break;
-            }
-            std::thread::sleep(TRIAL_SYNC_EVERY);
         }
+        std::thread::sleep(SYNC_EVERY);
     });
 }
 
@@ -828,6 +836,33 @@ mod tests {
     fn clock_rollback_does_not_restore_trial_time() {
         assert_eq!(
             trial_status_at(Some(1_000), Some(1_000 + TRIAL_SECONDS), 1_000 + 86_400),
+            Status::Expired
+        );
+    }
+
+    #[test]
+    fn a_signed_server_timestamp_survives_a_wiped_local_floor() {
+        // Both local floors deleted and the clock rolled back to the trial
+        // start. The re-signed certificate's issue date is the only survivor,
+        // and it alone has to keep the trial expired.
+        let started = 1_000;
+        let issued = started + TRIAL_SECONDS;
+        let floor = latest(latest(None, None), Some(issued));
+        assert_eq!(
+            trial_status_at(Some(started), floor, started + 60),
+            Status::Expired
+        );
+    }
+
+    #[test]
+    fn a_stale_certificate_never_lowers_the_local_floor() {
+        // A replayed old certificate must not undo a newer local seen-at.
+        let started = 1_000;
+        let local = Some(started + TRIAL_SECONDS);
+        let floor = latest(local, Some(started + 60));
+        assert_eq!(floor, local);
+        assert_eq!(
+            trial_status_at(Some(started), floor, started + 60),
             Status::Expired
         );
     }
