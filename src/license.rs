@@ -289,7 +289,60 @@ fn trial_status_at(started: Option<i64>, last_seen: Option<i64>, now: i64) -> St
     }
 }
 
+/// Force what `status()` reports, so the trial and purchase flow can be walked
+/// through without waiting out a real 14 days.
+///
+/// `MATTESHOT_LICENSE_OVERRIDE=not-started | trial | trial:<days> | expired |
+/// licensed | licensed:<email>`. Anything else is ignored, so a typo fails
+/// safe by reporting the machine's real state.
+///
+/// This only changes what is reported. Nothing on disk or in the registry is
+/// written, so there is no test state to undo afterwards and the background
+/// sync keeps operating on the machine's real record.
+///
+/// Compiled only under the `debug-license` feature, which no shipped binary
+/// has: `verify-code.ps1` lints and tests with `--all-features` to keep this
+/// correct, then builds the release binary with none of them.
+#[cfg(feature = "debug-license")]
+fn debug_override() -> Option<Status> {
+    let raw = std::env::var("MATTESHOT_LICENSE_OVERRIDE").ok()?;
+    let raw = raw.trim();
+    let (kind, argument) = match raw.split_once(':') {
+        Some((kind, argument)) => (kind.trim(), Some(argument.trim())),
+        None => (raw, None),
+    };
+    let status = match kind {
+        "not-started" => Status::TrialNotStarted,
+        // Zero days left is not a state the real clock can produce, so treat
+        // it as the expiry the caller plainly meant.
+        "trial" => match argument.and_then(|value| value.parse::<u32>().ok()) {
+            Some(0) => Status::Expired,
+            Some(days_left) => Status::Trial { days_left },
+            None => Status::Trial { days_left: 14 },
+        },
+        "expired" => Status::Expired,
+        "licensed" => Status::Licensed {
+            customer_email: argument
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            updates_until: None,
+        },
+        _ => return None,
+    };
+    // Say so once per process. A forced state is otherwise indistinguishable
+    // from a real one in the tray, and that is a confusing way to lose an hour.
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    ANNOUNCED.call_once(|| {
+        crate::diagnostics::log(&format!("license overridden by environment: {raw}"));
+    });
+    Some(status)
+}
+
 pub fn status() -> Status {
+    #[cfg(feature = "debug-license")]
+    if let Some(forced) = debug_override() {
+        return forced;
+    }
     let _guard = crate::state_lock::lock(LICENSE_MUTEX).ok();
     let mut state = load_state();
     let device = device_id();
@@ -902,6 +955,51 @@ mod tests {
             trial_status_at(Some(started), None, signed_start + TRIAL_SECONDS),
             Status::Expired
         );
+    }
+
+    #[cfg(feature = "debug-license")]
+    #[test]
+    fn the_license_override_parses_every_documented_form() {
+        // Serialized against the other override test: std::env is process-wide.
+        let _guard = crate::state_lock::lock("Local\\Matteshot.Test.LicenseOverride").ok();
+        let cases = [
+            ("not-started", Status::TrialNotStarted),
+            ("trial", Status::Trial { days_left: 14 }),
+            ("trial:3", Status::Trial { days_left: 3 }),
+            (" trial : 3 ", Status::Trial { days_left: 3 }),
+            ("trial:0", Status::Expired),
+            ("expired", Status::Expired),
+            (
+                "licensed",
+                Status::Licensed {
+                    customer_email: None,
+                    updates_until: None,
+                },
+            ),
+            (
+                "licensed:person@example.com",
+                Status::Licensed {
+                    customer_email: Some("person@example.com".into()),
+                    updates_until: None,
+                },
+            ),
+        ];
+        for (value, expected) in cases {
+            std::env::set_var("MATTESHOT_LICENSE_OVERRIDE", value);
+            assert_eq!(debug_override(), Some(expected), "override {value:?}");
+        }
+        std::env::remove_var("MATTESHOT_LICENSE_OVERRIDE");
+    }
+
+    #[cfg(feature = "debug-license")]
+    #[test]
+    fn an_unknown_override_falls_back_to_the_real_state() {
+        let _guard = crate::state_lock::lock("Local\\Matteshot.Test.LicenseOverride").ok();
+        for value in ["", "nonsense", "trial-ish", "Expired"] {
+            std::env::set_var("MATTESHOT_LICENSE_OVERRIDE", value);
+            assert_eq!(debug_override(), None, "override {value:?} must be ignored");
+        }
+        std::env::remove_var("MATTESHOT_LICENSE_OVERRIDE");
     }
 
     #[test]

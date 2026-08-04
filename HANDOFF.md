@@ -155,6 +155,13 @@ Keep all three in sync if the design changes.
 - **Never inject keyboard/mouse input during his work hours** — foreground
   locks break the tests and keys leak into his apps. He tests by hand.
 - `MATTESHOT_THEME=dark|light` overrides the theme for testing.
+- `MATTESHOT_LICENSE_OVERRIDE=not-started|trial|trial:<days>|expired|licensed[:<email>]`
+  forces the licensing state, so the trial and purchase flow can be walked
+  without waiting 14 days or hand-editing `license.json` and the registry. It
+  only changes what is reported, never what is stored, so nothing needs
+  undoing. **Requires `--features debug-license`**: no shipped binary honours
+  it, and the variable name is not even present in a default build.
+  `--license-status` prints a second line when a state is forced.
 - Win11 Notepad is tabbed (title matching can grab the wrong tab); use
   Calculator or a fresh file for capture tests. His Pictures dir is
   OneDrive-redirected.
