@@ -60,6 +60,14 @@ features = [
     "Win32_UI_Shell",
 ]
 
+[features]
+default = []
+# Honour MATTESHOT_LICENSE_OVERRIDE so the trial and purchase flow can be
+# exercised without waiting 14 days. Never enabled for a shipped binary:
+# verify-code.ps1 lints and tests with --all-features so the code stays
+# correct, and builds the release binary with none of them.
+debug-license = []
+
 [profile.release]
 lto = true
 strip = true

@@ -59,6 +59,24 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Sleep/resume and display connect/disconnect leave the resident responsive.
 - [ ] An available update defers while a capture, recording, editor, or export is active.
 
+## Trial and purchase
+
+Every machine that has tested Matteshot so far has been licensed, so this path
+has never run end to end. Build with `cargo build --release --features
+debug-license` and set `MATTESHOT_LICENSE_OVERRIDE` per row; it changes only
+what the app reports, never what is stored, so there is nothing to undo. Unset
+it and confirm `--license-status` reports the real state before closing out.
+
+- [ ] `not-started`: capture works and the tray reads "14-day trial ready".
+- [ ] `trial:3`: the tray reads "Trial: 3 days left" and capture is unaffected.
+- [ ] `expired`: PrtScn no longer captures and the activation window appears.
+- [ ] Buy from the expired window, and from the tray, opens the pricing card at
+      matteshot.app rather than the top of the page.
+- [ ] Activating a real key from the expired state restores the hotkeys without
+      a restart, and the tray switches to the licensed label.
+- [ ] Unset the override: `--license-status` reports the machine's real state
+      and no forced-state line.
+
 ## Closeout
 
 - [ ] Restore Tyler's original audio, folders, theme override, and other settings.

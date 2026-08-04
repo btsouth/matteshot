@@ -1527,6 +1527,10 @@ fn main() -> Result<()> {
         }
         Some("--license-status") => {
             eprintln!("{}", license::status().tray_label());
+            #[cfg(feature = "debug-license")]
+            if let Ok(forced) = std::env::var("MATTESHOT_LICENSE_OVERRIDE") {
+                eprintln!("(forced by MATTESHOT_LICENSE_OVERRIDE={forced})");
+            }
             Ok(())
         }
         // Support-safe activation path: the key is read from redirected stdin
