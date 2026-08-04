@@ -26,6 +26,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
 thread_local! {
     /// D3D device creation costs tens of ms; cache per thread. All captures
@@ -113,16 +114,28 @@ pub fn device_pair() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     create_d3d_device()
 }
 
+/// The window's on-screen bounds in screen coordinates.
+///
+/// DWM frame bounds are preferred for normal windows, but layered/hosted
+/// surfaces (Ceiling's taskbar widget is a child of Explorer's `Shell_TrayWnd`)
+/// return empty or fail outright — fall back to `GetWindowRect`, which still
+/// reports where the window actually is.
 fn window_frame_bounds(hwnd: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
-    unsafe {
+    let dwm = unsafe {
         DwmGetWindowAttribute(
             hwnd,
             DWMWA_EXTENDED_FRAME_BOUNDS,
             &mut rect as *mut RECT as *mut _,
             std::mem::size_of::<RECT>() as u32,
         )
-        .context("DWM window bounds")?;
+    };
+    let dwm_ok = dwm.is_ok() && rect.right > rect.left && rect.bottom > rect.top;
+    if !dwm_ok {
+        let mut wr = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut wr) }
+            .with_context(|| format!("DWM window bounds: {dwm:?}"))?;
+        rect = wr;
     }
     if rect.right <= rect.left || rect.bottom <= rect.top {
         bail!(
@@ -164,7 +177,7 @@ fn capture_window_monitor_crop(hwnd: HWND) -> Result<RgbaImage> {
     Ok(image::imageops::crop_imm(&full, x, y, w, h).to_image())
 }
 
-fn capture_window_wgc(hwnd: HWND) -> Result<RgbaImage> {
+pub fn capture_window_wgc(hwnd: HWND) -> Result<RgbaImage> {
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
     // Empty items pass CreateForWindow on some hosted/layered surfaces and
