@@ -314,19 +314,29 @@ pub fn status() -> Status {
     // local floor only replaces it with the server's on the next sync.
     if let Some(stored) = state.trial.as_ref() {
         if let Ok(certificate) = verify_trial(stored, &device) {
-            let started = DateTime::parse_from_rfc3339(&certificate.started_at)
+            let signed_start = DateTime::parse_from_rfc3339(&certificate.started_at)
                 .map(|value| value.timestamp())
                 .unwrap_or_else(|_| Utc::now().timestamp());
             let issued = DateTime::parse_from_rfc3339(&certificate.issued_at)
                 .map(|value| value.timestamp())
                 .ok();
             let now = Utc::now().timestamp();
+            // The start only ever moves earlier. A certificate can undo a wipe,
+            // but it can never hand back time a local record says is spent:
+            // after a refund the server may not know this device ever trialed.
+            let started = earliest(
+                Some(signed_start),
+                earliest(state.trial_started_at, registry_time(REGISTRY_TRIAL_START)),
+            )
+            .unwrap_or(signed_start);
             let previous_seen = latest(
                 latest(state.last_seen_at, registry_time(REGISTRY_LAST_SEEN)),
                 issued,
             );
             let effective_now = now.max(previous_seen.unwrap_or(now));
+            state.trial_started_at = Some(started);
             state.last_seen_at = Some(effective_now);
+            set_registry_time(REGISTRY_TRIAL_START, started);
             set_registry_time(REGISTRY_LAST_SEEN, effective_now);
             let _ = save_state(&state);
             return trial_status_at(Some(started), previous_seen, now);
@@ -863,6 +873,32 @@ mod tests {
         assert_eq!(floor, local);
         assert_eq!(
             trial_status_at(Some(started), floor, started + 60),
+            Status::Expired
+        );
+    }
+
+    #[test]
+    fn a_certificate_never_moves_the_start_later_than_local_state() {
+        // After a refund the server may have no trial record for a device that
+        // bought outright, so its certificate can carry a start of "now". The
+        // local record of a spent trial has to win.
+        let spent = 1_000;
+        let signed_start = spent + 30 * 86_400;
+        let started = earliest(Some(signed_start), Some(spent)).unwrap_or(signed_start);
+        assert_eq!(started, spent);
+        assert_eq!(
+            trial_status_at(Some(started), Some(signed_start), signed_start),
+            Status::Expired
+        );
+    }
+
+    #[test]
+    fn a_certificate_still_restores_a_start_that_local_state_lost() {
+        let signed_start = 1_000;
+        let started = earliest(Some(signed_start), None).unwrap_or(signed_start);
+        assert_eq!(started, signed_start);
+        assert_eq!(
+            trial_status_at(Some(started), None, signed_start + TRIAL_SECONDS),
             Status::Expired
         );
     }
