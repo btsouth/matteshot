@@ -313,12 +313,17 @@ fn debug_override() -> Option<Status> {
     };
     let status = match kind {
         "not-started" => Status::TrialNotStarted,
-        // Zero days left is not a state the real clock can produce, so treat
-        // it as the expiry the caller plainly meant.
-        "trial" => match argument.and_then(|value| value.parse::<u32>().ok()) {
-            Some(0) => Status::Expired,
-            Some(days_left) => Status::Trial { days_left },
+        // A bare "trial" means the full window. An argument that does not parse
+        // is a typo, not a request for the default: silently handing back 14
+        // days would be exactly the permissive guess this is meant to avoid.
+        // Zero is not a state the real clock can produce, so it means expiry.
+        "trial" => match argument {
             None => Status::Trial { days_left: 14 },
+            Some(value) => match value.parse::<u32>() {
+                Ok(0) => Status::Expired,
+                Ok(days_left) => Status::Trial { days_left },
+                Err(_) => return None,
+            },
         },
         "expired" => Status::Expired,
         "licensed" => Status::Licensed {
@@ -336,6 +341,15 @@ fn debug_override() -> Option<Status> {
         crate::diagnostics::log(&format!("license overridden by environment: {raw}"));
     });
     Some(status)
+}
+
+/// Whether the environment is actually forcing a state, as opposed to merely
+/// setting the variable to something unrecognized. Callers report the two
+/// cases differently, because "forced" next to the machine's real state is a
+/// worse lie than no message at all.
+#[cfg(feature = "debug-license")]
+pub fn debug_override_active() -> bool {
+    debug_override().is_some()
 }
 
 pub fn status() -> Status {
@@ -995,7 +1009,10 @@ mod tests {
     #[test]
     fn an_unknown_override_falls_back_to_the_real_state() {
         let _guard = crate::state_lock::lock("Local\\Matteshot.Test.LicenseOverride").ok();
-        for value in ["", "nonsense", "trial-ish", "Expired"] {
+        // A malformed day count is a typo, not a request for the default.
+        for value in [
+            "", "nonsense", "trial-ish", "Expired", "trial:abc", "trial:", "trial:-1", "trial:1e3",
+        ] {
             std::env::set_var("MATTESHOT_LICENSE_OVERRIDE", value);
             assert_eq!(debug_override(), None, "override {value:?} must be ignored");
         }

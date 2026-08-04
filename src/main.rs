@@ -1528,8 +1528,15 @@ fn main() -> Result<()> {
         Some("--license-status") => {
             eprintln!("{}", license::status().tray_label());
             #[cfg(feature = "debug-license")]
-            if let Ok(forced) = std::env::var("MATTESHOT_LICENSE_OVERRIDE") {
-                eprintln!("(forced by MATTESHOT_LICENSE_OVERRIDE={forced})");
+            if let Ok(value) = std::env::var("MATTESHOT_LICENSE_OVERRIDE") {
+                if license::debug_override_active() {
+                    eprintln!("(forced by MATTESHOT_LICENSE_OVERRIDE={value})");
+                } else {
+                    eprintln!(
+                        "(ignoring unrecognized MATTESHOT_LICENSE_OVERRIDE={value}; \
+                         the state above is real)"
+                    );
+                }
             }
             Ok(())
         }
