@@ -122,21 +122,19 @@ pub fn device_pair() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
 /// reports where the window actually is.
 fn window_frame_bounds(hwnd: HWND) -> Result<RECT> {
     let mut rect = RECT::default();
-    let dwm_ok = unsafe {
+    let dwm = unsafe {
         DwmGetWindowAttribute(
             hwnd,
             DWMWA_EXTENDED_FRAME_BOUNDS,
             &mut rect as *mut RECT as *mut _,
             std::mem::size_of::<RECT>() as u32,
         )
-        .is_ok()
-    } && rect.right > rect.left
-        && rect.bottom > rect.top;
+    };
+    let dwm_ok = dwm.is_ok() && rect.right > rect.left && rect.bottom > rect.top;
     if !dwm_ok {
         let mut wr = RECT::default();
         unsafe { GetWindowRect(hwnd, &mut wr) }
-            .ok()
-            .context("window rect")?;
+            .with_context(|| format!("DWM window bounds: {dwm:?}"))?;
         rect = wr;
     }
     if rect.right <= rect.left || rect.bottom <= rect.top {
