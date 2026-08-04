@@ -181,17 +181,23 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         Source::Window { hwnd, frozen } => {
             capture_title = window::title_of(hwnd);
             eprintln!("capturing: {capture_title}");
-            match capture::capture_window(hwnd) {
-                Ok(img) => img,
-                Err(e) => match frozen {
-                    Some(img) => {
-                        eprintln!(
-                            "live window capture failed ({e:#}); using freeze-frame crop"
-                        );
-                        img
+            // Overlay picks carry the freeze-frame crop of what the user
+            // highlighted. Prefer a live WGC frame when the window is
+            // capturable, but never let the monitor-crop fallback inside
+            // `capture_window` mask a WGC rejection: for a window that has
+            // since moved or dismissed (Ceiling's hover flyout hides when the
+            // pointer leaves the widget) the monitor crop would "succeed" by
+            // capturing whatever is behind it. The frozen crop is always what
+            // the user actually saw.
+            match frozen {
+                Some(frozen_img) => match capture::capture_window_wgc(hwnd) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        eprintln!("live window capture failed ({e:#}); using freeze-frame crop");
+                        frozen_img
                     }
-                    None => return Err(e).context("capture failed"),
                 },
+                None => capture::capture_window(hwnd).context("capture failed")?,
             }
         }
         Source::Image(img) => {
