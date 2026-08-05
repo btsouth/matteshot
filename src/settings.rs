@@ -727,8 +727,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // Alt combinations arrive as WM_SYSKEYDOWN, so both are needed or
         // every shortcut containing Alt would be uncapturable.
-        WM_KEYDOWN | WM_SYSKEYDOWN if state_of(hwnd).is_some_and(|s| s.capturing) => {
-            if let Some(state) = state_of(hwnd) {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            // state_of hands out a &'static mut from a raw pointer, so it is
+            // taken exactly once. Testing `capturing` in a match guard and
+            // again in the body would alias two &mut to the same State.
+            let Some(state) = state_of(hwnd) else {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            };
+            if !state.capturing {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            {
                 let vk = wparam.0 as u32;
                 let down = |key: VIRTUAL_KEY| (GetKeyState(key.0 as i32) as u16 & 0x8000) != 0;
                 if vk == VK_ESCAPE.0 as u32 {
@@ -765,8 +774,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let chosen = crate::hotkey::Hotkey { modifiers, vk };
                 let text = crate::hotkey::label(Some(chosen));
                 // Round-trip through the parser so what is stored is something
-                // the app can read back; an unlabelable key is refused here
-                // rather than written and silently ignored at startup.
+                // the app can read back. label() has a "0x.." fallback for keys
+                // it has no name for, and parse() rejects those, so this
+                // refuses them at capture rather than writing a combo that is
+                // silently ignored at startup.
                 if crate::hotkey::parse(&text).is_none() {
                     return LRESULT(0);
                 }
