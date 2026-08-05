@@ -36,6 +36,16 @@ pub struct Config {
     /// Keep the tweak editor's tab open after Copy so the capture can keep
     /// being refined. Off restores the old close-after-copy behavior.
     pub keep_editor_open: bool,
+    /// Shortcut for capturing the active window, as text ("Ctrl+Alt+S").
+    /// "None" unbinds it. Text rather than a keycode so the file stays
+    /// readable and a combo the Settings window does not offer can still be
+    /// set by hand. See `crate::hotkey`.
+    #[serde(default = "default_capture_hotkey")]
+    pub capture_hotkey: String,
+}
+
+fn default_capture_hotkey() -> String {
+    crate::hotkey::DEFAULT.to_owned()
 }
 
 impl Default for Config {
@@ -53,7 +63,24 @@ impl Default for Config {
             auto_update: true,
             telemetry: true,
             keep_editor_open: true,
+            capture_hotkey: default_capture_hotkey(),
         }
+    }
+}
+
+impl Config {
+    /// The capture shortcut to register, or `None` when it is unbound.
+    ///
+    /// Unreadable text falls back to the default rather than leaving the app
+    /// with no shortcut, because a typo in a config file should not silently
+    /// remove a feature. "None" is honoured as written: choosing to unbind is
+    /// not a mistake to correct.
+    pub fn capture_hotkey(&self) -> Option<crate::hotkey::Hotkey> {
+        let text = self.capture_hotkey.trim();
+        if text.eq_ignore_ascii_case(crate::hotkey::NONE) {
+            return None;
+        }
+        crate::hotkey::parse(text).or_else(|| crate::hotkey::parse(crate::hotkey::DEFAULT))
     }
 }
 
@@ -111,5 +138,51 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("Matteshot")
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_shortcut_setting_uses_the_default() {
+        // Configs written before the setting existed have no such key, and
+        // serde's default has to supply one or every upgrade loses its
+        // shortcut.
+        let cfg: Config = serde_json::from_str("{}").expect("empty config");
+        assert_eq!(cfg.capture_hotkey, crate::hotkey::DEFAULT);
+        assert!(cfg.capture_hotkey().is_some());
+    }
+
+    #[test]
+    fn unreadable_text_falls_back_rather_than_unbinding() {
+        let cfg = Config {
+            capture_hotkey: "Ctrl+Nonsense".into(),
+            ..Default::default()
+        };
+        // A typo should not silently remove the feature.
+        assert_eq!(cfg.capture_hotkey(), crate::hotkey::parse(crate::hotkey::DEFAULT));
+    }
+
+    #[test]
+    fn choosing_none_is_honoured_not_corrected() {
+        for text in ["None", "none", " NONE "] {
+            let cfg = Config {
+                capture_hotkey: text.into(),
+                ..Default::default()
+            };
+            assert_eq!(cfg.capture_hotkey(), None, "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_custom_shortcut_is_used_as_written() {
+        let cfg = Config {
+            capture_hotkey: "Ctrl+Shift+F9".into(),
+            ..Default::default()
+        };
+        let parsed = cfg.capture_hotkey().expect("custom shortcut");
+        assert_eq!(parsed.vk, 0x70 + 8);
     }
 }
