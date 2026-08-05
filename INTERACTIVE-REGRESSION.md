@@ -28,6 +28,8 @@ layout/DPI, theme, and audio mode with the result.
 
 ## Screenshot editor
 
+- [ ] A maximized-window capture previews sharply, not softened: small text in the preview is as legible as in the capture itself, on every monitor.
+- [ ] Dragging the editor window larger stays smooth, and the preview sharpens to the new size when the mouse comes up; maximize and restore sharpen immediately.
 - [ ] Multiple captures become tabs; Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1-9, middle-click, and close choose the expected neighbour.
 - [ ] Every annotation can be created, selected, moved, resized, deleted, and undone.
 - [ ] Every annotation tool stays armed after each add, so repeats need no re-pick; clicking the armed tool again, picking a different tool, or pressing Escape disarms it and restores selection.

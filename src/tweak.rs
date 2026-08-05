@@ -311,6 +311,11 @@ struct State {
     scale: f32,
     width: i32,
     height: i32,
+    /// Inside an interactive resize loop. Growing the working bitmap means
+    /// resizing the capture, which is far too expensive to do on every WM_SIZE
+    /// a drag emits; the preview stretches for the duration and sharpens when
+    /// the mouse comes up.
+    sizing: bool,
     theme: crate::theme::Theme,
 }
 
@@ -476,6 +481,92 @@ fn sync_annotation_controls(state: &mut State, index: usize) {
     state.caption_size = ann.size;
     state.caption_style = ann.text_style;
     state.caption_box_opacity = ann.text_box_opacity;
+}
+
+/// Longest edge the preview working bitmap should have for this viewport.
+///
+/// The editor stretches its working bitmap to fill the pane, so anything
+/// smaller than the pane is upscaled and the text you are annotating against
+/// goes soft — worse the larger the monitor, which is backwards. Matching the
+/// pane means the picture is only ever downscaled.
+///
+/// Targeting the pane's own long edge is deliberately a little generous: the
+/// composite carries the matte's padding on top of the content, so it is
+/// always larger than the content and reaches the pane before the content
+/// does. The slack is a margin against upscaling, not wasted work.
+///
+/// Bounded on both sides. There is nothing to gain above the capture's own
+/// resolution, and `PREVIEW_CEILING` keeps an enormous monitor from turning
+/// every rebuild into a visible pause.
+fn preview_target_edge(preview_box: RECT, raw_w: u32, raw_h: u32) -> u32 {
+    const PREVIEW_CEILING: u32 = 3200;
+    const PREVIEW_FLOOR: u32 = 900;
+    let pane = (preview_box.right - preview_box.left)
+        .max(preview_box.bottom - preview_box.top)
+        .max(0) as u32;
+    pane.clamp(PREVIEW_FLOOR, PREVIEW_CEILING)
+        .min(raw_w.max(raw_h))
+}
+
+/// `preview_sources` for `--preview-bench`: growing the working bitmap costs a
+/// resize of the capture, and the benchmark has to measure the real one.
+pub fn preview_sources_for_bench(
+    raw: &RgbaImage,
+    target_edge: u32,
+) -> (RgbaImage, f32, RgbaImage, f32) {
+    preview_sources(raw, target_edge)
+}
+
+/// Build the working bitmap and its drag-quality half at `target_edge`.
+fn preview_sources(raw: &RgbaImage, target_edge: u32) -> (RgbaImage, f32, RgbaImage, f32) {
+    let scale = (target_edge as f32 / raw.width().max(raw.height()) as f32).min(1.0);
+    let small = if scale < 1.0 {
+        image::imageops::resize(
+            raw,
+            (raw.width() as f32 * scale) as u32,
+            (raw.height() as f32 * scale) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        raw.clone()
+    };
+    // Drag-quality source, built once so a padding drag never pays for a
+    // resize per frame.
+    let small_fast = image::imageops::resize(
+        &small,
+        (small.width() / 2).max(1),
+        (small.height() / 2).max(1),
+        image::imageops::FilterType::Triangle,
+    );
+    (small, scale, small_fast, scale * 0.5)
+}
+
+/// Grow the working bitmap when the pane has outgrown it. Returns whether the
+/// source changed, which means the composite cache is stale.
+///
+/// Only ever grows. Shrinking would reclaim memory that is already bounded,
+/// and it would pay for a resize on the way back out of every window drag —
+/// WM_SIZE arrives continuously, so this has to be cheap to call and quiet
+/// when nothing is needed.
+fn ensure_preview_source(state: &mut State) -> bool {
+    let (raw_w, raw_h) = (state.doc().raw.width(), state.doc().raw.height());
+    let target = preview_target_edge(state.preview_box, raw_w, raw_h);
+    let current = state.doc().small.width().max(state.doc().small.height());
+    // A few pixels either way is not worth a full resize of the capture.
+    if target <= (current as f32 * 1.05) as u32 {
+        return false;
+    }
+    let (small, metric, small_fast, metric_fast) = preview_sources(&state.doc().raw, target);
+    let doc = state.doc_mut();
+    doc.small = small;
+    doc.preview_metric = metric;
+    doc.small_fast = small_fast;
+    doc.metric_fast = metric_fast;
+    // Keyed by matte, padding, aspect and draft quality — not by resolution,
+    // so a composite built against the old source would be reused at the wrong
+    // size.
+    doc.base_cache = None;
+    true
 }
 
 /// Preview source for the current interaction: reduced while a geometry drag
@@ -831,6 +922,11 @@ unsafe fn wash_all(hdc: HDC, color: COLORREF, rects: &[(RECT, u8)]) {
 }
 
 fn rebuild_preview(state: &mut State) {
+    // Cheap and quiet unless the pane has outgrown the working bitmap. Here
+    // rather than only on resize so every path that opens a capture — a new
+    // tab, a tab switch, a second capture joining the window — gets a source
+    // matched to the pane without having to remember to ask.
+    ensure_preview_source(state);
     let (source, metric) = preview_source(state);
     let source = source.clone();
     let opts = opts_of(state, metric);
@@ -3044,6 +3140,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.caption_size_slider = next.caption_size_slider;
                     state.caption_opacity_slider = next.caption_opacity_slider;
                     state.caption_style_controls = next.caption_style_controls;
+                    // A bigger pane needs a bigger working bitmap, or the extra
+                    // room is filled by stretching what is already there. A
+                    // no-op unless the pane actually grew, and deferred to the
+                    // end of a drag-resize so the window still follows the
+                    // mouse. Maximize and restore arrive as a single WM_SIZE
+                    // outside that loop, so they sharpen immediately.
+                    if !state.sizing && ensure_preview_source(state) {
+                        rebuild_preview(state);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_ENTERSIZEMOVE => {
+            if let Some(state) = state_of(hwnd) {
+                state.sizing = true;
+            }
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE => {
+            if let Some(state) = state_of(hwnd) {
+                state.sizing = false;
+                if ensure_preview_source(state) {
+                    rebuild_preview(state);
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
@@ -3291,34 +3412,19 @@ fn build_document(
     initial: usize,
     title: String,
 ) -> Document {
-    // Preview source — large enough that text stays readable.
-    const PREVIEW_MAX: u32 = 1200;
-    let scale = (PREVIEW_MAX as f32 / raw.width().max(raw.height()) as f32).min(1.0);
-    let small = if scale < 1.0 {
-        image::imageops::resize(
-            &raw,
-            (raw.width() as f32 * scale) as u32,
-            (raw.height() as f32 * scale) as u32,
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        raw.clone()
-    };
-    // Drag-quality source, built once so a padding drag never pays for a
-    // resize per frame.
-    let small_fast = image::imageops::resize(
-        &small,
-        (small.width() / 2).max(1),
-        (small.height() / 2).max(1),
-        image::imageops::FilterType::Triangle,
-    );
+    // Provisional preview source. The pane's real size is not known until the
+    // window has been created and sized, and `ensure_preview_source` grows
+    // this to match before the first paint. Opening at a modest size keeps
+    // that first frame cheap on a large capture.
+    const PREVIEW_INITIAL: u32 = 1200;
+    let (small, scale, small_fast, metric_fast) = preview_sources(&raw, PREVIEW_INITIAL);
     Document {
         title,
         raw,
         small,
         preview_metric: scale,
         small_fast,
-        metric_fast: scale * 0.5,
+        metric_fast,
         fast_preview: false,
         styles,
         sel: initial,
@@ -3509,8 +3615,11 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         scale: dpi_scale,
         width: cw,
         height: ch,
+        sizing: false,
         theme: crate::theme::current(),
     });
+    // `preview_box` is already known here, so this first rebuild composes at
+    // the pane's size rather than opening soft and sharpening a frame later.
     rebuild_preview(&mut state);
 
     unsafe {
@@ -3592,11 +3701,12 @@ mod tests {
         apply_text_input, custom_size_axis, custom_size_bounds, custom_size_result,
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
         output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
-        redacted, tab_for_digit,
+        preview_sources, preview_target_edge, redacted, tab_for_digit,
         tool_after_pick, History, HISTORY_LIMIT,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
         TOOLS,
     };
+    use image::{Rgba, RgbaImage};
     use windows::Win32::Foundation::RECT;
 
     #[test]
@@ -3913,6 +4023,87 @@ mod tests {
             annotation_tool_index(&Shape::Freehand { points: vec![(0.0, 0.0), (1.0, 1.0)] }),
             8
         );
+    }
+
+    #[test]
+    fn the_preview_source_matches_the_pane_and_never_upscales() {
+        let pane = |w: i32, h: i32| RECT { left: 0, top: 0, right: w, bottom: h };
+
+        // The pane drives it, so a large monitor gets a sharp preview instead
+        // of a stretched one. This is the case that was visibly soft: a 2862px
+        // capture on a big screen used to work from a 1200px bitmap.
+        assert_eq!(preview_target_edge(pane(2480, 1400), 2862, 1694), 2480);
+
+        // Never more than the capture actually has. Pixels that do not exist
+        // in the source cannot be recovered by composing at a larger size.
+        assert_eq!(preview_target_edge(pane(2480, 1400), 1000, 600), 1000);
+
+        // Bounded above, so an enormous monitor cannot turn every rebuild into
+        // a visible pause, and below, so a tiny window still previews usably.
+        assert_eq!(preview_target_edge(pane(7000, 4000), 8000, 6000), 3200);
+        assert_eq!(preview_target_edge(pane(200, 120), 2862, 1694), 900);
+
+        // Portrait panes and portrait captures are measured on their own long
+        // edge, not on width.
+        assert_eq!(preview_target_edge(pane(1000, 2000), 2000, 3000), 2000);
+
+        // Whatever the target, the working bitmap keeps the capture's shape
+        // and the drag source stays exactly half of it.
+        let raw = RgbaImage::from_pixel(2862, 1694, Rgba([10, 20, 30, 255]));
+        let (small, metric, fast, metric_fast) = preview_sources(&raw, 2400);
+        assert_eq!(small.width(), 2400);
+        assert!((metric - 2400.0 / 2862.0).abs() < 0.001);
+        assert_eq!(fast.width(), small.width() / 2);
+        assert!((metric_fast - metric * 0.5).abs() < 0.001);
+
+        // A target at or above the capture uses it untouched, so a small
+        // capture is never blurred by a pointless resize.
+        let (same, metric, _, _) = preview_sources(&raw, 4000);
+        assert_eq!((same.width(), same.height()), (2862, 1694));
+        assert_eq!(metric, 1.0);
+    }
+
+    /// The bug this guards: a maximized 2560x1392 capture on a 1440p monitor
+    /// worked from a 1200px bitmap and the editor stretched it ~1.39x to fill
+    /// the pane, so the text being annotated was softer than the capture.
+    /// Sizing the source to the pane has to leave the blit downscaling.
+    #[test]
+    fn the_editor_never_has_to_stretch_its_preview_to_fill_the_pane() {
+        // Editor opens at 85% of the work area; layout_controls carves the
+        // pane out of that. Both monitors here, plus a small window.
+        for (work_w, work_h, raw_w, raw_h) in [
+            (2560, 1392, 2560u32, 1392u32),
+            (1920, 1032, 1920, 1032),
+            (2560, 1392, 3840, 2160),
+            (1280, 720, 2560, 1392),
+        ] {
+            let (cw, ch) = ((work_w as f32 * 0.85) as i32, (work_h as f32 * 0.85) as i32);
+            let pane = layout_controls(1.0, cw, ch, 7).preview_box;
+
+            let target = preview_target_edge(pane, raw_w, raw_h);
+            let raw = RgbaImage::from_pixel(raw_w, raw_h, Rgba([9, 9, 9, 255]));
+            let (small, metric, _, _) = preview_sources(&raw, target);
+
+            // What rebuild_preview composes: content plus the matte's padding.
+            let opts = crate::compose::ComposeOpts {
+                metric_scale: metric,
+                pad_factor: crate::compose::DEFAULT_PAD_FACTOR,
+                aspect: None,
+            };
+            let layout =
+                crate::compose::layout(small.width() as usize, small.height() as usize, &opts);
+            let composite_w = small.width() as i32 + layout.pad_x as i32 * 2;
+            let composite_h = small.height() as i32 + layout.pad_y as i32 * 2;
+
+            let (_, _, draw_scale, _, _) =
+                preview_draw_geometry(pane, composite_w, composite_h, 1.0);
+            assert!(
+                draw_scale <= 1.0,
+                "pane {}x{} with a {raw_w}x{raw_h} capture stretches the preview {draw_scale:.3}x",
+                pane.right - pane.left,
+                pane.bottom - pane.top,
+            );
+        }
     }
 
     #[test]

@@ -932,6 +932,144 @@ fn run_app() -> Result<()> {
     Ok(())
 }
 
+/// Time the editor's two preview-rebuild paths across working-bitmap sizes.
+///
+/// The editor rebuilds in two shapes and they cost very differently, so a
+/// single number would be misleading. A *cold* rebuild recomposes the matte
+/// and is what a matte, padding, or aspect change pays. A *cached* rebuild
+/// reuses that composite and only restamps annotations, which is what every
+/// annotation edit pays — the interactive one, and the one that decides
+/// whether a larger preview feels slower to draw on.
+fn preview_bench(long_edge: u32) -> Result<()> {
+    use rayon::prelude::*;
+
+    let height = (long_edge as f32 * 1694.0 / 2862.0) as u32;
+    // Fine detail, so a resize has real work to do rather than smearing flat
+    // colour. Timing barely cares; realism costs nothing here.
+    let mut raw = RgbaImage::new(long_edge, height);
+    for (x, y, pixel) in raw.enumerate_pixels_mut() {
+        let checker = ((x / 3 + y / 3) % 2) as u8;
+        *pixel = image::Rgba([
+            32u8.saturating_add(checker * 180),
+            40u8.saturating_add((y % 251) as u8),
+            60u8.saturating_add((x % 199) as u8),
+            255,
+        ]);
+    }
+    let style = style::variants(&raw)
+        .into_iter()
+        .next()
+        .context("no matte styles")?;
+
+    // A working set on the heavy side of typical: shapes cost per pixel they
+    // cover, so under-annotating would flatter the larger sizes.
+    let annotations: Vec<annotate::Annotation> = vec![
+        annotate::Shape::Rect { a: (120.0, 140.0), b: (900.0, 700.0) },
+        annotate::Shape::Arrow { from: (200.0, 900.0), to: (1200.0, 1300.0) },
+        annotate::Shape::Ellipse { a: (1300.0, 200.0), b: (2000.0, 800.0) },
+        annotate::Shape::Highlight { a: (300.0, 1400.0), b: (1800.0, 1500.0) },
+        annotate::Shape::Text { pos: (400.0, 300.0), text: "Annotation".into() },
+        annotate::Shape::Counter { pos: (1000.0, 1000.0), n: 3 },
+    ]
+    .into_iter()
+    .map(|shape| annotate::Annotation {
+        shape,
+        color: 0,
+        size: 1.0,
+        text_style: annotate::TextStyle::Shadow,
+        text_box_opacity: 1.0,
+    })
+    .collect();
+
+    let time = |runs: u32, body: &mut dyn FnMut()| -> f64 {
+        // One untimed pass first: the allocator and any lazy init should not
+        // land on the first measured run.
+        body();
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            body();
+        }
+        start.elapsed().as_secs_f64() * 1000.0 / runs as f64
+    };
+
+    eprintln!("preview bench: source {long_edge}x{height}, {} annotations", annotations.len());
+    eprintln!(
+        "{:>6}  {:>11}  {:>7}  {:>7}  {:>7}",
+        "cap", "preview", "source", "cold", "cached"
+    );
+
+    for cap in [1200u32, 1600, 2000, 2400, 2862, long_edge] {
+        if cap > long_edge {
+            continue;
+        }
+        let metric = (cap as f32 / long_edge as f32).min(1.0);
+        let small = if metric < 1.0 {
+            image::imageops::resize(
+                &raw,
+                (long_edge as f32 * metric) as u32,
+                (height as f32 * metric) as u32,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            raw.clone()
+        };
+        let opts = compose::ComposeOpts {
+            metric_scale: metric,
+            pad_factor: compose::DEFAULT_PAD_FACTOR,
+            aspect: None,
+        };
+        let (sw, sh) = (small.width() as usize, small.height() as usize);
+        let layout = compose::layout(sw, sh, &opts);
+        let offset = (layout.pad_x as f32, layout.pad_y as f32);
+
+        // Source build: downscaling the capture and its drag-quality half.
+        // Paid once when the pane grows, not per rebuild.
+        let source = time(3, &mut || {
+            let built = tweak::preview_sources_for_bench(&raw, cap);
+            std::hint::black_box(&built);
+        });
+
+        // Cold: recompose the matte, blend the content in, stamp annotations,
+        // swizzle to BGRA. What a matte/padding/aspect change pays.
+        let cold = time(3, &mut || {
+            let mut base = compose::compose_base(sw, sh, &style, &opts);
+            compose::blend_content(&mut base, &small, &opts);
+            annotate::render(&mut base, &annotations, metric, offset, None);
+            let mut bgra = base.into_raw();
+            bgra.par_chunks_mut(4).for_each(|pixel| {
+                pixel.swap(0, 2);
+                pixel[3] = 255;
+            });
+            std::hint::black_box(&bgra);
+        });
+
+        // Cached: the composite is reused, so this is the clone, the
+        // annotation stamp, and the swizzle. What every annotation edit pays.
+        let mut base = compose::compose_base(sw, sh, &style, &opts);
+        compose::blend_content(&mut base, &small, &opts);
+        let cached = time(5, &mut || {
+            let mut img = base.clone();
+            annotate::render(&mut img, &annotations, metric, offset, None);
+            let mut bgra = img.into_raw();
+            bgra.par_chunks_mut(4).for_each(|pixel| {
+                pixel.swap(0, 2);
+                pixel[3] = 255;
+            });
+            std::hint::black_box(&bgra);
+        });
+
+        eprintln!(
+            "{:>6}  {:>11}  {:>5.1}ms  {:>5.1}ms  {:>5.1}ms",
+            cap,
+            format!("{}x{}", small.width(), small.height()),
+            source,
+            cold,
+            cached
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     unsafe {
         // STA: the folder picker (IFileDialog) requires it; WGC's
@@ -1041,6 +1179,18 @@ fn main() -> Result<()> {
                 eprintln!("bench: raw capture saved to {}", p.display());
             }
             Ok(())
+        }
+        // Headless timing of the tweak editor's preview rebuild at a range of
+        // working-bitmap sizes. The editor caps its preview source and then
+        // stretches it to fill the pane, so on a large monitor the picture it
+        // annotates against is softer than the capture. Raising the cap costs
+        // time on every rebuild, and this is what says how much.
+        Some("--preview-bench") => {
+            let long_edge: u32 = args
+                .get(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2862);
+            preview_bench(long_edge)
         }
         // Headless timing of the multi-monitor freeze and GDI-layer path.
         // `sequential` keeps the old capture order as a local baseline.
