@@ -56,6 +56,10 @@ fn shortcut_bit(vk: u32) -> Option<u32> {
         0x46 => Some(3), // F
         0x56 => Some(4), // V
         0x53 => Some(5), // S
+        // Without this the D shortcut only works when the overlay already
+        // owns the foreground; the hook is what covers the case where it
+        // does not, which is exactly when shortcuts matter most.
+        0x44 => Some(6), // D
         _ => None,
     }
 }
@@ -105,6 +109,10 @@ pub enum Selection {
         frozen: RgbaImage,
     },
     Region(RgbaImage),
+    /// Close the overlay, count down, and open it again. The freeze happens
+    /// when the overlay opens, so a menu can only be caught by getting out of
+    /// the way first and re-freezing afterwards.
+    Delay,
     /// Record instead of capture — carries virtual-screen geometry.
     RecordWindow(HWND),
     RecordRegion(RECT, HMONITOR),
@@ -138,6 +146,7 @@ enum Btn {
     Screen,
     Record,
     Scroll,
+    Delay,
     Close,
 }
 
@@ -148,6 +157,7 @@ fn shortcut_button(vk: u16) -> Option<Btn> {
         0x46 => Some(Btn::Screen), // F
         0x56 => Some(Btn::Record), // V
         0x53 => Some(Btn::Scroll), // S
+        0x44 => Some(Btn::Delay),  // D
         _ => None,
     }
 }
@@ -197,6 +207,10 @@ struct State {
     recording: bool,
     /// Scroll mode armed: selections start a scrolling capture.
     scrolling: bool,
+    /// This overlay is the second half of a delayed capture. Purely a hint:
+    /// the delay chip stays lit so the reopen reads as a continuation rather
+    /// than the overlay having bounced back for no reason.
+    delayed: bool,
 }
 
 unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
@@ -312,7 +326,8 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
             (b.btn, state.mode),
             (Btn::Window, Mode::Window) | (Btn::Region, Mode::Region)
         ) || (b.btn == Btn::Record && state.recording)
-            || (b.btn == Btn::Scroll && state.scrolling);
+            || (b.btn == Btn::Scroll && state.scrolling)
+            || (b.btn == Btn::Delay && state.delayed);
         if selected {
             let bg = CreateSolidBrush(state.theme.chip);
             let nopen = CreatePen(PS_SOLID, 1, state.theme.chip);
@@ -427,6 +442,9 @@ unsafe fn press_button(hwnd: HWND, state: &mut State, btn: Btn) {
             state.recording = false;
             let _ = InvalidateRect(hwnd, None, false);
         }
+        // Not a mode: the overlay has to leave the screen for the delay to be
+        // worth anything, so this ends the overlay and lets the caller reopen.
+        Btn::Delay => finish(hwnd, state, Some(Selection::Delay)),
         Btn::Close => finish(hwnd, state, None),
     }
 }
@@ -878,7 +896,12 @@ pub fn benchmark_freeze(batched: bool) -> Result<()> {
 /// whatever is on screen at call time (including a live picker strip) is
 /// snippable as a region. Returns the selection and the monitor to anchor
 /// follow-up UI on, or None if cancelled.
-pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
+/// Open the capture overlay. `delayed` marks this as the reopen after a
+/// countdown, which only changes how the toolbar reads. `delay_secs` labels
+/// the delay chip and is passed in rather than read here: opening the overlay
+/// is a timed path (freeze_ms is measured in the log) and `Config::load` is
+/// file I/O under a lock.
+pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONITOR)>> {
     let mons = monitors()?;
 
     // Virtual-screen bounding box.
@@ -967,12 +990,16 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
 
         // Toolbar layout, measured with the real font.
         let old_font = SelectObject(screen_dc, font);
-        let specs: [(&str, Btn); 6] = [
+        // The row is actions, not only modes: Close already lives here, and
+        // "capture after Ns" belongs beside it.
+        let delay_label = format!("\u{23F1} {}s", crate::delay::sanitize(delay_secs));
+        let specs: [(&str, Btn); 7] = [
             ("Window", Btn::Window),
             ("Region", Btn::Region),
             ("Screen", Btn::Screen),
             ("\u{25CF} Record", Btn::Record),
             ("\u{2193} Scroll", Btn::Scroll),
+            (delay_label.as_str(), Btn::Delay),
             ("\u{2715}", Btn::Close),
         ];
         const BTN_PAD: i32 = 16;
@@ -1028,6 +1055,7 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
         }
 
         let mut state = Box::new(State {
+            delayed,
             frozen,
             dim_dc,
             bright_dc,
@@ -1145,6 +1173,20 @@ mod tests {
         assert!(shortcut_bit(0x1B).is_some());
         assert!(shortcut_bit(0x56).is_some());
         assert!(shortcut_bit(0x41).is_none());
+        // D has to be in both tables. shortcut_button alone only works once
+        // the overlay owns the foreground; shortcut_bit is what carries it
+        // through the low-level hook when it does not, which is the case the
+        // hook exists for.
+        assert!(shortcut_bit(0x44).is_some(), "D missing from the keyboard hook");
+        assert!(matches!(shortcut_button(0x44), Some(Btn::Delay)));
+        // Every shortcut_button key must also pass the hook, or it silently
+        // works only some of the time.
+        for vk in [0x57u16, 0x52, 0x46, 0x56, 0x53, 0x44] {
+            assert!(
+                shortcut_button(vk).is_some() && shortcut_bit(vk as u32).is_some(),
+                "vk {vk:#04x} is not in both shortcut tables"
+            );
+        }
     }
 
     #[test]

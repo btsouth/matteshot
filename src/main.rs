@@ -372,6 +372,17 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                     let img = scroll::capture(scroll::Target::Region(r, m, anchor))?;
                     shoot(Source::Image(img), mon, None)
                 }
+                // Re-snipped into a delay. Run the countdown here rather than
+                // handing back to shoot_overlay, which would open a fresh
+                // undelayed overlay and make the user choose Delay twice.
+                overlay::Selection::Delay => {
+                    let seconds = cfg.capture_delay_secs;
+                    if note_failure("delay", delay::countdown(seconds))? {
+                        shoot_overlay_delayed()
+                    } else {
+                        Ok(())
+                    }
+                }
             };
         }
     };
@@ -414,11 +425,44 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     Ok(())
 }
 
+/// Reopen after a countdown that has already run.
+fn shoot_overlay_delayed() -> Result<()> {
+    shoot_overlay_from(true)
+}
+
 /// PrtScn / tray-click flow: freeze-frame overlay, then the picker.
 fn shoot_overlay() -> Result<()> {
-    // The overlay failing is its own category: nothing was captured, and the
-    // usual suspects are DPI, multi-monitor, and graphics-capture support.
-    match note_failure("overlay", overlay::select())? {
+    shoot_overlay_from(false)
+}
+
+fn shoot_overlay_from(start_delayed: bool) -> Result<()> {
+    // A delay reopens the overlay, so this is a loop rather than recursion:
+    // the screen freezes the moment the overlay opens, so the only way to
+    // catch a menu is to get out of the way, count down, and freeze again.
+    let mut delayed = start_delayed;
+    let seconds = Config::load().capture_delay_secs;
+    loop {
+        let selection = note_failure("overlay", overlay::select(delayed, seconds))?;
+        if matches!(selection, Some((overlay::Selection::Delay, _))) {
+            // Escape during the countdown abandons the capture rather than
+            // bringing the overlay back.
+            if !note_failure("delay", delay::countdown(seconds))? {
+                return Ok(());
+            }
+            // The reopened overlay says so, or coming back looks like a glitch.
+            delayed = true;
+            continue;
+        }
+        return dispatch_selection(selection);
+    }
+}
+
+/// Act on what the overlay returned. Delay never reaches here: the loop
+/// above consumes it.
+fn dispatch_selection(
+    selection: Option<(overlay::Selection, HMONITOR)>,
+) -> Result<()> {
+    match selection {
         Some((overlay::Selection::Window { hwnd, frozen }, mon)) => note_failure(
             "capture",
             shoot(
@@ -467,6 +511,13 @@ fn shoot_overlay() -> Result<()> {
             )?;
             telemetry::report("matteshot_scroll_capture");
             note_failure("capture", shoot(Source::Image(img), mon, None))
+        }
+        // Consumed by the loop in shoot_overlay, so arriving here means that
+        // stopped being true. Not worth panicking over, but silence would hide
+        // a regression behind a capture that simply does nothing.
+        Some((overlay::Selection::Delay, _)) => {
+            diagnostics::log("delay reached the dispatcher; capture skipped");
+            Ok(())
         }
         None => {
             eprintln!("cancelled");

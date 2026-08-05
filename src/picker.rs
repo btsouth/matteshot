@@ -364,7 +364,7 @@ unsafe fn trigger_reshoot(hwnd: HWND, state: &mut State) {
         return;
     }
     state.suspended = true;
-    let result = crate::overlay::select();
+    let result = crate::overlay::select(false, crate::config::Config::load().capture_delay_secs);
     state.suspended = false;
     match result {
         Ok(Some((sel, mon))) => finish(hwnd, state, PickAction::Reshoot(sel, mon)),
