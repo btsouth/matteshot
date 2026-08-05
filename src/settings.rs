@@ -157,12 +157,16 @@ impl Layout {
 
     /// Furniture on a line the cursor has already passed, for a label that
     /// shares its row with controls.
-    fn chrome_at(&mut self, top: i32, height: i32, chrome: Chrome) {
+    ///
+    /// `width` stops short of whatever else is on the line. Without it the
+    /// label gets the full band, and at a DPI or font where the text runs
+    /// wider it would slide under the controls and be overdrawn by them.
+    fn chrome_at(&mut self, top: i32, height: i32, width: i32, chrome: Chrome) {
         self.chrome.push((
             RECT {
                 left: self.margin,
                 top,
-                right: self.width - self.margin,
+                right: self.margin + self.sc(width),
                 bottom: top + self.sc(height),
             },
             chrome,
@@ -820,7 +824,7 @@ pub fn open() -> Result<()> {
         l.gap(4);
         let audio_top = l.y;
         l.chips(&[Ctrl::Audio("off"), Ctrl::Audio("system"), Ctrl::Audio("mic")], 70, 78, 150, 28);
-        l.chrome_at(audio_top, 28, Chrome::AudioLabel);
+        l.chrome_at(audio_top, 28, 145, Chrome::AudioLabel);
 
         l.gap(4);
         l.checkbox(Ctrl::AutoUpdate);
