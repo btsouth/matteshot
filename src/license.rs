@@ -63,6 +63,23 @@ impl Status {
         !matches!(self, Status::Expired)
     }
 
+    /// How long this license is entitled to new versions, in words.
+    ///
+    /// Worth stating plainly. The term is the part of a perpetual license
+    /// people misremember, and it decides only which versions arrive, never
+    /// whether the app keeps working.
+    pub fn updates_note(&self) -> Option<String> {
+        let Status::Licensed {
+            updates_until: Some(until),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let until = DateTime::parse_from_rfc3339(until).ok()?;
+        Some(format!("Updates through {}", until.format("%-d %B %Y")))
+    }
+
     pub fn tray_label(&self) -> String {
         match self {
             Status::Licensed {
@@ -874,6 +891,39 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_update_term_is_stated_in_plain_words() {
+        let licensed = Status::Licensed {
+            customer_email: None,
+            updates_until: Some("2027-07-30T00:00:00.000Z".into()),
+        };
+        assert_eq!(
+            licensed.updates_note().as_deref(),
+            Some("Updates through 30 July 2027")
+        );
+    }
+
+    /// Nothing to say when nothing is limited, and the row is hidden instead
+    /// of showing an empty or guessed date.
+    #[test]
+    fn no_term_means_no_note() {
+        for status in [
+            Status::Licensed {
+                customer_email: None,
+                updates_until: None,
+            },
+            Status::Licensed {
+                customer_email: None,
+                updates_until: Some("not a date".into()),
+            },
+            Status::Trial { days_left: 7 },
+            Status::TrialNotStarted,
+            Status::Expired,
+        ] {
+            assert_eq!(status.updates_note(), None, "for {status:?}");
+        }
+    }
 
     fn stored(token: &str) -> StoredLicense {
         StoredLicense {

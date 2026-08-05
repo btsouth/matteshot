@@ -79,6 +79,7 @@ enum Chrome {
     AudioLabel,
     HotkeyLabel,
     DelayLabel,
+    UpdateTerm,
 }
 
 /// Walks down the window handing out rects.
@@ -170,6 +171,13 @@ impl Layout {
     /// `width` stops short of whatever else is on the line. Without it the
     /// label gets the full band, and at a DPI or font where the text runs
     /// wider it would slide under the controls and be overdrawn by them.
+    /// A muted line under the control it explains, aligned with that
+    /// control's label rather than with the margin.
+    fn note(&mut self, chrome: Chrome, indent: i32, height: i32) {
+        let rect = self.band(height);
+        let left = rect.left + self.sc(indent);
+        self.chrome.push((RECT { left, ..rect }, chrome));
+    }
     fn chrome_at(&mut self, top: i32, height: i32, width: i32, chrome: Chrome) {
         self.chrome.push((
             RECT {
@@ -380,6 +388,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
             }
             Chrome::DelayLabel => {
                 draw_text_in(hdc, state.font, state.theme.text, *r, "Capture delay", 0)
+            }
+            Chrome::UpdateTerm => {
+                if let Some(note) = state.license.updates_note() {
+                    draw_text_in(hdc, state.font_small, state.theme.muted, *r, &note, 0);
+                }
             }
             // The paths stop short of the buttons sharing their line.
             Chrome::SavePath | Chrome::VideoPath => {
@@ -907,6 +920,10 @@ pub fn open() -> Result<()> {
         // to be baked into ~37 literal coordinates in this function and 17
         // more in the paint routine; they are derived from that geometry, so
         // the window is pixel-identical to before the cursor existed.
+        // Read once: the layout needs to know whether there is an update term
+        // to make room for, and the window then keeps the same answer.
+        let license = crate::license::status();
+
         let mut l = Layout::new(scale, cw);
 
         l.gap(20);
@@ -977,6 +994,10 @@ pub fn open() -> Result<()> {
 
         l.gap(4);
         l.checkbox(Ctrl::AutoUpdate);
+        // Said where it is asked about, rather than left for a support email.
+        if license.updates_note().is_some() {
+            l.note(Chrome::UpdateTerm, 28, 18);
+        }
         l.gap(4);
         l.checkbox(Ctrl::Telemetry);
 
@@ -991,7 +1012,7 @@ pub fn open() -> Result<()> {
 
         let state = Box::new(State {
             cfg: Config::load(),
-            license: crate::license::status(),
+            license,
             font,
             font_small,
             controls,
