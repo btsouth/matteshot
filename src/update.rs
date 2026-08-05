@@ -199,19 +199,28 @@ fn available_from(
         });
     }
 
+    // A bad entry is skipped, never fatal. This list only grows, and every
+    // caller of `check_once` discards errors, so one malformed line in the
+    // history would silently disable updates for everyone who reads it. The
+    // entry is still never offered; it is dropped rather than rejected, and
+    // `check-site.mjs` catches the mistake at publish time where it can
+    // actually be fixed.
     let mut best: Option<(Version, String)> = None;
     for release in candidates {
         if release.version.len() > 32 {
-            bail!("update version is too long");
+            continue;
         }
-        let version = Version::parse(release.version.trim_start_matches('v'))
-            .context("parse update version")?;
+        let Ok(version) = Version::parse(release.version.trim_start_matches('v')) else {
+            continue;
+        };
         if version <= current || !covered(release.released.as_deref(), deadline) {
             continue;
         }
-        let download_url = release.download.context("update manifest has no URL")?;
+        let Some(download_url) = release.download else {
+            continue;
+        };
         if download_url.len() > 2048 || !download_url.starts_with("https://") {
-            bail!("update URL must be HTTPS");
+            continue;
         }
         if best.as_ref().is_none_or(|(highest, _)| version > *highest) {
             best = Some((version, download_url));
@@ -378,9 +387,36 @@ mod tests {
             .is_none());
     }
 
+    /// What matters is that such a URL is never handed to the installer. It is
+    /// dropped rather than raised, so one bad entry cannot take the whole
+    /// update check down with it.
     #[test]
-    fn non_https_update_url_is_rejected() {
-        assert!(available_from(&manifest("1.0.0", "file:///tmp/setup.exe"), "0.9.1", None).is_err());
+    fn a_non_https_url_is_never_offered() {
+        for bad in ["file:///tmp/setup.exe", "http://download.matteshot.app/x.exe"] {
+            assert!(
+                available_from(&manifest("1.0.0", bad), "0.9.1", None)
+                    .unwrap()
+                    .is_none(),
+                "for {bad}"
+            );
+        }
+    }
+
+    /// One malformed entry must not cost everyone their updates.
+    #[test]
+    fn a_broken_entry_does_not_disable_the_rest() {
+        let body = r#"{
+          "version": "1.5.0",
+          "releases": [
+            {"version":"not-a-version","released":"2027-06-02T00:00:00Z","download":"https://d/x.exe"},
+            {"version":"1.5.0","released":"2027-06-01T00:00:00Z","download":"https://d/b.exe"},
+            {"version":"1.4.0","released":"2027-05-01T00:00:00Z"},
+            {"version":"1.3.0","released":"2027-01-01T00:00:00Z","download":"http://d/c.exe"}
+          ]
+        }"#;
+        let update = available_from(body, "1.0.0", None).unwrap().unwrap();
+        assert_eq!(update.version, "1.5.0");
+        assert_eq!(update.download_url, "https://d/b.exe");
     }
 
     #[test]
@@ -413,11 +449,13 @@ mod tests {
     /// release date and never against today.
     #[test]
     fn an_entitlement_does_not_decay() {
-        for current in ["1.0.0", "1.0.0"] {
+        // Whatever they are running, the ceiling their term bought is the same
+        // one, and nothing here consults a clock to decide it.
+        for current in ["0.9.0", "1.0.0", "v1.1.0", "1.4.9"] {
             let update = available_from(&history(), current, Some("2027-08-01T00:00:00Z"))
                 .unwrap()
                 .unwrap();
-            assert_eq!(update.version, "1.5.0");
+            assert_eq!(update.version, "1.5.0", "from {current}");
         }
         // And once on that build, there is nothing further owed.
         assert!(
