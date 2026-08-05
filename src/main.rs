@@ -504,6 +504,32 @@ pub fn capture_hotkey_taken() -> bool {
     CAPTURE_HOTKEY_TAKEN.load(Ordering::Relaxed)
 }
 
+/// Re-register the capture shortcut after Settings changes it, reporting
+/// whether the new combo is actually available.
+///
+/// Safe to call from Settings because `settings::open` runs on the resident's
+/// message loop, and `RegisterHotKey(None, ..)` binds to the calling thread,
+/// so this is the same thread that holds the existing registration. The
+/// standalone `--settings` process is the exception: it has no hotkeys of its
+/// own to rebind, exactly as the PrtScn toggle already behaves there.
+pub fn rebind_capture_hotkey() -> bool {
+    unsafe {
+        let _ = UnregisterHotKey(None, HOTKEY_ID);
+    }
+    let taken = match Config::load().capture_hotkey() {
+        Some(hotkey) => {
+            unsafe { RegisterHotKey(None, HOTKEY_ID, hotkey.modifiers, hotkey.vk) }.is_err()
+        }
+        // Unbound on purpose is not the same as unavailable.
+        None => false,
+    };
+    CAPTURE_HOTKEY_TAKEN.store(taken, Ordering::Relaxed);
+    if taken {
+        diagnostics::log("new capture shortcut already owned by another app");
+    }
+    !taken
+}
+
 fn enable_capture_hotkeys() -> Result<bool> {
     // Never fatal. This used to be `?`, so a shortcut another app already
     // owned propagated out of run_app, and because the binary is a windows
