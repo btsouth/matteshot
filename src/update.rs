@@ -238,7 +238,13 @@ pub fn start(hwnd: HWND) {
                             // Staging failed or the installer would not start.
                             // The tray still offers the manual download, so
                             // this is a quiet degradation, not a dead end.
+                            //
+                            // Quiet for the user, but not for us: a silent
+                            // update failure strands people on an old build
+                            // with nothing to report, so it is the one failure
+                            // most worth counting.
                             crate::diagnostics::log("update could not be applied");
+                            crate::telemetry::report_failure("update", &error);
                             eprintln!("update failed: {error:#}");
                         }
                     }

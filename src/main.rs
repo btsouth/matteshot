@@ -125,6 +125,18 @@ fn pump_until_closed(open: fn() -> bool) {
     }
 }
 
+/// Report a failed operation once, then hand the error back untouched.
+///
+/// Tagging happens at the branch that knows which operation ran, because every
+/// capture path funnels into the same handler by the time the error surfaces,
+/// and "something failed" is the one answer that would not help.
+fn note_failure<T>(operation: &'static str, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result {
+        telemetry::report_failure(operation, error);
+    }
+    result
+}
+
 fn error_box(text: &str) {
     unsafe {
         MessageBoxW(
@@ -403,19 +415,28 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
 
 /// PrtScn / tray-click flow: freeze-frame overlay, then the picker.
 fn shoot_overlay() -> Result<()> {
-    match overlay::select()? {
-        Some((overlay::Selection::Window { hwnd, frozen }, mon)) => shoot(
-            Source::Window {
-                hwnd,
-                frozen: Some(frozen),
-            },
-            mon,
-            None,
+    // The overlay failing is its own category: nothing was captured, and the
+    // usual suspects are DPI, multi-monitor, and graphics-capture support.
+    match note_failure("overlay", overlay::select())? {
+        Some((overlay::Selection::Window { hwnd, frozen }, mon)) => note_failure(
+            "capture",
+            shoot(
+                Source::Window {
+                    hwnd,
+                    frozen: Some(frozen),
+                },
+                mon,
+                None,
+            ),
         ),
-        Some((overlay::Selection::Region(img), mon)) => shoot(Source::Image(img), mon, None),
+        Some((overlay::Selection::Region(img), mon)) => {
+            note_failure("capture", shoot(Source::Image(img), mon, None))
+        }
         Some((overlay::Selection::RecordWindow(hwnd), _)) => {
-            let result =
-                record::session(record::Target::window(hwnd), Config::load().record_gif);
+            let result = note_failure(
+                "record",
+                record::session(record::Target::window(hwnd), Config::load().record_gif),
+            );
             if result.is_ok() {
                 license::record_successful_capture();
                 telemetry::report("matteshot_record_completed");
@@ -423,8 +444,10 @@ fn shoot_overlay() -> Result<()> {
             result
         }
         Some((overlay::Selection::RecordRegion(r, mon), _)) => {
-            let result =
-                record::session(record::Target::region(r, mon), Config::load().record_gif);
+            let result = note_failure(
+                "record",
+                record::session(record::Target::region(r, mon), Config::load().record_gif),
+            );
             if result.is_ok() {
                 license::record_successful_capture();
                 telemetry::report("matteshot_record_completed");
@@ -432,14 +455,17 @@ fn shoot_overlay() -> Result<()> {
             result
         }
         Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
-            let img = scroll::capture(scroll::Target::Window(h, anchor))?;
+            let img = note_failure("scroll", scroll::capture(scroll::Target::Window(h, anchor)))?;
             telemetry::report("matteshot_scroll_capture");
-            shoot(Source::Image(img), mon, None)
+            note_failure("capture", shoot(Source::Image(img), mon, None))
         }
         Some((overlay::Selection::ScrollRegion(r, m, anchor), mon)) => {
-            let img = scroll::capture(scroll::Target::Region(r, m, anchor))?;
+            let img = note_failure(
+                "scroll",
+                scroll::capture(scroll::Target::Region(r, m, anchor)),
+            )?;
             telemetry::report("matteshot_scroll_capture");
-            shoot(Source::Image(img), mon, None)
+            note_failure("capture", shoot(Source::Image(img), mon, None))
         }
         None => {
             eprintln!("cancelled");
@@ -456,13 +482,16 @@ fn shoot_active() -> Result<()> {
 
 fn shoot_active_window(fg: HWND) -> Result<()> {
     let mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY) };
-    shoot(
-        Source::Window {
-            hwnd: fg,
-            frozen: None,
-        },
-        mon,
-        None,
+    note_failure(
+        "capture",
+        shoot(
+            Source::Window {
+                hwnd: fg,
+                frozen: None,
+            },
+            mon,
+            None,
+        ),
     )
 }
 
