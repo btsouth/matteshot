@@ -89,10 +89,20 @@ fn failure_kind(error: &anyhow::Error) -> &'static str {
         "encoder"
     } else if has(&["graphics capture", "wgc", "dwm", "d3d", "direct3d", "adapter", "surface"]) {
         "capture_unavailable"
+    // Before the disk bucket: "no such file or directory" contains both "file"
+    // and "directory", so checking disk first would swallow every not-found
+    // and leave that bucket permanently empty.
+    } else if has(&[
+        "not found",
+        "not be found",
+        "does not exist",
+        "missing",
+        "no such",
+        "cannot find",
+    ]) {
+        "not_found"
     } else if has(&["disk", "space", "write", "create ", "open ", "file", "directory", "io error"]) {
         "disk"
-    } else if has(&["not found", "missing", "no such"]) {
-        "not_found"
     } else {
         "other"
     }
@@ -115,7 +125,35 @@ pub fn report_failure(operation: &'static str, error: &anyhow::Error) {
     );
 }
 
+/// Every event this app may send, in the order the privacy policy lists them.
+///
+/// The policy at matteshot.app/privacy names these and promises nothing else
+/// is transmitted, so this list is the contract. `report_with` refuses
+/// anything absent from it: sending an undisclosed event would make that page
+/// untrue, and dropping one costs only a metric.
+pub const PUBLISHED_EVENTS: [&str; 9] = [
+    "matteshot_launch",
+    "matteshot_capture",
+    "matteshot_trial_started",
+    "matteshot_license_activated",
+    "matteshot_ocr_used",
+    "matteshot_editor_opened",
+    "matteshot_record_completed",
+    "matteshot_scroll_capture",
+    "matteshot_failure",
+];
+
 pub fn report_with(event: &str, properties: &[(&str, serde_json::Value)]) {
+    // Enforced here rather than by scanning the source for call sites, because
+    // a scan only sees the formatting it was written for. Loud in debug, and
+    // silent-but-closed in release: never send what was not disclosed.
+    debug_assert!(
+        PUBLISHED_EVENTS.contains(&event),
+        "{event} is not in PUBLISHED_EVENTS, so it is missing from the privacy policy"
+    );
+    if !PUBLISHED_EVENTS.contains(&event) {
+        return;
+    }
     if !TELEMETRY_ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -319,22 +357,6 @@ mod tests {
         }
     }
 
-    /// Every event this app can send. The privacy policy at
-    /// matteshot.app/privacy lists these by name and promises nothing else is
-    /// transmitted, so adding one here without publishing it makes that page
-    /// untrue. This test is the reminder.
-    const PUBLISHED_EVENTS: [&str; 9] = [
-        "matteshot_launch",
-        "matteshot_capture",
-        "matteshot_trial_started",
-        "matteshot_license_activated",
-        "matteshot_ocr_used",
-        "matteshot_editor_opened",
-        "matteshot_record_completed",
-        "matteshot_scroll_capture",
-        "matteshot_failure",
-    ];
-
     #[test]
     fn every_event_in_the_source_is_a_published_one() {
         let mut found = std::collections::BTreeSet::new();
@@ -345,15 +367,24 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read source file");
-            // Scoped to report call sites. A bare "matteshot_" scan also picks
-            // up the Win32 window class names (matteshot_overlay, _picker,
-            // _tray and friends), which are not events and must not be
-            // disclosed as if they were.
-            for marker in ["report(\"matteshot_", "report_with(\"matteshot_"] {
+            // Scoped to report call sites, because a bare "matteshot_ scan
+            // also matches the Win32 window class names (matteshot_overlay,
+            // _picker, _tray), which are not events.
+            //
+            // Whitespace after the paren is skipped: report_with( is written
+            // multiline in this very file, and a marker that assumed the
+            // literal came straight after the paren silently missed it.
+            for marker in ["report(", "report_with("] {
                 for (index, _) in text.match_indices(marker) {
-                    let rest = &text[index + marker.len() - "matteshot_".len()..];
-                    if let Some(end) = rest.find('"') {
-                        found.insert(rest[..end].to_owned());
+                    let rest = text[index + marker.len()..].trim_start();
+                    let Some(literal) = rest.strip_prefix('"') else {
+                        continue;
+                    };
+                    if let Some(end) = literal.find('"') {
+                        let name = &literal[..end];
+                        if name.starts_with("matteshot_") {
+                            found.insert(name.to_owned());
+                        }
                     }
                 }
             }
@@ -380,6 +411,9 @@ mod tests {
             ("media foundation could not start", "encoder"),
             ("graphics capture item was 0x0", "capture_unavailable"),
             ("user cancelled the export", "cancelled"),
+            ("no such file or directory", "not_found"),
+            ("the installer could not be found", "not_found"),
+            ("save the png: disk full", "disk"),
             ("wobbling gizmo misaligned", "other"),
         ];
         for (message, expected) in cases {
