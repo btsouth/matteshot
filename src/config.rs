@@ -42,6 +42,14 @@ pub struct Config {
     /// set by hand. See `crate::hotkey`.
     #[serde(default = "default_capture_hotkey")]
     pub capture_hotkey: String,
+    /// Seconds the delayed capture waits before freezing the screen, so a
+    /// menu or tooltip can be opened first. See `crate::delay`.
+    #[serde(default = "default_capture_delay")]
+    pub capture_delay_secs: u32,
+}
+
+fn default_capture_delay() -> u32 {
+    crate::delay::DEFAULT_SECONDS
 }
 
 fn default_capture_hotkey() -> String {
@@ -64,6 +72,7 @@ impl Default for Config {
             telemetry: true,
             keep_editor_open: true,
             capture_hotkey: default_capture_hotkey(),
+            capture_delay_secs: default_capture_delay(),
         }
     }
 }
