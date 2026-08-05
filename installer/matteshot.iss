@@ -2,7 +2,7 @@
 ; Build: ISCC.exe installer\matteshot.iss   (from the repo root)
 
 #ifndef AppVersion
-  #define AppVersion "0.14.9"
+  #define AppVersion "0.14.10"
 #endif
 
 ; Release tags may carry a SemVer prerelease suffix (v0.13.2-rc1), which the
