@@ -79,9 +79,18 @@ site through purchase into daily app use. Every event is tagged
 - **GitHub downloads** (`matteshot-site/license-worker`): a daily 13:00 UTC
   cron posts `matteshot_github_downloads` with per-asset and total counts.
 - **App** (src/telemetry.rs): launch, capture, trial start, license
-  activation, OCR, editor, recording, scroll capture. `distinct_id` is the
+  activation, OCR, editor, recording, scroll capture, plus
+  `matteshot_failure` for the paths that go wrong. `distinct_id` is the
   SHA-256 machine GUID (same id as licensing) and the Settings window can
   opt out; it defaults on.
+  - The failure event carries `operation` (capture / record / scroll /
+    overlay / update) and `kind`, both from fixed sets. **Error messages are
+    never sent**: `failure_kind` returns `&'static str`, so a path or window
+    title inside an error context has no route out, and an unrecognised
+    failure reports `other`.
+  - Adding an event means updating the privacy policy, which lists them by
+    name. `every_event_in_the_source_is_a_published_one` fails the build if
+    you forget.
 
 PostHog API key: `phc_piwT9huE46Hn8gZxs9X4SvjAHzgQVZGT9QipDWSq7cUx` (publishable;
 embedded in the site snippet, `license-worker/wrangler.toml` vars, and
