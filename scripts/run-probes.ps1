@@ -151,6 +151,15 @@ if ($NoCapture) {
     }
 }
 
+# ------------------------------------------------------------ tweak editor ---
+# The editor sizes its working bitmap to the preview pane so a large capture
+# stays sharp to annotate against, which means every rebuild composes more
+# pixels than it used to. That trade only holds while a rebuild stays cheap, and
+# nothing else here would notice it getting expensive. Synthetic input, so it
+# needs no window and is safe to run anywhere.
+Invoke-Probe -Name 'preview rebuild budget' -ProbeArgs @('--preview-bench', '2560') `
+    -Expect 'preview rebuild within budget' | Out-Null
+
 # ------------------------------------------------- recording and exporting ---
 if (-not $Fixture) {
     $videos = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'Matteshot'

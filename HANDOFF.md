@@ -190,9 +190,9 @@ Keep all three in sync if the design changes.
   `--trim-test`, `--ocr`, `--assets <title> <dir>` (marketing exports),
   `--icon [dir]`, `--settings`, `--tweak`, `--once [--window <t>] [--pick N]`.
 - **Run `.\scripts\run-probes.ps1` before calling anything done.** It runs every
-  headless probe (capture, OCR, playback, all three export paths, the
-  auto-update trust gates) and fails loudly. It is safe mid-work: no clipboard,
-  no injected input, no windows. Two silent breakages got shipped for want of
+  headless probe (capture, OCR, playback, all three export paths, the editor's
+  preview-rebuild budget, the auto-update trust gates) and fails loudly. It is
+  safe mid-work: no clipboard, no injected input, no windows. Two silent breakages got shipped for want of
   this — `--video-edit-test` was broken for weeks, and clippy was red through a
   release. `release-candidate.yml` now runs it too, with `-Strict` (a skipped
   probe fails the run) and `-SignedFile` pointed at the installer it just

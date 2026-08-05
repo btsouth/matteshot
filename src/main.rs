@@ -992,11 +992,24 @@ fn preview_bench(long_edge: u32) -> Result<()> {
         start.elapsed().as_secs_f64() * 1000.0 / runs as f64
     };
 
+    // Order-of-magnitude guards, deliberately not performance targets. The
+    // real interactive claim is that an annotation edit lands inside a frame,
+    // which is ~5ms on a developer machine, but this runs on CI hardware too
+    // and a bound tight enough to be a target would fail there for no reason.
+    // These survive a runner several times slower while still catching an edit
+    // that got an order of magnitude more expensive — which is what a
+    // regression here would look like.
+    const CACHED_BUDGET_MS: f64 = 40.0;
+    const COLD_BUDGET_MS: f64 = 200.0;
+
     eprintln!("preview bench: source {long_edge}x{height}, {} annotations", annotations.len());
     eprintln!(
         "{:>6}  {:>11}  {:>7}  {:>7}  {:>7}",
         "cap", "preview", "source", "cold", "cached"
     );
+
+    let mut over_budget: Vec<String> = Vec::new();
+    let (mut worst_cold, mut worst_cached) = (0.0f64, 0.0f64);
 
     for cap in [1200u32, 1600, 2000, 2400, 2862, long_edge] {
         if cap > long_edge {
@@ -1066,7 +1079,32 @@ fn preview_bench(long_edge: u32) -> Result<()> {
             cold,
             cached
         );
+
+        worst_cold = worst_cold.max(cold);
+        worst_cached = worst_cached.max(cached);
+        if cached > CACHED_BUDGET_MS {
+            over_budget.push(format!(
+                "an annotation edit at {cap} takes {cached:.1}ms, over {CACHED_BUDGET_MS:.0}ms"
+            ));
+        }
+        if cold > COLD_BUDGET_MS {
+            over_budget.push(format!(
+                "a matte change at {cap} takes {cold:.1}ms, over {COLD_BUDGET_MS:.0}ms"
+            ));
+        }
     }
+
+    if !over_budget.is_empty() {
+        for line in &over_budget {
+            eprintln!("over budget: {line}");
+        }
+        bail!("preview rebuild is over budget");
+    }
+    // run-probes.ps1 matches this line, so keep the wording stable.
+    eprintln!(
+        "preview rebuild within budget: worst cold {worst_cold:.1}ms of {COLD_BUDGET_MS:.0}ms, \
+         worst cached {worst_cached:.1}ms of {CACHED_BUDGET_MS:.0}ms"
+    );
     Ok(())
 }
 
