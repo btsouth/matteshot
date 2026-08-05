@@ -1,9 +1,13 @@
 //! Anonymous usage telemetry, sent to PostHog.
 //!
-//! Opt-out by default: `Config::telemetry` defaults to true and the Settings
-//! window can switch it off. Only event names, the anonymous `device_id()`,
-//! the app version, and the Windows build are ever transmitted. Screenshots,
-//! OCR text, file names, and paths are never part of an event.
+//! Consent first: `Config::telemetry` is `Option<bool>` and starts as `None`,
+//! meaning unanswered. Nothing is sent while that holds. The first-run screen
+//! asks, with the box ticked where opt-out is lawful and empty across the EU,
+//! EEA, UK and Switzerland, and Settings can change the answer later.
+//!
+//! Only event names, the anonymous `device_id()`, the app version, and the
+//! Windows build are ever transmitted. Screenshots, OCR text, file names, and
+//! paths are never part of an event.
 //!
 //! `matteshot_failure` additionally carries an `operation` and a `kind`, both
 //! drawn from fixed sets. Error messages are never sent: `failure_kind`

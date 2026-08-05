@@ -60,7 +60,8 @@ struct State {
     font_body: HFONT,
     font_step: HFONT,
     font_small: HFONT,
-    /// Hit area for the consent checkbox.
+    /// Hit and hover area for the whole consent row, box and label together,
+    /// so the label is clickable rather than only the 18px box.
     consent: RECT,
     /// What the checkbox currently shows. Nothing is written until the user
     /// leaves this screen, so closing it without choosing means no consent.
@@ -536,8 +537,16 @@ fn record_consent(state: &State) {
         return;
     }
     let allowed = state.consent_checked;
-    crate::config::Config::update(|cfg| cfg.telemetry = Some(allowed));
-    crate::telemetry::set_enabled(allowed);
+    // Re-checked inside the update, which holds the config lock. This window
+    // is non-modal, so Settings can answer the question while it sits open,
+    // and pressing a button here must not overwrite that real answer with the
+    // default this screen happened to open with.
+    let settled = crate::config::Config::update(|cfg| {
+        if cfg.telemetry.is_none() {
+            cfg.telemetry = Some(allowed);
+        }
+    });
+    crate::telemetry::set_enabled(settled.telemetry_enabled());
 }
 unsafe fn activate(hwnd: HWND, action: u8) {
     ACTION.store(action, Ordering::SeqCst);

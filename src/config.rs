@@ -85,12 +85,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The capture shortcut to register, or `None` when it is unbound.
-    ///
-    /// Unreadable text falls back to the default rather than leaving the app
-    /// with no shortcut, because a typo in a config file should not silently
-    /// remove a feature. "None" is honoured as written: choosing to unbind is
-    /// not a mistake to correct.
     /// Telemetry only runs once someone has said yes. Unanswered is off.
     pub fn telemetry_enabled(&self) -> bool {
         self.telemetry == Some(true)
@@ -101,6 +95,12 @@ impl Config {
         self.telemetry.is_none()
     }
 
+    /// The capture shortcut to register, or `None` when it is unbound.
+    ///
+    /// Unreadable text falls back to the default rather than leaving the app
+    /// with no shortcut, because a typo in a config file should not silently
+    /// remove a feature. "None" is honoured as written: choosing to unbind is
+    /// not a mistake to correct.
     pub fn capture_hotkey(&self) -> Option<crate::hotkey::Hotkey> {
         let text = self.capture_hotkey.trim();
         if text.eq_ignore_ascii_case(crate::hotkey::NONE) {
