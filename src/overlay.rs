@@ -105,6 +105,10 @@ pub enum Selection {
         frozen: RgbaImage,
     },
     Region(RgbaImage),
+    /// Close the overlay, count down, and open it again. The freeze happens
+    /// when the overlay opens, so a menu can only be caught by getting out of
+    /// the way first and re-freezing afterwards.
+    Delay,
     /// Record instead of capture — carries virtual-screen geometry.
     RecordWindow(HWND),
     RecordRegion(RECT, HMONITOR),
@@ -138,6 +142,7 @@ enum Btn {
     Screen,
     Record,
     Scroll,
+    Delay,
     Close,
 }
 
@@ -148,6 +153,7 @@ fn shortcut_button(vk: u16) -> Option<Btn> {
         0x46 => Some(Btn::Screen), // F
         0x56 => Some(Btn::Record), // V
         0x53 => Some(Btn::Scroll), // S
+        0x44 => Some(Btn::Delay),  // D
         _ => None,
     }
 }
@@ -197,6 +203,10 @@ struct State {
     recording: bool,
     /// Scroll mode armed: selections start a scrolling capture.
     scrolling: bool,
+    /// This overlay is the second half of a delayed capture. Purely a hint:
+    /// the delay chip stays lit so the reopen reads as a continuation rather
+    /// than the overlay having bounced back for no reason.
+    delayed: bool,
 }
 
 unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
@@ -312,7 +322,8 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
             (b.btn, state.mode),
             (Btn::Window, Mode::Window) | (Btn::Region, Mode::Region)
         ) || (b.btn == Btn::Record && state.recording)
-            || (b.btn == Btn::Scroll && state.scrolling);
+            || (b.btn == Btn::Scroll && state.scrolling)
+            || (b.btn == Btn::Delay && state.delayed);
         if selected {
             let bg = CreateSolidBrush(state.theme.chip);
             let nopen = CreatePen(PS_SOLID, 1, state.theme.chip);
@@ -427,6 +438,9 @@ unsafe fn press_button(hwnd: HWND, state: &mut State, btn: Btn) {
             state.recording = false;
             let _ = InvalidateRect(hwnd, None, false);
         }
+        // Not a mode: the overlay has to leave the screen for the delay to be
+        // worth anything, so this ends the overlay and lets the caller reopen.
+        Btn::Delay => finish(hwnd, state, Some(Selection::Delay)),
         Btn::Close => finish(hwnd, state, None),
     }
 }
@@ -878,7 +892,9 @@ pub fn benchmark_freeze(batched: bool) -> Result<()> {
 /// whatever is on screen at call time (including a live picker strip) is
 /// snippable as a region. Returns the selection and the monitor to anchor
 /// follow-up UI on, or None if cancelled.
-pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
+/// Open the capture overlay. `delayed` marks this as the reopen after a
+/// countdown, which only changes how the toolbar reads.
+pub fn select(delayed: bool) -> Result<Option<(Selection, HMONITOR)>> {
     let mons = monitors()?;
 
     // Virtual-screen bounding box.
@@ -967,12 +983,19 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
 
         // Toolbar layout, measured with the real font.
         let old_font = SelectObject(screen_dc, font);
-        let specs: [(&str, Btn); 6] = [
+        // The row is actions, not only modes: Close already lives here, and
+        // "capture after Ns" belongs beside it.
+        let delay_label = format!(
+            "\u{23F1} {}s",
+            crate::delay::sanitize(crate::config::Config::load().capture_delay_secs)
+        );
+        let specs: [(&str, Btn); 7] = [
             ("Window", Btn::Window),
             ("Region", Btn::Region),
             ("Screen", Btn::Screen),
             ("\u{25CF} Record", Btn::Record),
             ("\u{2193} Scroll", Btn::Scroll),
+            (delay_label.as_str(), Btn::Delay),
             ("\u{2715}", Btn::Close),
         ];
         const BTN_PAD: i32 = 16;
@@ -1028,6 +1051,7 @@ pub fn select() -> Result<Option<(Selection, HMONITOR)>> {
         }
 
         let mut state = Box::new(State {
+            delayed,
             frozen,
             dim_dc,
             bright_dc,
