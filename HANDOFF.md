@@ -32,7 +32,7 @@ Read `README.md` for the full feature map and architecture — it is accurate.
 | Downloads | R2 bucket `matteshot-downloads`, custom domain `download.matteshot.app` | upload: `npx wrangler r2 object put "matteshot-downloads/<name>" --file <f> --content-type application/octet-stream --remote` |
 | Code signing | Azure Trusted Signing, account `southforgesigning`, profile `conduit`, endpoint `https://eus.codesigning.azure.net/` | via GitHub Actions OIDC only (federated credential on Entra app `35f2e38f-8e1d-43a3-b4e2-c3b0be34b0e0`, tenant `b87fd204-c1aa-47fb-a84c-2e89f6ec5073`). Credential subject: `repo:tsouth89@258147599/matteshot@1317701781:environment:release`. |
 | Release CI | `.github/workflows/release.yml` | push tag `v*` → build → sign exe → Inno installer (version from tag) → sign installer → verify → GitHub release → R2 publish (skips itself until the `CLOUDFLARE_R2_API_TOKEN` secret exists — see TODO). Signing config lives in GitHub **environment `release`** variables (not repo vars). |
-| Version endpoint | https://matteshot.app/version.json | `{version, url, download, notes}` — for the future in-app update check |
+| Version endpoint | https://matteshot.app/version.json | `{version, url, download, released, notes, releases[]}`. `releases` is the full served history, newest first; the app picks the newest entry it is entitled to. |
 
 ## Trial licensing (server-authoritative, done both sides)
 
@@ -107,7 +107,12 @@ src/telemetry.rs). No event ever carries an email or device name.
    the `release` environment. CI uploads both `MatteshotSetup-X.Y.Z.exe` and
    the stable `MatteshotSetup.exe`, then re-downloads the public URLs and fails
    the release if an installer and its checksum disagree.
-5. Update `public/version.json` in the site repo and deploy. **`download` must
+5. Update `public/version.json` in the site repo and deploy. Add the new build
+   to the top of the `releases` array with its real `released` date, and set
+   the matching top-level `version`/`download`/`released`. `check-site.mjs`
+   gates all of it. **Never remove an entry, and never delete an installer from
+   R2**: the update term is enforced by offering a lapsed license the newest
+   build its year covered, which may be several versions back. **`download` must
    point at the VERSIONED installer**: the stable name is mutable and can be
    momentarily out of step with its checksum, which would fail every client's
    hash gate. The custom domain can lag a Pages deploy by ~15s.
