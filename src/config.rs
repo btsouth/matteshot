@@ -30,9 +30,16 @@ pub struct Config {
     pub video_dir: Option<PathBuf>,
     /// Install updates in the background instead of only announcing them.
     pub auto_update: bool,
-    /// Send anonymous usage telemetry to PostHog. Opt-out by default: the
-    /// Settings window can switch it off, and events never carry content.
-    pub telemetry: bool,
+    /// Whether anonymous usage telemetry may be sent.
+    ///
+    /// `None` means the question has not been answered, and nothing is sent
+    /// while that is true. Consent has to be an actual choice: defaulting to
+    /// on would have the first launch reporting before anyone could decline,
+    /// which is the one thing that cannot be undone afterwards.
+    ///
+    /// Installs that already carry an explicit true or false keep it and are
+    /// not asked again.
+    pub telemetry: Option<bool>,
     /// Keep the tweak editor's tab open after Copy so the capture can keep
     /// being refined. Off restores the old close-after-copy behavior.
     pub keep_editor_open: bool,
@@ -69,7 +76,7 @@ impl Default for Config {
             record_audio: "off".into(),
             video_dir: None,
             auto_update: true,
-            telemetry: true,
+            telemetry: None,
             keep_editor_open: true,
             capture_hotkey: default_capture_hotkey(),
             capture_delay_secs: default_capture_delay(),
@@ -78,6 +85,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Telemetry only runs once someone has said yes. Unanswered is off.
+    pub fn telemetry_enabled(&self) -> bool {
+        self.telemetry == Some(true)
+    }
+
+    /// Whether the consent question still needs asking.
+    pub fn telemetry_unanswered(&self) -> bool {
+        self.telemetry.is_none()
+    }
+
     /// The capture shortcut to register, or `None` when it is unbound.
     ///
     /// Unreadable text falls back to the default rather than leaving the app
@@ -153,6 +170,35 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point: a fresh install must not report anything before the
+    /// question has been answered.
+    #[test]
+    fn telemetry_is_off_until_the_question_is_answered() {
+        let fresh: Config = serde_json::from_str("{}").expect("empty config");
+        assert!(fresh.telemetry_unanswered(), "a fresh install must be unanswered");
+        assert!(!fresh.telemetry_enabled(), "nothing may be sent before consent");
+    }
+
+    #[test]
+    fn an_existing_answer_is_kept_and_not_re_asked() {
+        for (json, expected) in [
+            (r#"{"telemetry":true}"#, true),
+            (r#"{"telemetry":false}"#, false),
+        ] {
+            let cfg: Config = serde_json::from_str(json).expect(json);
+            assert!(!cfg.telemetry_unanswered(), "{json} was already answered");
+            assert_eq!(cfg.telemetry_enabled(), expected, "for {json}");
+        }
+    }
+
+    #[test]
+    fn declining_is_distinct_from_never_asked() {
+        // Otherwise a decline would put the question back the next time round.
+        let declined = Config { telemetry: Some(false), ..Default::default() };
+        assert!(!declined.telemetry_enabled());
+        assert!(!declined.telemetry_unanswered());
+    }
 
     #[test]
     fn a_missing_shortcut_setting_uses_the_default() {

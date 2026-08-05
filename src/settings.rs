@@ -505,7 +505,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 *r,
                 "Send anonymous usage stats",
                 state,
-                state.cfg.telemetry,
+                state.cfg.telemetry_enabled(),
                 hot,
             ),
             Ctrl::KeepEditorOpen => draw_checkbox(
@@ -661,8 +661,10 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             state.cfg = Config::update(|cfg| cfg.auto_update = enabled);
         }
         Ctrl::Telemetry => {
-            let enabled = !state.cfg.telemetry;
-            state.cfg = Config::update(|cfg| cfg.telemetry = enabled);
+            // Toggling here answers the question too, so an install that
+            // reaches Settings before the welcome screen is not asked twice.
+            let enabled = !state.cfg.telemetry_enabled();
+            state.cfg = Config::update(|cfg| cfg.telemetry = Some(enabled));
             crate::telemetry::set_enabled(enabled);
         }
         Ctrl::KeepEditorOpen => {

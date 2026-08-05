@@ -1,9 +1,13 @@
 //! Anonymous usage telemetry, sent to PostHog.
 //!
-//! Opt-out by default: `Config::telemetry` defaults to true and the Settings
-//! window can switch it off. Only event names, the anonymous `device_id()`,
-//! the app version, and the Windows build are ever transmitted. Screenshots,
-//! OCR text, file names, and paths are never part of an event.
+//! Consent first: `Config::telemetry` is `Option<bool>` and starts as `None`,
+//! meaning unanswered. Nothing is sent while that holds. The first-run screen
+//! asks, with the box ticked where opt-out is lawful and empty across the EU,
+//! EEA, UK and Switzerland, and Settings can change the answer later.
+//!
+//! Only event names, the anonymous `device_id()`, the app version, and the
+//! Windows build are ever transmitted. Screenshots, OCR text, file names, and
+//! paths are never part of an event.
 //!
 //! `matteshot_failure` additionally carries an `operation` and a `kind`, both
 //! drawn from fixed sets. Error messages are never sent: `failure_kind`
@@ -53,13 +57,62 @@ pub fn set_enabled(enabled: bool) {
 
 /// Reload the toggle from config at launch.
 pub fn init() {
-    set_enabled(crate::config::Config::load().telemetry);
+    set_enabled(crate::config::Config::load().telemetry_enabled());
 }
 
 /// Fire-and-forget a single event on a background thread. Never blocks the UI;
 /// a slow or unreachable network only delays the spawned thread's exit.
 pub fn report(event: &str) {
     report_with(event, &[]);
+}
+
+/// Where consent has to be asked for rather than assumed.
+///
+/// EU27 plus the rest of the EEA, the UK, and Switzerland. In these a
+/// pre-ticked box is not valid consent, so the box starts empty and telemetry
+/// stays off unless someone actively turns it on. Everywhere else it starts
+/// ticked and can be switched off.
+const CONSENT_REQUIRED_REGIONS: [&str; 32] = [
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT",
+    "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", // EU27
+    "IS", "LI", "NO", // rest of the EEA
+    "GB", "CH", // UK, and Switzerland's revised FADP
+];
+
+/// Whether the consent box may start ticked for this region.
+///
+/// Anything that is not a plain two-letter code counts as unknown, including
+/// the empty string `user_region` returns when the lookup fails. Unknown means
+/// ask: guessing toward "assume consent" is the expensive direction to be
+/// wrong in.
+fn opt_out_allowed(region: &str) -> bool {
+    let region = region.trim().to_ascii_uppercase();
+    if region.len() != 2 || !region.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    !CONSENT_REQUIRED_REGIONS.contains(&region.as_str())
+}
+
+/// Windows' idea of the user's country, e.g. "US" or "DE".
+///
+/// This is the region setting, not the display language: someone running an
+/// English install in Berlin still reports DE, which is the thing that
+/// matters here.
+fn user_region() -> String {
+    use windows::Win32::Globalization::GetUserDefaultGeoName;
+    let mut buffer = [0u16; 16];
+    let written = unsafe { GetUserDefaultGeoName(&mut buffer) };
+    if written <= 1 {
+        // Unknown region: treat it as one that requires asking. Guessing wrong
+        // toward "assume consent" is the expensive direction.
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..(written - 1) as usize])
+}
+
+/// What the first-run consent box should start as.
+pub fn consent_default_checked() -> bool {
+    opt_out_allowed(&user_region())
 }
 
 /// Bounded, stable reason an operation failed.
@@ -397,6 +450,31 @@ mod tests {
             "these events are sent but not in PUBLISHED_EVENTS, and so are probably \
              missing from matteshot.app/privacy: {undisclosed:?}"
         );
+    }
+
+    #[test]
+    fn consent_must_be_asked_for_across_the_eea_uk_and_switzerland() {
+        for region in ["DE", "FR", "IE", "PL", "GB", "NO", "IS", "LI", "CH", "de", " gb "] {
+            assert!(!opt_out_allowed(region), "{region} may not be opted out by default");
+        }
+    }
+
+    #[test]
+    fn elsewhere_the_box_may_start_ticked() {
+        for region in ["US", "CA", "AU", "JP", "BR", "IN", "us"] {
+            assert!(opt_out_allowed(region), "{region} allows opt-out");
+        }
+    }
+
+    /// Guessing toward "assume consent" is the expensive direction, so
+    /// anything unrecognisable is treated as requiring consent. The empty
+    /// string matters most: that is what user_region returns when the lookup
+    /// fails, and it used to fall through to opt-out.
+    #[test]
+    fn an_unreadable_region_requires_asking() {
+        for region in ["", "   ", "ZZ-not-a-country", "U", "USA", "12"] {
+            assert!(!opt_out_allowed(region), "{region:?} must require asking");
+        }
     }
 
     #[test]
