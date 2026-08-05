@@ -414,8 +414,11 @@ fn annotation_tool_index(shape: &crate::annotate::Shape) -> usize {
     }
 }
 
-fn tool_stays_active_after_use(tool: usize) -> bool {
-    tool == PEN_TOOL || tool == STEP_TOOL
+/// Picking a tool arms it until it is put away: picking the armed one again
+/// disarms, picking another switches. Nothing else clears it except Esc, so a
+/// run of boxes or arrows takes one trip to the palette.
+fn tool_after_pick(current: Option<usize>, picked: usize) -> Option<usize> {
+    (current != Some(picked)).then_some(picked)
 }
 
 fn text_context(state: &State) -> bool {
@@ -1331,8 +1334,10 @@ unsafe fn paint(hdc: HDC, state: &State) {
         Some("drag on the preview to draw   \u{00b7}   Pen stays active   \u{00b7}   P or Esc exits")
     } else if state.tool == Some(STEP_TOOL) {
         Some("click the preview to place the next step   \u{00b7}   Step stays active   \u{00b7}   Esc exits")
+    } else if state.tool == Some(5) {
+        Some("click the preview to place a caption   \u{00b7}   Text stays active   \u{00b7}   Esc exits")
     } else if state.tool.is_some() {
-        Some("drag on the preview to draw   \u{00b7}   tool clears after each add")
+        Some("drag on the preview to draw   \u{00b7}   tool stays active   \u{00b7}   click it again or Esc exits")
     } else if !state.doc().anns.is_empty() {
         Some("drag to move   \u{00b7}   grab handles to reshape   \u{00b7}   right-click for properties   \u{00b7}   double-click text to edit   \u{00b7}   Del removes")
     } else {
@@ -1759,9 +1764,15 @@ fn commit_editing(state: &mut State) -> bool {
             }
             return false;
         }
-        // One-shot tools: a successful add returns to the selector.
-        state.tool = None;
+        // The Text tool stays armed after a successful add, so the next click
+        // starts another caption. Callers that mean to leave annotation mode
+        // clear `tool` themselves.
         state.doc_mut().editing_original = None;
+        if state.tool.is_some() {
+            // As with a finished shape: a selection that cannot be drawn would
+            // still take the colour and size chips and the Delete key.
+            state.doc_mut().selected = None;
+        }
         return true;
     }
     false
@@ -2070,10 +2081,8 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
     match ctl {
         Ctl::Tool(n) => {
             commit_editing(state);
-            if state.tool == Some(n) {
-                state.tool = None;
-            } else {
-                state.tool = Some(n);
+            state.tool = tool_after_pick(state.tool, n);
+            if state.tool.is_some() {
                 state.doc_mut().selected = None;
                 if n == 5 {
                     state.color_idx = 3;
@@ -2527,8 +2536,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             text_style: crate::annotate::TextStyle::Shadow,
                             text_box_opacity: box_opacity,
                         });
-                        state.doc_mut().selected = Some(state.doc_mut().anns.len() - 1);
-                        state.tool = tool_stays_active_after_use(tool).then_some(tool);
+                        // Armed tool, so no selection — see the drag release.
+                        state.doc_mut().selected = None;
                         rebuild_preview(state);
                         let _ = InvalidateRect(hwnd, None, false);
                     } else {
@@ -2627,13 +2636,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.doc_mut().anns.pop();
                         state.doc_mut().discard_history();
                     } else {
-                        // Shapes are one-shot, but Pen stays armed so lifting
-                        // the mouse does not interrupt handwriting or a
-                        // multi-stroke drawing.
-                        if !state.tool.is_some_and(tool_stays_active_after_use) {
-                            state.tool = None;
-                        }
-                        state.doc_mut().selected = Some(state.doc_mut().anns.len() - 1);
+                        // The tool stays armed after the stroke: drawing four
+                        // boxes should not mean picking Box four times. Only
+                        // Esc, the tool chip again, or another tool disarms.
+                        //
+                        // Nothing is left selected, because the selection
+                        // overlay is hidden while a tool is armed. A shape
+                        // selected with no handles on screen still answers the
+                        // colour and size chips and the Delete key, so the
+                        // palette would silently retarget the previous shape
+                        // instead of setting up the next one.
+                        state.doc_mut().selected = None;
                     }
                     rebuild_preview(state);
                     let _ = InvalidateRect(hwnd, None, false);
@@ -2870,13 +2883,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if reedit && i < state.doc_mut().anns.len() {
                                 state.doc_mut().selected = Some(i);
                             }
-                            state.tool = None;
+                            // The Text tool stays armed: abandoning one caption
+                            // is not a reason to leave caption mode. The next
+                            // Esc puts the tool away.
                             rebuild_preview(state);
                             let _ = InvalidateRect(hwnd, None, false);
                         } else if state.tool.take().is_some() {
-                            // Esc leaves an armed tool first. A second Esc can
-                            // close the tab, which is especially important for
-                            // the persistent Pen mode.
+                            // Esc peels one layer at a time — caption, then the
+                            // armed tool, then the selection, and only then the
+                            // tab. Tools stay armed across uses, so without this
+                            // ladder a single Esc would throw away the capture.
+                            let _ = InvalidateRect(hwnd, None, false);
+                        } else if state.doc_mut().selected.take().is_some() {
                             let _ = InvalidateRect(hwnd, None, false);
                         } else {
                             let active = state.active;
@@ -3575,9 +3593,9 @@ mod tests {
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
         output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
         redacted, tab_for_digit,
-        tool_stays_active_after_use, History, HISTORY_LIMIT,
+        tool_after_pick, History, HISTORY_LIMIT,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
-        PEN_TOOL, STEP_TOOL, TOOLS,
+        TOOLS,
     };
     use windows::Win32::Foundation::RECT;
 
@@ -3898,12 +3916,14 @@ mod tests {
     }
 
     #[test]
-    fn pen_and_step_stay_armed_after_a_stroke() {
+    fn picking_a_tool_toggles_it_and_switching_keeps_the_new_one() {
         for tool in 0..TOOLS.len() {
-            assert_eq!(
-                tool_stays_active_after_use(tool),
-                tool == PEN_TOOL || tool == STEP_TOOL
-            );
+            // Every tool arms from the selector and disarms on a second pick.
+            assert_eq!(tool_after_pick(None, tool), Some(tool));
+            assert_eq!(tool_after_pick(Some(tool), tool), None);
+            // Any other tool takes over rather than clearing.
+            let other = (tool + 1) % TOOLS.len();
+            assert_eq!(tool_after_pick(Some(other), tool), Some(tool));
         }
     }
 

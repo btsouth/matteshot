@@ -30,6 +30,9 @@ layout/DPI, theme, and audio mode with the result.
 
 - [ ] Multiple captures become tabs; Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1-9, middle-click, and close choose the expected neighbour.
 - [ ] Every annotation can be created, selected, moved, resized, deleted, and undone.
+- [ ] Every annotation tool stays armed after each add, so repeats need no re-pick; clicking the armed tool again, picking a different tool, or pressing Escape disarms it and restores selection.
+- [ ] Esc peels one layer per press in both editors: cancel the caption being typed, then disarm the tool, then clear the selection, and only then close the tab or window.
+- [ ] With a tool armed nothing is selected, so the colour chips, size chips, and Delete set up the next shape instead of silently changing the last one; disarming restores normal select-and-edit.
 - [ ] Text accepts Unicode, can be re-edited, and preserves its style after matte/aspect changes.
 - [ ] OCR selection tracks words after matte, padding, aspect, and window-size changes.
 - [ ] Pixelated words cannot be selected or copied through the redaction.
@@ -42,7 +45,8 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Off, System, and Mic modes produce a playable file with the expected audio.
 - [ ] Play/Pause, Space, keyboard seeks, timeline scrubbing, and trim handles stay synchronized.
 - [ ] Matte, padding, aspect, and annotations remain responsive during playback.
-- [ ] The + Add drawer shows Arrow, Line, Box, Oval, Mark, Text, Blur, Step, and Pen in a balanced 3x3 grid; each renders in preview and export, Step numbers advance on consecutive clicks without re-picking, and Pen stays active across strokes until toggled or Escaped.
+- [ ] The + Add drawer shows Arrow, Line, Box, Oval, Mark, Text, Blur, Step, and Pen in a balanced 3x3 grid; each renders in preview and export, and every tool stays armed across uses (four boxes in a row, Step numbers advancing, Pen across strokes) until the same tool, another tool, or Escape puts it away.
+- [ ] Adding closes the drawer so it stops covering the top-right of the frame, and the + Add chip then reads as the armed tool's name until it is put away.
 - [ ] Existing and newly added annotations remain visible and editable on the terminal frame.
 - [ ] Export progress advances; cancellation keeps the original and removes incomplete output.
 - [ ] Successful export preserves audio, never overwrites an earlier edit, and copies the edit.

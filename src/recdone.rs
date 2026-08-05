@@ -117,6 +117,28 @@ const VIDEO_TOOLS: [(Tool, &str); 9] = [
     (Tool::Pen, "Pen"),
 ];
 
+/// The drawer's own name for a tool, reused on the + Add chip so a closed
+/// drawer still says what is armed.
+fn tool_label(tool: Tool) -> &'static str {
+    VIDEO_TOOLS
+        .iter()
+        .find(|(candidate, _)| *candidate == tool)
+        .map(|(_, label)| *label)
+        .unwrap_or("Tool")
+}
+
+/// Adding closes the drawer so it stops covering the frame, but the tool it
+/// armed is still live. The chip carries that state: with the drawer shut it
+/// reads as the armed tool's name, which is both the reminder and the way back
+/// to the lit chip that turns it off.
+fn add_chip_label(tools_open: bool, tool: Option<Tool>) -> &'static str {
+    match (tools_open, tool) {
+        (true, _) => "Done",
+        (false, Some(tool)) => tool_label(tool),
+        (false, None) => "+ Add",
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum TimingChoice {
     WholeVideo,
@@ -133,7 +155,6 @@ enum Drag {
     Draw {
         index: usize,
         start: (f32, f32),
-        tool: Tool,
     },
     Move {
         index: usize,
@@ -1246,18 +1267,20 @@ fn next_counter_number(annotations: &[crate::video_edit::Item]) -> u32 {
         .saturating_add(1)
 }
 
-fn tool_stays_active_after_use(tool: Tool) -> bool {
-    tool == Tool::Pen || tool == Tool::Counter
+/// Picking a tool arms it until it is put away: picking the armed one again
+/// disarms, picking another switches. Nothing else clears it except Esc, so a
+/// run of boxes or arrows takes one trip to the drawer.
+fn tool_after_pick(current: Option<Tool>, picked: Tool) -> Option<Tool> {
+    (current != Some(picked)).then_some(picked)
 }
 
 fn select_annotation_tool(state: &mut State, tool: Tool) {
     stop_playback(state);
     state.text_entry = None;
-    if state.tool == Some(tool) {
-        state.tool = None;
+    state.tool = tool_after_pick(state.tool, tool);
+    if state.tool.is_none() {
         return;
     }
-    state.tool = Some(tool);
     state.selected = None;
     if tool == Tool::Text {
         state.color_idx = 3;
@@ -1306,8 +1329,9 @@ fn commit_text(state: &mut State) {
         state.annotations.push(item);
         state.selected = Some(state.annotations.len() - 1);
     }
-    state.tool = None;
-    state.tools_open = false;
+    // The Text tool stays armed after a caption lands, so the next click on
+    // the preview starts another one. Callers that mean to leave annotation
+    // mode clear `tool` themselves.
     recompose_preview(state);
 }
 
@@ -1607,8 +1631,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
     paint_chip(
         hdc,
         state.add_control,
-        if state.tools_open { "Done" } else { "+ Add" },
-        state.tools_open,
+        add_chip_label(state.tools_open, state.tool),
+        state.tools_open || state.tool.is_some(),
         state,
     );
     if state.tools_open {
@@ -1838,13 +1862,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
             "Type caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel"
         } else if let Some(tool) = state.tool {
             match tool {
-                Tool::Text => "Click the preview to place a caption",
-                Tool::Arrow => "Drag on the preview to draw an arrow",
-                Tool::Line => "Drag on the preview to draw a line",
-                Tool::Rect => "Drag on the preview to draw a box",
-                Tool::Ellipse => "Drag on the preview to draw an oval",
-                Tool::Highlight => "Drag on the preview to mark an area",
-                Tool::Blur => "Drag over anything sensitive to blur it",
+                Tool::Text => "Click the preview to place a caption   \u{00b7}   Text stays active   \u{00b7}   Esc exits",
+                Tool::Arrow => "Drag on the preview to draw an arrow   \u{00b7}   Arrow stays active   \u{00b7}   Esc exits",
+                Tool::Line => "Drag on the preview to draw a line   \u{00b7}   Line stays active   \u{00b7}   Esc exits",
+                Tool::Rect => "Drag on the preview to draw a box   \u{00b7}   Box stays active   \u{00b7}   Esc exits",
+                Tool::Ellipse => "Drag on the preview to draw an oval   \u{00b7}   Oval stays active   \u{00b7}   Esc exits",
+                Tool::Highlight => "Drag on the preview to mark an area   \u{00b7}   Mark stays active   \u{00b7}   Esc exits",
+                Tool::Blur => "Drag over anything sensitive to blur it   \u{00b7}   Blur stays active   \u{00b7}   Esc exits",
                 Tool::Counter => "Click the preview to place the next step   \u{00b7}   Step stays active   \u{00b7}   Esc exits",
                 Tool::Pen => "Draw on the preview   \u{00b7}   Pen stays active   \u{00b7}   Esc exits",
             }
@@ -2529,11 +2553,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Drag::Padding => update_padding(state, x),
                         Drag::CaptionSize => update_caption_size(state, x),
                         Drag::CaptionOpacity => update_caption_opacity(state, x),
-                        Drag::Draw {
-                            index,
-                            start,
-                            tool: _,
-                        } => {
+                        Drag::Draw { index, start } => {
                             if let Some(point) = screen_to_preview(state, x, y) {
                                 if let Some(item) = state.annotations.get_mut(index) {
                                     update_draw_shape(&mut item.shape, start, point);
@@ -2780,7 +2800,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 text: String::new(),
                                 editing: None,
                             });
-                            state.tool = None;
                             state.tools_open = false;
                             state.selected = None;
                             recompose_preview(state);
@@ -2798,7 +2817,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 caption_box_opacity: state.caption_box_opacity,
                             });
                             state.selected = Some(state.annotations.len() - 1);
-                            state.tool = tool_stays_active_after_use(tool).then_some(tool);
                             state.tools_open = false;
                             recompose_preview(state);
                         } else {
@@ -2815,13 +2833,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             });
                             let index = state.annotations.len() - 1;
                             state.selected = Some(index);
-                            state.tool = tool_stays_active_after_use(tool).then_some(tool);
                             state.tools_open = false;
-                            state.dragging = Some(Drag::Draw {
-                                index,
-                                start: point,
-                                tool,
-                            });
+                            state.dragging = Some(Drag::Draw { index, start: point });
                             windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                             recompose_preview(state);
                         }
@@ -2944,13 +2957,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // at full resolution.
                             recompose_preview(state);
                         }
-                        if let Drag::Draw { index, tool, .. } = drag {
+                        // The tool is still armed here: releasing the mouse
+                        // ends the shape, not the tool. Only a stray click
+                        // that drew nothing is thrown away.
+                        if let Drag::Draw { index, .. } = drag {
                             if let Some(item) = state.annotations.get(index) {
                                 if draw_shape_is_degenerate(&item.shape) {
                                     state.annotations.remove(index);
                                     state.selected = None;
-                                } else if tool_stays_active_after_use(tool) {
-                                    state.tool = Some(tool);
                                 }
                             }
                         }
@@ -3796,8 +3810,8 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::{
-        annotation_preview_time, apply_caption_input, available_export_path, layout,
-        minimum_client_size, next_counter_number, tool_stays_active_after_use, CaptionInput,
+        add_chip_label, annotation_preview_time, apply_caption_input, available_export_path,
+        layout, minimum_client_size, next_counter_number, tool_after_pick, CaptionInput,
         NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
     use std::sync::atomic::Ordering;
@@ -3951,9 +3965,32 @@ mod tests {
             assert!(row.windows(2).all(|pair| pair[0].0.right < pair[1].0.left));
         }
         assert!(controls.windows(4).all(|window| window[0].0.bottom < window[3].0.top));
-        assert!(tool_stays_active_after_use(super::Tool::Pen));
-        assert!(tool_stays_active_after_use(super::Tool::Counter));
-        assert!(!tool_stays_active_after_use(super::Tool::Arrow));
+        // Every tool arms until it is put away: a second pick disarms it, and
+        // any other pick switches instead of clearing.
+        for (tool, _) in VIDEO_TOOLS {
+            assert_eq!(tool_after_pick(None, tool), Some(tool));
+            assert_eq!(tool_after_pick(Some(tool), tool), None);
+            let other = if tool == super::Tool::Arrow {
+                super::Tool::Pen
+            } else {
+                super::Tool::Arrow
+            };
+            assert_eq!(tool_after_pick(Some(other), tool), Some(tool));
+        }
+    }
+
+    #[test]
+    fn the_add_chip_names_the_armed_tool_while_the_drawer_is_shut() {
+        assert_eq!(add_chip_label(false, None), "+ Add");
+        assert_eq!(add_chip_label(true, None), "Done");
+        for (tool, label) in VIDEO_TOOLS {
+            // Adding closes the drawer, so this is the only thing left on
+            // screen saying a tool is still armed.
+            assert_eq!(add_chip_label(false, Some(tool)), label);
+            // Open, the lit chip in the drawer says which one; the add chip is
+            // the way out of the drawer.
+            assert_eq!(add_chip_label(true, Some(tool)), "Done");
+        }
     }
 
     #[test]
