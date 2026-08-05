@@ -112,7 +112,14 @@ src/telemetry.rs). No event ever carries an email or device name.
    momentarily out of step with its checksum, which would fail every client's
    hash gate. The custom domain can lag a Pages deploy by ~15s.
 
-**v0.14.6 is fully shipped**: signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped to 0.14.6 pointing at the versioned installer. Verified independently: the published SHA-256 matches the downloaded installer, Authenticode is `Valid` under `CN=Brandon South`, and `run-probes.ps1 -Strict -SignedFile` accepts that exact artifact through the app's own auto-update trust gate. Capture reliability and control:
+**v0.14.7 is fully shipped**: signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped to 0.14.7. Verified independently: published SHA-256 matches the downloaded installer, Authenticode `Valid` under `CN=Brandon South`, and `run-probes.ps1 -Strict -SignedFile` accepts that exact artifact through the app's own auto-update trust gate.
+
+Delayed capture reached from the capture toolbar, not just the tray. A clock chip labelled from `capture_delay_secs`, keyboard **D**. Choosing it ends the overlay with `Selection::Delay`; `shoot_overlay_from` counts down and opens again, as a loop rather than recursion. The reopened toolbar keeps that chip lit, reusing the same `selected` rendering Record and Scroll use, because without it the return reads as a glitch rather than a continuation.
+
+Two traps worth remembering here:
+
+- **A toolbar shortcut must be in BOTH `shortcut_button` and `shortcut_bit`.** The first only applies once the overlay owns the foreground; `shortcut_bit` is what carries the key through the low-level hook when it does not, which is the case the hook exists for. `D` was missing from it and the shortcut silently did nothing. A test now asserts every key is in both tables.
+- **Do not call `Config::load()` while the overlay is opening.** It is file I/O under a lock on the path whose latency is logged as `freeze_ms`. Pass values in instead.
 
 - A capture shortcut another app already owns is no longer fatal. Registration used `?`, and with no console `main`'s `eprintln!` went nowhere, so Matteshot exited at launch with no window and no tray icon. It also aborted before PrtScn was acquired, so one collision cost every hotkey and left no way into Settings to fix it.
 - The shortcut is configurable (`config.capture_hotkey`, text like `Ctrl+Alt+S`, `None` unbinds) and can be set in Settings by pressing it. Bare keys are refused: Windows would register one and swallow that key system-wide.
