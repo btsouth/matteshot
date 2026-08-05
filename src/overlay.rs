@@ -56,6 +56,10 @@ fn shortcut_bit(vk: u32) -> Option<u32> {
         0x46 => Some(3), // F
         0x56 => Some(4), // V
         0x53 => Some(5), // S
+        // Without this the D shortcut only works when the overlay already
+        // owns the foreground; the hook is what covers the case where it
+        // does not, which is exactly when shortcuts matter most.
+        0x44 => Some(6), // D
         _ => None,
     }
 }
@@ -893,8 +897,11 @@ pub fn benchmark_freeze(batched: bool) -> Result<()> {
 /// snippable as a region. Returns the selection and the monitor to anchor
 /// follow-up UI on, or None if cancelled.
 /// Open the capture overlay. `delayed` marks this as the reopen after a
-/// countdown, which only changes how the toolbar reads.
-pub fn select(delayed: bool) -> Result<Option<(Selection, HMONITOR)>> {
+/// countdown, which only changes how the toolbar reads. `delay_secs` labels
+/// the delay chip and is passed in rather than read here: opening the overlay
+/// is a timed path (freeze_ms is measured in the log) and `Config::load` is
+/// file I/O under a lock.
+pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONITOR)>> {
     let mons = monitors()?;
 
     // Virtual-screen bounding box.
@@ -985,10 +992,7 @@ pub fn select(delayed: bool) -> Result<Option<(Selection, HMONITOR)>> {
         let old_font = SelectObject(screen_dc, font);
         // The row is actions, not only modes: Close already lives here, and
         // "capture after Ns" belongs beside it.
-        let delay_label = format!(
-            "\u{23F1} {}s",
-            crate::delay::sanitize(crate::config::Config::load().capture_delay_secs)
-        );
+        let delay_label = format!("\u{23F1} {}s", crate::delay::sanitize(delay_secs));
         let specs: [(&str, Btn); 7] = [
             ("Window", Btn::Window),
             ("Region", Btn::Region),
@@ -1169,6 +1173,20 @@ mod tests {
         assert!(shortcut_bit(0x1B).is_some());
         assert!(shortcut_bit(0x56).is_some());
         assert!(shortcut_bit(0x41).is_none());
+        // D has to be in both tables. shortcut_button alone only works once
+        // the overlay owns the foreground; shortcut_bit is what carries it
+        // through the low-level hook when it does not, which is the case the
+        // hook exists for.
+        assert!(shortcut_bit(0x44).is_some(), "D missing from the keyboard hook");
+        assert!(matches!(shortcut_button(0x44), Some(Btn::Delay)));
+        // Every shortcut_button key must also pass the hook, or it silently
+        // works only some of the time.
+        for vk in [0x57u16, 0x52, 0x46, 0x56, 0x53, 0x44] {
+            assert!(
+                shortcut_button(vk).is_some() && shortcut_bit(vk as u32).is_some(),
+                "vk {vk:#04x} is not in both shortcut tables"
+            );
+        }
     }
 
     #[test]
