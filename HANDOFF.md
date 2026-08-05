@@ -5,7 +5,7 @@ Owner: Brandon Tyler South, who goes by **Tyler** (the code-signing certificate
 reads `CN=Brandon South`, which is the legal name and is deliberate — the
 updater pins that exact string). Works in IT/cybersecurity; this is his
 commercial side project. Repo: `tsouth89/matteshot` (private). Everything below
-is current as of v0.13.0.
+is current as of v0.14.10.
 
 ## What this is
 
@@ -117,7 +117,21 @@ src/telemetry.rs). No event ever carries an email or device name.
    momentarily out of step with its checksum, which would fail every client's
    hash gate. The custom domain can lag a Pages deploy by ~15s.
 
-**v0.14.7 is fully shipped**: signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped to 0.14.7. Verified independently: published SHA-256 matches the downloaded installer, Authenticode `Valid` under `CN=Brandon South`, and `run-probes.ps1 -Strict -SignedFile` accepts that exact artifact through the app's own auto-update trust gate.
+**v0.14.10 is fully shipped**, as are 0.14.8 and 0.14.9 before it: each signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped and deployed. Verified the same way every time: the published SHA-256 matches the GitHub asset digest, and the *installed* build is pointed at the live manifest and made to download and verify the new installer through the app's own trust gates (`--update-test` then `--update-stage-test`), which is the path a customer actually takes.
+
+What went out in each:
+
+- **0.14.8** — telemetry asks before it sends anything (`Config::telemetry` is `Option<bool>`, empty by default across the EU, EEA, UK and Switzerland), and update entitlements are enforced for the first time.
+- **0.14.9** — annotation tools stay armed until they are put away, instead of clearing after a single use. Escape peels one layer per press in both editors: caption, then tool, then selection, then close.
+- **0.14.10** — the tweak editor previews at the size it displays. It had been composing a fixed 1200px working bitmap and stretching it to fill the pane, so a maximized capture on a 1440p monitor was rebuilt from 47% of its pixels and magnified 1.39x. Text went soft exactly where annotation happens.
+
+Three traps this run, all cheap to hit again:
+
+- **Check `git tag -l` before assuming a prepared version is unreleased.** `Cargo.toml` said 0.14.8 and the working tree looked mid-flight, but v0.14.8 was already tagged and published; the work had to become 0.14.9. `validate-release-version.ps1 -Tag vX.Y.Z` catches the mismatch, and CI refuses the build, but only after you have pushed a tag.
+- **`released` in version.json must be UTC.** `git log --date=format-local` without `TZ=UTC` hands back local time, which would have dated 0.14.10 four hours early. That field decides which licenses are offered the build, so it is not cosmetic. Use `TZ=UTC git log -1 --format=%cd --date=format-local:"%Y-%m-%dT%H:%M:%SZ" <commit>`.
+- **A publish can look like a failed update for a minute.** Straight after the 0.14.10 deploy, one `--update-stage-test` reported "already current" while checks either side of it offered 0.14.10 — most likely an edge node still serving the previous manifest. Five consecutive runs after were clean. Re-run before believing it.
+
+0.14.10 was also this project's first double-digit patch number, which is where a textual version compare breaks: as strings `"0.14.10" < "0.14.9"`, so every 0.14.9 install would have been told it was current, permanently. `update.rs` uses semver and is fine, and `a_double_digit_patch_is_newer_than_a_single_digit_one` now pins it.
 
 Delayed capture reached from the capture toolbar, not just the tray. A clock chip labelled from `capture_delay_secs`, keyboard **D**. Choosing it ends the overlay with `Selection::Delay`; `shoot_overlay_from` counts down and opens again, as a loop rather than recursion. The reopened toolbar keeps that chip lit, reusing the same `selected` rendering Record and Scroll use, because without it the return reads as a glitch rather than a continuation.
 
@@ -169,6 +183,9 @@ Keep all three in sync if the design changes.
   with `Start-Process -RedirectStandardError <log> -Wait`, then read the log.
 - Test flags: `--bench <title>` (timed capture, raw PNG to %TEMP%),
   `--overlay-bench [batched|sequential]` (headless multi-monitor freeze/layer timing),
+  `--preview-bench [long edge]` (tweak-editor rebuild timing per working-bitmap
+  size: source build, cold recompose, cached annotation restamp — the three
+  costs that decide how sharp the preview can afford to be),
   `--scroll-test <title>` (+ env `MATTESHOT_SCROLL_DEBUG=1`), `--record-test`,
   `--trim-test`, `--ocr`, `--assets <title> <dir>` (marketing exports),
   `--icon [dir]`, `--settings`, `--tweak`, `--once [--window <t>] [--pick N]`.

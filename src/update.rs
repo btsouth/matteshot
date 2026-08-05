@@ -377,6 +377,38 @@ mod tests {
         assert_eq!(update.version, "0.9.2");
     }
 
+    /// Every comparison here is numeric, not textual. As strings "0.14.10" is
+    /// *less* than "0.14.9", because the compare stops at the first differing
+    /// character, so a textual version check would tell every 0.14.9 install it
+    /// was current and leave it there permanently. 0.14.10 was this project's
+    /// first double-digit patch, which is where that mistake first bites and
+    /// the reason it is pinned here.
+    #[test]
+    fn a_double_digit_patch_is_newer_than_a_single_digit_one() {
+        for (offered, running) in [
+            ("0.14.10", "0.14.9"),
+            ("0.14.10", "0.14.2"),
+            ("0.15.0", "0.14.10"),
+            ("1.0.10", "1.0.9"),
+        ] {
+            let update = available_from(&manifest(offered, SETUP), running, None)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{offered} should be offered to {running}"));
+            assert_eq!(update.version, offered);
+        }
+
+        // And the reverse never happens: a smaller patch number that sorts
+        // later as text must not be mistaken for an upgrade.
+        for (offered, running) in [("0.14.9", "0.14.10"), ("1.0.9", "1.0.10")] {
+            assert!(
+                available_from(&manifest(offered, SETUP), running, None)
+                    .unwrap()
+                    .is_none(),
+                "{offered} must not be offered to {running}"
+            );
+        }
+    }
+
     #[test]
     fn equal_or_older_version_is_ignored() {
         assert!(available_from(&manifest("0.9.1", SETUP), "0.9.1", None)
