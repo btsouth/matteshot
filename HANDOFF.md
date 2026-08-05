@@ -112,7 +112,14 @@ src/telemetry.rs). No event ever carries an email or device name.
    momentarily out of step with its checksum, which would fail every client's
    hash gate. The custom domain can lag a Pages deploy by ~15s.
 
-**v0.14.5 is fully shipped**: signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped to 0.14.5 pointing at the versioned installer. Verified independently: the published SHA-256 matches the downloaded installer, Authenticode is `Valid` under `CN=Brandon South`, and `run-probes.ps1 -Strict -SignedFile` accepts that exact artifact through the app's own auto-update trust gate. Trial and licensing hardening, both halves live (worker deployed, client released):
+**v0.14.6 is fully shipped**: signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped to 0.14.6 pointing at the versioned installer. Verified independently: the published SHA-256 matches the downloaded installer, Authenticode is `Valid` under `CN=Brandon South`, and `run-probes.ps1 -Strict -SignedFile` accepts that exact artifact through the app's own auto-update trust gate. Capture reliability and control:
+
+- A capture shortcut another app already owns is no longer fatal. Registration used `?`, and with no console `main`'s `eprintln!` went nowhere, so Matteshot exited at launch with no window and no tray icon. It also aborted before PrtScn was acquired, so one collision cost every hotkey and left no way into Settings to fix it.
+- The shortcut is configurable (`config.capture_hotkey`, text like `Ctrl+Alt+S`, `None` unbinds) and can be set in Settings by pressing it. Bare keys are refused: Windows would register one and swallow that key system-wide.
+- **Delayed capture** (tray item, delay in Settings). Windows suspends hotkey delivery for the duration of a menu's modal loop, so menus and hover flyouts were previously impossible to capture at all. The pill is `WS_EX_NOACTIVATE` so it cannot dismiss what it is waiting for, and excludes itself from capture. `--delay-test [seconds]` exercises it.
+- `matteshot_failure` reports what breaks, classified into a fixed set. **Error text is never sent**: `failure_kind` returns `&'static str`. `report_with` refuses any event absent from `PUBLISHED_EVENTS`, because the privacy policy lists them by name.
+- Settings is laid out by a cursor rather than ~37 literal coordinates plus 17 more in the paint routine. Adding a row is one call; the window height falls out of where the cursor stops.
+- Removed device counts the app cannot know: the Deactivate prompt, the activation-limit error, and the tray's hardcoded `Ctrl+Alt+S` accelerator.
 
 - The trial certificate is re-signed on every `trial/status`, so its `issued_at` is a server timestamp the machine cannot forge. The client folds it into the seen-at floor, which is what stops a rolled-back clock from buying trial days.
 - `status()` takes the *earliest* of the signed start and local state, so a certificate can never hand back time a spent trial already used. The worker no longer clamps an old `started_at` to now, which is what created that hole after a refund.
