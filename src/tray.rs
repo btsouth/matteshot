@@ -46,6 +46,7 @@ const CMD_UPDATE: usize = 108;
 const CMD_BUY: usize = 109;
 const CMD_ACTIVATE: usize = 110;
 const CMD_OPEN_VIDEOS: usize = 113;
+const CMD_CAPTURE_DELAYED: usize = 114;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Matteshot";
@@ -54,6 +55,7 @@ const RUN_VALUE: &str = "Matteshot";
 pub enum Action {
     Capture,
     CaptureActive,
+    CaptureDelayed,
     OpenFolder,
     OpenVideos,
     Settings,
@@ -351,6 +353,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     let action = match cmd.0 as usize {
         CMD_CAPTURE => Some(Action::Capture),
         CMD_CAPTURE_ACTIVE => Some(Action::CaptureActive),
+        CMD_CAPTURE_DELAYED => Some(Action::CaptureDelayed),
         CMD_OPEN_FOLDER => Some(Action::OpenFolder),
         CMD_OPEN_VIDEOS => Some(Action::OpenVideos),
         CMD_SETTINGS => Some(Action::Settings),
@@ -468,6 +471,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.pending = match wparam.0 {
                     x if x == Action::Capture as usize => Some(Action::Capture),
                     x if x == Action::CaptureActive as usize => Some(Action::CaptureActive),
+                    x if x == Action::CaptureDelayed as usize => Some(Action::CaptureDelayed),
                     x if x == Action::OpenFolder as usize => Some(Action::OpenFolder),
                     x if x == Action::OpenVideos as usize => Some(Action::OpenVideos),
                     x if x == Action::Settings as usize => Some(Action::Settings),

@@ -4,6 +4,7 @@ mod annotate;
 mod capture;
 mod compose;
 mod config;
+mod delay;
 mod diagnostics;
 mod hotkey;
 mod icon;
@@ -783,6 +784,21 @@ fn run_app() -> Result<()> {
                     tray::Action::Capture => {
                         if ensure_capture_allowed(&mut hotkeys_active)? {
                             shoot_overlay()
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    // The countdown exists so a menu can be opened during it,
+                    // so the tray popup must be gone before it starts; the
+                    // action is already deferred until the popup dismisses.
+                    tray::Action::CaptureDelayed => {
+                        if ensure_capture_allowed(&mut hotkeys_active)? {
+                            let seconds = Config::load().capture_delay_secs;
+                            if note_failure("delay", delay::countdown(seconds))? {
+                                shoot_overlay()
+                            } else {
+                                Ok(())
+                            }
                         } else {
                             Ok(())
                         }
@@ -1619,6 +1635,23 @@ fn main() -> Result<()> {
         }
         // Open only the activation window (testing; does not capture or write
         // to the clipboard).
+        // Countdown only, with no capture after it: proves the pill paints,
+        // counts, and can be cancelled without writing anything.
+        Some("--delay-test") => {
+            let seconds = args
+                .get(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(delay::DEFAULT_SECONDS);
+            let started = std::time::Instant::now();
+            let completed = delay::countdown(seconds)?;
+            eprintln!(
+                "delay: requested={seconds}s effective={}s elapsed={:.1}s {}",
+                delay::sanitize(seconds),
+                started.elapsed().as_secs_f32(),
+                if completed { "completed" } else { "cancelled" }
+            );
+            Ok(())
+        }
         Some("--license") => {
             let activated = license_ui::open()?;
             eprintln!(
@@ -1655,7 +1688,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --welcome | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
         None => run_app(),
     };

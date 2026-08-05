@@ -56,6 +56,7 @@ enum Ctrl {
     KeepEditorOpen,
     Audio(&'static str),
     CaptureHotkey,
+    CaptureDelay(u32),
     Diagnostics,
     Deactivate,
 }
@@ -77,6 +78,7 @@ enum Chrome {
     ScreenshotSizeHeader,
     AudioLabel,
     HotkeyLabel,
+    DelayLabel,
 }
 
 /// Walks down the window handing out rects.
@@ -376,6 +378,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Chrome::HotkeyLabel => {
                 draw_text_in(hdc, state.font, state.theme.text, *r, "Capture shortcut", 0)
             }
+            Chrome::DelayLabel => {
+                draw_text_in(hdc, state.font, state.theme.text, *r, "Capture delay", 0)
+            }
             // The paths stop short of the buttons sharing their line.
             Chrome::SavePath | Chrome::VideoPath => {
                 let text = if *chrome == Chrome::SavePath {
@@ -548,6 +553,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     );
                 }
             }
+            Ctrl::CaptureDelay(seconds) => draw_chip_button(
+                hdc,
+                *r,
+                &format!("{seconds}s"),
+                state,
+                crate::delay::sanitize(state.cfg.capture_delay_secs) == *seconds,
+                hot,
+            ),
             Ctrl::Diagnostics => draw_chip_button(hdc, *r, "Copy diagnostics", state, false, hot),
             Ctrl::Deactivate => {
                 let licensed = matches!(state.license, crate::license::Status::Licensed { .. });
@@ -635,6 +648,9 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
         }
         Ctrl::CaptureHotkey => {
             state.capturing = true;
+        }
+        Ctrl::CaptureDelay(seconds) => {
+            state.cfg = Config::update(|cfg| cfg.capture_delay_secs = seconds);
         }
         Ctrl::RecordGif => {
             let enabled = !state.cfg.record_gif;
@@ -935,6 +951,16 @@ pub fn open() -> Result<()> {
         let hotkey_top = l.y;
         l.chips(&[Ctrl::CaptureHotkey], 190, 0, 150, 28);
         l.chrome_at(hotkey_top, 28, 145, Chrome::HotkeyLabel);
+
+        // Delay sits under the shortcut: both are about arming a capture.
+        l.gap(4);
+        let delay_top = l.y;
+        let delays: Vec<Ctrl> = crate::delay::CHOICES
+            .iter()
+            .map(|seconds| Ctrl::CaptureDelay(*seconds))
+            .collect();
+        l.chips(&delays, 54, 62, 150, 28);
+        l.chrome_at(delay_top, 28, 145, Chrome::DelayLabel);
 
         l.gap(4);
         l.checkbox(Ctrl::KeepEditorOpen);
