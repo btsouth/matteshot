@@ -24,7 +24,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW,
     CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
     SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_NCDESTROY, WM_PAINT, WM_SYSKEYDOWN, WNDCLASSW,
+    WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VIRTUAL_KEY,
+    VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 
 use crate::config::Config;
@@ -50,6 +55,7 @@ enum Ctrl {
     Telemetry,
     KeepEditorOpen,
     Audio(&'static str),
+    CaptureHotkey,
     Diagnostics,
     Deactivate,
 }
@@ -70,6 +76,7 @@ enum Chrome {
     RenderQualityHeader,
     ScreenshotSizeHeader,
     AudioLabel,
+    HotkeyLabel,
 }
 
 /// Walks down the window handing out rects.
@@ -203,6 +210,9 @@ struct State {
     font_small: HFONT,
     controls: Vec<(RECT, Ctrl)>,
     chrome: Vec<(RECT, Chrome)>,
+    /// True while the shortcut chip is waiting for a key. Purely a window
+    /// mode: nothing is written until a usable combo arrives.
+    capturing: bool,
     hover: i32,
     scale: f32,
     width: i32,
@@ -363,6 +373,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Chrome::AudioLabel => {
                 draw_text_in(hdc, state.font, state.theme.text, *r, "Recording audio", 0)
             }
+            Chrome::HotkeyLabel => {
+                draw_text_in(hdc, state.font, state.theme.text, *r, "Capture shortcut", 0)
+            }
             // The paths stop short of the buttons sharing their line.
             Chrome::SavePath | Chrome::VideoPath => {
                 let text = if *chrome == Chrome::SavePath {
@@ -510,6 +523,31 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 state.cfg.record_audio == *mode,
                 hot,
             ),
+            Ctrl::CaptureHotkey => {
+                // While capturing, the chip is the prompt; there is nowhere
+                // else on this row to put one.
+                let label = if state.capturing {
+                    "Press a key\u{2026}".to_string()
+                } else {
+                    crate::hotkey::label(state.cfg.capture_hotkey())
+                };
+                draw_chip_button(hdc, *r, &label, state, state.capturing, hot);
+                if !state.capturing && crate::capture_hotkey_taken() {
+                    draw_text_in(
+                        hdc,
+                        state.font_small,
+                        state.theme.muted,
+                        RECT {
+                            left: r.right + s(state, 8),
+                            top: r.top,
+                            right: state.width - s(state, 24),
+                            bottom: r.bottom,
+                        },
+                        "In use",
+                        0,
+                    );
+                }
+            }
             Ctrl::Diagnostics => draw_chip_button(hdc, *r, "Copy diagnostics", state, false, hot),
             Ctrl::Deactivate => {
                 let licensed = matches!(state.license, crate::license::Status::Licensed { .. });
@@ -594,6 +632,9 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             } else {
                 prtscn::release(HOTKEY_ID_PRTSCN);
             }
+        }
+        Ctrl::CaptureHotkey => {
+            state.capturing = true;
         }
         Ctrl::RecordGif => {
             let enabled = !state.cfg.record_gif;
@@ -681,6 +722,69 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = DeleteObject(bmp);
                 let _ = DeleteDC(mem);
                 let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        // Alt combinations arrive as WM_SYSKEYDOWN, so both are needed or
+        // every shortcut containing Alt would be uncapturable.
+        WM_KEYDOWN | WM_SYSKEYDOWN if state_of(hwnd).is_some_and(|s| s.capturing) => {
+            if let Some(state) = state_of(hwnd) {
+                let vk = wparam.0 as u32;
+                let down = |key: VIRTUAL_KEY| (GetKeyState(key.0 as i32) as u16 & 0x8000) != 0;
+                if vk == VK_ESCAPE.0 as u32 {
+                    state.capturing = false;
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+                // Holding a modifier is not yet a choice; keep waiting for the
+                // key it modifies rather than binding Ctrl on its own.
+                let modifier_only = [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                    .iter()
+                    .any(|m| vk == m.0 as u32);
+                if modifier_only {
+                    return LRESULT(0);
+                }
+                let mut modifiers = HOT_KEY_MODIFIERS(0);
+                if down(VK_CONTROL) {
+                    modifiers |= MOD_CONTROL;
+                }
+                if down(VK_MENU) {
+                    modifiers |= MOD_ALT;
+                }
+                if down(VK_SHIFT) {
+                    modifiers |= MOD_SHIFT;
+                }
+                if down(VK_LWIN) || down(VK_RWIN) {
+                    modifiers |= MOD_WIN;
+                }
+                // A bare key would register system-wide and swallow that key
+                // everywhere. Stay in capture mode rather than accept it.
+                if modifiers.0 == 0 {
+                    return LRESULT(0);
+                }
+                let chosen = crate::hotkey::Hotkey { modifiers, vk };
+                let text = crate::hotkey::label(Some(chosen));
+                // Round-trip through the parser so what is stored is something
+                // the app can read back; an unlabelable key is refused here
+                // rather than written and silently ignored at startup.
+                if crate::hotkey::parse(&text).is_none() {
+                    return LRESULT(0);
+                }
+                state.cfg = Config::update(|cfg| cfg.capture_hotkey = text);
+                state.capturing = false;
+                crate::rebind_capture_hotkey();
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        // Clicking away or alt-tabbing abandons the capture, so the window is
+        // never left silently swallowing keys.
+        WM_KILLFOCUS => {
+            if let Some(state) = state_of(hwnd) {
+                if state.capturing {
+                    state.capturing = false;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }
@@ -815,6 +919,12 @@ pub fn open() -> Result<()> {
         l.checkbox(Ctrl::Autostart);
         l.gap(4);
         l.checkbox(Ctrl::Prtscn);
+        // Sits with the PrtScn toggle: both decide how capture is reached.
+        l.gap(4);
+        let hotkey_top = l.y;
+        l.chips(&[Ctrl::CaptureHotkey], 190, 0, 150, 28);
+        l.chrome_at(hotkey_top, 28, 145, Chrome::HotkeyLabel);
+
         l.gap(4);
         l.checkbox(Ctrl::KeepEditorOpen);
         l.gap(4);
@@ -847,6 +957,7 @@ pub fn open() -> Result<()> {
             font_small,
             controls,
             chrome,
+            capturing: false,
             hover: -1,
             scale,
             width: cw,
