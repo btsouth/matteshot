@@ -275,11 +275,31 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         MF_STRING | MF_GRAYED
     };
     let _ = AppendMenuW(menu, capture_flags, CMD_CAPTURE, w!("Capture\tPrtScn"));
+    // The accelerator is read from config rather than baked in: it stopped
+    // being Ctrl+Alt+S the moment the shortcut became configurable.
+    let cfg = crate::config::Config::load();
+    let active_label: Vec<u16> = match cfg.capture_hotkey() {
+        Some(hotkey) => format!("Capture active window	{}", crate::hotkey::label(Some(hotkey))),
+        None => "Capture active window".to_string(),
+    }
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
     let _ = AppendMenuW(
         menu,
         capture_flags,
         CMD_CAPTURE_ACTIVE,
-        w!("Capture active window\tCtrl+Alt+S"),
+        PCWSTR(active_label.as_ptr()),
+    );
+    let delayed_label: Vec<u16> = format!("Capture after {} seconds", cfg.capture_delay_secs)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let _ = AppendMenuW(
+        menu,
+        capture_flags,
+        CMD_CAPTURE_DELAYED,
+        PCWSTR(delayed_label.as_ptr()),
     );
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_FOLDER, w!("Open captures folder"));
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_VIDEOS, w!("Open videos folder"));

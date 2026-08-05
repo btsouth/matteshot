@@ -191,13 +191,24 @@ pub fn countdown(seconds: u32) -> Result<bool> {
         let mut cancelled = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
         let mut shown = seconds;
-        while std::time::Instant::now() < deadline {
+        loop {
+            // One clock reading per iteration, and a saturating difference:
+            // checking the loop condition and then subtracting a second, later
+            // reading can underflow, and Instant subtraction panics when it
+            // does. That would be a rare crash under scheduling jitter.
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
             if esc_pressed() {
                 cancelled = true;
                 break;
             }
-            let left = (deadline - std::time::Instant::now()).as_secs_f32().ceil() as u32;
-            let left = left.max(1);
+            let left = deadline
+                .saturating_duration_since(now)
+                .as_secs_f32()
+                .ceil()
+                .max(1.0) as u32;
             if left != shown {
                 shown = left;
                 pill.text = label(left).encode_utf16().collect();
