@@ -54,12 +54,151 @@ enum Ctrl {
     Deactivate,
 }
 
+/// Painted furniture: section headers, the folder paths, and the one inline
+/// label. Positioned by the same pass as the controls so the two can no longer
+/// disagree.
+///
+/// The text is resolved at paint time rather than stored here, because
+/// `refresh` reloads the config and repaints without rebuilding the layout, so
+/// a baked string would go stale the moment a setting changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chrome {
+    SaveFolderHeader,
+    SavePath,
+    VideoFolderHeader,
+    VideoPath,
+    RenderQualityHeader,
+    ScreenshotSizeHeader,
+    AudioLabel,
+}
+
+/// Walks down the window handing out rects.
+///
+/// Every position used to be a literal, in two lists that had to agree by
+/// hand: the builder placed controls, and the paint routine separately placed
+/// headers at its own hardcoded coordinates. Inserting a row meant editing
+/// both and shifting everything below in each. Here a row is one call, what
+/// follows moves on its own, and the window height is wherever the cursor
+/// stopped.
+struct Layout {
+    scale: f32,
+    margin: i32,
+    width: i32,
+    y: i32,
+    controls: Vec<(RECT, Ctrl)>,
+    chrome: Vec<(RECT, Chrome)>,
+}
+
+impl Layout {
+    fn new(scale: f32, width: i32) -> Layout {
+        let margin = (24.0 * scale) as i32;
+        Layout {
+            scale,
+            margin,
+            width,
+            y: 0,
+            controls: Vec::new(),
+            chrome: Vec::new(),
+        }
+    }
+
+    fn sc(&self, v: i32) -> i32 {
+        (v as f32 * self.scale) as i32
+    }
+
+    fn gap(&mut self, v: i32) {
+        self.y += self.sc(v);
+    }
+
+    /// Full-width band at the cursor, which the cursor then moves past.
+    fn band(&mut self, height: i32) -> RECT {
+        let rect = RECT {
+            left: self.margin,
+            top: self.y,
+            right: self.width - self.margin,
+            bottom: self.y + self.sc(height),
+        };
+        self.y = rect.bottom;
+        rect
+    }
+
+    fn header(&mut self, chrome: Chrome, height: i32) {
+        let rect = self.band(height);
+        self.chrome.push((rect, chrome));
+    }
+
+    /// A folder path with its Change / Open buttons on the same line.
+    fn path_row(&mut self, chrome: Chrome, change: Ctrl, open: Ctrl) {
+        let rect = self.band(30);
+        self.chrome.push((rect, chrome));
+        let right = self.width - self.margin;
+        self.controls.push((
+            RECT { left: right - self.sc(140), top: rect.top, right: right - self.sc(64), bottom: rect.bottom },
+            change,
+        ));
+        self.controls.push((
+            RECT { left: right - self.sc(56), top: rect.top, right, bottom: rect.bottom },
+            open,
+        ));
+    }
+
+    /// A run of chips starting at the left margin, or at `indent` when it
+    /// shares its line with a label.
+    fn chips(&mut self, items: &[Ctrl], width: i32, stride: i32, indent: i32, height: i32) {
+        let rect = self.band(height);
+        for (i, ctrl) in items.iter().enumerate() {
+            let x = self.margin + self.sc(indent) + i as i32 * self.sc(stride);
+            self.controls.push((
+                RECT { left: x, top: rect.top, right: x + self.sc(width), bottom: rect.bottom },
+                *ctrl,
+            ));
+        }
+    }
+
+    /// Furniture on a line the cursor has already passed, for a label that
+    /// shares its row with controls.
+    fn chrome_at(&mut self, top: i32, height: i32, chrome: Chrome) {
+        self.chrome.push((
+            RECT {
+                left: self.margin,
+                top,
+                right: self.width - self.margin,
+                bottom: top + self.sc(height),
+            },
+            chrome,
+        ));
+    }
+
+    fn checkbox(&mut self, ctrl: Ctrl) {
+        let rect = self.band(28);
+        self.controls.push((rect, ctrl));
+    }
+
+    /// Two side-by-side actions at the foot of the window.
+    fn button_pair(&mut self, left: Ctrl, right: Ctrl, width: i32, stride: i32) {
+        let rect = self.band(30);
+        for (i, ctrl) in [left, right].into_iter().enumerate() {
+            let x = self.margin + i as i32 * self.sc(stride);
+            self.controls.push((
+                RECT { left: x, top: rect.top, right: x + self.sc(width), bottom: rect.bottom },
+                ctrl,
+            ));
+        }
+    }
+
+    /// Client height: where the cursor stopped, plus room for the footer line.
+    fn finish(&self) -> i32 {
+        self.y + self.sc(38)
+    }
+}
+
 struct State {
     cfg: Config,
     license: crate::license::Status,
     font: HFONT,
     font_small: HFONT,
     controls: Vec<(RECT, Ctrl)>,
+    chrome: Vec<(RECT, Chrome)>,
     hover: i32,
     scale: f32,
     width: i32,
@@ -177,52 +316,69 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let _ = DeleteObject(bg);
     SetBkMode(hdc, TRANSPARENT);
 
-    let m = s(state, 24);
-    let mut y = s(state, 20);
-
-    // Save folder
-    draw_text_in(
-        hdc,
-        state.font_small,
-        state.theme.muted,
-        RECT { left: m, top: y, right: state.width - m, bottom: y + s(state, 20) },
-        "SAVE FOLDER",
-        0,
-    );
-    y += s(state, 24);
-    let path = state.cfg.save_dir().display().to_string();
-    let path_r = RECT {
-        left: m,
-        top: y,
-        right: state.width - m - s(state, 150),
-        bottom: y + s(state, 30),
-    };
-    SelectObject(hdc, state.font);
-    SetTextColor(hdc, state.theme.text);
-    let mut t = wide(&path);
-    let mut rc = path_r;
-    DrawTextW(hdc, &mut t, &mut rc, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
-
-    // Video folder — recordings live apart from screenshots.
-    draw_text_in(
-        hdc,
-        state.font_small,
-        state.theme.muted,
-        RECT { left: m, top: s(state, 82), right: state.width - m, bottom: s(state, 102) },
-        "VIDEO FOLDER  (recordings)",
-        0,
-    );
-    let vpath = state.cfg.video_dir().display().to_string();
-    SelectObject(hdc, state.font);
-    SetTextColor(hdc, state.theme.text);
-    let mut vt = wide(&vpath);
-    let mut vrc = RECT {
-        left: m,
-        top: s(state, 106),
-        right: state.width - m - s(state, 150),
-        bottom: s(state, 136),
-    };
-    DrawTextW(hdc, &mut vt, &mut vrc, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
+    // Furniture first, from the same layout pass that placed the controls.
+    // These used to be drawn at their own hardcoded coordinates, which is what
+    // made inserting a row a two-list edit.
+    for (r, chrome) in &state.chrome {
+        match chrome {
+            Chrome::SaveFolderHeader => {
+                draw_text_in(hdc, state.font_small, state.theme.muted, *r, "SAVE FOLDER", 0)
+            }
+            Chrome::VideoFolderHeader => draw_text_in(
+                hdc,
+                state.font_small,
+                state.theme.muted,
+                *r,
+                "VIDEO FOLDER  (recordings)",
+                0,
+            ),
+            Chrome::RenderQualityHeader => draw_text_in(
+                hdc,
+                state.font_small,
+                state.theme.muted,
+                *r,
+                "RENDER QUALITY  (2x recommended for sharing)",
+                0,
+            ),
+            Chrome::ScreenshotSizeHeader => {
+                // Resolved here, not at layout time: refresh reloads the
+                // config and repaints without rebuilding the layout.
+                let summary = match state.cfg.output_max_edge {
+                    crate::output::OUTPUT_ORIGINAL => "Original pixels".to_string(),
+                    value => format!("{value} px maximum edge"),
+                };
+                draw_text_in(
+                    hdc,
+                    state.font_small,
+                    state.theme.muted,
+                    *r,
+                    &format!("SCREENSHOT SIZE  ({summary})"),
+                    0,
+                );
+            }
+            Chrome::AudioLabel => {
+                draw_text_in(hdc, state.font, state.theme.text, *r, "Recording audio", 0)
+            }
+            // The paths stop short of the buttons sharing their line.
+            Chrome::SavePath | Chrome::VideoPath => {
+                let text = if *chrome == Chrome::SavePath {
+                    state.cfg.save_dir().display().to_string()
+                } else {
+                    state.cfg.video_dir().display().to_string()
+                };
+                SelectObject(hdc, state.font);
+                SetTextColor(hdc, state.theme.text);
+                let mut wide_text = wide(&text);
+                let mut rc = RECT { right: r.right - s(state, 150), ..*r };
+                DrawTextW(
+                    hdc,
+                    &mut wide_text,
+                    &mut rc,
+                    DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER,
+                );
+            }
+        }
+    }
 
     for (r, c) in &state.controls {
         let hot = state
@@ -360,50 +516,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
     }
 
-    // Section label for supersampled matte rendering.
-    y = s(state, 152);
-    draw_text_in(
-        hdc,
-        state.font_small,
-        state.theme.muted,
-        RECT { left: m, top: y, right: state.width - m, bottom: y + s(state, 20) },
-        "RENDER QUALITY  (2x recommended for sharing)",
-        0,
-    );
-
-    // Finished screenshot size.
-    let size_summary = match state.cfg.output_max_edge {
-        crate::output::OUTPUT_ORIGINAL => "Original pixels".to_string(),
-        value => format!("{} px maximum edge", value),
-    };
-    draw_text_in(
-        hdc,
-        state.font_small,
-        state.theme.muted,
-        RECT {
-            left: m,
-            top: s(state, 216),
-            right: state.width - m,
-            bottom: s(state, 238),
-        },
-        &format!("SCREENSHOT SIZE  ({size_summary})"),
-        0,
-    );
-
-    // Recording audio label.
-    draw_text_in(
-        hdc,
-        state.font,
-        state.theme.text,
-        RECT {
-            left: m,
-            top: s(state, 414),
-            right: m + s(state, 145),
-            bottom: s(state, 442),
-        },
-        "Recording audio",
-        0,
-    );
+    let m = s(state, 24);
 
     // Footer
     let footer = RECT {
@@ -648,99 +761,80 @@ pub fn open() -> Result<()> {
 
         let scale = GetDpiForSystem() as f32 / 96.0;
         let sc = |v: i32| (v as f32 * scale) as i32;
-        let (cw, ch) = (sc(500), sc(580));
+        let cw = sc(500);
 
         let font = make_font(-sc(15));
         let font_small = make_font(-sc(12));
 
-        // Static layout.
-        let m = sc(24);
-        // Save folder row buttons (right-aligned).
-        let mut controls = vec![
-            (
-                RECT { left: cw - m - sc(140), top: sc(42), right: cw - m - sc(64), bottom: sc(72) },
-                Ctrl::ChangeDir,
-            ),
-            (
-                RECT { left: cw - m - sc(56), top: sc(42), right: cw - m, bottom: sc(72) },
-                Ctrl::OpenDir,
-            ),
-            (
-                RECT { left: cw - m - sc(140), top: sc(106), right: cw - m - sc(64), bottom: sc(136) },
-                Ctrl::ChangeVideoDir,
-            ),
-            (
-                RECT { left: cw - m - sc(56), top: sc(106), right: cw - m, bottom: sc(136) },
-                Ctrl::OpenVideoDir,
-            ),
-        ];
-        // Export scale segmented.
-        for (i, n) in [1u32, 2, 3].iter().enumerate() {
-            let x = m + i as i32 * sc(62);
-            controls.push((
-                RECT { left: x, top: sc(176), right: x + sc(54), bottom: sc(206) },
-                Ctrl::Scale(*n),
-            ));
-        }
+        // One pass, top to bottom. The gaps below are the spacing that used
+        // to be baked into ~37 literal coordinates in this function and 17
+        // more in the paint routine; they are derived from that geometry, so
+        // the window is pixel-identical to before the cursor existed.
+        let mut l = Layout::new(scale, cw);
+
+        l.gap(20);
+        l.header(Chrome::SaveFolderHeader, 20);
+        l.gap(2);
+        l.path_row(Chrome::SavePath, Ctrl::ChangeDir, Ctrl::OpenDir);
+
+        l.gap(10);
+        l.header(Chrome::VideoFolderHeader, 20);
+        l.gap(4);
+        l.path_row(Chrome::VideoPath, Ctrl::ChangeVideoDir, Ctrl::OpenVideoDir);
+
+        l.gap(16);
+        l.header(Chrome::RenderQualityHeader, 20);
+        l.gap(4);
+        l.chips(&[Ctrl::Scale(1), Ctrl::Scale(2), Ctrl::Scale(3)], 54, 62, 0, 30);
+
         // Finished screenshot size. These cap the completed matte and never
         // upscale a smaller image.
-        let size_controls = [
-            (Ctrl::OutputSize(crate::output::OUTPUT_ORIGINAL), 0),
-            (Ctrl::OutputSize(crate::output::OUTPUT_EMAIL), 1),
-            (Ctrl::OutputSize(crate::output::OUTPUT_COMPACT), 2),
-            (Ctrl::CustomSize, 3),
-        ];
-        for (ctrl, i) in size_controls {
-            let x = m + i * sc(110);
-            controls.push((
-                RECT { left: x, top: sc(240), right: x + sc(102), bottom: sc(270) },
-                ctrl,
-            ));
-        }
+        l.gap(10);
+        l.header(Chrome::ScreenshotSizeHeader, 22);
+        l.gap(2);
+        l.chips(
+            &[
+                Ctrl::OutputSize(crate::output::OUTPUT_ORIGINAL),
+                Ctrl::OutputSize(crate::output::OUTPUT_EMAIL),
+                Ctrl::OutputSize(crate::output::OUTPUT_COMPACT),
+                Ctrl::CustomSize,
+            ],
+            102,
+            110,
+            0,
+            30,
+        );
+
         // Checkboxes, grouped: app and editor behavior, then recording,
         // then updates, with privacy last.
-        controls.push((
-            RECT { left: m, top: sc(286), right: cw - m, bottom: sc(314) },
-            Ctrl::Autostart,
-        ));
-        controls.push((
-            RECT { left: m, top: sc(318), right: cw - m, bottom: sc(346) },
-            Ctrl::Prtscn,
-        ));
-        controls.push((
-            RECT { left: m, top: sc(350), right: cw - m, bottom: sc(378) },
-            Ctrl::KeepEditorOpen,
-        ));
-        controls.push((
-            RECT { left: m, top: sc(382), right: cw - m, bottom: sc(410) },
-            Ctrl::RecordGif,
-        ));
-        // Recording audio segmented control, next to the GIF toggle.
-        for (i, mode) in ["off", "system", "mic"].iter().enumerate() {
-            let x = m + sc(150) + i as i32 * sc(78);
-            controls.push((
-                RECT { left: x, top: sc(414), right: x + sc(70), bottom: sc(442) },
-                Ctrl::Audio(mode),
-            ));
-        }
-        controls.push((
-            RECT { left: m, top: sc(446), right: cw - m, bottom: sc(474) },
-            Ctrl::AutoUpdate,
-        ));
-        controls.push((
-            RECT { left: m, top: sc(478), right: cw - m, bottom: sc(506) },
-            Ctrl::Telemetry,
-        ));
+        l.gap(16);
+        l.checkbox(Ctrl::Autostart);
+        l.gap(4);
+        l.checkbox(Ctrl::Prtscn);
+        l.gap(4);
+        l.checkbox(Ctrl::KeepEditorOpen);
+        l.gap(4);
+        l.checkbox(Ctrl::RecordGif);
+
+        // Recording audio: the label shares its line with the chips.
+        l.gap(4);
+        let audio_top = l.y;
+        l.chips(&[Ctrl::Audio("off"), Ctrl::Audio("system"), Ctrl::Audio("mic")], 70, 78, 150, 28);
+        l.chrome_at(audio_top, 28, Chrome::AudioLabel);
+
+        l.gap(4);
+        l.checkbox(Ctrl::AutoUpdate);
+        l.gap(4);
+        l.checkbox(Ctrl::Telemetry);
+
         // Support and license actions, above the footer. Deactivate is hidden
         // for anyone without a license to give up.
-        controls.push((
-            RECT { left: m, top: sc(512), right: m + sc(190), bottom: sc(542) },
-            Ctrl::Diagnostics,
-        ));
-        controls.push((
-            RECT { left: m + sc(198), top: sc(512), right: m + sc(388), bottom: sc(542) },
-            Ctrl::Deactivate,
-        ));
+        l.gap(6);
+        l.button_pair(Ctrl::Diagnostics, Ctrl::Deactivate, 190, 198);
+
+        let ch = l.finish();
+        let controls = l.controls;
+        let chrome = l.chrome;
 
         let state = Box::new(State {
             cfg: Config::load(),
@@ -748,6 +842,7 @@ pub fn open() -> Result<()> {
             font,
             font_small,
             controls,
+            chrome,
             hover: -1,
             scale,
             width: cw,
