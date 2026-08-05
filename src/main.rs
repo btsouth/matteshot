@@ -5,6 +5,7 @@ mod capture;
 mod compose;
 mod config;
 mod diagnostics;
+mod hotkey;
 mod icon;
 mod installer;
 mod license;
@@ -44,20 +45,19 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IsWindow, MessageBoxW, PostMessageW, IDYES,
     MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, WM_CLOSE, WM_HOTKEY,
 };
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
 use crate::picker::PickAction;
 
 const HOTKEY_ID: i32 = 1;
 pub const HOTKEY_ID_PRTSCN: i32 = 2;
-const VK_S: u32 = 0x53;
 
 /// Max dimension of the downscaled capture used for picker previews.
 const PREVIEW_MAX: u32 = 480;
@@ -495,11 +495,38 @@ fn shoot_active_window(fg: HWND) -> Result<()> {
     )
 }
 
+/// Whether the configured capture shortcut is currently registered. Settings
+/// reads this to say so, since a shortcut another app already owns is
+/// otherwise indistinguishable from one that simply does nothing.
+static CAPTURE_HOTKEY_TAKEN: AtomicBool = AtomicBool::new(false);
+
+pub fn capture_hotkey_taken() -> bool {
+    CAPTURE_HOTKEY_TAKEN.load(Ordering::Relaxed)
+}
+
 fn enable_capture_hotkeys() -> Result<bool> {
-    unsafe {
-        RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_S)
-            .context("Ctrl+Alt+S is already taken by another app")?;
+    // Never fatal. This used to be `?`, so a shortcut another app already
+    // owned propagated out of run_app, and because the binary is a windows
+    // subsystem app with no console, main's eprintln went nowhere: Matteshot
+    // exited at launch with no tray icon and no message. It also aborted
+    // before PrtScn was acquired, so one collision cost every hotkey and left
+    // the user no way into Settings to change it.
+    let configured = Config::load().capture_hotkey();
+    let mut taken = false;
+    if let Some(hotkey) = configured {
+        let registered =
+            unsafe { RegisterHotKey(None, HOTKEY_ID, hotkey.modifiers, hotkey.vk) }.is_ok();
+        taken = !registered;
+        if !registered {
+            diagnostics::log("capture shortcut already owned by another app");
+            telemetry::report_failure(
+                "hotkey",
+                &anyhow::anyhow!("register capture shortcut: already in use"),
+            );
+        }
     }
+    CAPTURE_HOTKEY_TAKEN.store(taken, Ordering::Relaxed);
+
     if !prtscn::preferred() {
         return Ok(false);
     }
@@ -626,6 +653,22 @@ fn run_app() -> Result<()> {
     // autostart state, or the tray menu shows the box unchecked for someone
     // whose old Run value is still the thing starting Matteshot.
     tray::migrate_autostart_from_run_key();
+    // A shortcut another app owns used to be fatal and silent. It is survivable
+    // now, but survivable and unexplained is its own trap: the user presses the
+    // key, nothing happens, and nothing ever says why. PrtScn and the tray are
+    // unaffected, so this is the only place that can tell them.
+    if capture_hotkey_taken() {
+        // Canonical spelling, not whatever was typed, so "alt+ctrl+s" in the
+        // config file still reads as Ctrl+Alt+S here.
+        let configured = hotkey::label(Config::load().capture_hotkey());
+        tray.notify(
+            "Capture shortcut unavailable",
+            &format!(
+                "{configured} is already used by another app. \
+                 PrtScn still works. Pick a different shortcut in Settings."
+            ),
+        );
+    }
     diagnostics::log(if tray::autostart_enabled() {
         "autostart enabled at startup"
     } else {
