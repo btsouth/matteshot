@@ -57,8 +57,8 @@ for all ages.
 
 **What's new** (first submission): `First Microsoft Store release.`
 
-**Screenshots**: use `screenshots/01-hero.jpg` through `07-private-native.jpg`
-in this folder — 1366×818, above the Store's 1366×768 minimum, rendered from
+**Screenshots**: use `screenshots/01-hero.png` through `07-private-native.png`
+in this folder — 1366×818, above the Store's 1366×768 minimum, PNG, rendered from
 the Product Hunt gallery. Order them the same way the PH gallery does: hero,
 six looks, photo editor, select text, video editor, capture more, private and
 native.
