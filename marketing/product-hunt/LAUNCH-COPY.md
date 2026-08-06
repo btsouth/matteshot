@@ -6,9 +6,11 @@
 
 **Tagline:** Press PrtScn. Pick a look. Paste something polished.
 
-**Description:** Matteshot is a native Windows capture app that turns one PrtScn into six polished, ready-to-paste results. Select and copy OCR text straight from a screenshot, annotate and redact images, or trim and add time-ranged annotations to video. Everything stays local. No uploads. No subscription.
+**Description:** Press PrtScn and Matteshot instantly turns any window, region, scrolling page, or screen into six polished looks ready to paste. Select and copy only the text you need directly from a screenshot with offline OCR, annotate or redact images, and record, trim, and annotate video. Native to Windows. Everything stays local. Free 14-day trial, then one $19 purchase. No subscription.
 
-**Pricing:** Paid with a free 14-day trial. $12.99 during launch, then $19 once.
+**Pricing:** Paid with a free 14-day trial. $19 once.
+
+**Promo offer:** "$12.99 instead of $19" with code EARLYSUPPORTER.
 
 **Categories:** Screenshots and screen recording apps; Graphic design tools; Productivity.
 
@@ -16,17 +18,17 @@
 
 ## Maker comment draft
 
-Hey Product Hunt. I'm Tyler. I built Matteshot because the normal Windows screenshot workflow had too many steps: capture, open another app, add padding and a background, export, then finally paste it where I needed it.
+Hey Product Hunt! I built Matteshot because the usual Windows screenshot workflow had too many steps: capture, open another app, add padding and a background, export, then finally paste.
 
-Matteshot changes that loop. Press PrtScn, click a window or drag a region, and you immediately get six finished looks. Pick one and it's already on your clipboard. The deeper tools are there when you need them, but they never get between capture and paste.
+Matteshot changes that loop. Press PrtScn, click a window or drag a region, and you immediately get six finished looks. Pick one and it's already on your clipboard.
 
-Select Text turns the screenshot into something you can drag across like normal text, using Windows' offline OCR. Redacted words stay blocked from selection and copying. The video editor carries over the same nine annotation tools as the photo editor, with each annotation applied to the whole recording or a three-second moment on the timeline.
+When you need more control, you can annotate and redact screenshots, capture scrolling content, or record and trim video. Selective OCR lets you drag across a screenshot and copy only the text you need. All offline.
 
-I built it as a native Windows app because PrtScn should feel immediate and screenshots should stay on your computer.
+I built Matteshot as a native Windows app because PrtScn should feel immediate, and your screenshots should stay on your computer.
 
-Matteshot includes a 14-day trial with no card required. It's a one-time $19 purchase, discounted to $12.99 during launch.
+Matteshot includes a 14-day trial with no card required. After that it's a one-time $19 purchase, and your license works on up to three PCs. For launch, code EARLYSUPPORTER at checkout brings it to $12.99.
 
-The balance I care about most is fast defaults versus useful control. I'd love feedback on two things: does the picker eliminate enough editing for you, and what is the one editor control you still miss?
+The balance I care about most is fast defaults versus useful control. Two things I want feedback on: does the picker eliminate enough editing, and which editor control do you still miss?
 
 ## Launch post
 
@@ -44,8 +46,8 @@ If you use Windows, I'd love you to try it and tell me where the workflow still 
 
 - **Rust:** Native performance and a lightweight resident app.
 - **Microsoft Windows:** Capture, recording, OCR, clipboard and signing APIs.
-- **Lemon Squeezy:** Licensing and checkout.
-- **Cloudflare:** Installer and update distribution.
+- **Paddle:** Checkout, payments, and tax as merchant of record.
+- **Cloudflare:** Site, license service, email delivery, and update distribution.
 
 ## Asset order
 

@@ -1,6 +1,6 @@
 //! Trial and perpetual-license state.
 //!
-//! The app never embeds a Lemon Squeezy credential. Activation goes through
+//! The app never embeds a payment-provider credential. Activation goes through
 //! license.matteshot.app and stores a device-bound Ed25519 certificate. The
 //! certificate can be verified offline; network refreshes only propagate
 //! refunds, disabled keys, and device deactivations.
@@ -484,7 +484,7 @@ pub fn record_successful_capture() {
 pub fn activate(license_key: &str) -> Result<Status> {
     let license_key = license_key.trim();
     if license_key.is_empty() || license_key.len() > 200 {
-        bail!("Enter the license key from your Lemon Squeezy receipt.");
+        bail!("Enter the license key from your purchase email.");
     }
 
     let device = device_id();
