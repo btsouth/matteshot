@@ -18,7 +18,6 @@ use windows::Win32::Graphics::Gdi::{
     PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
@@ -3173,7 +3172,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         windows::Win32::UI::WindowsAndMessaging::WM_GETMINMAXINFO => {
             let mmi = lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::MINMAXINFO;
             if !mmi.is_null() {
-                let s = unsafe { GetDpiForSystem() } as f32 / 96.0;
+                let s = crate::dpi::scale_for_window(hwnd);
                 (*mmi).ptMinTrackSize.x = (760.0 * s) as i32;
                 (*mmi).ptMinTrackSize.y = (620.0 * s) as i32;
             }
@@ -3571,7 +3570,9 @@ pub fn open(
 }
 
 fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
-    let dpi_scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+    // The editor sizes itself to this monitor, so it is this monitor's scale
+    // that its chrome is measured in, not the primary one's.
+    let dpi_scale = crate::dpi::scale_for_monitor(monitor);
     let sc = |v: i32| (v as f32 * dpi_scale) as i32;
 
     // Size to the monitor: the editor earns its screen space.

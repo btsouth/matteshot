@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use anyhow::{Context, Result};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
@@ -15,7 +15,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Shell::{
     FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
 };
@@ -260,6 +259,110 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 
 fn s(state: &State, v: i32) -> i32 {
     (v as f32 * state.scale) as i32
+}
+
+/// A finished layout pass: where every control and every piece of painted
+/// furniture goes, and how tall the window ended up.
+struct LaidOut {
+    controls: Vec<(RECT, Ctrl)>,
+    chrome: Vec<(RECT, Chrome)>,
+    height: i32,
+}
+
+/// Lay the window out top to bottom for a given monitor scale.
+///
+/// Extracted from `open` so `WM_DPICHANGED` can re-run exactly the same pass
+/// rather than a second copy of it. Returns the controls, the chrome, and the
+/// client height the sequence ended up needing.
+fn build_layout(scale: f32, cw: i32, license: &crate::license::Status) -> LaidOut {
+    let mut l = Layout::new(scale, cw);
+
+    l.gap(20);
+    l.header(Chrome::SaveFolderHeader, 20);
+    l.gap(2);
+    l.path_row(Chrome::SavePath, Ctrl::ChangeDir, Ctrl::OpenDir);
+
+    l.gap(10);
+    l.header(Chrome::VideoFolderHeader, 20);
+    l.gap(4);
+    l.path_row(Chrome::VideoPath, Ctrl::ChangeVideoDir, Ctrl::OpenVideoDir);
+
+    l.gap(16);
+    l.header(Chrome::RenderQualityHeader, 20);
+    l.gap(4);
+    l.chips(&[Ctrl::Scale(1), Ctrl::Scale(2), Ctrl::Scale(3)], 54, 62, 0, 30);
+
+    // Finished screenshot size. These cap the completed matte and never
+    // upscale a smaller image.
+    l.gap(10);
+    l.header(Chrome::ScreenshotSizeHeader, 22);
+    l.gap(2);
+    l.chips(
+        &[
+            Ctrl::OutputSize(crate::output::OUTPUT_ORIGINAL),
+            Ctrl::OutputSize(crate::output::OUTPUT_EMAIL),
+            Ctrl::OutputSize(crate::output::OUTPUT_COMPACT),
+            Ctrl::CustomSize,
+        ],
+        102,
+        110,
+        0,
+        30,
+    );
+
+    // Checkboxes, grouped: app and editor behavior, then recording,
+    // then updates, with privacy last.
+    l.gap(16);
+    l.checkbox(Ctrl::Autostart);
+    l.gap(4);
+    l.checkbox(Ctrl::Prtscn);
+    // Sits with the PrtScn toggle: both decide how capture is reached.
+    l.gap(4);
+    let hotkey_top = l.y;
+    l.chips(&[Ctrl::CaptureHotkey], 190, 0, 150, 28);
+    l.chrome_at(hotkey_top, 28, 145, Chrome::HotkeyLabel);
+
+    // Delay sits under the shortcut: both are about arming a capture.
+    l.gap(4);
+    let delay_top = l.y;
+    let delays: Vec<Ctrl> = crate::delay::CHOICES
+        .iter()
+        .map(|seconds| Ctrl::CaptureDelay(*seconds))
+        .collect();
+    l.chips(&delays, 54, 62, 150, 28);
+    l.chrome_at(delay_top, 28, 145, Chrome::DelayLabel);
+
+    l.gap(4);
+    l.checkbox(Ctrl::KeepEditorOpen);
+    l.gap(4);
+    l.checkbox(Ctrl::RecordGif);
+
+    // Recording audio: the label shares its line with the chips.
+    l.gap(4);
+    let audio_top = l.y;
+    l.chips(&[Ctrl::Audio("off"), Ctrl::Audio("system"), Ctrl::Audio("mic")], 70, 78, 150, 28);
+    l.chrome_at(audio_top, 28, 145, Chrome::AudioLabel);
+
+    l.gap(4);
+    l.checkbox(Ctrl::AutoUpdate);
+    // Said where it is asked about, rather than left for a support email.
+    if license.updates_note().is_some() {
+        l.note(Chrome::UpdateTerm, 28, 18);
+    }
+    l.gap(4);
+    l.checkbox(Ctrl::Telemetry);
+
+    // Support and license actions, above the footer. Deactivate is hidden
+    // for anyone without a license to give up.
+    l.gap(6);
+    l.button_pair(Ctrl::Diagnostics, Ctrl::Deactivate, 190, 198);
+
+    let height = l.finish();
+    LaidOut {
+        controls: l.controls,
+        chrome: l.chrome,
+        height,
+    }
 }
 
 unsafe fn draw_text_in(hdc: HDC, font: HFONT, color: COLORREF, r: RECT, text: &str, flags: u32) {
@@ -739,6 +842,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        // The window's height falls out of the layout pass, so re-run that
+        // pass at the new scale rather than accepting the size Windows
+        // suggests, which is only the old one multiplied by the DPI ratio. Its
+        // suggested position is still taken: that is what keeps the window on
+        // the monitor it was dragged to.
+        windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED => {
+            if let Some(state) = state_of(hwnd) {
+                let scale = crate::dpi::scale_from_message(wparam);
+                let cw = (500.0 * scale) as i32;
+                let laid_out = build_layout(scale, cw, &state.license);
+                state.scale = scale;
+                state.controls = laid_out.controls;
+                state.chrome = laid_out.chrome;
+                state.width = cw;
+                state.height = laid_out.height;
+                let _ = DeleteObject(state.font);
+                let _ = DeleteObject(state.font_small);
+                state.font = make_font(-(15.0 * scale) as i32);
+                state.font_small = make_font(-(12.0 * scale) as i32);
+                // Hover is an index into the controls just replaced.
+                state.hover = -1;
+                let mut outer = RECT { left: 0, top: 0, right: cw, bottom: state.height };
+                let _ = windows::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
+                    &mut outer,
+                    WS_CAPTION | WS_SYSMENU,
+                    false,
+                    windows::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW,
+                );
+                crate::dpi::apply_suggested_origin(
+                    hwnd,
+                    lparam,
+                    outer.right - outer.left,
+                    outer.bottom - outer.top,
+                );
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            LRESULT(0)
+        }
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             if let Some(state) = state_of(hwnd) {
@@ -909,7 +1050,11 @@ pub fn open() -> Result<()> {
             return Ok(());
         }
 
-        let scale = GetDpiForSystem() as f32 / 96.0;
+        // Centres on the cursor's monitor below (the tray was just clicked
+        // there), so that monitor's scale is the one this is sized for.
+        let mut cursor = POINT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor);
+        let scale = crate::dpi::scale_for_point(cursor);
         let sc = |v: i32| (v as f32 * scale) as i32;
         let cw = sc(500);
 
@@ -924,91 +1069,8 @@ pub fn open() -> Result<()> {
         // to make room for, and the window then keeps the same answer.
         let license = crate::license::status();
 
-        let mut l = Layout::new(scale, cw);
-
-        l.gap(20);
-        l.header(Chrome::SaveFolderHeader, 20);
-        l.gap(2);
-        l.path_row(Chrome::SavePath, Ctrl::ChangeDir, Ctrl::OpenDir);
-
-        l.gap(10);
-        l.header(Chrome::VideoFolderHeader, 20);
-        l.gap(4);
-        l.path_row(Chrome::VideoPath, Ctrl::ChangeVideoDir, Ctrl::OpenVideoDir);
-
-        l.gap(16);
-        l.header(Chrome::RenderQualityHeader, 20);
-        l.gap(4);
-        l.chips(&[Ctrl::Scale(1), Ctrl::Scale(2), Ctrl::Scale(3)], 54, 62, 0, 30);
-
-        // Finished screenshot size. These cap the completed matte and never
-        // upscale a smaller image.
-        l.gap(10);
-        l.header(Chrome::ScreenshotSizeHeader, 22);
-        l.gap(2);
-        l.chips(
-            &[
-                Ctrl::OutputSize(crate::output::OUTPUT_ORIGINAL),
-                Ctrl::OutputSize(crate::output::OUTPUT_EMAIL),
-                Ctrl::OutputSize(crate::output::OUTPUT_COMPACT),
-                Ctrl::CustomSize,
-            ],
-            102,
-            110,
-            0,
-            30,
-        );
-
-        // Checkboxes, grouped: app and editor behavior, then recording,
-        // then updates, with privacy last.
-        l.gap(16);
-        l.checkbox(Ctrl::Autostart);
-        l.gap(4);
-        l.checkbox(Ctrl::Prtscn);
-        // Sits with the PrtScn toggle: both decide how capture is reached.
-        l.gap(4);
-        let hotkey_top = l.y;
-        l.chips(&[Ctrl::CaptureHotkey], 190, 0, 150, 28);
-        l.chrome_at(hotkey_top, 28, 145, Chrome::HotkeyLabel);
-
-        // Delay sits under the shortcut: both are about arming a capture.
-        l.gap(4);
-        let delay_top = l.y;
-        let delays: Vec<Ctrl> = crate::delay::CHOICES
-            .iter()
-            .map(|seconds| Ctrl::CaptureDelay(*seconds))
-            .collect();
-        l.chips(&delays, 54, 62, 150, 28);
-        l.chrome_at(delay_top, 28, 145, Chrome::DelayLabel);
-
-        l.gap(4);
-        l.checkbox(Ctrl::KeepEditorOpen);
-        l.gap(4);
-        l.checkbox(Ctrl::RecordGif);
-
-        // Recording audio: the label shares its line with the chips.
-        l.gap(4);
-        let audio_top = l.y;
-        l.chips(&[Ctrl::Audio("off"), Ctrl::Audio("system"), Ctrl::Audio("mic")], 70, 78, 150, 28);
-        l.chrome_at(audio_top, 28, 145, Chrome::AudioLabel);
-
-        l.gap(4);
-        l.checkbox(Ctrl::AutoUpdate);
-        // Said where it is asked about, rather than left for a support email.
-        if license.updates_note().is_some() {
-            l.note(Chrome::UpdateTerm, 28, 18);
-        }
-        l.gap(4);
-        l.checkbox(Ctrl::Telemetry);
-
-        // Support and license actions, above the footer. Deactivate is hidden
-        // for anyone without a license to give up.
-        l.gap(6);
-        l.button_pair(Ctrl::Diagnostics, Ctrl::Deactivate, 190, 198);
-
-        let ch = l.finish();
-        let controls = l.controls;
-        let chrome = l.chrome;
+        let laid_out = build_layout(scale, cw, &license);
+        let (controls, chrome, ch) = (laid_out.controls, laid_out.chrome, laid_out.height);
 
         let state = Box::new(State {
             cfg: Config::load(),
@@ -1127,3 +1189,61 @@ pub fn is_open() -> bool {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{build_layout, Ctrl};
+
+    /// The window is laid out for the monitor it is on, and `WM_DPICHANGED`
+    /// re-runs this same pass. Both only work if the pass is a pure function of
+    /// scale: same controls, in the same order, at proportional positions. A
+    /// literal that forgot to be scaled would hold still here while everything
+    /// around it moved.
+    #[test]
+    fn the_layout_scales_whole_rather_than_in_parts() {
+        let license = crate::license::Status::TrialNotStarted;
+        let base = build_layout(1.0, 500, &license);
+
+        for scale in [1.25f32, 1.5, 2.0] {
+            let width = (500.0 * scale) as i32;
+            let scaled = build_layout(scale, width, &license);
+
+            // Same rows, in the same order: scale must not change what the
+            // window contains, only how big it is.
+            assert_eq!(scaled.controls.len(), base.controls.len(), "control count at {scale}x");
+            assert_eq!(scaled.chrome.len(), base.chrome.len(), "chrome count at {scale}x");
+            assert!(
+                scaled
+                    .controls
+                    .iter()
+                    .zip(&base.controls)
+                    .all(|((_, a), (_, b))| matches_kind(a, b)),
+                "control order changed at {scale}x"
+            );
+
+            // Proportional within rounding: `sc` truncates, and the errors
+            // accumulate down a column of stacked rows, so this is a couple of
+            // pixels per row rather than exact.
+            let slack = 4.0 * scale;
+            assert!(
+                ((scaled.height as f32) - base.height as f32 * scale).abs() <= slack * 4.0,
+                "height {} at {scale}x is not {} scaled",
+                scaled.height,
+                base.height
+            );
+            for ((rect, _), (base_rect, _)) in scaled.controls.iter().zip(&base.controls) {
+                let expected_top = base_rect.top as f32 * scale;
+                assert!(
+                    (rect.top as f32 - expected_top).abs() <= slack * 4.0,
+                    "a control sits at {} at {scale}x, expected about {expected_top}",
+                    rect.top
+                );
+                assert!(rect.right > rect.left && rect.bottom > rect.top);
+            }
+        }
+    }
+
+    fn matches_kind(a: &Ctrl, b: &Ctrl) -> bool {
+        std::mem::discriminant(a) == std::mem::discriminant(b)
+    }
+}

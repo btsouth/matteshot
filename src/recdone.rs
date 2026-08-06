@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
     VK_SPACE,
@@ -3546,9 +3546,11 @@ pub fn show(
     if let Some(parent) = mp4.parent() {
         crate::output::cleanup_stale_video_partials(parent);
     }
-    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
-    let sc = |v: i32| (v as f32 * scale) as i32;
     let mut cursor = POINT::default();
+    unsafe { let _ = GetCursorPos(&mut cursor); }
+    // Opens on the cursor's monitor, so that is the scale its chrome uses.
+    let scale = crate::dpi::scale_for_point(cursor);
+    let sc = |v: i32| (v as f32 * scale) as i32;
     let mut monitor_info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
