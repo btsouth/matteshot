@@ -1203,7 +1203,7 @@ pub fn is_open() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_layout, Ctrl};
+    use super::build_layout;
 
     /// The window is laid out for the monitor it is on, and `WM_DPICHANGED`
     /// re-runs this same pass. Both only work if the pass is a pure function of
@@ -1228,7 +1228,7 @@ mod tests {
                     .controls
                     .iter()
                     .zip(&base.controls)
-                    .all(|((_, a), (_, b))| matches_kind(a, b)),
+                    .all(|((_, a), (_, b))| a == b),
                 "control order changed at {scale}x"
             );
 
@@ -1252,9 +1252,5 @@ mod tests {
                 assert!(rect.right > rect.left && rect.bottom > rect.top);
             }
         }
-    }
-
-    fn matches_kind(a: &Ctrl, b: &Ctrl) -> bool {
-        std::mem::discriminant(a) == std::mem::discriminant(b)
     }
 }
