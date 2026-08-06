@@ -24,7 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
     GetCursorPos, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE,
@@ -3386,17 +3386,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // still deliver a tiny client. Repair it immediately
                         // instead of painting an inverted preview and a clipped
                         // filmstrip.
-                        let mut outer = RECT {
-                            left: 0,
-                            top: 0,
-                            right: w.max(minimum_w),
-                            bottom: h.max(minimum_h),
-                        };
-                        let _ = AdjustWindowRectEx(
-                            &mut outer,
+                        let outer = crate::dpi::outer_bounds(
+                            RECT {
+                                left: 0,
+                                top: 0,
+                                right: w.max(minimum_w),
+                                bottom: h.max(minimum_h),
+                            },
                             editor_style(),
-                            false,
                             WS_EX_APPWINDOW,
+                            crate::dpi::scale_for_window(hwnd),
                         );
                         let _ = SetWindowPos(
                             hwnd,
@@ -3438,17 +3437,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !mmi.is_null() {
                 let s = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
                 let (minimum_w, minimum_h) = minimum_client_size(s);
-                let mut outer = RECT {
-                    left: 0,
-                    top: 0,
-                    right: minimum_w,
-                    bottom: minimum_h,
-                };
-                let _ = AdjustWindowRectEx(
-                    &mut outer,
+                let outer = crate::dpi::outer_bounds(
+                    RECT { left: 0, top: 0, right: minimum_w, bottom: minimum_h },
                     editor_style(),
-                    false,
                     WS_EX_APPWINDOW,
+                    s,
                 );
                 (*mmi).ptMinTrackSize.x = outer.right - outer.left;
                 (*mmi).ptMinTrackSize.y = outer.bottom - outer.top;
@@ -3709,13 +3702,13 @@ pub fn show(
         RegisterClassW(&class);
 
         let style = editor_style();
-        let mut outer = RECT {
+        let outer = RECT {
             left: 0,
             top: 0,
             right: cw,
             bottom: ch,
         };
-        let _ = AdjustWindowRectEx(&mut outer, style, false, WS_EX_APPWINDOW);
+        let outer = crate::dpi::outer_bounds(outer, style, WS_EX_APPWINDOW, scale);
         match CreateWindowExW(
             WS_EX_APPWINDOW,
             w!("matteshot_recdone"),

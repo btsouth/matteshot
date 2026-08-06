@@ -857,18 +857,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.chrome = laid_out.chrome;
                 state.width = cw;
                 state.height = laid_out.height;
-                let _ = DeleteObject(state.font);
-                let _ = DeleteObject(state.font_small);
-                state.font = make_font(-(15.0 * scale) as i32);
-                state.font_small = make_font(-(12.0 * scale) as i32);
+                // Create first, then swap: deleting up front leaves the
+                // window with no font at all if a creation fails.
+                for (slot, height) in [
+                    (&mut state.font as *mut HFONT, -(15.0 * scale) as i32),
+                    (&mut state.font_small as *mut HFONT, -(12.0 * scale) as i32),
+                ] {
+                    let replacement = make_font(height);
+                    if replacement.is_invalid() {
+                        continue;
+                    }
+                    let previous = std::mem::replace(&mut *slot, replacement);
+                    if !previous.is_invalid() {
+                        let _ = DeleteObject(previous);
+                    }
+                }
                 // Hover is an index into the controls just replaced.
                 state.hover = -1;
-                let mut outer = RECT { left: 0, top: 0, right: cw, bottom: state.height };
-                let _ = windows::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
-                    &mut outer,
+                let outer = crate::dpi::outer_bounds(
+                    RECT { left: 0, top: 0, right: cw, bottom: state.height },
                     WS_CAPTION | WS_SYSMENU,
-                    false,
                     windows::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW,
+                    scale,
                 );
                 crate::dpi::apply_suggested_origin(
                     hwnd,
@@ -1101,21 +1111,22 @@ pub fn open() -> Result<()> {
         RegisterClassW(&class);
 
         let leaked = Box::into_raw(state);
-        let mut outer = RECT { left: 0, top: 0, right: cw, bottom: ch };
-        let _ = windows::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
-            &mut outer,
+        let outer = RECT { left: 0, top: 0, right: cw, bottom: ch };
+        let outer = crate::dpi::outer_bounds(
+            outer,
             WS_CAPTION | WS_SYSMENU,
-            false,
             windows::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW,
+            scale,
         );
         // Center on the monitor the cursor is on (the user just clicked the
         // tray there); a fixed 120,120 lands behind whatever is maximized.
+        // The same reading that chose the scale: sampling the pointer twice
+        // lets it cross monitors in between, pairing one monitor's scale with
+        // another's work area.
         let (ww, wh) = (outer.right - outer.left, outer.bottom - outer.top);
-        let mut pt = windows::Win32::Foundation::POINT::default();
-        let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
         let mon = windows::Win32::Graphics::Gdi::MonitorFromPoint(
-            pt,
-            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY,
+            cursor,
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
         );
         let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
             cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,

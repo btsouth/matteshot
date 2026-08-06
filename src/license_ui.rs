@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsWindow,
     LoadCursorW, MoveWindow, PostMessageW, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
@@ -98,14 +98,21 @@ impl UiState {
             right: width - sc(24),
             bottom: button_top + sc(36),
         };
-        for font in [self.font_title, self.font, self.font_small] {
-            if !font.is_invalid() {
-                let _ = DeleteObject(font);
+        // Create first, then swap — see welcome::State::apply_scale.
+        for (slot, height, weight) in [
+            (&mut self.font_title as *mut HFONT, -sc(25), 600),
+            (&mut self.font as *mut HFONT, -sc(14), 400),
+            (&mut self.font_small as *mut HFONT, -sc(12), 400),
+        ] {
+            let replacement = make_font(height, weight);
+            if replacement.is_invalid() {
+                continue;
+            }
+            let previous = std::mem::replace(&mut *slot, replacement);
+            if !previous.is_invalid() {
+                let _ = DeleteObject(previous);
             }
         }
-        self.font_title = make_font(-sc(25), 600);
-        self.font = make_font(-sc(14), 400);
-        self.font_small = make_font(-sc(12), 400);
         // The edit is a real child window, so it has to be moved rather than
         // just re-measured, and told about the new font.
         if !self.edit.is_invalid() {
@@ -638,23 +645,22 @@ pub fn open() -> Result<bool> {
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_APPWINDOW;
-        let mut bounds = RECT {
-            left: 0,
-            top: 0,
-            right: client_width,
-            bottom: client_height,
-        };
-        AdjustWindowRectEx(&mut bounds, style, false, ex_style)
-            .context("size activation window")?;
+        let bounds = crate::dpi::outer_bounds(
+            RECT { left: 0, top: 0, right: client_width, bottom: client_height },
+            style,
+            ex_style,
+            scale,
+        );
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
 
-        let mut cursor = POINT::default();
+        // The same cursor reading that chose the scale above. Sampling it
+        // twice lets a moving pointer hand this window one monitor's scale and
+        // another monitor's work area.
         let mut monitor_info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let _ = GetCursorPos(&mut cursor);
         let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);
         let x = monitor_info.rcWork.left

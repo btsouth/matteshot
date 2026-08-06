@@ -3650,12 +3650,11 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
             | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME
             | windows::Win32::UI::WindowsAndMessaging::WS_MAXIMIZEBOX
             | windows::Win32::UI::WindowsAndMessaging::WS_MINIMIZEBOX;
-        let mut outer = RECT { left: 0, top: 0, right: cw, bottom: ch };
-        let _ = windows::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
-            &mut outer,
+        let outer = crate::dpi::outer_bounds(
+            RECT { left: 0, top: 0, right: cw, bottom: ch },
             style,
-            false,
             windows::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW,
+            dpi_scale,
         );
         // An editing session must be findable: taskbar button + Alt+Tab.
         let hwnd = CreateWindowExW(

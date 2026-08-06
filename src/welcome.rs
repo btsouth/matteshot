@@ -21,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
     GetWindowLongPtrW, IsWindow, LoadCursorW, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, CREATESTRUCTW, CS_HREDRAW,
     CS_VREDRAW, GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, SWP_NOMOVE, SWP_NOSIZE,
@@ -129,22 +129,25 @@ impl State {
             right: sc(606),
             bottom: sc(392),
         };
-        for font in [
-            self.font_brand,
-            self.font_title,
-            self.font_body,
-            self.font_step,
-            self.font_small,
+        // Create first, then swap: deleting the old handles up front leaves
+        // the window with no font at all if a creation fails, and a window
+        // that cannot draw text is worse than one drawn at the old size.
+        for (slot, height, weight) in [
+            (&mut self.font_brand as *mut HFONT, -sc(11), 600),
+            (&mut self.font_title as *mut HFONT, -sc(29), 650),
+            (&mut self.font_body as *mut HFONT, -sc(14), 400),
+            (&mut self.font_step as *mut HFONT, -sc(15), 600),
+            (&mut self.font_small as *mut HFONT, -sc(12), 400),
         ] {
-            if !font.is_invalid() {
-                let _ = DeleteObject(font);
+            let replacement = make_font(height, weight);
+            if replacement.is_invalid() {
+                continue;
+            }
+            let previous = std::mem::replace(&mut *slot, replacement);
+            if !previous.is_invalid() {
+                let _ = DeleteObject(previous);
             }
         }
-        self.font_brand = make_font(-sc(11), 600);
-        self.font_title = make_font(-sc(29), 650);
-        self.font_body = make_font(-sc(14), 400);
-        self.font_step = make_font(-sc(15), 600);
-        self.font_small = make_font(-sc(12), 400);
     }
 }
 
@@ -752,13 +755,12 @@ fn open(mark_seen: bool) -> Result<()> {
 
         let style: WINDOW_STYLE = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_APPWINDOW;
-        let mut bounds = RECT {
-            left: 0,
-            top: 0,
-            right: client_width,
-            bottom: client_height,
-        };
-        AdjustWindowRectEx(&mut bounds, style, false, ex_style).context("size welcome window")?;
+        let bounds = crate::dpi::outer_bounds(
+            RECT { left: 0, top: 0, right: client_width, bottom: client_height },
+            style,
+            ex_style,
+            scale,
+        );
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
 

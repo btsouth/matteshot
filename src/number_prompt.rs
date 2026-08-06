@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
     GetCursorPos, GetWindowTextW, IsWindow, LoadCursorW, MoveWindow, RegisterClassW,
     SendMessageW,
@@ -115,10 +115,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state(hwnd) {
                 state.scale = crate::dpi::scale_from_message(wparam);
                 crate::dpi::apply_suggested_bounds(hwnd, lparam);
-                let _ = DeleteObject(state.font);
-                let _ = DeleteObject(state.font_small);
-                state.font = font(-sc(state, 16), 600);
-                state.font_small = font(-sc(state, 13), 400);
+                // Create first, then swap: deleting up front leaves the
+                // window with no font at all if a creation fails.
+                for (slot, height, weight) in [
+                    (&mut state.font as *mut HFONT, -sc(state, 16), 600),
+                    (&mut state.font_small as *mut HFONT, -sc(state, 13), 400),
+                ] {
+                    let replacement = font(height, weight);
+                    if replacement.is_invalid() {
+                        continue;
+                    }
+                    let previous = std::mem::replace(&mut *slot, replacement);
+                    if !previous.is_invalid() {
+                        let _ = DeleteObject(previous);
+                    }
+                }
                 let _ = MoveWindow(
                     state.edit,
                     sc(state, 22),
@@ -242,9 +253,9 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
 
         // This prompt centres on its owner, so it opens on the owner's
         // monitor and must be scaled for that one rather than for the primary.
+        let mut cursor = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut cursor);
         let scale = if owner.0.is_null() {
-            let mut cursor = windows::Win32::Foundation::POINT::default();
-            let _ = GetCursorPos(&mut cursor);
             crate::dpi::scale_for_point(cursor)
         } else {
             crate::dpi::scale_for_window(owner)
@@ -264,9 +275,30 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
 
         let style = WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_DLGMODALFRAME;
-        let mut bounds = RECT { left: 0, top: 0, right: px(360), bottom: px(196) };
-        AdjustWindowRectEx(&mut bounds, style, false, ex_style).context("size output prompt")?;
-        let (mut x, mut y) = (100, 100);
+        let bounds = crate::dpi::outer_bounds(
+            RECT { left: 0, top: 0, right: px(360), bottom: px(196) },
+            style,
+            ex_style,
+            scale,
+        );
+        // Unowned, this is sized for the cursor's monitor, so it belongs on
+        // that monitor rather than at a fixed corner of the primary one.
+        let (mut x, mut y) = {
+            let monitor = windows::Win32::Graphics::Gdi::MonitorFromPoint(
+                cursor,
+                windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+            );
+            let mut info = windows::Win32::Graphics::Gdi::MONITORINFO {
+                cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info);
+            let work = info.rcWork;
+            (
+                work.left + (work.right - work.left - (bounds.right - bounds.left)) / 2,
+                work.top + (work.bottom - work.top - (bounds.bottom - bounds.top)) / 2,
+            )
+        };
         let mut owner_rect = RECT::default();
         if !owner.0.is_null() && GetWindowRect(owner, &mut owner_rect).is_ok() {
             x = owner_rect.left + ((owner_rect.right - owner_rect.left) - (bounds.right - bounds.left)) / 2;

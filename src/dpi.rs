@@ -13,11 +13,12 @@
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTOPRIMARY,
 };
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+    AdjustWindowRectEx, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
 /// 96 DPI is 1.0. Everything in the UI is expressed as a multiple of it.
@@ -53,8 +54,11 @@ pub fn scale_for_point(point: POINT) -> f32 {
 }
 
 /// Scale of the monitor a window is currently on.
+/// Nearest rather than primary: a window that is off-screen, or not shown
+/// yet, is still going to appear somewhere, and the monitor closest to it is a
+/// far better guess than whichever one happens to be primary.
 pub fn scale_for_window(hwnd: HWND) -> f32 {
-    scale_for_monitor(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) })
+    scale_for_monitor(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
 }
 
 /// The scale `WM_DPICHANGED` is announcing.
@@ -89,6 +93,34 @@ pub unsafe fn apply_suggested_bounds(hwnd: HWND, lparam: LPARAM) {
         bounds.bottom - bounds.top,
         SWP_NOZORDER | SWP_NOACTIVATE,
     );
+}
+
+/// Outer window size for a wanted client size, measured at a given scale.
+///
+/// `AdjustWindowRectEx` takes its border and caption metrics from the *system*
+/// DPI, so under PMv2 it is wrong on any monitor that is not the primary one:
+/// the client area comes out short by the difference in non-client thickness,
+/// which is the same bug this module exists to remove. The `ForDpi` form is
+/// told which DPI to measure at.
+///
+/// Takes the scale the window is already working in, so a caller cannot supply
+/// a DPI that disagrees with the layout it just built.
+pub fn outer_bounds(
+    client: RECT,
+    style: WINDOW_STYLE,
+    ex_style: WINDOW_EX_STYLE,
+    scale: f32,
+) -> RECT {
+    let mut bounds = client;
+    let dpi = (scale * BASE_DPI).round() as u32;
+    unsafe {
+        if AdjustWindowRectExForDpi(&mut bounds, style, false, ex_style, dpi).is_err() {
+            // Falling back to the un-scaled form is still better than giving
+            // up on a size: the window is a little off rather than absent.
+            let _ = AdjustWindowRectEx(&mut bounds, style, false, ex_style);
+        }
+    }
+    bounds
 }
 
 /// Move to the position `WM_DPICHANGED` suggests, at a size the window works
