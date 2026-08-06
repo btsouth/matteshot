@@ -99,7 +99,7 @@ impl UiState {
             status: if matches!(crate::license::status(), crate::license::Status::Expired) {
                 "Your 14-day trial has ended. Enter your license key to keep capturing.".into()
             } else {
-                "Enter the license key from your Lemon Squeezy receipt.".into()
+                "Enter the license key from your purchase email.".into()
             },
             hover: 0,
             scale,
@@ -372,7 +372,7 @@ unsafe fn begin_activation(hwnd: HWND, state: &mut UiState) {
     let copied = GetWindowTextW(state.edit, &mut buffer);
     let key = String::from_utf16_lossy(&buffer[..copied.max(0) as usize]);
     if key.trim().is_empty() {
-        state.status = "Enter the license key from your Lemon Squeezy receipt.".into();
+        state.status = "Enter the license key from your purchase email.".into();
         let _ = InvalidateRect(hwnd, None, false);
         return;
     }
