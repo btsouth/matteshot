@@ -6,6 +6,7 @@ mod compose;
 mod config;
 mod delay;
 mod diagnostics;
+mod dpi;
 mod hotkey;
 mod icon;
 mod installer;

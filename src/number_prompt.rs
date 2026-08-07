@@ -10,12 +10,12 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, IsWindow, LoadCursorW, RegisterClassW, SendMessageW,
+    GetCursorPos, GetWindowTextW, IsWindow, LoadCursorW, MoveWindow, RegisterClassW,
+    SendMessageW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, ES_NUMBER, GWLP_USERDATA,
     HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW,
@@ -106,6 +106,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let create = &*(lparam.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // Moved to a monitor at a different scale. Everything here is derived
+        // from `state.scale` at paint time, so the whole relayout is the new
+        // scale, fonts rebuilt at the new size, and the edit box moved to
+        // match. Windows' suggested bounds are used as given.
+        windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED => {
+            if let Some(state) = state(hwnd) {
+                state.scale = crate::dpi::scale_from_message(wparam);
+                crate::dpi::apply_suggested_bounds(hwnd, lparam);
+                // Create first, then swap: deleting up front leaves the
+                // window with no font at all if a creation fails.
+                for (slot, height, weight) in [
+                    (&mut state.font as *mut HFONT, -sc(state, 16), 600),
+                    (&mut state.font_small as *mut HFONT, -sc(state, 13), 400),
+                ] {
+                    let replacement = font(height, weight);
+                    if replacement.is_invalid() {
+                        continue;
+                    }
+                    let previous = std::mem::replace(&mut *slot, replacement);
+                    if !previous.is_invalid() {
+                        let _ = DeleteObject(previous);
+                    }
+                }
+                let _ = MoveWindow(
+                    state.edit,
+                    sc(state, 22),
+                    sc(state, 72),
+                    sc(state, 316),
+                    sc(state, 34),
+                    true,
+                );
+                SendMessageW(
+                    state.edit,
+                    windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
+                    WPARAM(state.font.0 as usize),
+                    LPARAM(1),
+                );
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_CTLCOLOREDIT => {
@@ -210,7 +251,15 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
         };
         let _ = RegisterClassW(&class);
 
-        let scale = GetDpiForSystem() as f32 / 96.0;
+        // This prompt centres on its owner, so it opens on the owner's
+        // monitor and must be scaled for that one rather than for the primary.
+        let mut cursor = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let scale = if owner.0.is_null() {
+            crate::dpi::scale_for_point(cursor)
+        } else {
+            crate::dpi::scale_for_window(owner)
+        };
         let px = |value: i32| (value as f32 * scale) as i32;
         let theme = crate::theme::current();
         let mut state = Box::new(State {
@@ -226,9 +275,30 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
 
         let style = WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_DLGMODALFRAME;
-        let mut bounds = RECT { left: 0, top: 0, right: px(360), bottom: px(196) };
-        AdjustWindowRectEx(&mut bounds, style, false, ex_style).context("size output prompt")?;
-        let (mut x, mut y) = (100, 100);
+        let bounds = crate::dpi::outer_bounds(
+            RECT { left: 0, top: 0, right: px(360), bottom: px(196) },
+            style,
+            ex_style,
+            scale,
+        );
+        // Unowned, this is sized for the cursor's monitor, so it belongs on
+        // that monitor rather than at a fixed corner of the primary one.
+        let (mut x, mut y) = {
+            let monitor = windows::Win32::Graphics::Gdi::MonitorFromPoint(
+                cursor,
+                windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+            );
+            let mut info = windows::Win32::Graphics::Gdi::MONITORINFO {
+                cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info);
+            let work = info.rcWork;
+            (
+                work.left + (work.right - work.left - (bounds.right - bounds.left)) / 2,
+                work.top + (work.bottom - work.top - (bounds.bottom - bounds.top)) / 2,
+            )
+        };
         let mut owner_rect = RECT::default();
         if !owner.0.is_null() && GetWindowRect(owner, &mut owner_rect).is_ok() {
             x = owner_rect.left + ((owner_rect.right - owner_rect.left) - (bounds.right - bounds.left)) / 2;

@@ -16,12 +16,12 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
     GetWindowLongPtrW, IsWindow, LoadCursorW, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, CREATESTRUCTW, CS_HREDRAW,
     CS_VREDRAW, GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, SWP_NOMOVE, SWP_NOSIZE,
@@ -74,43 +74,79 @@ struct State {
 
 impl State {
     unsafe fn new(scale: f32, width: i32, height: i32) -> Self {
-        let sc = |value: i32| (value as f32 * scale) as i32;
-        Self {
+        let mut state = Self {
             theme: crate::theme::current(),
             scale,
             width,
             height,
             hover: 0,
             tracking_mouse: false,
-            primary: RECT {
-                left: sc(318),
-                top: sc(412),
-                right: sc(606),
-                bottom: sc(456),
-            },
-            settings: RECT {
-                left: sc(206),
-                top: sc(412),
-                right: sc(306),
-                bottom: sc(456),
-            },
-            // Above the buttons, so the choice is read before either is
-            // pressed rather than discovered afterwards.
-            consent: RECT {
-                left: sc(34),
-                top: sc(360),
-                right: sc(606),
-                bottom: sc(392),
-            },
+            primary: RECT::default(),
+            settings: RECT::default(),
+            consent: RECT::default(),
             // Ticked where opt-out is lawful, empty where consent must be
             // asked for. See crate::telemetry::consent_default_checked.
             consent_checked: crate::telemetry::consent_default_checked(),
             consent_needed: crate::config::Config::load().telemetry_unanswered(),
-            font_brand: make_font(-sc(11), 600),
-            font_title: make_font(-sc(29), 650),
-            font_body: make_font(-sc(14), 400),
-            font_step: make_font(-sc(15), 600),
-            font_small: make_font(-sc(12), 400),
+            font_brand: HFONT::default(),
+            font_title: HFONT::default(),
+            font_body: HFONT::default(),
+            font_step: HFONT::default(),
+            font_small: HFONT::default(),
+        };
+        state.apply_scale(scale, width, height);
+        state
+    }
+
+    /// Rebuild everything measured in pixels for a new monitor scale.
+    ///
+    /// Every geometry and font here is a multiple of the scale, so a DPI
+    /// change is this and a repaint. Kept as one method rather than inlined
+    /// into `new` so the two paths cannot drift: a rect added for creation but
+    /// forgotten here would stay at the old monitor's size forever.
+    unsafe fn apply_scale(&mut self, scale: f32, width: i32, height: i32) {
+        let sc = |value: i32| (value as f32 * scale) as i32;
+        self.scale = scale;
+        self.width = width;
+        self.height = height;
+        self.primary = RECT {
+            left: sc(318),
+            top: sc(412),
+            right: sc(606),
+            bottom: sc(456),
+        };
+        self.settings = RECT {
+            left: sc(206),
+            top: sc(412),
+            right: sc(306),
+            bottom: sc(456),
+        };
+        // Above the buttons, so the choice is read before either is pressed
+        // rather than discovered afterwards.
+        self.consent = RECT {
+            left: sc(34),
+            top: sc(360),
+            right: sc(606),
+            bottom: sc(392),
+        };
+        // Create first, then swap: deleting the old handles up front leaves
+        // the window with no font at all if a creation fails, and a window
+        // that cannot draw text is worse than one drawn at the old size.
+        for (slot, height, weight) in [
+            (&mut self.font_brand as *mut HFONT, -sc(11), 600),
+            (&mut self.font_title as *mut HFONT, -sc(29), 650),
+            (&mut self.font_body as *mut HFONT, -sc(14), 400),
+            (&mut self.font_step as *mut HFONT, -sc(15), 600),
+            (&mut self.font_small as *mut HFONT, -sc(12), 400),
+        ] {
+            let replacement = make_font(height, weight);
+            if replacement.is_invalid() {
+                continue;
+            }
+            let previous = std::mem::replace(&mut *slot, replacement);
+            if !previous.is_invalid() {
+                let _ = DeleteObject(previous);
+            }
         }
     }
 }
@@ -581,6 +617,19 @@ unsafe extern "system" fn wndproc(
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        // Dragged to a monitor at a different scale. The window is fixed-size,
+        // so this is the new scale, a rebuild of everything measured from it,
+        // and the bounds Windows suggests.
+        windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED => {
+            if let Some(state) = state(hwnd) {
+                let scale = crate::dpi::scale_from_message(wparam);
+                let sc = |value: i32| (value as f32 * scale) as i32;
+                state.apply_scale(scale, sc(640), sc(476));
+                crate::dpi::apply_suggested_bounds(hwnd, lparam);
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            LRESULT(0)
+        }
         WM_ERASEBKGND => LRESULT(1),
         WM_MOUSEMOVE => {
             if let Some(state) = state(hwnd) {
@@ -683,7 +732,11 @@ fn open(mark_seen: bool) -> Result<()> {
 
         ACTION.store(0, Ordering::SeqCst);
         let instance = GetModuleHandleW(None).context("get app module for welcome")?;
-        let scale = GetDpiForSystem() as f32 / 96.0;
+        // This opens centred on the cursor's monitor, so it is that monitor's
+        // scale that decides its size, not the primary one's.
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let scale = crate::dpi::scale_for_point(cursor);
         let sc = |value: i32| (value as f32 * scale) as i32;
         let (client_width, client_height) = (sc(640), sc(476));
         let state = Box::new(State::new(scale, client_width, client_height));
@@ -702,22 +755,19 @@ fn open(mark_seen: bool) -> Result<()> {
 
         let style: WINDOW_STYLE = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_APPWINDOW;
-        let mut bounds = RECT {
-            left: 0,
-            top: 0,
-            right: client_width,
-            bottom: client_height,
-        };
-        AdjustWindowRectEx(&mut bounds, style, false, ex_style).context("size welcome window")?;
+        let bounds = crate::dpi::outer_bounds(
+            RECT { left: 0, top: 0, right: client_width, bottom: client_height },
+            style,
+            ex_style,
+            scale,
+        );
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
 
-        let mut cursor = POINT::default();
         let mut monitor_info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let _ = GetCursorPos(&mut cursor);
         let monitor =
             windows::Win32::Graphics::Gdi::MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);

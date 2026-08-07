@@ -15,14 +15,13 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsWindow,
-    LoadCursorW, PostMessageW, RegisterClassW,
+    LoadCursorW, MoveWindow, PostMessageW, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, GWLP_USERDATA,
     HMENU, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
@@ -64,35 +63,74 @@ struct UiState {
 }
 
 impl UiState {
-    fn new(scale: f32, width: i32, height: i32) -> Self {
-        let theme = crate::theme::current();
+    /// Rebuild everything measured in pixels for a monitor scale.
+    ///
+    /// Shared by construction and by `WM_DPICHANGED` so the two cannot drift:
+    /// a control added to one and forgotten in the other would keep the old
+    /// monitor's size for the rest of the window's life.
+    unsafe fn apply_scale(&mut self, scale: f32, width: i32, height: i32) {
         let sc = |value: i32| (value as f32 * scale) as i32;
-        let edit_border = RECT {
+        self.scale = scale;
+        self.width = width;
+        self.height = height;
+        self.edit_border = RECT {
             left: sc(32),
             top: sc(116),
             right: width - sc(32),
             bottom: sc(164),
         };
         let button_top = height - sc(66);
-        let activate_button = RECT {
+        self.activate_button = RECT {
             left: width - sc(344),
             top: button_top,
             right: width - sc(224),
             bottom: button_top + sc(36),
         };
-        let buy_button = RECT {
+        self.buy_button = RECT {
             left: width - sc(216),
             top: button_top,
             right: width - sc(90),
             bottom: button_top + sc(36),
         };
-        let cancel_button = RECT {
+        self.cancel_button = RECT {
             left: width - sc(82),
             top: button_top,
             right: width - sc(24),
             bottom: button_top + sc(36),
         };
-        Self {
+        // Create first, then swap — see welcome::State::apply_scale.
+        for (slot, height, weight) in [
+            (&mut self.font_title as *mut HFONT, -sc(25), 600),
+            (&mut self.font as *mut HFONT, -sc(14), 400),
+            (&mut self.font_small as *mut HFONT, -sc(12), 400),
+        ] {
+            let replacement = make_font(height, weight);
+            if replacement.is_invalid() {
+                continue;
+            }
+            let previous = std::mem::replace(&mut *slot, replacement);
+            if !previous.is_invalid() {
+                let _ = DeleteObject(previous);
+            }
+        }
+        // The edit is a real child window, so it has to be moved rather than
+        // just re-measured, and told about the new font.
+        if !self.edit.is_invalid() {
+            let _ = MoveWindow(
+                self.edit,
+                self.edit_border.left + sc(12),
+                self.edit_border.top + sc(8),
+                self.edit_border.right - self.edit_border.left - sc(24),
+                self.edit_border.bottom - self.edit_border.top - sc(16),
+                true,
+            );
+            SendMessageW(self.edit, WM_SETFONT, WPARAM(self.font.0 as usize), LPARAM(1));
+        }
+    }
+
+    fn new(scale: f32, width: i32, height: i32) -> Self {
+        let theme = crate::theme::current();
+        let mut state = Self {
             edit: HWND::default(),
             activated: false,
             activating: false,
@@ -105,17 +143,19 @@ impl UiState {
             scale,
             width,
             height,
-            edit_border,
-            activate_button,
-            buy_button,
-            cancel_button,
+            edit_border: RECT::default(),
+            activate_button: RECT::default(),
+            buy_button: RECT::default(),
+            cancel_button: RECT::default(),
             background: unsafe { CreateSolidBrush(theme.bg) },
             edit_background: unsafe { CreateSolidBrush(theme.chip) },
-            font_title: unsafe { make_font(-sc(25), 600) },
-            font: unsafe { make_font(-sc(14), 400) },
-            font_small: unsafe { make_font(-sc(12), 400) },
+            font_title: HFONT::default(),
+            font: HFONT::default(),
+            font_small: HFONT::default(),
             theme,
-        }
+        };
+        unsafe { state.apply_scale(scale, width, height) };
+        state
     }
 }
 
@@ -556,6 +596,18 @@ unsafe extern "system" fn wndproc(
             let _ = SetBkColor(hdc, state.theme.chip);
             LRESULT(state.edit_background.0 as isize)
         }
+        // Fixed-size window, so a DPI change is the new scale, a rebuild of
+        // everything measured from it, and the bounds Windows suggests.
+        windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED => {
+            if let Some(state) = state(hwnd) {
+                let scale = crate::dpi::scale_from_message(wparam);
+                let sc = |value: i32| (value as f32 * scale) as i32;
+                state.apply_scale(scale, sc(600), sc(320));
+                crate::dpi::apply_suggested_bounds(hwnd, lparam);
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            LRESULT(0)
+        }
         WM_ERASEBKGND => LRESULT(1),
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
@@ -571,7 +623,11 @@ unsafe extern "system" fn wndproc(
 pub fn open() -> Result<bool> {
     unsafe {
         let instance = GetModuleHandleW(None).context("get app module for activation")?;
-        let scale = GetDpiForSystem() as f32 / 96.0;
+        // Centres on the cursor's monitor below, so that is the monitor whose
+        // scale decides its size.
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let scale = crate::dpi::scale_for_point(cursor);
         let sc = |value: i32| (value as f32 * scale) as i32;
         let (client_width, client_height) = (sc(600), sc(320));
         let mut ui_state = Box::new(UiState::new(scale, client_width, client_height));
@@ -589,23 +645,22 @@ pub fn open() -> Result<bool> {
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_APPWINDOW;
-        let mut bounds = RECT {
-            left: 0,
-            top: 0,
-            right: client_width,
-            bottom: client_height,
-        };
-        AdjustWindowRectEx(&mut bounds, style, false, ex_style)
-            .context("size activation window")?;
+        let bounds = crate::dpi::outer_bounds(
+            RECT { left: 0, top: 0, right: client_width, bottom: client_height },
+            style,
+            ex_style,
+            scale,
+        );
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
 
-        let mut cursor = POINT::default();
+        // The same cursor reading that chose the scale above. Sampling it
+        // twice lets a moving pointer hand this window one monitor's scale and
+        // another monitor's work area.
         let mut monitor_info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let _ = GetCursorPos(&mut cursor);
         let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         let _ = GetMonitorInfoW(monitor, &mut monitor_info);
         let x = monitor_info.rcWork.left
