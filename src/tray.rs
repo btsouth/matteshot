@@ -59,13 +59,18 @@ pub enum Action {
     CaptureDelayed,
     OpenFolder,
     OpenVideos,
-    History,
     Settings,
     OpenUpdate,
     Buy,
     Activate,
     Deactivate,
     Quit,
+    // Appended rather than inserted: WM_TRAY_ACTION encodes these as `as
+    // usize` discriminants, and posting/receiving can straddle an
+    // auto-update where an older resident and a newer CLI invocation (or
+    // vice versa) briefly coexist. Inserting a variant earlier would shift
+    // every later discriminant and desync that protocol.
+    History,
 }
 
 struct TrayState {

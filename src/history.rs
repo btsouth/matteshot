@@ -19,18 +19,19 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-    InvalidateRect, MonitorFromPoint, RoundRect, SelectObject, SetBkMode, SetTextColor,
-    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, HDC, HFONT,
-    HMONITOR, MONITORINFO, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    InvalidateRect, MonitorFromPoint, MonitorFromWindow, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
+    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+    FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetCursorPos, GetWindowLongPtrW, IsWindow, KillTimer, LoadCursorW, MessageBoxW,
-    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TrackPopupMenu, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    GetCursorPos, GetWindowLongPtrW, IsWindow, KillTimer, LoadCursorW,
+    MessageBoxW, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TrackPopupMenu, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDYES, MB_ICONWARNING, MB_OK, MB_YESNO, MF_STRING,
     SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
     WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
@@ -125,7 +126,15 @@ pub fn list() -> Vec<Entry> {
 /// a Delete click that silently failed would look like it had worked.
 pub fn remove(path: &Path) -> Result<()> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
-    std::fs::remove_file(path).context("delete capture")?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        // Already gone (deleted outside the app, or a repeat click racing
+        // its own first Delete): the index is just stale, so finish
+        // dropping the entry instead of reporting a failure the user has no
+        // way to act on.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("delete capture"),
+    }
     let mut log = load_unlocked();
     log.entries.retain(|e| e.path != path);
     save_unlocked(&log);
@@ -191,6 +200,11 @@ const WIN_W: i32 = 860;
 const WIN_H: i32 = 620;
 const WHEEL_STEP: i32 = 90;
 const STATUS_MS: u128 = 1500;
+/// Periodic timer that ages out `status`.
+const STATUS_TIMER_ID: usize = 1;
+/// One-shot, armed on WM_LBUTTONUP and cancelled by WM_LBUTTONDBLCLK: what
+/// tells a single click from the first half of a double-click.
+const CLICK_TIMER_ID: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cell {
@@ -200,23 +214,33 @@ struct Cell {
 
 /// Row-major grid: as many columns as fit `viewport_w`, at least one. Returns
 /// each cell's top-left in unscrolled content coordinates, plus the total
-/// content height.
-fn grid_layout(count: usize, viewport_w: i32, cell_w: i32, cell_h: i32) -> (Vec<Cell>, i32) {
-    let cols = (((viewport_w - MARGIN * 2 + GAP) / (cell_w + GAP)).max(1)) as usize;
+/// content height. `margin`/`gap` are parameters rather than the module
+/// constants directly so a caller can pass DPI-scaled values — `viewport_w`,
+/// `cell_w`, and `cell_h` already have to be, and gutters that stayed at
+/// logical size while the cards around them grew would look inconsistent.
+fn grid_layout(
+    count: usize,
+    viewport_w: i32,
+    cell_w: i32,
+    cell_h: i32,
+    margin: i32,
+    gap: i32,
+) -> (Vec<Cell>, i32) {
+    let cols = (((viewport_w - margin * 2 + gap) / (cell_w + gap)).max(1)) as usize;
     let cells: Vec<Cell> = (0..count)
         .map(|i| {
             let (col, row) = (i % cols, i / cols);
             Cell {
-                x: MARGIN + col as i32 * (cell_w + GAP),
-                y: MARGIN + row as i32 * (cell_h + GAP),
+                x: margin + col as i32 * (cell_w + gap),
+                y: margin + row as i32 * (cell_h + gap),
             }
         })
         .collect();
     let rows = if count == 0 { 0 } else { (count - 1) / cols + 1 };
     let content_h = if rows == 0 {
-        MARGIN * 2
+        margin * 2
     } else {
-        MARGIN * 2 + rows as i32 * cell_h + (rows as i32 - 1) * GAP
+        margin * 2 + rows as i32 * cell_h + (rows as i32 - 1) * gap
     };
     (cells, content_h)
 }
@@ -243,8 +267,8 @@ mod layout_tests {
 
     #[test]
     fn a_wide_viewport_fits_more_columns_than_a_narrow_one() {
-        let (wide_cells, _) = grid_layout(12, 900, CELL_W, CELL_H);
-        let (narrow_cells, _) = grid_layout(12, 300, CELL_W, CELL_H);
+        let (wide_cells, _) = grid_layout(12, 900, CELL_W, CELL_H, MARGIN, GAP);
+        let (narrow_cells, _) = grid_layout(12, 300, CELL_W, CELL_H, MARGIN, GAP);
         let wide_cols = wide_cells.iter().filter(|c| c.y == wide_cells[0].y).count();
         let narrow_cols = narrow_cells.iter().filter(|c| c.y == narrow_cells[0].y).count();
         assert!(wide_cols > narrow_cols);
@@ -252,7 +276,7 @@ mod layout_tests {
 
     #[test]
     fn cells_never_overlap() {
-        let (cells, _) = grid_layout(23, 860, CELL_W, CELL_H);
+        let (cells, _) = grid_layout(23, 860, CELL_W, CELL_H, MARGIN, GAP);
         for (i, a) in cells.iter().enumerate() {
             for b in &cells[i + 1..] {
                 let overlap_x = a.x < b.x + CELL_W && b.x < a.x + CELL_W;
@@ -264,20 +288,20 @@ mod layout_tests {
 
     #[test]
     fn an_empty_history_has_no_cells_and_minimal_height() {
-        let (cells, h) = grid_layout(0, 860, CELL_W, CELL_H);
+        let (cells, h) = grid_layout(0, 860, CELL_W, CELL_H, MARGIN, GAP);
         assert!(cells.is_empty());
         assert_eq!(h, MARGIN * 2);
     }
 
     #[test]
     fn even_a_single_pixel_viewport_still_lays_out_one_column() {
-        let (cells, _) = grid_layout(3, 1, CELL_W, CELL_H);
+        let (cells, _) = grid_layout(3, 1, CELL_W, CELL_H, MARGIN, GAP);
         assert_eq!(cells.iter().filter(|c| c.x == MARGIN).count(), 3, "must collapse to one column, not zero");
     }
 
     #[test]
     fn hit_test_accounts_for_scroll_offset() {
-        let (cells, _) = grid_layout(4, 860, CELL_W, CELL_H);
+        let (cells, _) = grid_layout(4, 860, CELL_W, CELL_H, MARGIN, GAP);
         // Unscrolled, the mouse over the first cell hits index 0.
         assert_eq!(hit_test(&cells, CELL_W, CELL_H, 0, MARGIN + 5, MARGIN + 5), 0);
         // Scroll the content up by one row's worth; the same screen point now
@@ -356,11 +380,15 @@ struct State {
     viewport_h: i32,
     /// DPI-scaled cell geometry, fixed for the window's lifetime (it does not
     /// handle WM_DPICHANGED). Every layout/hit-test/repaint after creation
-    /// must read these rather than the logical CELL_* constants, or a click
-    /// stops lining up with what is drawn on any non-100% monitor.
+    /// must read these rather than the logical CELL_*/MARGIN/GAP constants,
+    /// or a click stops lining up with what is drawn (cell_w/cell_h) or the
+    /// gutters stay logical-sized while the cards around them scale
+    /// (margin/gap) on any non-100% monitor.
     cell_w: i32,
     cell_h: i32,
     cell_img_h: i32,
+    margin: i32,
+    gap: i32,
     scroll_y: i32,
     hover: i32,
     font: HFONT,
@@ -369,7 +397,11 @@ struct State {
     /// Feedback text (e.g. "Copied") shown at the bottom, cleared by the
     /// window's periodic timer once it has been up for `STATUS_MS`.
     status: Option<(String, std::time::Instant)>,
-    monitor: HMONITOR,
+    /// A click on this cell copies it once `CLICK_TIMER_ID` fires unless a
+    /// double-click (or anything else that can invalidate the index) cancels
+    /// it first — otherwise every double-click would also copy, once for
+    /// each of a double-click's two WM_LBUTTONUP events.
+    pending_click: Option<usize>,
 }
 
 /// Singleton like Settings: reopening focuses the existing window instead of
@@ -382,8 +414,14 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 }
 
 fn relayout(state: &mut State) {
-    let (cells, content_h) =
-        grid_layout(state.thumbs.len(), state.viewport_w, state.cell_w, state.cell_h);
+    let (cells, content_h) = grid_layout(
+        state.thumbs.len(),
+        state.viewport_w,
+        state.cell_w,
+        state.cell_h,
+        state.margin,
+        state.gap,
+    );
     state.cells = cells;
     state.content_h = content_h;
     state.scroll_y = state.scroll_y.min(max_scroll(content_h, state.viewport_h)).max(0);
@@ -399,10 +437,23 @@ unsafe fn paint(hdc: HDC, state: &State) {
         SelectObject(hdc, state.font);
         SetTextColor(hdc, state.theme.muted);
         let mut msg = wide("No captures yet \u{2014} press PrtScn to make your first one.");
-        let mut rc = RECT { left: MARGIN, top: 0, right: state.viewport_w - MARGIN, bottom: state.viewport_h };
+        let mut rc = RECT {
+            left: state.margin,
+            top: 0,
+            right: state.viewport_w - state.margin,
+            bottom: state.viewport_h,
+        };
         DrawTextW(hdc, &mut msg, &mut rc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
         return;
     }
+
+    // Created once and reused for every cell: the colors never change within
+    // a paint, so recreating either per cell was pure repeated GDI overhead
+    // on a repaint every hover-driven mouse move.
+    let card = CreateSolidBrush(state.theme.chip);
+    let hover_pen = CreatePen(windows::Win32::Graphics::Gdi::PS_SOLID, 2, state.theme.accent);
+    let null_brush =
+        windows::Win32::Graphics::Gdi::GetStockObject(windows::Win32::Graphics::Gdi::NULL_BRUSH);
 
     for (i, (thumb, cell)) in state.thumbs.iter().zip(&state.cells).enumerate() {
         let (cx, cy) = (cell.x, cell.y - state.scroll_y);
@@ -411,21 +462,15 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
 
         let hovered = i as i32 == state.hover;
-        let card = CreateSolidBrush(state.theme.chip);
         let card_rect =
             RECT { left: cx, top: cy, right: cx + state.cell_w, bottom: cy + state.cell_h };
         FillRect(hdc, &card_rect, card);
-        let _ = DeleteObject(card);
         if hovered {
-            let pen = CreatePen(windows::Win32::Graphics::Gdi::PS_SOLID, 2, state.theme.accent);
-            let old_pen = SelectObject(hdc, pen);
-            let old_brush = SelectObject(hdc, windows::Win32::Graphics::Gdi::GetStockObject(
-                windows::Win32::Graphics::Gdi::NULL_BRUSH,
-            ));
+            let old_pen = SelectObject(hdc, hover_pen);
+            let old_brush = SelectObject(hdc, null_brush);
             let _ = RoundRect(hdc, cx, cy, cx + state.cell_w, cy + state.cell_h, 8, 8);
             SelectObject(hdc, old_pen);
             SelectObject(hdc, old_brush);
-            let _ = DeleteObject(pen);
         }
 
         // Letterboxed, centered within the image area.
@@ -476,65 +521,91 @@ unsafe fn paint(hdc: HDC, state: &State) {
         SetTextColor(hdc, state.theme.accent);
         let mut t = wide(text);
         let mut rc = RECT {
-            left: MARGIN,
+            left: state.margin,
             top: state.viewport_h - 22,
-            right: state.viewport_w - MARGIN,
+            right: state.viewport_w - state.margin,
             bottom: state.viewport_h,
         };
         DrawTextW(hdc, &mut t, &mut rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
+
+    // null_brush is a stock object owned by GDI and must not be deleted.
+    let _ = DeleteObject(card);
+    let _ = DeleteObject(hover_pen);
 }
 
-unsafe fn copy_entry(hwnd: HWND, state: &mut State, index: usize) {
-    let entry = state.thumbs[index].entry.clone();
-    match image::open(&entry.path) {
-        Ok(img) => match crate::output::to_clipboard(&img.to_rgba8(), Some(&entry.path)) {
-            Ok(()) => state.status = Some(("Copied to clipboard".to_string(), std::time::Instant::now())),
-            Err(error) => warn(hwnd, "This capture could not be copied.", &error),
-        },
-        Err(error) => warn(hwnd, "This capture could not be opened.", &error),
+// The four actions below deliberately take plain data (an already-cloned
+// `Entry`) rather than `&State`/`&mut State`. `warn` (and, for delete, the
+// confirmation prompt) calls `MessageBoxW`, which pumps this window's own
+// message queue while blocking — including WM_TIMER, which fires every
+// `STATUS_TIMER_ID` tick. A `&mut State` (or even a `&State`) still in scope
+// across that call would race a second, freshly fetched `state_of(hwnd)` from
+// the timer handler: two live references to the same allocation, one of them
+// mutable, which is undefined behavior regardless of whether it happens to
+// work today. Every touch of `State` here happens either before or after the
+// blocking call, never spanning it, via a fresh `state_of(hwnd)` each time.
+
+unsafe fn copy_entry(hwnd: HWND, entry: &Entry) {
+    let image = match image::open(&entry.path) {
+        Ok(img) => img.to_rgba8(),
+        Err(error) => return warn(hwnd, "This capture could not be opened.", &error),
+    };
+    if let Err(error) = crate::output::to_clipboard(&image, Some(&entry.path)) {
+        return warn(hwnd, "This capture could not be copied.", &error);
     }
-    let _ = InvalidateRect(hwnd, None, false);
-}
-
-unsafe fn open_in_editor(hwnd: HWND, state: &State, index: usize) {
-    let entry = state.thumbs[index].entry.clone();
-    match image::open(&entry.path) {
-        Ok(img) => {
-            let raw = img.to_rgba8();
-            let styles = crate::style::variants(&raw);
-            // Reopens un-matted: the file is already a finished composite, and
-            // re-applying a matte on top of one would double-frame it. The
-            // editor still offers every matte chip if the user wants one.
-            let none = styles.iter().position(|s| s.name == "None").unwrap_or(0);
-            let title = entry
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Capture".to_string());
-            if let Err(error) = crate::tweak::open(raw, styles, none, state.monitor, title) {
-                warn(hwnd, "This capture could not be reopened.", &error);
-            }
-        }
-        Err(error) => warn(hwnd, "This capture could not be opened.", &error),
+    if let Some(state) = state_of(hwnd) {
+        state.status = Some(("Copied to clipboard".to_string(), std::time::Instant::now()));
+        let _ = InvalidateRect(hwnd, None, false);
     }
 }
 
-unsafe fn reveal_entry(state: &State, index: usize) {
-    crate::output::reveal_in_explorer(&state.thumbs[index].entry.path);
+unsafe fn open_in_editor(hwnd: HWND, monitor: HMONITOR, entry: &Entry) {
+    let img = match image::open(&entry.path) {
+        Ok(img) => img,
+        Err(error) => return warn(hwnd, "This capture could not be opened.", &error),
+    };
+    let raw = img.to_rgba8();
+    let styles = crate::style::variants(&raw);
+    // Reopens un-matted: the file is already a finished composite, and
+    // re-applying a matte on top of one would double-frame it. The editor
+    // still offers every matte chip if the user wants one.
+    let none = styles.iter().position(|s| s.name == "None").unwrap_or(0);
+    let title = entry
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Capture".to_string());
+    if let Err(error) = crate::tweak::open(raw, styles, none, monitor, title) {
+        warn(hwnd, "This capture could not be reopened.", &error);
+    }
 }
 
-unsafe fn delete_entry(hwnd: HWND, state: &mut State, index: usize) {
-    let entry = state.thumbs[index].entry.clone();
+unsafe fn reveal_entry(entry: &Entry) {
+    crate::output::reveal_in_explorer(&entry.path);
+}
+
+unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
     let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let prompt = HSTRING::from(format!("Delete {name}? This cannot be undone."));
     let confirmed = MessageBoxW(hwnd, PCWSTR(prompt.as_ptr()), w!("Matteshot"), MB_YESNO | MB_ICONWARNING) == IDYES;
     if !confirmed {
         return;
     }
-    match crate::history::remove(&entry.path) {
+    let result = crate::history::remove(&entry.path);
+    let Some(state) = state_of(hwnd) else { return };
+    match result {
         Ok(()) => {
-            state.thumbs.remove(index);
+            // Looked up by path rather than trusting a pre-dialog index: nothing
+            // can actually resize `thumbs` while a modal MessageBoxW owns
+            // input, but this makes that assumption unnecessary rather than
+            // load-bearing.
+            if let Some(i) = state.thumbs.iter().position(|t| t.entry.path == entry.path) {
+                state.thumbs.remove(i);
+            }
+            // The whole index mapping can shift on a removal, so any stale
+            // hover is cleared outright rather than only when it pointed at
+            // the deleted cell.
+            state.hover = -1;
             relayout(state);
             state.status = Some(("Deleted".to_string(), std::time::Instant::now()));
         }
@@ -549,7 +620,10 @@ unsafe fn warn(hwnd: HWND, prefix: &str, error: &dyn std::fmt::Display) {
     let _ = MessageBoxW(hwnd, PCWSTR(message.as_ptr()), w!("Matteshot"), MB_OK | MB_ICONWARNING);
 }
 
-unsafe fn context_menu(hwnd: HWND, state: &mut State, index: usize) {
+/// No `State` reference is held across `TrackPopupMenu` below, for the same
+/// reason spelled out above the action functions: it pumps WM_TIMER for this
+/// window while blocked.
+unsafe fn context_menu(hwnd: HWND, entry: Entry) {
     let Ok(menu) = CreatePopupMenu() else { return };
     let _ = AppendMenuW(menu, MF_STRING, 1, w!("Copy"));
     let _ = AppendMenuW(menu, MF_STRING, 2, w!("Open in editor"));
@@ -561,10 +635,10 @@ unsafe fn context_menu(hwnd: HWND, state: &mut State, index: usize) {
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, None);
     let _ = DestroyMenu(menu);
     match cmd.0 {
-        1 => copy_entry(hwnd, state, index),
-        2 => open_in_editor(hwnd, state, index),
-        3 => reveal_entry(state, index),
-        4 => delete_entry(hwnd, state, index),
+        1 => copy_entry(hwnd, &entry),
+        2 => open_in_editor(hwnd, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &entry),
+        3 => reveal_entry(&entry),
+        4 => delete_entry(hwnd, &entry),
         _ => {}
     }
 }
@@ -619,28 +693,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
                 let hit = hit_test(&state.cells, state.cell_w, state.cell_h, state.scroll_y, mx, my);
                 if hit >= 0 {
-                    copy_entry(hwnd, state, hit as usize);
+                    // Deferred rather than immediate: WM_LBUTTONDBLCLK
+                    // cancels this before it fires, so a double-click opens
+                    // the editor instead of also copying to the clipboard.
+                    state.pending_click = Some(hit as usize);
+                    let _ = SetTimer(hwnd, CLICK_TIMER_ID, GetDoubleClickTime(), None);
                 }
             }
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
-            if let Some(state) = state_of(hwnd) {
+            let entry = state_of(hwnd).and_then(|state| {
+                let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                state.pending_click = None;
                 let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
                 let hit = hit_test(&state.cells, state.cell_w, state.cell_h, state.scroll_y, mx, my);
-                if hit >= 0 {
-                    open_in_editor(hwnd, state, hit as usize);
-                }
+                (hit >= 0).then(|| state.thumbs[hit as usize].entry.clone())
+            });
+            if let Some(entry) = entry {
+                open_in_editor(hwnd, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &entry);
             }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            if let Some(state) = state_of(hwnd) {
+            let entry = state_of(hwnd).and_then(|state| {
+                // A right-click cancels any pending single-click too: the
+                // menu below can delete the very entry it would have copied.
+                let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                state.pending_click = None;
                 let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
                 let hit = hit_test(&state.cells, state.cell_w, state.cell_h, state.scroll_y, mx, my);
-                if hit >= 0 {
-                    context_menu(hwnd, state, hit as usize);
-                }
+                (hit >= 0).then(|| state.thumbs[hit as usize].entry.clone())
+            });
+            if let Some(entry) = entry {
+                context_menu(hwnd, entry);
             }
             LRESULT(0)
         }
@@ -651,7 +737,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER => {
-            if let Some(state) = state_of(hwnd) {
+            if wparam.0 == CLICK_TIMER_ID {
+                let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                let pending = state_of(hwnd).and_then(|state| {
+                    let index = state.pending_click.take()?;
+                    Some(state.thumbs[index].entry.clone())
+                });
+                if let Some(entry) = pending {
+                    copy_entry(hwnd, &entry);
+                }
+            } else if let Some(state) = state_of(hwnd) {
                 if let Some((_, shown_at)) = &state.status {
                     if shown_at.elapsed().as_millis() > STATUS_MS {
                         state.status = None;
@@ -666,7 +761,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            let _ = KillTimer(hwnd, 1);
+            let _ = KillTimer(hwnd, STATUS_TIMER_ID);
+            let _ = KillTimer(hwnd, CLICK_TIMER_ID);
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
@@ -683,6 +779,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// Reload the entry list and thumbnails into an already-open window.
 unsafe fn reload(hwnd: HWND) {
     let Some(state) = state_of(hwnd) else { return };
+    let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+    state.pending_click = None;
     let entries = list();
     state.thumbs = build_thumbs(&entries, state.cell_w, state.cell_img_h);
     state.scroll_y = 0;
@@ -715,8 +813,10 @@ pub fn open() -> Result<()> {
         let cell_w = sc(CELL_W);
         let cell_img_h = sc(CELL_IMG_H);
         let cell_h = sc(CELL_H);
+        let margin = sc(MARGIN);
+        let gap = sc(GAP);
         let thumbs = build_thumbs(&entries, cell_w, cell_img_h);
-        let (cells, content_h) = grid_layout(thumbs.len(), cw, cell_w, cell_h);
+        let (cells, content_h) = grid_layout(thumbs.len(), cw, cell_w, cell_h, margin, gap);
 
         let monitor = MonitorFromPoint(cursor, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
         let font = make_font(-sc(14));
@@ -731,13 +831,15 @@ pub fn open() -> Result<()> {
             cell_w,
             cell_h,
             cell_img_h,
+            margin,
+            gap,
             scroll_y: 0,
             hover: -1,
             font,
             font_small,
             theme: crate::theme::current(),
             status: None,
-            monitor,
+            pending_click: None,
         });
 
         let hinstance = GetModuleHandleW(None).context("get app module for history")?;
@@ -788,7 +890,7 @@ pub fn open() -> Result<()> {
 
         crate::theme::apply_titlebar(hwnd, &crate::theme::current());
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
-        let _ = SetTimer(hwnd, 1, 500, None);
+        let _ = SetTimer(hwnd, STATUS_TIMER_ID, 500, None);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         // Mirrors settings::open: a tray menu just closed, so this process may
         // have lost foreground permission; the topmost toggle forces z-order
