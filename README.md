@@ -45,7 +45,11 @@ Opens at 85% of the monitor, resizable. Live preview with matte swap (7 chips in
 - Settle-detection (grab until two consecutive frames agree, ≤700ms) handles smooth-scroll browsers and instant apps with no per-app tuning.
 - Sticky chrome (toolbars, status bars) is detected as contiguous unchanged edge rows, deliberately over-biased (over-detect = smaller viewport, harmless; under-detect = repeated footers), captured once.
 
-Verified on Notepad (instant scroll), Chrome (smooth scroll, 19k-px pages), VS Code (webview + animated content). Esc aborts; progress pill excluded from capture.
+**Stopping early.** **Esc**, **Ctrl+Shift+S**, or the **Stop** button on the progress pill all do the same thing: end the capture where it is and hand back what has been stitched. That is how you take the top of a page without the rest of it. There is deliberately no mid-capture discard — getting here takes three steps (PrtScn, S, click), after which the user is a passenger watching the page scroll, so the common intent is "that's far enough", and Esc is the key they reach for to say it. Pointing the most reachable key at "throw away the last minute of scrolling" had it backwards. Abandoning a capture is the picker's job: Esc there closes it, so the way out is the same key twice.
+
+A stop landing mid-step discards that step's frame rather than stitching a half-scrolled one, so the image always ends on a clean boundary. The hotkey is a registered chord rather than a polled key, so the keystroke never reaches the page — a bare Space or Enter would page-down the target out from under the step measuring it. Both are checked every settle tick, not once per step, since a step can run most of a second. PrtScn during a capture does nothing: starting a second capture inside a running one would open a nested overlay and fight for the cursor, so `pump` drops the resident's thread-posted hotkeys.
+
+Verified on Notepad (instant scroll), Chrome (smooth scroll, 19k-px pages), VS Code (webview + animated content). Progress pill excluded from capture, non-activating so it never takes focus off the target.
 
 ## Mattes
 

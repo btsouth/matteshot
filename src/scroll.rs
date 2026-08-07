@@ -2,25 +2,30 @@
 //! stitch the frames into one tall image by measuring how far the content
 //! actually moved (never trusting the scroll amount we asked for).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
 use image::{Rgba, RgbaImage};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, SetBkMode, SelectObject, SetTextColor,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE,
-    HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT, TRANSPARENT,
+    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ScreenToClient, SetBkMode, SelectObject,
+    SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    FF_DONTCARE, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_ESCAPE,
+    GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_MOUSE, MOD_CONTROL,
+    MOD_NOREPEAT, MOD_SHIFT, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW, GetCursorPos,
     GetWindowLongPtrW, PeekMessageW, RegisterClassW, SetCursorPos, SetWindowLongPtrW,
-    CREATESTRUCTW, GWLP_USERDATA, MSG, PM_REMOVE, WM_ERASEBKGND, WM_NCCREATE, WM_PAINT,
-    WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CREATESTRUCTW, GWLP_USERDATA, MSG, PM_REMOVE, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// What to scroll-capture.
@@ -70,12 +75,149 @@ fn safety_limit(steps: usize, height: u32) -> Option<SafetyLimit> {
 /// Wheel notches per step — small enough that frames always overlap.
 const NOTCHES: i32 = 3;
 
+/// Why the stitching loop ended.
+///
+/// Ending early used to mean one thing — an error — so the only way out that
+/// kept an image was reaching the real bottom of the page. A stop the user
+/// asked for is a legitimate ending with a usable result, and telling the two
+/// apart is what this exists for.
+enum Outcome {
+    /// The content stopped moving: a complete capture.
+    Bottom,
+    /// The user asked to stop. What has been stitched so far *is* the capture.
+    Stopped,
+    /// Ran into a runaway guard before the page ended.
+    Limit(SafetyLimit),
+    Failed(anyhow::Error),
+}
+
+impl Outcome {
+    /// The error this ending reports, or `None` when it hands back the canvas.
+    ///
+    /// Only a real bottom-of-page and a stop the user asked for keep the
+    /// image. Everything else has to fail rather than pass off a partial
+    /// capture as the whole page.
+    fn into_error(self) -> Option<anyhow::Error> {
+        match self {
+            Outcome::Bottom | Outcome::Stopped => None,
+            Outcome::Limit(SafetyLimit::Steps) => Some(anyhow::anyhow!(
+                "scrolling capture reached its {MAX_STEPS}-step safety limit before the page ended"
+            )),
+            Outcome::Limit(SafetyLimit::Height) => Some(anyhow::anyhow!(
+                "scrolling capture reached its {MAX_HEIGHT}-pixel safety limit before the page ended"
+            )),
+            Outcome::Failed(error) => Some(error),
+        }
+    }
+}
+
+/// Raised by the pill's Stop button and by its hotkey, read by the loop.
+///
+/// Shared rather than reached through the window pointer so that the loop and
+/// the window procedure never hold overlapping borrows of the same state.
+type StopSignal = Arc<AtomicBool>;
+
+/// The pill's own hotkey id. `RegisterHotKey` ids are per-window, so this
+/// cannot collide with the recorder's.
+const STOP_HOTKEY: i32 = 1;
+
+/// Pill metrics at 96 DPI, scaled to whichever monitor it opens on.
+const PILL_W: i32 = 300;
+const PILL_H: i32 = 58;
+const PILL_PAD: i32 = 16;
+
+/// Where to put the pill so that it cannot swallow the wheel.
+///
+/// The pill is a real window sitting in the cursor's path: `send_wheel_at`
+/// drives the pointer to the scroll anchor and synthesizes a wheel event
+/// there, and whatever window is under that point receives it. If that window
+/// is the pill, the target never scrolls — and because nothing moved, the
+/// capture reads it as a clean bottom-of-page and returns a single frame.
+///
+/// Window captures walk their anchor out to a window edge after the first
+/// step, but `recovery_anchor` declines to move a region's, so a region chosen
+/// near the top centre of the screen would sit under the pill for the whole
+/// run.
+fn pill_origin(work: RECT, w: i32, h: i32, gap: i32, anchor: POINT) -> POINT {
+    let cx = work.left + (work.right - work.left - w) / 2;
+    let candidates = [
+        POINT { x: cx, y: work.top + gap },
+        POINT { x: cx, y: work.bottom - gap - h },
+        POINT { x: work.left + gap, y: work.top + gap },
+        POINT { x: work.right - gap - w, y: work.top + gap },
+    ];
+    let home = candidates[0];
+    candidates
+        .into_iter()
+        .find(|p| {
+            !in_rect(
+                &RECT { left: p.x, top: p.y, right: p.x + w, bottom: p.y + h },
+                anchor,
+            )
+        })
+        .unwrap_or(home)
+}
+
+/// The pill's geometry at one scale.
+struct PillLayout {
+    w: i32,
+    h: i32,
+    stop_rect: RECT,
+    pad: i32,
+}
+
+/// Lay the pill out for a monitor's scale.
+///
+/// Separate from the window so it can be checked: the Stop button is the first
+/// interactive control in this window, and a hit rect that scales differently
+/// from what is painted is a button that misses.
+fn pill_layout(scale: f32) -> PillLayout {
+    let sc = |v: i32| (v as f32 * scale) as i32;
+    PillLayout {
+        w: sc(PILL_W),
+        h: sc(PILL_H),
+        stop_rect: RECT {
+            left: sc(202),
+            top: sc(8),
+            right: sc(284),
+            bottom: sc(34),
+        },
+        pad: sc(PILL_PAD),
+    }
+}
+
 struct Pill {
     text: Vec<u16>,
     theme: crate::theme::Theme,
     font: HFONT,
+    font_small: HFONT,
+    stop: StopSignal,
+    stop_rect: RECT,
+    pad: i32,
     w: i32,
     h: i32,
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+fn in_rect(r: &RECT, p: POINT) -> bool {
+    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+}
+
+/// Whether the pointer is over Stop, read live rather than tracked.
+///
+/// The capture drives the cursor itself, teleporting it back to the scroll
+/// anchor several times a second, so a hover flag maintained from mouse
+/// messages would get stuck on: the pointer leaves without the pill ever
+/// seeing it go.
+unsafe fn hovering_stop(hwnd: HWND, pill: &Pill) -> bool {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
+        return false;
+    }
+    in_rect(&pill.stop_rect, pt)
 }
 
 unsafe extern "system" fn pill_proc(
@@ -91,6 +233,10 @@ unsafe extern "system" fn pill_proc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_ERASEBKGND => LRESULT(1),
+        // The pill must never take focus from the window being scrolled:
+        // activation can change what that window draws (focus rings, sticky
+        // headers) halfway through a capture.
+        WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE
         WM_PAINT => {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Pill;
             if let Some(p) = ptr.as_mut() {
@@ -100,12 +246,64 @@ unsafe extern "system" fn pill_proc(
                 FillRect(hdc, &RECT { left: 0, top: 0, right: p.w, bottom: p.h }, bg);
                 let _ = DeleteObject(bg);
                 SetBkMode(hdc, TRANSPARENT);
+
                 SelectObject(hdc, p.font);
                 SetTextColor(hdc, p.theme.text);
                 let mut t = p.text.clone();
-                let mut r = RECT { left: 0, top: 0, right: p.w, bottom: p.h };
-                DrawTextW(hdc, &mut t, &mut r, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                let mut r = RECT {
+                    left: p.pad,
+                    top: p.stop_rect.top,
+                    right: p.stop_rect.left - p.pad,
+                    bottom: p.stop_rect.bottom,
+                };
+                DrawTextW(hdc, &mut t, &mut r, DT_SINGLELINE | DT_VCENTER);
+
+                let hot = hovering_stop(hwnd, p);
+                let fill = CreateSolidBrush(if hot { p.theme.accent } else { p.theme.chip });
+                FillRect(hdc, &p.stop_rect, fill);
+                let _ = DeleteObject(fill);
+                SetTextColor(hdc, if hot { p.theme.accent_text } else { p.theme.text });
+                let mut stop = wide("Stop");
+                let mut sr = p.stop_rect;
+                DrawTextW(hdc, &mut stop, &mut sr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+                SelectObject(hdc, p.font_small);
+                SetTextColor(hdc, p.theme.faint);
+                let mut hint = wide("Esc or Ctrl+Shift+S to stop");
+                let mut hr =
+                    RECT { left: 0, top: p.stop_rect.bottom, right: p.w, bottom: p.h };
+                DrawTextW(hdc, &mut hint, &mut hr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
                 let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        // Repaint so the Stop button lights up under the pointer; the hover
+        // test itself happens in WM_PAINT.
+        WM_MOUSEMOVE => {
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        // Down, not up: the capture teleports the cursor back to the scroll
+        // anchor between wheel events, so a press and its release frequently
+        // do not land on the same window and the up never arrives.
+        WM_LBUTTONDOWN => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Pill;
+            if let Some(p) = ptr.as_mut() {
+                let pt = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                if in_rect(&p.stop_rect, pt) {
+                    p.stop.store(true, Ordering::Relaxed);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_HOTKEY => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Pill;
+            if let Some(p) = ptr.as_mut() {
+                p.stop.store(true, Ordering::Relaxed);
             }
             LRESULT(0)
         }
@@ -113,29 +311,47 @@ unsafe extern "system" fn pill_proc(
     }
 }
 
-unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
+unsafe fn make_font(height: i32, weight: i32) -> HFONT {
+    CreateFontW(
+        height,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        0,
+        0,
+        CLEARTYPE_QUALITY.0 as u32,
+        FF_DONTCARE.0 as u32,
+        w!("Segoe UI"),
+    )
+}
+
+unsafe fn show_pill(
+    monitor: HMONITOR,
+    wheel_anchor: POINT,
+    stop: StopSignal,
+) -> Result<(HWND, Box<Pill>)> {
     let theme = crate::theme::current();
-    let (w, h) = (240, 40);
+    // The pill opens on the monitor it is anchored to, so that monitor's scale
+    // is the one its metrics are measured in — including the Stop button's hit
+    // rect, which is no use if it is drawn at a third of its intended size.
+    let scale = crate::dpi::scale_for_monitor(monitor);
+    let sc = |v: i32| (v as f32 * scale) as i32;
+    let layout = pill_layout(scale);
+    let (w, h) = (layout.w, layout.h);
     let hinstance = GetModuleHandleW(None)?;
     let mut pill = Box::new(Pill {
-        text: "Scrolling capture\u{2026}".encode_utf16().collect(),
+        text: wide("Scrolling\u{2026}"),
         theme,
-        font: CreateFontW(
-            -15,
-            0,
-            0,
-            0,
-            500,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY.0 as u32,
-            FF_DONTCARE.0 as u32,
-            w!("Segoe UI"),
-        ),
+        font: make_font(-sc(15), 600),
+        font_small: make_font(-sc(12), 400),
+        stop,
+        stop_rect: layout.stop_rect,
+        pad: layout.pad,
         w,
         h,
     });
@@ -150,11 +366,12 @@ unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    let _ = GetMonitorInfoW(anchor, &mut mi);
-    let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
-    let y = mi.rcWork.top + 40;
+    let _ = GetMonitorInfoW(monitor, &mut mi);
+    let POINT { x, y } = pill_origin(mi.rcWork, w, h, sc(40), wheel_anchor);
     let hwnd = match CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        // NOACTIVATE so that clicking Stop does not pull focus off the window
+        // being captured.
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         w!("matteshot_scrollpill"),
         w!("Matteshot"),
         WS_POPUP | WS_VISIBLE,
@@ -170,6 +387,7 @@ unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
         Ok(hwnd) => hwnd,
         Err(error) => {
             let _ = DeleteObject(pill.font);
+            let _ = DeleteObject(pill.font_small);
             return Err(error.into());
         }
     };
@@ -178,13 +396,43 @@ unsafe fn show_pill(anchor: HMONITOR) -> Result<(HWND, Box<Pill>)> {
         hwnd,
         windows::Win32::UI::WindowsAndMessaging::WDA_EXCLUDEFROMCAPTURE,
     );
+    // A chord, and registered rather than polled, for one reason: RegisterHotKey
+    // swallows the keystroke. A bare key would reach the page being captured,
+    // and the obvious candidates are the worst offenders — Space is page-down
+    // in every browser, which would scroll the target out from under the very
+    // step that is measuring it.
+    let _ = RegisterHotKey(
+        hwnd,
+        STOP_HOTKEY,
+        MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+        0x53, // S
+    );
     Ok((hwnd, pill))
 }
 
+/// Drain the queue so the pill repaints and its Stop button and hotkey land.
+///
+/// The resident's capture hotkeys are dropped here on purpose. They are posted
+/// to the *thread* — the PrtScn hook via `PostThreadMessageW`, and both
+/// `RegisterHotKey` calls with a null window — so they arrive with a null
+/// `hwnd`, while the pill's own hotkey is posted to its window and must still
+/// be dispatched. Starting a second capture inside a running one would open a
+/// nested overlay and fight this loop for the cursor, and nothing else guards
+/// against it: `state_lock` enforces a single resident *process*, not a single
+/// capture.
+///
+/// `DispatchMessageW` ignores null-`hwnd` messages anyway, so this check
+/// changes no behaviour today. It is written out because the obvious way to
+/// make a new hotkey work during a capture is to handle `WM_HOTKEY` inline
+/// here, exactly as the main loop does — and doing that without noticing this
+/// distinction would quietly turn PrtScn into "open an overlay mid-scroll".
 fn pump() {
     unsafe {
         let mut msg = MSG::default();
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message == WM_HOTKEY && msg.hwnd.0.is_null() {
+                continue;
+            }
             DispatchMessageW(&msg);
         }
     }
@@ -192,6 +440,20 @@ fn pump() {
 
 fn esc_pressed() -> bool {
     unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000 != 0 }
+}
+
+/// Whether the user has asked the capture to end.
+///
+/// Esc counts, and it keeps the image rather than discarding it. Getting into
+/// a scrolling capture takes three deliberate steps, after which the user is a
+/// passenger watching the page go by, so the overwhelmingly common thing they
+/// want mid-capture is "that is far enough" — and Esc is the key they will
+/// reach for to say it. Pointing the most reachable key at "throw away the
+/// last minute of scrolling" got that exactly backwards. Abandoning a capture
+/// outright is now the picker's job: Esc there closes it, so the way out is
+/// the same key twice.
+fn stop_requested(stop: &StopSignal) -> bool {
+    esc_pressed() || stop.load(Ordering::Relaxed)
 }
 
 fn grab(target: Target) -> Result<RgbaImage> {
@@ -360,20 +622,40 @@ fn send_wheel_at(point: POINT) {
     }
 }
 
+/// What one wheel step produced.
+enum Frame {
+    /// A settled frame, ready to stitch.
+    Ready(RgbaImage),
+    /// The user stopped the capture partway through this step. The frame in
+    /// flight is mid-scroll and is thrown away: the canvas ends on the last
+    /// step that completed, rather than on a torn one.
+    Stopped,
+}
+
 fn frame_after_wheel(
     target: Target,
     point: POINT,
     view_top: u32,
     view_bottom: u32,
-) -> Result<RgbaImage> {
+    stop: &StopSignal,
+) -> Result<Frame> {
     send_wheel_at(point);
     std::thread::sleep(std::time::Duration::from_millis(110));
     pump();
+    if stop_requested(stop) {
+        return Ok(Frame::Stopped);
+    }
     let mut next = grab(target).context("capture scrolled frame")?;
     let settle_by = std::time::Instant::now() + std::time::Duration::from_millis(700);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(70));
         pump();
+        // Checked here and not only once per step: a step can run the better
+        // part of a second, and a Stop that takes that long to register reads
+        // as a button that did nothing.
+        if stop_requested(stop) {
+            return Ok(Frame::Stopped);
+        }
         let again = grab(target).context("capture settling frame")?;
         let moving = viewport_diff(&next, &again, view_top, view_bottom);
         next = again;
@@ -381,20 +663,22 @@ fn frame_after_wheel(
             break;
         }
     }
-    Ok(next)
+    Ok(Frame::Ready(next))
 }
 
 struct CaptureCleanup {
     saved: POINT,
-    pill: Option<(HWND, HFONT)>,
+    pill: Option<(HWND, HFONT, HFONT)>,
 }
 
 impl Drop for CaptureCleanup {
     fn drop(&mut self) {
         unsafe {
-            if let Some((pill, font)) = self.pill.take() {
+            if let Some((pill, font, font_small)) = self.pill.take() {
+                let _ = UnregisterHotKey(pill, STOP_HOTKEY);
                 let _ = DestroyWindow(pill);
                 let _ = DeleteObject(font);
+                let _ = DeleteObject(font_small);
             }
             let _ = SetCursorPos(self.saved.x, self.saved.y);
         }
@@ -584,23 +868,26 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     let mut cleanup = CaptureCleanup { saved, pill: None };
     eprintln!("scroll: wheel anchor {},{}", hover.x, hover.y);
 
-    let (pill, mut pill_state) = unsafe { show_pill(anchor)? };
-    cleanup.pill = Some((pill, pill_state.font));
-    pump();
-
+    // Checked before the pill exists, so that the window can never outlive the
+    // state its window procedure reads through `GWLP_USERDATA`: the pill's
+    // teardown is `cleanup`'s, and `cleanup` is declared first, so it is
+    // dropped last.
     let first = grab(target).context("first frame")?;
     let (fw, fh) = (first.width(), first.height());
     if fh < 80 {
-        unsafe {
-            let _ = DestroyWindow(pill);
-        }
         bail!("target too short to scroll-capture");
     }
+
+    let stop: StopSignal = Arc::new(AtomicBool::new(false));
+    let (pill, mut pill_state) = unsafe { show_pill(anchor, hover, Arc::clone(&stop))? };
+    cleanup.pill = Some((pill, pill_state.font, pill_state.font_small));
+    pump();
+
     let mut canvas = first.clone();
     let mut prev = first.clone();
     let mut last_observed = first.clone();
     let mut steps = 0usize;
-    let mut failure: Option<anyhow::Error> = None;
+    let mut outcome = Outcome::Bottom;
     // Learned on the first successful step, then held steady.
     let mut chrome: Option<(u32, u32)> = None;
     let scrollbar_width = transient_scrollbar_width(target);
@@ -609,22 +896,26 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     let mut last_shift: Option<u32> = None;
 
     while steps < MAX_STEPS && canvas.height() < MAX_HEIGHT {
-        if esc_pressed() {
-            failure = Some(anyhow::anyhow!("scrolling capture cancelled"));
+        if stop_requested(&stop) {
+            outcome = Outcome::Stopped;
             break;
         }
         // The viewport we know so far (whole frame until chrome is learned).
         let (vt, vb) = chrome.map(|(t, b)| (t, fh - b)).unwrap_or((0, fh));
 
-        let mut next = match frame_after_wheel(target, hover, vt, vb) {
-            Ok(frame) => frame,
+        let mut next = match frame_after_wheel(target, hover, vt, vb, &stop) {
+            Ok(Frame::Ready(frame)) => frame,
+            Ok(Frame::Stopped) => {
+                outcome = Outcome::Stopped;
+                break;
+            }
             Err(error) => {
-                failure = Some(error);
+                outcome = Outcome::Failed(error);
                 break;
             }
         };
         if next.dimensions() != (fw, fh) {
-            failure = Some(anyhow::anyhow!(
+            outcome = Outcome::Failed(anyhow::anyhow!(
                 "the scrolling target changed size during capture"
             ));
             break;
@@ -636,19 +927,20 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         if movement.idle < 2.5 {
             std::thread::sleep(std::time::Duration::from_millis(280));
             pump();
+            if stop_requested(&stop) {
+                outcome = Outcome::Stopped;
+                break;
+            }
             match grab(target) {
                 Ok(retry) => {
                     next = retry;
                     movement = motion(&prev, &next, fh, vt, vb);
                 }
                 Err(error) => {
-                    failure = Some(error.context("recapture scrolling target"));
+                    outcome = Outcome::Failed(error.context("recapture scrolling target"));
                     break;
                 }
             }
-        }
-        if failure.is_some() {
-            break;
         }
         last_observed = next.clone();
 
@@ -675,7 +967,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
                 .filter(|p| *p != hover)
             else {
                 if movement.idle >= 2.5 {
-                    failure = Some(anyhow::anyhow!(
+                    outcome = Outcome::Failed(anyhow::anyhow!(
                         "content moved but Matteshot could not stitch it reliably"
                     ));
                 }
@@ -686,10 +978,14 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
                 "scroll: anchor blocked; retrying at {},{}",
                 fallback.x, fallback.y
             );
-            let retry = match frame_after_wheel(target, fallback, vt, vb) {
-                Ok(frame) => frame,
+            let retry = match frame_after_wheel(target, fallback, vt, vb, &stop) {
+                Ok(Frame::Ready(frame)) => frame,
+                Ok(Frame::Stopped) => {
+                    outcome = Outcome::Stopped;
+                    break;
+                }
                 Err(error) => {
-                    failure = Some(error);
+                    outcome = Outcome::Failed(error);
                     break;
                 }
             };
@@ -697,7 +993,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
             let recovered = motion(&recovery_base, &retry, fh, vt, vb);
             if !stitchable(recovered, last_shift) {
                 if recovered.idle >= 2.5 {
-                    failure = Some(anyhow::anyhow!(
+                    outcome = Outcome::Failed(anyhow::anyhow!(
                         "content moved but Matteshot could not stitch it reliably"
                     ));
                 }
@@ -753,7 +1049,9 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         let tail_top = tail_bottom.saturating_sub(shift).max(view_top);
         let tail_h = tail_bottom - tail_top;
         if tail_h == 0 {
-            failure = Some(anyhow::anyhow!("scrolling capture found no new rows to append"));
+            outcome = Outcome::Failed(anyhow::anyhow!(
+                "scrolling capture found no new rows to append"
+            ));
             break;
         }
         let mut grown = RgbaImage::new(fw, canvas.height() + tail_h);
@@ -768,9 +1066,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         prev = next;
         steps += 1;
 
-        pill_state.text = format!("Scrolling capture\u{2026}  {} px", canvas.height())
-            .encode_utf16()
-            .collect();
+        pill_state.text = wide(&format!("Scrolling\u{2026}  {} px", canvas.height()));
         unsafe {
             let _ = InvalidateRect(pill, None, false);
         }
@@ -794,16 +1090,12 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         }
     }
 
-    if failure.is_none() {
-        failure = match safety_limit(steps, canvas.height()) {
-            Some(SafetyLimit::Steps) => Some(anyhow::anyhow!(
-                "scrolling capture reached its {MAX_STEPS}-step safety limit before the page ended"
-            )),
-            Some(SafetyLimit::Height) => Some(anyhow::anyhow!(
-                "scrolling capture reached its {MAX_HEIGHT}-pixel safety limit before the page ended"
-            )),
-            None => None,
-        };
+    // Only a loop that ran to its own end can have run into a guard; any other
+    // ending got there first and keeps its own reason.
+    if matches!(outcome, Outcome::Bottom) {
+        if let Some(limit) = safety_limit(steps, canvas.height()) {
+            outcome = Outcome::Limit(limit);
+        }
     }
 
     if scrollbar_track_colors.is_some() {
@@ -815,14 +1107,16 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     drop(cleanup);
     pump();
 
-    if let Some(error) = failure {
+    let stopped = matches!(outcome, Outcome::Stopped);
+    if let Some(error) = outcome.into_error() {
         return Err(error);
     }
     eprintln!(
-        "scroll capture: {} steps, {}x{}",
+        "scroll capture: {} steps, {}x{}{}",
         steps,
         canvas.width(),
-        canvas.height()
+        canvas.height(),
+        if stopped { " (stopped by the user)" } else { "" }
     );
     Ok(canvas)
 }
@@ -830,6 +1124,69 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_deliberate_stop_or_a_real_bottom_hands_back_the_canvas() {
+        // Stopping is the whole point of the pill: it ends the capture *with*
+        // an image. Every ending the user did not ask for stays an error, so a
+        // partial page is never returned as if it were a whole one.
+        assert!(Outcome::Bottom.into_error().is_none());
+        assert!(Outcome::Stopped.into_error().is_none());
+        assert!(Outcome::Limit(SafetyLimit::Steps).into_error().is_some());
+        assert!(Outcome::Limit(SafetyLimit::Height).into_error().is_some());
+        assert!(Outcome::Failed(anyhow::anyhow!("boom")).into_error().is_some());
+    }
+
+    #[test]
+    fn the_pill_never_parks_on_the_point_the_wheel_is_sent_to() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let (w, h, gap) = (300, 58, 40);
+        let covers = |o: POINT, p: POINT| {
+            in_rect(
+                &RECT { left: o.x, top: o.y, right: o.x + w, bottom: o.y + h },
+                p,
+            )
+        };
+        // A region chosen near the top centre is exactly where the pill wants
+        // to sit, and a region capture never moves its anchor off it.
+        let under = POINT { x: 960, y: 60 };
+        assert!(!covers(pill_origin(work, w, h, gap, under), under));
+        // Everywhere else it stays where it has always been.
+        assert_eq!(
+            pill_origin(work, w, h, gap, POINT { x: 400, y: 700 }),
+            POINT { x: (1920 - w) / 2, y: gap }
+        );
+    }
+
+    #[test]
+    fn the_stop_button_stays_inside_the_pill_at_every_scale() {
+        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let l = pill_layout(scale);
+            let r = l.stop_rect;
+            assert!(r.left > l.pad && r.right < l.w, "at {scale}x");
+            assert!(r.top > 0 && r.bottom < l.h, "at {scale}x");
+            // The label sits between the padding and the button; if the button
+            // ever slid left far enough to close that gap the progress text
+            // would be drawn into a backwards rect and vanish.
+            assert!(r.left - l.pad > l.pad, "no room for the label at {scale}x");
+            // Small targets are the whole reason this is scaled: a button that
+            // stays 82px while the screen doubles is half the size it looks.
+            assert!(
+                r.right - r.left >= (82.0 * scale) as i32 - 1,
+                "button did not scale at {scale}x"
+            );
+        }
+    }
+
+    // Esc's half of `stop_requested` reads real key state and so is not
+    // reachable from a test; the signal the pill raises is.
+    #[test]
+    fn a_raised_stop_signal_ends_the_loop() {
+        let stop: StopSignal = Arc::new(AtomicBool::new(false));
+        assert!(!stop_requested(&stop));
+        stop.store(true, Ordering::Relaxed);
+        assert!(stop_requested(&stop));
+    }
 
     #[test]
     fn incomplete_safety_limited_captures_are_detected() {
