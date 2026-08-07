@@ -563,6 +563,23 @@ fn capture_loop(
         }
     }
 
+    // The resampler always holds the last frame back as interpolation
+    // context for a chunk that will never arrive now (SBS-595); flush it so
+    // the recording's last bit of audio isn't silently dropped.
+    if let (Some(fmt), Some(astream)) = (audio_fmt.as_ref(), audio_stream) {
+        if let Some(r) = resampler.as_mut() {
+            let tail = r.flush();
+            if !tail.is_empty() {
+                // The returned duration has nothing left to advance:
+                // Finalize() runs right after this, so audio_cursor's last
+                // real use was the loop above.
+                unsafe {
+                    write_pcm(&writer, astream, &tail, fmt.rate, fmt.channels, audio_cursor)?;
+                }
+            }
+        }
+    }
+
     unsafe { writer.Finalize().context("finalize mp4")? };
     let _ = session.Close();
     let _ = pool.Close();
