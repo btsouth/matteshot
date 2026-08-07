@@ -34,13 +34,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, HC_ACTION, HWND_TOPMOST, IDC_ARROW,
     IDC_CROSS, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WH_KEYBOARD_LL, WM_DESTROY,
     WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 const WHITE: COLORREF = COLORREF(0x00FFFFFF);
 
 const DRAG_THRESHOLD: i32 = 6;
+
+/// Width reserved for the delay chip's dropdown caret, reserved out of the
+/// chip's own measured width so the caret never crowds the label.
+const DELAY_CARET_W: i32 = 22;
 
 // The frozen overlay is modal even when Windows rejects a foreground request
 // (common immediately after a tray menu closes). Route keyboard input directly
@@ -111,8 +115,10 @@ pub enum Selection {
     Region(RgbaImage),
     /// Close the overlay, count down, and open it again. The freeze happens
     /// when the overlay opens, so a menu can only be caught by getting out of
-    /// the way first and re-freezing afterwards.
-    Delay,
+    /// the way first and re-freezing afterwards. The payload is the delay to
+    /// arm: the value the chip was already showing, or a new one picked from
+    /// the in-overlay list, which also becomes the new default.
+    Delay(u32),
     /// Record instead of capture — carries virtual-screen geometry.
     RecordWindow(HWND),
     RecordRegion(RECT, HMONITOR),
@@ -166,6 +172,35 @@ struct Button {
     rect: RECT,
     btn: Btn,
     label: Vec<u16>,
+    /// Only meaningful for `Btn::Delay`: the trailing sub-rect that opens the
+    /// delay list, carved out of `rect` rather than a separate widget so
+    /// hover/paint stay driven by the same button entry.
+    caret_rect: RECT,
+}
+
+/// The caret sits flush against the button's trailing edge, `caret_w` wide.
+fn delay_caret_rect(button_rect: RECT, caret_w: i32) -> RECT {
+    RECT {
+        left: button_rect.right - caret_w,
+        top: button_rect.top,
+        right: button_rect.right,
+        bottom: button_rect.bottom,
+    }
+}
+
+/// Lay out the delay-choice list directly below its anchor button, one row
+/// per choice, left/right-aligned with the button.
+fn delay_list_rects(anchor: RECT, item_h: i32, choices: &[u32]) -> Vec<(RECT, u32)> {
+    let mut items = Vec::with_capacity(choices.len());
+    let mut top = anchor.bottom + 6;
+    for &seconds in choices {
+        items.push((
+            RECT { left: anchor.left, top, right: anchor.right, bottom: top + item_h },
+            seconds,
+        ));
+        top += item_h;
+    }
+    items
 }
 
 struct WinEntry {
@@ -211,6 +246,16 @@ struct State {
     /// the delay chip stays lit so the reopen reads as a continuation rather
     /// than the overlay having bounced back for no reason.
     delayed: bool,
+    /// The delay the chip currently reads and would arm. Only changes when
+    /// the in-overlay list picks a different one; picking arms immediately,
+    /// so this never drifts from what is on screen.
+    delay_secs: u32,
+    /// Toolbar button height, kept for laying out the delay list's rows to
+    /// match without re-measuring text.
+    btn_h: i32,
+    delay_list_open: bool,
+    delay_list: Vec<(RECT, u32)>,
+    delay_list_hover: i32,
 }
 
 unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
@@ -327,7 +372,7 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
             (Btn::Window, Mode::Window) | (Btn::Region, Mode::Region)
         ) || (b.btn == Btn::Record && state.recording)
             || (b.btn == Btn::Scroll && state.scrolling)
-            || (b.btn == Btn::Delay && state.delayed);
+            || (b.btn == Btn::Delay && (state.delayed || state.delay_list_open));
         if selected {
             let bg = CreateSolidBrush(state.theme.chip);
             let nopen = CreatePen(PS_SOLID, 1, state.theme.chip);
@@ -349,8 +394,64 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
                 state.theme.muted
             },
         );
-        let mut label = b.label.clone();
-        let mut rc = b.rect;
+        if b.btn == Btn::Delay {
+            // The label and the caret are two independently hit-testable
+            // zones, so they are drawn in their own sub-rects rather than as
+            // one centered string.
+            let mut label = b.label.clone();
+            let mut label_rc =
+                RECT { left: b.rect.left, top: b.rect.top, right: b.caret_rect.left, bottom: b.rect.bottom };
+            DrawTextW(hdc, &mut label, &mut label_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            let mut caret = wide("\u{25BE}");
+            let mut caret_rc = b.caret_rect;
+            DrawTextW(hdc, &mut caret, &mut caret_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            let mut label = b.label.clone();
+            let mut rc = b.rect;
+            DrawTextW(hdc, &mut label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+}
+
+/// The delay list: one row per `crate::delay::CHOICES` value, opened by the
+/// chip's caret or a right-click anywhere on the chip.
+unsafe fn draw_delay_list(hdc: HDC, state: &State) {
+    if !state.delay_list_open || state.delay_list.is_empty() {
+        return;
+    }
+    let first = state.delay_list[0].0;
+    let last = state.delay_list[state.delay_list.len() - 1].0;
+    let panel = RECT { left: first.left, top: first.top, right: first.right, bottom: last.bottom };
+    let brush = CreateSolidBrush(state.theme.panel);
+    let pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
+    let old_brush = SelectObject(hdc, brush);
+    let old_pen = SelectObject(hdc, pen);
+    let _ = RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 10, 10);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(brush);
+    let _ = DeleteObject(pen);
+
+    SelectObject(hdc, state.font);
+    SetBkMode(hdc, TRANSPARENT);
+    let current = crate::delay::sanitize(state.delay_secs);
+    for (i, (rect, seconds)) in state.delay_list.iter().enumerate() {
+        let highlighted = *seconds == current || i as i32 == state.delay_list_hover;
+        if highlighted {
+            let bg = CreateSolidBrush(state.theme.chip);
+            let nopen = CreatePen(PS_SOLID, 1, state.theme.chip);
+            let ob = SelectObject(hdc, bg);
+            let op = SelectObject(hdc, nopen);
+            let _ =
+                RoundRect(hdc, rect.left + 3, rect.top + 2, rect.right - 3, rect.bottom - 2, 8, 8);
+            SelectObject(hdc, ob);
+            SelectObject(hdc, op);
+            let _ = DeleteObject(bg);
+            let _ = DeleteObject(nopen);
+        }
+        SetTextColor(hdc, if *seconds == current { state.theme.accent } else { state.theme.text });
+        let mut label = wide(&format!("{seconds}s"));
+        let mut rc = *rect;
         DrawTextW(hdc, &mut label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 }
@@ -394,6 +495,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
     if state.pressed.is_none() {
         draw_toolbar(hdc, state);
+        draw_delay_list(hdc, state);
     }
 }
 
@@ -444,7 +546,7 @@ unsafe fn press_button(hwnd: HWND, state: &mut State, btn: Btn) {
         }
         // Not a mode: the overlay has to leave the screen for the delay to be
         // worth anything, so this ends the overlay and lets the caller reopen.
-        Btn::Delay => finish(hwnd, state, Some(Selection::Delay)),
+        Btn::Delay => finish(hwnd, state, Some(Selection::Delay(state.delay_secs))),
         Btn::Close => finish(hwnd, state, None),
     }
 }
@@ -452,6 +554,27 @@ unsafe fn press_button(hwnd: HWND, state: &mut State, btn: Btn) {
 unsafe fn finish(hwnd: HWND, state: &mut State, selection: Option<Selection>) {
     state.selection = Some(selection);
     let _ = DestroyWindow(hwnd);
+}
+
+/// Open the delay list below the chip, positioned from the chip's own rect
+/// so it tracks whichever monitor the toolbar landed on.
+unsafe fn open_delay_list(hwnd: HWND, state: &mut State) {
+    let Some(delay_btn) = state.buttons.iter().find(|b| b.btn == Btn::Delay) else {
+        return;
+    };
+    state.delay_list = delay_list_rects(delay_btn.rect, state.btn_h, &crate::delay::CHOICES);
+    state.delay_list_open = true;
+    state.delay_list_hover = -1;
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+unsafe fn close_delay_list(hwnd: HWND, state: &mut State) {
+    if state.delay_list_open {
+        state.delay_list_open = false;
+        state.delay_list.clear();
+        state.delay_list_hover = -1;
+        let _ = InvalidateRect(hwnd, None, false);
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -485,6 +608,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x: (lparam.0 & 0xFFFF) as i16 as i32,
                     y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 };
+                if state.delay_list_open {
+                    let h = state
+                        .delay_list
+                        .iter()
+                        .position(|(r, _)| in_rect(r, pt.x, pt.y))
+                        .map(|i| i as i32)
+                        .unwrap_or(-1);
+                    if h != state.delay_list_hover {
+                        state.delay_list_hover = h;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(start) = state.pressed {
                     if state.drag_to.is_some()
                         || (pt.x - start.x).abs() > DRAG_THRESHOLD
@@ -548,9 +684,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x: (lparam.0 & 0xFFFF) as i16 as i32,
                     y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 };
+                // The list is a popup on top of everything else: resolve
+                // clicks against it first and never let them fall through to
+                // a drag-select.
+                if state.delay_list_open {
+                    if let Some(&(_, seconds)) =
+                        state.delay_list.iter().find(|(r, _)| in_rect(r, pt.x, pt.y))
+                    {
+                        finish(hwnd, state, Some(Selection::Delay(seconds)));
+                    } else {
+                        close_delay_list(hwnd, state);
+                    }
+                    return LRESULT(0);
+                }
                 // Toolbar clicks act on button-up, never start a drag.
                 if !in_rect(&state.toolbar_rect, pt.x, pt.y) {
                     state.pressed = Some(pt);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            if let Some(state) = state_of(hwnd) {
+                let pt = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                if state
+                    .buttons
+                    .iter()
+                    .any(|b| b.btn == Btn::Delay && in_rect(&b.rect, pt.x, pt.y))
+                {
+                    open_delay_list(hwnd, state);
+                } else if state.delay_list_open {
+                    close_delay_list(hwnd, state);
                 }
             }
             LRESULT(0)
@@ -565,7 +732,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(i) = state.buttons.iter().position(|b| in_rect(&b.rect, pt.x, pt.y))
                     {
                         let btn = state.buttons[i].btn;
-                        press_button(hwnd, state, btn);
+                        if btn == Btn::Delay && in_rect(&state.buttons[i].caret_rect, pt.x, pt.y) {
+                            open_delay_list(hwnd, state);
+                        } else {
+                            press_button(hwnd, state, btn);
+                        }
                     }
                     return LRESULT(0);
                 }
@@ -684,6 +855,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_KEYDOWN => {
             if let Some(state) = state_of(hwnd) {
                 let key = wparam.0 as u16;
+                if state.delay_list_open && key == VK_ESCAPE.0 {
+                    close_delay_list(hwnd, state);
+                    return LRESULT(0);
+                }
+                // Any other key acts on the overlay proper, so a stale open
+                // list (left over from a right-click before a shortcut) must
+                // not linger on top of it.
+                close_delay_list(hwnd, state);
                 if key == VK_ESCAPE.0 {
                     finish(hwnd, state, None);
                 } else if let Some(button) = shortcut_button(key) {
@@ -1005,13 +1184,21 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
         const BTN_PAD: i32 = 16;
         const BTN_GAP: i32 = 6;
         const PILL_PAD: i32 = 9;
+        // Sized against "10s", the widest choice, rather than whatever is
+        // currently armed — otherwise the chip (and every button after it)
+        // would shift width between captures as the delay changes.
+        let delay_measure_label = wide("\u{23F1} 10s");
         let mut sizes = Vec::new();
         let mut text_h = 0;
-        for (label, _) in &specs {
-            let mut t = wide(label);
+        for (label, btn) in &specs {
+            let mut t = if *btn == Btn::Delay { delay_measure_label.clone() } else { wide(label) };
             let mut rc = RECT::default();
             DrawTextW(screen_dc, &mut t, &mut rc, DT_CALCRECT | DT_SINGLELINE);
-            sizes.push(rc.right - rc.left + BTN_PAD * 2);
+            let mut w = rc.right - rc.left + BTN_PAD * 2;
+            if *btn == Btn::Delay {
+                w += DELAY_CARET_W;
+            }
+            sizes.push(w);
             text_h = text_h.max(rc.bottom - rc.top);
         }
         SelectObject(screen_dc, old_font);
@@ -1041,16 +1228,15 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
         let mut buttons = Vec::new();
         let mut bx = pill_left + PILL_PAD;
         for ((label, btn), w) in specs.iter().zip(&sizes) {
-            buttons.push(Button {
-                rect: RECT {
-                    left: bx,
-                    top: pill_top + PILL_PAD,
-                    right: bx + w,
-                    bottom: pill_top + PILL_PAD + btn_h,
-                },
-                btn: *btn,
-                label: wide(label),
-            });
+            let rect = RECT {
+                left: bx,
+                top: pill_top + PILL_PAD,
+                right: bx + w,
+                bottom: pill_top + PILL_PAD + btn_h,
+            };
+            let caret_rect =
+                if *btn == Btn::Delay { delay_caret_rect(rect, DELAY_CARET_W) } else { RECT::default() };
+            buttons.push(Button { rect, btn: *btn, label: wide(label), caret_rect });
             bx += w + BTN_GAP;
         }
 
@@ -1079,6 +1265,11 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
             theme: crate::theme::current(),
             recording: false,
             scrolling: false,
+            delay_secs: crate::delay::sanitize(delay_secs),
+            btn_h,
+            delay_list_open: false,
+            delay_list: Vec::new(),
+            delay_list_hover: -1,
         });
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -1160,7 +1351,10 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
 
 #[cfg(test)]
 mod tests {
-    use super::{shortcut_bit, shortcut_button, write_overlay_layers, Btn};
+    use super::{
+        delay_caret_rect, delay_list_rects, shortcut_bit, shortcut_button, write_overlay_layers,
+        Btn, RECT,
+    };
 
     #[test]
     fn frozen_overlay_shortcuts_map_to_the_visible_toolbar() {
@@ -1199,6 +1393,35 @@ mod tests {
 
         assert_eq!(dim, [84, 62, 42, 255, 0, 4, 107, 255]);
         assert_eq!(bright, [200, 150, 100, 255, 0, 10, 255, 255]);
+    }
+
+    #[test]
+    fn delay_caret_sits_on_the_trailing_edge_without_consuming_the_whole_chip() {
+        let button = RECT { left: 10, top: 0, right: 100, bottom: 24 };
+        let caret = delay_caret_rect(button, 22);
+        assert_eq!(caret.right, button.right);
+        assert_eq!(caret.left, button.right - 22);
+        assert!(caret.left > button.left, "caret ate the whole chip");
+        assert_eq!(caret.top, button.top);
+        assert_eq!(caret.bottom, button.bottom);
+    }
+
+    #[test]
+    fn delay_list_rows_stack_below_the_chip_without_overlap_or_gaps() {
+        let anchor = RECT { left: 100, top: 50, right: 160, bottom: 80 };
+        let items = delay_list_rects(anchor, 24, &crate::delay::CHOICES);
+
+        assert_eq!(items.len(), crate::delay::CHOICES.len());
+        assert!(items[0].0.top > anchor.bottom, "list must not overlap the chip");
+        for pair in items.windows(2) {
+            assert_eq!(pair[0].0.bottom, pair[1].0.top, "rows must not overlap or leave gaps");
+        }
+        assert!(
+            items.iter().all(|(r, _)| r.left == anchor.left && r.right == anchor.right),
+            "rows must align with the chip"
+        );
+        let values: Vec<u32> = items.iter().map(|(_, s)| *s).collect();
+        assert_eq!(values, crate::delay::CHOICES.to_vec());
     }
 }
 
