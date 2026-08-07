@@ -143,6 +143,15 @@ const STOP_B: i32 = 34;
 /// step, but `recovery_anchor` declines to move a region's, so a region chosen
 /// near the top centre of the screen would sit under the pill for the whole
 /// run.
+///
+/// Clearing the anchor's *row* rather than the anchor point is deliberate, and
+/// it is what makes this hold for the whole capture rather than only the first
+/// step. The anchor moves horizontally — `edge_anchor` rebuilds it as
+/// `{ x: <window edge>, y: current.y }` — so its y never changes once chosen.
+/// Avoiding that row therefore avoids every position the anchor can ever take,
+/// without having to predict which edge it will walk to. Testing the initial
+/// point alone would leave a narrow window centred on screen able to walk its
+/// anchor under the pill on a later step.
 fn pill_origin(work: RECT, w: i32, h: i32, gap: i32, anchor: POINT) -> POINT {
     let cx = work.left + (work.right - work.left - w) / 2;
     let candidates = [
@@ -154,12 +163,7 @@ fn pill_origin(work: RECT, w: i32, h: i32, gap: i32, anchor: POINT) -> POINT {
     let home = candidates[0];
     candidates
         .into_iter()
-        .find(|p| {
-            !in_rect(
-                &RECT { left: p.x, top: p.y, right: p.x + w, bottom: p.y + h },
-                anchor,
-            )
-        })
+        .find(|p| anchor.y < p.y || anchor.y >= p.y + h)
         .unwrap_or(home)
 }
 
@@ -953,6 +957,10 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     let stop: StopSignal = Arc::new(AtomicBool::new(false));
     let (pill, pill_state) = unsafe { show_pill(anchor, hover, Arc::clone(&stop))? };
     cleanup.pill = Some((pill, pill_state));
+    // An Esc already held as the capture begins would read as "stop" on the
+    // very first poll and hand back a single frame, because clearing the latch
+    // cannot clear the key actually being down. Let it come up first.
+    wait_for_esc_release();
     // Whatever the latch accumulated before now belongs to the overlay, not to
     // this capture.
     clear_esc_latch();
@@ -1236,6 +1244,17 @@ mod tests {
             pill_origin(work, w, h, gap, POINT { x: 400, y: 700 }),
             POINT { x: (1920 - w) / 2, y: gap }
         );
+        // The whole row is cleared, not just the point. The anchor only ever
+        // moves horizontally, so a placement that dodges the initial x but
+        // keeps the row would still be walked under on a later step.
+        for x in [0, 400, 960, 1500, 1919] {
+            let anchor = POINT { x, y: 60 };
+            let origin = pill_origin(work, w, h, gap, anchor);
+            assert!(
+                !covers(origin, POINT { x: 960, y: 60 }),
+                "row not cleared for an anchor at x={x}"
+            );
+        }
     }
 
     #[test]
