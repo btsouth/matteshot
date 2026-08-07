@@ -125,6 +125,11 @@ const STOP_HOTKEY: i32 = 1;
 const PILL_W: i32 = 300;
 const PILL_H: i32 = 58;
 const PILL_PAD: i32 = 16;
+/// Stop button box at 96 DPI, in the pill's client coordinates.
+const STOP_L: i32 = 202;
+const STOP_T: i32 = 8;
+const STOP_R: i32 = 284;
+const STOP_B: i32 = 34;
 
 /// Where to put the pill so that it cannot swallow the wheel.
 ///
@@ -177,10 +182,10 @@ fn pill_layout(scale: f32) -> PillLayout {
         w: sc(PILL_W),
         h: sc(PILL_H),
         stop_rect: RECT {
-            left: sc(202),
-            top: sc(8),
-            right: sc(284),
-            bottom: sc(34),
+            left: sc(STOP_L),
+            top: sc(STOP_T),
+            right: sc(STOP_R),
+            bottom: sc(STOP_B),
         },
         pad: sc(PILL_PAD),
     }
@@ -193,6 +198,9 @@ struct Pill {
     font_small: HFONT,
     stop: StopSignal,
     stop_rect: RECT,
+    /// Named separately from the button because it has to tell the truth about
+    /// whether the chord actually registered.
+    hint: Vec<u16>,
     pad: i32,
     w: i32,
     h: i32,
@@ -269,7 +277,7 @@ unsafe extern "system" fn pill_proc(
 
                 SelectObject(hdc, p.font_small);
                 SetTextColor(hdc, p.theme.faint);
-                let mut hint = wide("Esc or Ctrl+Shift+S to stop");
+                let mut hint = p.hint.clone();
                 let mut hr =
                     RECT { left: 0, top: p.stop_rect.bottom, right: p.w, bottom: p.h };
                 DrawTextW(hdc, &mut hint, &mut hr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -351,6 +359,7 @@ unsafe fn show_pill(
         font_small: make_font(-sc(12), 400),
         stop,
         stop_rect: layout.stop_rect,
+        hint: wide("Esc or Ctrl+Shift+S to stop"),
         pad: layout.pad,
         w,
         h,
@@ -401,12 +410,22 @@ unsafe fn show_pill(
     // and the obvious candidates are the worst offenders — Space is page-down
     // in every browser, which would scroll the target out from under the very
     // step that is measuring it.
-    let _ = RegisterHotKey(
+    //
+    // A chord can already be owned by another process, in which case the hint
+    // must stop naming it: a control that is advertised and does nothing is
+    // worse than one that was never offered. Esc and the button are unaffected,
+    // so this degrades rather than fails.
+    if RegisterHotKey(
         hwnd,
         STOP_HOTKEY,
         MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
         0x53, // S
-    );
+    )
+    .is_err()
+    {
+        eprintln!("scroll: Ctrl+Shift+S is already taken; Esc and Stop still work");
+        pill.hint = wide("Esc or the Stop button to stop");
+    }
     Ok((hwnd, pill))
 }
 
@@ -438,8 +457,51 @@ fn pump() {
     }
 }
 
+/// Whether Esc has been pressed, including a tap that started and finished
+/// between two polls.
+///
+/// The high bit alone samples a level — "is it down at this instant" — and the
+/// gaps between polls here are 70ms to 280ms, which is the length of an
+/// ordinary key tap. Sampling would drop those, and a stop key that needs to
+/// be held to work teaches people to hold it, which is exactly what
+/// `wait_for_esc_release` then has to clean up after. The low bit latches
+/// "was pressed since the previous call", turning the poll into an edge test.
+///
+/// Relying on that latch is safe here because it is per-process and nothing
+/// else polls `VK_ESCAPE` while a capture runs: `delay.rs` is the only other
+/// caller, and a countdown and a scrolling capture never overlap.
 fn esc_pressed() -> bool {
-    unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000 != 0 }
+    unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8001 != 0 }
+}
+
+/// Clear a stale "pressed since last call" latch before the loop reads it.
+///
+/// The latch accumulates from whenever it was last read, so an Esc pressed
+/// before the capture began would otherwise stop it on the first poll.
+fn clear_esc_latch() {
+    let _ = esc_pressed();
+}
+
+/// Wait for Esc to come back up before handing control to the picker.
+///
+/// The stop is detected while the key is still down, and the picker cancels on
+/// `WM_KEYDOWN`, which auto-repeat keeps delivering for as long as the key is
+/// held. Returning with Esc still down would let it close the picker the
+/// instant it opens and destroy the very capture the stop was meant to save.
+///
+/// Bounded: a key reported as stuck must not hang the capture behind it.
+fn wait_for_esc_release() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    // The level bit only — the edge latch would re-trigger on the press that
+    // stopped us and never clear.
+    while unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } as u16 & 0x8000 != 0 {
+        if std::time::Instant::now() > deadline {
+            eprintln!("scroll: Esc still down after 3s; continuing anyway");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        pump();
+    }
 }
 
 /// Whether the user has asked the capture to end.
@@ -666,19 +728,29 @@ fn frame_after_wheel(
     Ok(Frame::Ready(next))
 }
 
+/// Owns everything the capture has to hand back: the cursor position, and the
+/// pill window together with the state its window procedure reads.
+///
+/// The `Box<Pill>` lives here rather than beside it in `capture` so the
+/// ordering is structural. `GWLP_USERDATA` points into that box, so the window
+/// must be destroyed before the box is freed; keeping them in separate
+/// bindings makes that a fact about declaration order, which an unwind would
+/// invert.
 struct CaptureCleanup {
     saved: POINT,
-    pill: Option<(HWND, HFONT, HFONT)>,
+    pill: Option<(HWND, Box<Pill>)>,
 }
 
 impl Drop for CaptureCleanup {
     fn drop(&mut self) {
         unsafe {
-            if let Some((pill, font, font_small)) = self.pill.take() {
-                let _ = UnregisterHotKey(pill, STOP_HOTKEY);
-                let _ = DestroyWindow(pill);
-                let _ = DeleteObject(font);
-                let _ = DeleteObject(font_small);
+            if let Some((hwnd, pill)) = self.pill.take() {
+                let _ = UnregisterHotKey(hwnd, STOP_HOTKEY);
+                // Before the fonts, and before `pill` falls out of scope: the
+                // window procedure can still run during destruction.
+                let _ = DestroyWindow(hwnd);
+                let _ = DeleteObject(pill.font);
+                let _ = DeleteObject(pill.font_small);
             }
             let _ = SetCursorPos(self.saved.x, self.saved.y);
         }
@@ -879,8 +951,11 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
     }
 
     let stop: StopSignal = Arc::new(AtomicBool::new(false));
-    let (pill, mut pill_state) = unsafe { show_pill(anchor, hover, Arc::clone(&stop))? };
-    cleanup.pill = Some((pill, pill_state.font, pill_state.font_small));
+    let (pill, pill_state) = unsafe { show_pill(anchor, hover, Arc::clone(&stop))? };
+    cleanup.pill = Some((pill, pill_state));
+    // Whatever the latch accumulated before now belongs to the overlay, not to
+    // this capture.
+    clear_esc_latch();
     pump();
 
     let mut canvas = first.clone();
@@ -1066,7 +1141,9 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         prev = next;
         steps += 1;
 
-        pill_state.text = wide(&format!("Scrolling\u{2026}  {} px", canvas.height()));
+        if let Some((_, pill_state)) = cleanup.pill.as_mut() {
+            pill_state.text = wide(&format!("Scrolling\u{2026}  {} px", canvas.height()));
+        }
         unsafe {
             let _ = InvalidateRect(pill, None, false);
         }
@@ -1103,6 +1180,9 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         paint_final_scrollbar(&mut canvas, &last_observed, scrollbar_width, view_top);
         eprintln!("scroll: kept browser scrollbar at start and finish");
     }
+
+    // With the pill still up, so the wait is visible rather than a freeze.
+    wait_for_esc_release();
 
     drop(cleanup);
     pump();
@@ -1172,7 +1252,7 @@ mod tests {
             // Small targets are the whole reason this is scaled: a button that
             // stays 82px while the screen doubles is half the size it looks.
             assert!(
-                r.right - r.left >= (82.0 * scale) as i32 - 1,
+                r.right - r.left >= ((STOP_R - STOP_L) as f32 * scale) as i32 - 1,
                 "button did not scale at {scale}x"
             );
         }
