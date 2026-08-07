@@ -84,6 +84,29 @@ impl Resampler {
         }
         out
     }
+
+    /// Emit whatever `process` is still holding back once no more input is
+    /// coming (end of recording). `process` never emits a frame without a
+    /// following one to interpolate toward, so without this call the last
+    /// frame of every resampled recording is silently dropped. There is
+    /// nothing to interpolate toward here either, so this repeats the tail's
+    /// last frame as a flat (zero-order-hold) value instead — present but
+    /// unresampled, rather than missing.
+    pub fn flush(&mut self) -> Vec<f32> {
+        let frames = self.tail.len() / self.channels;
+        if frames == 0 {
+            return Vec::new();
+        }
+        let last = frames - 1;
+        let mut out = Vec::with_capacity(self.out_channels);
+        for c in 0..self.out_channels {
+            let sc = c.min(self.channels - 1);
+            out.push(self.tail[last * self.channels + sc]);
+        }
+        self.tail.clear();
+        self.pos = 0.0;
+        out
+    }
 }
 
 /// Encoder-friendly rate/channels for a device format.
@@ -285,16 +308,31 @@ mod tests {
     }
 
     #[test]
-    fn the_final_frame_is_held_and_lost_without_a_flush() {
-        // Documents a real gap, tracked separately (SBS-595) rather than
-        // fixed here: nothing calls process() again after the last chunk of
-        // a real recording, and there is no flush/finalize method, so the
-        // last frame held for interpolation context is silently never
-        // emitted. In practice this drops well under a video frame's worth
-        // of audio from the end of every recording.
+    fn flush_recovers_the_frame_process_alone_would_drop() {
+        // process() never emits a frame without a following one to
+        // interpolate toward (SBS-595), so the last frame of every
+        // recording depends on flush() to not be silently dropped.
         let mut r = Resampler::new(48_000, 48_000, 1, 1);
         let out = r.process(&[1.0, 2.0, 3.0]);
-        assert_eq!(out, vec![1.0, 2.0], "3.0 is held as interpolation context, not emitted");
+        assert_eq!(out, vec![1.0, 2.0], "3.0 is held as interpolation context, not emitted yet");
+        assert_eq!(r.flush(), vec![3.0], "flush recovers it instead of losing it");
+    }
+
+    #[test]
+    fn flush_on_an_empty_tail_is_a_no_op() {
+        let mut r = Resampler::new(48_000, 48_000, 1, 1);
+        assert_eq!(r.flush(), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn flush_downmixes_the_tail_to_the_front_stereo_pair_too() {
+        let mut r = Resampler::new(48_000, 48_000, 6, 2);
+        // Same input as `a_surround_source_downmixes_to_the_front_stereo_pair`
+        // above: frame 0 is emitted by process(), frame 1 (3.0, 4.0, ...) is
+        // what's left in the tail for flush() to recover.
+        let input = vec![1.0, 2.0, 9.0, 9.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 9.0, 9.0];
+        let _ = r.process(&input);
+        assert_eq!(r.flush(), vec![3.0, 4.0], "only the front L/R channels should survive");
     }
 
     #[test]
