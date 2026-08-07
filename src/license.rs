@@ -448,6 +448,18 @@ pub fn status() -> Status {
     trial_status_at(started, previous_seen, now)
 }
 
+/// The signed certificate + signature this device's license holds, for
+/// callers (like the Share action) that need to attach proof of license to a
+/// request without a license.matteshot.app round trip. `None` unless
+/// `status()` would currently return `Licensed`, so a caller never attaches
+/// a certificate this device already knows is stale or mismatched.
+pub fn signed_certificate() -> Option<(String, String)> {
+    let state = load_state();
+    let stored = state.license.as_ref()?;
+    verify(stored, &device_id()).ok()?;
+    Some((stored.certificate.clone(), stored.signature.clone()))
+}
+
 /// Begin the trial after the first completed capture. Calling this again never
 /// moves the start date forward.
 static TRIAL_SYNC_SPAWNED: AtomicBool = AtomicBool::new(false);

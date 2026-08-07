@@ -76,6 +76,7 @@ enum Ctl {
     Ocr,
     Copy,
     Save,
+    Share,
 }
 
 const TOOLS: [&str; 9] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"];
@@ -1562,6 +1563,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::CustomSizeCancel => chip(hdc, *r, "Cancel", state, false, hot),
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
+            Ctl::Share => chip(hdc, *r, "Share", state, false, hot),
             Ctl::Tool(n) => {
                 let property_tool = if state.tool.is_none() {
                     state.doc()
@@ -2306,8 +2308,33 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 ),
             }
         }
+        Ctl::Share => share_current(hwnd, state),
         // Tool/Color/Undo/Clear handled above.
         _ => {}
+    }
+}
+
+/// Saves the current tab (same as Save) then uploads it in the background and
+/// copies the resulting link once it lands. Unlike Save, the tab stays open —
+/// closer in spirit to Copy, since sharing is not "finished with this
+/// capture" the way saving is.
+unsafe fn share_current(hwnd: HWND, state: &mut State) {
+    commit_editing(state);
+    let img = final_image(state);
+    let cfg = Config::load();
+    let style_name = state.doc().styles[state.doc().sel].name;
+    match output::save_png(&img, style_name, &cfg.save_dir()) {
+        Ok(path) => {
+            state.copy_hint = Some(("Sharing\u{2026}".into(), std::time::Instant::now()));
+            let _ = InvalidateRect(hwnd, None, false);
+            crate::share::share_in_background(hwnd, path);
+        }
+        Err(error) => show_output_error(
+            hwnd,
+            "The edited screenshot could not be saved. Your tab is still open.",
+            &error,
+            true,
+        ),
     }
 }
 
@@ -3046,6 +3073,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // PrtScn mid-tweak: nested overlay; the frozen image includes this
         // window, so it's snippable. Esc there returns here untouched.
+        crate::share::WM_SHARE_COMPLETE => {
+            let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
+            if let Some(state) = state_of(hwnd) {
+                state.copy_hint = match outcome {
+                    Ok(url) => match crate::output::text_to_clipboard(&url) {
+                        Ok(()) => Some(("Link copied".into(), std::time::Instant::now())),
+                        Err(error) => {
+                            show_output_error(hwnd, "The share link could not be copied.", &error, false);
+                            None
+                        }
+                    },
+                    Err(message) => {
+                        show_output_error(
+                            hwnd,
+                            "This capture could not be shared.",
+                            &anyhow::anyhow!(message),
+                            false,
+                        );
+                        None
+                    }
+                };
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         WM_OCR_READY => {
             if lparam.0 == 0 {
                 return LRESULT(0);
@@ -3391,6 +3443,10 @@ fn layout_controls(
     controls.push((
         RECT { left: col_x + sc(72), top: by, right: col_x + sc(136), bottom: by + sc(30) },
         Ctl::Save,
+    ));
+    controls.push((
+        RECT { left: col_x + sc(144), top: by, right: col_x + sc(208), bottom: by + sc(30) },
+        Ctl::Share,
     ));
     WindowLayout {
         controls,
@@ -4220,7 +4276,7 @@ mod tests {
             let action_top = layout
                 .controls
                 .iter()
-                .filter(|(_, control)| matches!(control, Ctl::Copy | Ctl::Save))
+                .filter(|(_, control)| matches!(control, Ctl::Copy | Ctl::Save | Ctl::Share))
                 .map(|(rect, _)| rect.top)
                 .min()
                 .unwrap();
