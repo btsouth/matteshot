@@ -188,11 +188,15 @@ fn delay_caret_rect(button_rect: RECT, caret_w: i32) -> RECT {
     }
 }
 
-/// Lay out the delay-choice list directly below its anchor button, one row
-/// per choice, left/right-aligned with the button.
-fn delay_list_rects(anchor: RECT, item_h: i32, choices: &[u32]) -> Vec<(RECT, u32)> {
+/// Lay out the delay-choice list against its anchor button, one row per
+/// choice, left/right-aligned with the button. Opens downward when
+/// `open_below`, else upward — the caller decides based on whether the
+/// monitor actually has room below the chip, so the list never runs off a
+/// short or heavily DPI-scaled monitor.
+fn delay_list_rects(anchor: RECT, item_h: i32, choices: &[u32], open_below: bool) -> Vec<(RECT, u32)> {
+    let list_h = item_h * choices.len() as i32;
+    let mut top = if open_below { anchor.bottom + 6 } else { anchor.top - 6 - list_h };
     let mut items = Vec::with_capacity(choices.len());
-    let mut top = anchor.bottom + 6;
     for &seconds in choices {
         items.push((
             RECT { left: anchor.left, top, right: anchor.right, bottom: top + item_h },
@@ -256,6 +260,11 @@ struct State {
     delay_list_open: bool,
     delay_list: Vec<(RECT, u32)>,
     delay_list_hover: i32,
+    /// Set when WM_LBUTTONDOWN closes the list because a caret click missed
+    /// every row. Without this, the matching WM_LBUTTONUP a moment later
+    /// still lands on the caret and reopens the list it just closed, so a
+    /// second caret click closes-then-reopens instead of toggling closed.
+    suppress_next_click: bool,
 }
 
 unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
@@ -556,13 +565,25 @@ unsafe fn finish(hwnd: HWND, state: &mut State, selection: Option<Selection>) {
     let _ = DestroyWindow(hwnd);
 }
 
-/// Open the delay list below the chip, positioned from the chip's own rect
-/// so it tracks whichever monitor the toolbar landed on.
+/// Open the delay list against the chip, positioned from the chip's own rect
+/// so it tracks whichever monitor the toolbar landed on. Prefers opening
+/// downward; flips to open upward instead when the monitor the chip is on
+/// does not have room below it for every row.
 unsafe fn open_delay_list(hwnd: HWND, state: &mut State) {
     let Some(delay_btn) = state.buttons.iter().find(|b| b.btn == Btn::Delay) else {
         return;
     };
-    state.delay_list = delay_list_rects(delay_btn.rect, state.btn_h, &crate::delay::CHOICES);
+    let anchor = delay_btn.rect;
+    let list_h = state.btn_h * crate::delay::CHOICES.len() as i32;
+    // Falls back to the overlay's own bottom edge if the anchor's monitor
+    // cannot be found, which is never tighter than a real monitor would be.
+    let mon_bottom = state
+        .monitors
+        .iter()
+        .find(|m| in_rect(m, anchor.left, anchor.top))
+        .map_or(state.height, |m| m.bottom);
+    let open_below = anchor.bottom + 6 + list_h <= mon_bottom;
+    state.delay_list = delay_list_rects(anchor, state.btn_h, &crate::delay::CHOICES, open_below);
     state.delay_list_open = true;
     state.delay_list_hover = -1;
     let _ = InvalidateRect(hwnd, None, false);
@@ -693,7 +714,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     {
                         finish(hwnd, state, Some(Selection::Delay(seconds)));
                     } else {
+                        // A caret click that lands here (missing every row)
+                        // is what re-clicking the caret to close the list
+                        // looks like — the caret itself is part of the
+                        // toolbar, not the list. Suppress the matching
+                        // WM_LBUTTONUP so it does not immediately reopen
+                        // what this just closed.
+                        let on_caret = state
+                            .buttons
+                            .iter()
+                            .any(|b| b.btn == Btn::Delay && in_rect(&b.caret_rect, pt.x, pt.y));
                         close_delay_list(hwnd, state);
+                        state.suppress_next_click = on_caret;
                     }
                     return LRESULT(0);
                 }
@@ -728,6 +760,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x: (lparam.0 & 0xFFFF) as i16 as i32,
                     y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 };
+                if std::mem::take(&mut state.suppress_next_click) {
+                    return LRESULT(0);
+                }
                 if state.pressed.is_none() {
                     if let Some(i) = state.buttons.iter().position(|b| in_rect(&b.rect, pt.x, pt.y))
                     {
@@ -1270,6 +1305,7 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
             delay_list_open: false,
             delay_list: Vec::new(),
             delay_list_hover: -1,
+            suppress_next_click: false,
         });
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -1409,7 +1445,7 @@ mod tests {
     #[test]
     fn delay_list_rows_stack_below_the_chip_without_overlap_or_gaps() {
         let anchor = RECT { left: 100, top: 50, right: 160, bottom: 80 };
-        let items = delay_list_rects(anchor, 24, &crate::delay::CHOICES);
+        let items = delay_list_rects(anchor, 24, &crate::delay::CHOICES, true);
 
         assert_eq!(items.len(), crate::delay::CHOICES.len());
         assert!(items[0].0.top > anchor.bottom, "list must not overlap the chip");
@@ -1420,6 +1456,22 @@ mod tests {
             items.iter().all(|(r, _)| r.left == anchor.left && r.right == anchor.right),
             "rows must align with the chip"
         );
+        let values: Vec<u32> = items.iter().map(|(_, s)| *s).collect();
+        assert_eq!(values, crate::delay::CHOICES.to_vec());
+    }
+
+    #[test]
+    fn delay_list_rows_stack_above_the_chip_when_told_to_open_upward() {
+        let anchor = RECT { left: 100, top: 50, right: 160, bottom: 80 };
+        let items = delay_list_rects(anchor, 24, &crate::delay::CHOICES, false);
+
+        assert_eq!(items.len(), crate::delay::CHOICES.len());
+        assert!(items.last().unwrap().0.bottom < anchor.top, "list must not overlap the chip");
+        for pair in items.windows(2) {
+            assert_eq!(pair[0].0.bottom, pair[1].0.top, "rows must not overlap or leave gaps");
+        }
+        // Same reading order regardless of direction: the first choice is
+        // still the topmost row, it is just higher up the screen.
         let values: Vec<u32> = items.iter().map(|(_, s)| *s).collect();
         assert_eq!(values, crate::delay::CHOICES.to_vec());
     }
