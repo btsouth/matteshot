@@ -376,8 +376,13 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 // Re-snipped into a delay. Run the countdown here rather than
                 // handing back to shoot_overlay, which would open a fresh
                 // undelayed overlay and make the user choose Delay twice.
-                overlay::Selection::Delay => {
-                    let seconds = cfg.capture_delay_secs;
+                overlay::Selection::Delay(seconds) => {
+                    // Persisted after the overlay closed, never during: the
+                    // overlay's own timing log (freeze_ms) must not include
+                    // config I/O.
+                    if seconds != cfg.capture_delay_secs {
+                        Config::update(|cfg| cfg.capture_delay_secs = seconds);
+                    }
                     if note_failure("delay", delay::countdown(seconds))? {
                         shoot_overlay_delayed()
                     } else {
@@ -441,20 +446,29 @@ fn shoot_overlay_from(start_delayed: bool) -> Result<()> {
     // the screen freezes the moment the overlay opens, so the only way to
     // catch a menu is to get out of the way, count down, and freeze again.
     let mut delayed = start_delayed;
-    let seconds = Config::load().capture_delay_secs;
+    let mut seconds = Config::load().capture_delay_secs;
     loop {
         let selection = note_failure("overlay", overlay::select(delayed, seconds))?;
-        if matches!(selection, Some((overlay::Selection::Delay, _))) {
-            // Escape during the countdown abandons the capture rather than
-            // bringing the overlay back.
-            if !note_failure("delay", delay::countdown(seconds))? {
-                return Ok(());
+        match selection {
+            Some((overlay::Selection::Delay(chosen), _)) => {
+                // Picking a new delay from the overlay's own list arms it
+                // immediately and becomes the new default. Persisted after
+                // the overlay closed, never during (config I/O on that path
+                // shows up in freeze_ms).
+                if chosen != seconds {
+                    seconds = chosen;
+                    Config::update(|cfg| cfg.capture_delay_secs = chosen);
+                }
+                // Escape during the countdown abandons the capture rather than
+                // bringing the overlay back.
+                if !note_failure("delay", delay::countdown(seconds))? {
+                    return Ok(());
+                }
+                // The reopened overlay says so, or coming back looks like a glitch.
+                delayed = true;
             }
-            // The reopened overlay says so, or coming back looks like a glitch.
-            delayed = true;
-            continue;
+            other => return dispatch_selection(other),
         }
-        return dispatch_selection(selection);
     }
 }
 
@@ -516,7 +530,7 @@ fn dispatch_selection(
         // Consumed by the loop in shoot_overlay, so arriving here means that
         // stopped being true. Not worth panicking over, but silence would hide
         // a regression behind a capture that simply does nothing.
-        Some((overlay::Selection::Delay, _)) => {
+        Some((overlay::Selection::Delay(_), _)) => {
             diagnostics::log("delay reached the dispatcher; capture skipped");
             Ok(())
         }
