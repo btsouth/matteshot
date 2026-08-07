@@ -7,6 +7,7 @@ mod config;
 mod delay;
 mod diagnostics;
 mod dpi;
+mod history;
 mod hotkey;
 mod icon;
 mod installer;
@@ -872,6 +873,7 @@ fn run_app() -> Result<()> {
                         output::open_folder(&Config::load().video_dir());
                         Ok(())
                     }
+                    tray::Action::History => history::open(),
                     tray::Action::Settings => settings::open(),
                     tray::Action::OpenUpdate => {
                         // Prefer an installer we have already downloaded and
@@ -1761,6 +1763,18 @@ fn main() -> Result<()> {
             let mut msg = MSG::default();
             unsafe {
                 while settings::is_open() && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            Ok(())
+        }
+        // Open only the history window (testing).
+        Some("--history") => {
+            history::open()?;
+            let mut msg = MSG::default();
+            unsafe {
+                while history::is_open() && GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }

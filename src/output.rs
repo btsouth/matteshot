@@ -225,6 +225,7 @@ pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path) -> Result<PathBuf
     );
     let path = dir.join(name);
     img.save(&path).context("write png")?;
+    crate::history::record(&path, img.width(), img.height(), style_name);
     Ok(path)
 }
 
