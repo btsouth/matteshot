@@ -156,3 +156,121 @@ pub fn variants(img: &RgbaImage) -> Vec<Style> {
         Style { name: "None", backdrop: Backdrop::Plain },
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: f32, b: f32, eps: f32) -> bool {
+        (a - b).abs() <= eps
+    }
+
+    #[test]
+    fn hsl_and_rgb_to_hsl_round_trip_for_saturated_colors() {
+        for (h, s, l) in [
+            (0.0, 1.0, 0.5),
+            (120.0, 0.6, 0.4),
+            (240.0, 0.8, 0.3),
+            (300.0, 0.5, 0.7),
+            (37.0, 0.9, 0.55),
+        ] {
+            let Rgb(r, g, b) = hsl(h, s, l);
+            let (h2, s2, l2) = rgb_to_hsl(r, g, b);
+            assert!(approx(h, h2, 0.5), "hue: {h} vs {h2}");
+            assert!(approx(s, s2, 0.01), "sat: {s} vs {s2}");
+            assert!(approx(l, l2, 0.01), "light: {l} vs {l2}");
+        }
+    }
+
+    #[test]
+    fn hsl_produces_the_expected_primary_colors() {
+        let Rgb(r, g, b) = hsl(0.0, 1.0, 0.5);
+        assert!(approx(r, 1.0, 0.01) && approx(g, 0.0, 0.01) && approx(b, 0.0, 0.01), "red");
+        let Rgb(r, g, b) = hsl(120.0, 1.0, 0.5);
+        assert!(approx(r, 0.0, 0.01) && approx(g, 1.0, 0.01) && approx(b, 0.0, 0.01), "green");
+        let Rgb(r, g, b) = hsl(240.0, 1.0, 0.5);
+        assert!(approx(r, 0.0, 0.01) && approx(g, 0.0, 0.01) && approx(b, 1.0, 0.01), "blue");
+    }
+
+    #[test]
+    fn zero_saturation_is_gray_regardless_of_hue() {
+        for h in [0.0, 90.0, 217.0, 359.0] {
+            let Rgb(r, g, b) = hsl(h, 0.0, 0.5);
+            assert!(
+                approx(r, 0.5, 0.001) && approx(g, 0.5, 0.001) && approx(b, 0.5, 0.001),
+                "for hue {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_uniformly_gray_capture_has_no_dominant_hue() {
+        let img = RgbaImage::from_pixel(64, 64, image::Rgba([128, 128, 128, 255]));
+        assert_eq!(dominant_hue(&img), None);
+    }
+
+    #[test]
+    fn a_saturated_capture_reports_its_hue() {
+        for (color, expected_hue) in [
+            (image::Rgba([255u8, 0, 0, 255]), 0.0f32),
+            (image::Rgba([0, 255, 0, 255]), 120.0),
+            (image::Rgba([0, 0, 255, 255]), 240.0),
+        ] {
+            let img = RgbaImage::from_pixel(64, 64, color);
+            let hue = dominant_hue(&img).expect("a saturated capture must report a hue");
+            assert!((hue - expected_hue).abs() < 1.0, "for {color:?}: got {hue}");
+        }
+    }
+
+    #[test]
+    fn near_transparent_pixels_do_not_vote() {
+        // Fully transparent red must not be mistaken for a red-hued capture.
+        let img = RgbaImage::from_pixel(64, 64, image::Rgba([255, 0, 0, 10]));
+        assert_eq!(dominant_hue(&img), None);
+    }
+
+    #[test]
+    fn variants_always_returns_the_same_seven_named_styles_in_order() {
+        let img = RgbaImage::from_pixel(20, 20, image::Rgba([10, 200, 90, 255]));
+        let names: Vec<&str> = variants(&img).iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["Adaptive", "Deep", "Aurora", "Slate", "Paper", "Pop", "None"]);
+    }
+
+    #[test]
+    fn the_none_style_is_a_plain_backdrop() {
+        let img = RgbaImage::from_pixel(20, 20, image::Rgba([10, 200, 90, 255]));
+        assert!(matches!(variants(&img).last().unwrap().backdrop, Backdrop::Plain));
+    }
+
+    #[test]
+    fn variants_are_deterministic_for_the_same_capture() {
+        let img = RgbaImage::from_pixel(20, 20, image::Rgba([200, 60, 40, 255]));
+        let (a, b) = (variants(&img), variants(&img));
+        for (sa, sb) in a.iter().zip(&b) {
+            match (&sa.backdrop, &sb.backdrop) {
+                (Backdrop::Linear { c1: a1, c2: a2 }, Backdrop::Linear { c1: b1, c2: b2 }) => {
+                    assert_eq!((a1.0, a1.1, a1.2), (b1.0, b1.1, b1.2), "{}", sa.name);
+                    assert_eq!((a2.0, a2.1, a2.2), (b2.0, b2.1, b2.2), "{}", sa.name);
+                }
+                (Backdrop::Plain, Backdrop::Plain) => {}
+                (Backdrop::Aurora { base: ab, blobs: abl }, Backdrop::Aurora { base: bb, blobs: bbl }) => {
+                    assert_eq!((ab.0, ab.1, ab.2), (bb.0, bb.1, bb.2), "{}", sa.name);
+                    assert_eq!(abl.len(), bbl.len(), "{}", sa.name);
+                }
+                _ => panic!("{} changed backdrop kind between calls", sa.name),
+            }
+        }
+    }
+
+    #[test]
+    fn a_grayscale_capture_still_produces_seven_finite_styles() {
+        // No dominant hue: falls back to the indigo default rather than NaN.
+        let img = RgbaImage::from_pixel(20, 20, image::Rgba([128, 128, 128, 255]));
+        for style in variants(&img) {
+            if let Backdrop::Linear { c1, c2 } = &style.backdrop {
+                assert!(c1.0.is_finite() && c1.1.is_finite() && c1.2.is_finite(), "{}", style.name);
+                assert!(c2.0.is_finite() && c2.1.is_finite() && c2.2.is_finite(), "{}", style.name);
+            }
+        }
+    }
+}
