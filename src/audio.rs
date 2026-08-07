@@ -269,6 +269,35 @@ mod tests {
     }
 
     #[test]
+    fn surround_downmix_still_works_combined_with_resampling() {
+        // The test above uses a 1:1 ratio, which never interpolates and so
+        // cannot tell a downmix-then-resample implementation from a
+        // resample-then-downmix one, or catch a wrong-channel read once the
+        // interleave stride matters. A 1.5x ratio does both.
+        let mut r = Resampler::new(48_000, 32_000, 6, 2);
+        let input = vec![
+            0.0, 0.0, 999.0, 999.0, 999.0, 999.0, // frame 0
+            10.0, 20.0, 999.0, 999.0, 999.0, 999.0, // frame 1
+            20.0, 40.0, 999.0, 999.0, 999.0, 999.0, // frame 2
+        ];
+        let out = r.process(&input);
+        assert_eq!(out, vec![0.0, 0.0, 15.0, 30.0]);
+    }
+
+    #[test]
+    fn the_final_frame_is_held_and_lost_without_a_flush() {
+        // Documents a real gap, tracked separately (SBS-595) rather than
+        // fixed here: nothing calls process() again after the last chunk of
+        // a real recording, and there is no flush/finalize method, so the
+        // last frame held for interpolation context is silently never
+        // emitted. In practice this drops well under a video frame's worth
+        // of audio from the end of every recording.
+        let mut r = Resampler::new(48_000, 48_000, 1, 1);
+        let out = r.process(&[1.0, 2.0, 3.0]);
+        assert_eq!(out, vec![1.0, 2.0], "3.0 is held as interpolation context, not emitted");
+    }
+
+    #[test]
     fn encode_format_prefers_44_1k_only_when_the_device_is_a_multiple_of_it_and_not_48k() {
         for (device_rate, expected) in [
             (44_100, 44_100),

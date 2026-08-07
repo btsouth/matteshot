@@ -230,6 +230,16 @@ mod tests {
     }
 
     #[test]
+    fn the_alpha_cutoff_is_exactly_200() {
+        // One below the cutoff still doesn't vote...
+        let below = RgbaImage::from_pixel(64, 64, image::Rgba([255, 0, 0, 199]));
+        assert_eq!(dominant_hue(&below), None, "alpha 199 must not vote");
+        // ...but the cutoff itself does.
+        let at = RgbaImage::from_pixel(64, 64, image::Rgba([255, 0, 0, 200]));
+        assert_eq!(dominant_hue(&at), Some(0.0), "alpha 200 must vote");
+    }
+
+    #[test]
     fn variants_always_returns_the_same_seven_named_styles_in_order() {
         let img = RgbaImage::from_pixel(20, 20, image::Rgba([10, 200, 90, 255]));
         let names: Vec<&str> = variants(&img).iter().map(|s| s.name).collect();
@@ -256,6 +266,14 @@ mod tests {
                 (Backdrop::Aurora { base: ab, blobs: abl }, Backdrop::Aurora { base: bb, blobs: bbl }) => {
                     assert_eq!((ab.0, ab.1, ab.2), (bb.0, bb.1, bb.2), "{}", sa.name);
                     assert_eq!(abl.len(), bbl.len(), "{}", sa.name);
+                    for (ba, bb) in abl.iter().zip(bbl) {
+                        assert_eq!(
+                            (ba.color.0, ba.color.1, ba.color.2),
+                            (bb.color.0, bb.color.1, bb.color.2),
+                            "{} blob color",
+                            sa.name
+                        );
+                    }
                 }
                 _ => panic!("{} changed backdrop kind between calls", sa.name),
             }
@@ -266,10 +284,19 @@ mod tests {
     fn a_grayscale_capture_still_produces_seven_finite_styles() {
         // No dominant hue: falls back to the indigo default rather than NaN.
         let img = RgbaImage::from_pixel(20, 20, image::Rgba([128, 128, 128, 255]));
+        let finite = |c: &Rgb| c.0.is_finite() && c.1.is_finite() && c.2.is_finite();
         for style in variants(&img) {
-            if let Backdrop::Linear { c1, c2 } = &style.backdrop {
-                assert!(c1.0.is_finite() && c1.1.is_finite() && c1.2.is_finite(), "{}", style.name);
-                assert!(c2.0.is_finite() && c2.1.is_finite() && c2.2.is_finite(), "{}", style.name);
+            match &style.backdrop {
+                Backdrop::Linear { c1, c2 } => {
+                    assert!(finite(c1) && finite(c2), "{}", style.name);
+                }
+                Backdrop::Aurora { base, blobs } => {
+                    assert!(finite(base), "{} base", style.name);
+                    for blob in blobs {
+                        assert!(finite(&blob.color), "{} blob", style.name);
+                    }
+                }
+                Backdrop::Plain => {}
             }
         }
     }
