@@ -174,3 +174,148 @@ pub fn capture_thread(source: Source, tx: Sender<Chunk>, stop: Arc<AtomicBool>) 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_resampling_reproduces_the_input_exactly() {
+        let mut r = Resampler::new(48_000, 48_000, 1, 1);
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out = r.process(&input);
+        // The final frame is always held back as interpolation context for
+        // the next chunk, so a 1.0 ratio reproduces every frame but the last.
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn downsampling_by_two_keeps_every_other_frame() {
+        let mut r = Resampler::new(48_000, 24_000, 1, 1);
+        let input: Vec<f32> = (0..10).map(|v| v as f32).collect();
+        let out = r.process(&input);
+        assert_eq!(out, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn upsampling_by_two_interpolates_the_halfway_point() {
+        let mut r = Resampler::new(24_000, 48_000, 1, 1);
+        let input = vec![0.0, 10.0, 20.0, 30.0];
+        let out = r.process(&input);
+        // Frame i lands exactly on input[i]; the odd frames fall halfway
+        // between consecutive input samples.
+        assert_eq!(out, vec![0.0, 5.0, 10.0, 15.0, 20.0, 25.0]);
+    }
+
+    #[test]
+    fn splitting_the_same_input_across_chunks_matches_one_shot_processing() {
+        let input: Vec<f32> = (0..12).map(|v| v as f32).collect();
+
+        let mut whole = Resampler::new(48_000, 48_000, 1, 1);
+        let one_shot = whole.process(&input);
+
+        let mut chunked = Resampler::new(48_000, 48_000, 1, 1);
+        let mut piecewise = Vec::new();
+        for chunk in input.chunks(4) {
+            piecewise.extend(chunked.process(chunk));
+        }
+
+        assert_eq!(piecewise, one_shot, "a chunk boundary must not disturb the resampled stream");
+    }
+
+    #[test]
+    fn a_fractional_position_spanning_a_chunk_boundary_still_interpolates_correctly() {
+        // A 1.5x ratio deliberately never lands on an integer frame position,
+        // so this exercises exactly what the tail exists for: a chunk
+        // boundary landing mid-interpolation, between one sample already
+        // consumed and one that has not arrived yet.
+        let input: Vec<f32> = (0..12).map(|v| v as f32).collect();
+
+        let mut whole = Resampler::new(48_000, 32_000, 1, 1);
+        let one_shot = whole.process(&input);
+        assert_eq!(one_shot, vec![0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5]);
+
+        let mut chunked = Resampler::new(48_000, 32_000, 1, 1);
+        let mut piecewise = Vec::new();
+        for chunk in input.chunks(5) {
+            piecewise.extend(chunked.process(chunk));
+        }
+
+        assert_eq!(piecewise, one_shot, "a chunk boundary must not disturb the resampled stream");
+    }
+
+    #[test]
+    fn a_chunk_too_short_to_interpolate_is_held_for_the_next_one() {
+        let mut r = Resampler::new(48_000, 48_000, 1, 1);
+        assert_eq!(
+            r.process(&[1.0]),
+            Vec::<f32>::new(),
+            "one frame alone has no pair to interpolate against"
+        );
+        // The held-back frame plus a follow-up chunk should now resolve.
+        let out = r.process(&[2.0, 3.0]);
+        assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_surround_source_downmixes_to_the_front_stereo_pair() {
+        let mut r = Resampler::new(48_000, 48_000, 6, 2);
+        // Two frames of 6 channels: front-L, front-R, center, LFE, rear-L,
+        // rear-R. The center/LFE/rear channels are poisoned with 9.0, which
+        // must never reach the output.
+        let input = vec![1.0, 2.0, 9.0, 9.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 9.0, 9.0];
+        let out = r.process(&input);
+        assert_eq!(out, vec![1.0, 2.0], "only the front L/R channels should survive");
+    }
+
+    #[test]
+    fn surround_downmix_still_works_combined_with_resampling() {
+        // The test above uses a 1:1 ratio, which never interpolates and so
+        // cannot tell a downmix-then-resample implementation from a
+        // resample-then-downmix one, or catch a wrong-channel read once the
+        // interleave stride matters. A 1.5x ratio does both.
+        let mut r = Resampler::new(48_000, 32_000, 6, 2);
+        let input = vec![
+            0.0, 0.0, 999.0, 999.0, 999.0, 999.0, // frame 0
+            10.0, 20.0, 999.0, 999.0, 999.0, 999.0, // frame 1
+            20.0, 40.0, 999.0, 999.0, 999.0, 999.0, // frame 2
+        ];
+        let out = r.process(&input);
+        assert_eq!(out, vec![0.0, 0.0, 15.0, 30.0]);
+    }
+
+    #[test]
+    fn the_final_frame_is_held_and_lost_without_a_flush() {
+        // Documents a real gap, tracked separately (SBS-595) rather than
+        // fixed here: nothing calls process() again after the last chunk of
+        // a real recording, and there is no flush/finalize method, so the
+        // last frame held for interpolation context is silently never
+        // emitted. In practice this drops well under a video frame's worth
+        // of audio from the end of every recording.
+        let mut r = Resampler::new(48_000, 48_000, 1, 1);
+        let out = r.process(&[1.0, 2.0, 3.0]);
+        assert_eq!(out, vec![1.0, 2.0], "3.0 is held as interpolation context, not emitted");
+    }
+
+    #[test]
+    fn encode_format_prefers_44_1k_only_when_the_device_is_a_multiple_of_it_and_not_48k() {
+        for (device_rate, expected) in [
+            (44_100, 44_100),
+            (48_000, 48_000),
+            (88_200, 44_100),  // 2x44.1k
+            (96_000, 48_000),  // 2x48k
+            (192_000, 48_000), // common high-rate interface; not a 44.1k multiple
+        ] {
+            let out = encode_format(&Format { rate: device_rate, channels: 2 });
+            assert_eq!(out.rate, expected, "for device rate {device_rate}");
+        }
+    }
+
+    #[test]
+    fn encode_format_clamps_channels_into_what_aac_accepts() {
+        for (device_channels, expected) in [(0u16, 1u16), (1, 1), (2, 2), (6, 2), (8, 2)] {
+            let out = encode_format(&Format { rate: 48_000, channels: device_channels });
+            assert_eq!(out.channels, expected, "for device channels {device_channels}");
+        }
+    }
+}
