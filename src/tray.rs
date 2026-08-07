@@ -47,6 +47,7 @@ const CMD_BUY: usize = 109;
 const CMD_ACTIVATE: usize = 110;
 const CMD_OPEN_VIDEOS: usize = 113;
 const CMD_CAPTURE_DELAYED: usize = 114;
+const CMD_HISTORY: usize = 115;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Matteshot";
@@ -64,6 +65,12 @@ pub enum Action {
     Activate,
     Deactivate,
     Quit,
+    // Appended rather than inserted: WM_TRAY_ACTION encodes these as `as
+    // usize` discriminants, and posting/receiving can straddle an
+    // auto-update where an older resident and a newer CLI invocation (or
+    // vice versa) briefly coexist. Inserting a variant earlier would shift
+    // every later discriminant and desync that protocol.
+    History,
 }
 
 struct TrayState {
@@ -303,6 +310,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     );
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_FOLDER, w!("Open captures folder"));
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_VIDEOS, w!("Open videos folder"));
+    let _ = AppendMenuW(menu, MF_STRING, CMD_HISTORY, w!("History\u{2026}"));
     if let Some(update) = &state.update {
         // A staged installer is already downloaded and verified, so the menu
         // promises an install rather than a trip to the browser.
@@ -376,6 +384,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         CMD_CAPTURE_DELAYED => Some(Action::CaptureDelayed),
         CMD_OPEN_FOLDER => Some(Action::OpenFolder),
         CMD_OPEN_VIDEOS => Some(Action::OpenVideos),
+        CMD_HISTORY => Some(Action::History),
         CMD_SETTINGS => Some(Action::Settings),
         CMD_UPDATE => Some(Action::OpenUpdate),
         CMD_BUY => Some(Action::Buy),
@@ -494,6 +503,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     x if x == Action::CaptureDelayed as usize => Some(Action::CaptureDelayed),
                     x if x == Action::OpenFolder as usize => Some(Action::OpenFolder),
                     x if x == Action::OpenVideos as usize => Some(Action::OpenVideos),
+                    x if x == Action::History as usize => Some(Action::History),
                     x if x == Action::Settings as usize => Some(Action::Settings),
                     x if x == Action::OpenUpdate as usize => Some(Action::OpenUpdate),
                     x if x == Action::Buy as usize => Some(Action::Buy),
