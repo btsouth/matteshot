@@ -2347,6 +2347,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
             "Show original"
         } else if *act == Act::Copy && original_only {
             "Copy original"
+        } else if *act == Act::Share && state.sharing {
+            "Sharing\u{2026}"
         } else if *act == Act::Share && original_only {
             "Share original"
         } else {
@@ -2427,7 +2429,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
             if let Some(state) = state_of(hwnd) {
                 state.sharing = false;
-                state.status = Some(match outcome {
+                let message = match outcome {
                     Ok(url) => match crate::output::text_to_clipboard(&url) {
                         Ok(()) => "link copied to clipboard".into(),
                         Err(error) => {
@@ -2440,7 +2442,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         crate::diagnostics::log("video share failed");
                         format!("could not share: {message}")
                     }
-                });
+                };
+                // An export's own progress ("exporting … 45%") is more
+                // time-sensitive than the share result and still ticking
+                // forward; do not stomp on it. The clipboard action above
+                // still happens either way — only the status line waits.
+                if !state.exporting {
+                    state.status = Some(message);
+                }
                 let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
