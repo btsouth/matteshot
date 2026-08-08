@@ -45,6 +45,7 @@ const WM_RETAKE: u32 = WM_USER + 41;
 enum KeyAction {
     Choose(usize),
     Tweak(usize),
+    Share(usize),
     Pin,
     CopyText,
     Cancel,
@@ -57,6 +58,7 @@ fn key_action(vk: u16, hover: i32, count: usize) -> Option<KeyAction> {
         v if v == VK_ESCAPE.0 => Some(KeyAction::Cancel),
         v if v == VK_RETURN.0 => selected.map(KeyAction::Choose),
         0x54 => selected.map(KeyAction::Tweak), // T
+        0x53 => selected.map(KeyAction::Share), // S
         0x50 => Some(KeyAction::Pin),           // P
         0x43 => Some(KeyAction::CopyText),      // C
         v if v == VK_LEFT.0 && count > 0 => Some(KeyAction::Hover(
@@ -89,6 +91,10 @@ pub enum PickAction {
     Cancel,
     /// Open the tweak panel on this variant.
     Tweak(usize),
+    /// Export this variant, upload it, and copy the link — same destination
+    /// as the tweak editor's and history browser's Share, just without a
+    /// window to open first.
+    Share(usize),
     /// Float the raw capture as a topmost reference pin.
     Pin,
     /// OCR the raw capture and copy the text.
@@ -334,7 +340,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.faint);
     let mut hint = wide(
-        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
+        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   S share   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
     );
     let mut hint_rect = RECT {
         left: 0,
@@ -450,6 +456,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         finish(hwnd, state, PickAction::Choose(index))
                     }
                     Some(KeyAction::Tweak(index)) => finish(hwnd, state, PickAction::Tweak(index)),
+                    Some(KeyAction::Share(index)) => finish(hwnd, state, PickAction::Share(index)),
                     Some(KeyAction::Pin) => finish(hwnd, state, PickAction::Pin),
                     Some(KeyAction::CopyText) => finish(hwnd, state, PickAction::CopyText),
                     Some(KeyAction::Hover(index)) => {
@@ -606,6 +613,7 @@ mod tests {
     fn picker_shortcuts_choose_the_visible_variant() {
         assert_eq!(key_action(VK_RETURN.0, 3, 7), Some(KeyAction::Choose(3)));
         assert_eq!(key_action(0x54, 3, 7), Some(KeyAction::Tweak(3)));
+        assert_eq!(key_action(0x53, 3, 7), Some(KeyAction::Share(3)));
         assert_eq!(key_action(0x50, 3, 7), Some(KeyAction::Pin));
         assert_eq!(key_action(0x43, 3, 7), Some(KeyAction::CopyText));
         assert_eq!(key_action(VK_ESCAPE.0, 3, 7), Some(KeyAction::Cancel));
