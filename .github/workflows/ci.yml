@@ -17,6 +17,9 @@ jobs:
   validate:
     name: Test, lint and build
     runs-on: [self-hosted, windows, matteshot]
+    # Self-hosted runners execute PR code on this host, not an ephemeral one;
+    # a fork PR would otherwise get arbitrary code execution here.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v7
 
