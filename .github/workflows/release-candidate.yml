@@ -10,15 +10,21 @@ permissions:
   contents: read
 
 jobs:
-  candidate:
+  # Build, test and sign on the free self-hosted runner. Only the desktop
+  # probes in the job below need a real GitHub-hosted VM, so everything that
+  # doesn't is kept off billed minutes.
+  build:
     name: Build and sign private candidate
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: windows-latest
+    runs-on: [self-hosted, windows, matteshot]
     environment: release
     timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      installer-name: ${{ steps.installer.outputs.name }}
     steps:
       - uses: actions/checkout@v7
 
@@ -43,6 +49,21 @@ jobs:
       - name: Verify code
         shell: pwsh
         run: .\scripts\verify-code.ps1
+
+      # GitHub-hosted images ship the Azure CLI preinstalled; this self-hosted
+      # one does not. The runner service's own process PATH predates any
+      # install, so a fresh choco install is invisible to later steps unless
+      # its directory is added to GITHUB_PATH explicitly.
+      - name: Install Azure CLI
+        shell: pwsh
+        run: |
+          if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+            choco install azure-cli -y --no-progress
+          }
+          $azDir = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin"
+          if (Test-Path $azDir) {
+            $azDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
 
       - name: Sign in to Azure with GitHub OIDC
         uses: azure/login@v3
@@ -79,6 +100,10 @@ jobs:
             exit 1
           }
           "path=$((Resolve-Path $path).Path)" >> $env:GITHUB_OUTPUT
+          # A job output the probe job below can use directly, rather than
+          # every downstream step reconstructing this filename from the
+          # version string and silently going stale if the naming changes.
+          "name=$(Split-Path -Leaf $path)" >> $env:GITHUB_OUTPUT
 
       - name: Sign installer with Trusted Signing
         uses: Azure/artifact-signing-action@v2
@@ -92,7 +117,6 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Verify signatures and checksum
-        id: verify
         shell: pwsh
         run: |
           $app = Get-AuthenticodeSignature '${{ github.workspace }}\target\release\matteshot.exe'
@@ -106,10 +130,67 @@ jobs:
             exit 1
           }
           $hash = (Get-FileHash -Algorithm SHA256 '${{ steps.installer.outputs.path }}').Hash.ToLowerInvariant()
-          $checksum = Join-Path $env:RUNNER_TEMP 'MatteshotSetup.exe.sha256'
+          # Written next to the installer (workspace-relative), not RUNNER_TEMP,
+          # so it travels with the installer into the artifact below and is
+          # still there once the probe job downloads it on a different machine.
           "$hash  MatteshotSetup-${{ steps.package.outputs.version }}.exe" |
-            Set-Content -Encoding ascii -NoNewline $checksum
-          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+            Set-Content -Encoding ascii -NoNewline 'installer\Output\MatteshotSetup.exe.sha256'
+
+      # Handed to the probe job below, which needs a real GitHub-hosted desktop
+      # session the self-hosted runner cannot provide.
+      - name: Upload unverified candidate for probing
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-unverified-${{ steps.package.outputs.version }}
+          path: |
+            target\release\matteshot.exe
+            installer\Output\${{ steps.installer.outputs.name }}
+            installer\Output\MatteshotSetup.exe.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # A real interactive desktop session is the one thing a Windows *service*
+  # (what the self-hosted runner is) fundamentally cannot provide, no matter
+  # which account it runs as — Session 0 has no desktop to record. This job
+  # exists only for the two steps that need one, so billed time here is a
+  # couple of minutes rather than the ~10 the whole candidate used to take.
+  probe:
+    name: Probe the signed candidate
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download unverified candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-unverified-${{ needs.build.outputs.version }}
+
+      # The build job already checked these once, but that was on a different
+      # machine: re-check after the artifact hop rather than trusting that a
+      # truncated download, storage corruption, or tampering in between would
+      # have been caught some other way.
+      - name: Re-verify signature and hash after transfer
+        shell: pwsh
+        run: |
+          $installerPath = "installer\Output\${{ needs.build.outputs.installer-name }}"
+          $app = Get-AuthenticodeSignature 'target\release\matteshot.exe'
+          $installer = Get-AuthenticodeSignature $installerPath
+          if ($app.Status -ne 'Valid') {
+            Write-Error "App signature is $($app.Status) after transfer."
+            exit 1
+          }
+          if ($installer.Status -ne 'Valid') {
+            Write-Error "Installer signature is $($installer.Status) after transfer."
+            exit 1
+          }
+          $expected = ((Get-Content -Raw 'installer\Output\MatteshotSetup.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $installerPath).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            Write-Error "Installer hash changed after transfer. Expected $expected, got $actual."
+            exit 1
+          }
 
       # The video probes need something to decode. Record it here rather than
       # committing a fixture: the recording and encode path gets exercised as a
@@ -135,14 +216,14 @@ jobs:
             -Offline `
             -NoCapture `
             -Exe '${{ github.workspace }}\target\release\matteshot.exe' `
-            -SignedFile '${{ steps.installer.outputs.path }}'
+            -SignedFile '${{ github.workspace }}\installer\Output\${{ needs.build.outputs.installer-name }}'
 
       - name: Upload private signed candidate
         uses: actions/upload-artifact@v4
         with:
-          name: Matteshot-${{ steps.package.outputs.version }}-signed-candidate
+          name: Matteshot-${{ needs.build.outputs.version }}-signed-candidate
           path: |
-            ${{ steps.installer.outputs.path }}
-            ${{ steps.verify.outputs.checksum }}
+            installer\Output\${{ needs.build.outputs.installer-name }}
+            installer\Output\MatteshotSetup.exe.sha256
           if-no-files-found: error
           retention-days: 14
