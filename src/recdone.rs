@@ -2416,6 +2416,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         crate::share::WM_SHARE_COMPLETE => {
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
             let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
             if let Some(state) = state_of(hwnd) {
                 state.status = Some(match outcome {
@@ -3052,9 +3055,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // edit export — the recorded file is what these three
                         // buttons agree the "real" artifact is.
                         Act::Share => {
-                            state.status = Some("Sharing\u{2026}".into());
-                            let _ = InvalidateRect(hwnd, None, false);
-                            crate::share::share_in_background(hwnd, state.mp4.clone());
+                            // A second click while one upload is already in
+                            // flight would start a redundant upload and let
+                            // whichever WM_SHARE_COMPLETE lands last silently
+                            // win.
+                            if state.status.as_deref() != Some("Sharing\u{2026}") {
+                                state.status = Some("Sharing\u{2026}".into());
+                                let _ = InvalidateRect(hwnd, None, false);
+                                crate::share::share_in_background(hwnd, state.mp4.clone());
+                            }
                         }
                         Act::Delete => {
                             if state.exporting {
