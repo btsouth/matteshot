@@ -24,6 +24,7 @@ jobs:
       id-token: write
     outputs:
       version: ${{ steps.package.outputs.version }}
+      installer-name: ${{ steps.installer.outputs.name }}
     steps:
       - uses: actions/checkout@v7
 
@@ -99,6 +100,10 @@ jobs:
             exit 1
           }
           "path=$((Resolve-Path $path).Path)" >> $env:GITHUB_OUTPUT
+          # A job output the probe job below can use directly, rather than
+          # every downstream step reconstructing this filename from the
+          # version string and silently going stale if the naming changes.
+          "name=$(Split-Path -Leaf $path)" >> $env:GITHUB_OUTPUT
 
       - name: Sign installer with Trusted Signing
         uses: Azure/artifact-signing-action@v2
@@ -139,7 +144,7 @@ jobs:
           name: candidate-unverified-${{ steps.package.outputs.version }}
           path: |
             target\release\matteshot.exe
-            installer\Output\MatteshotSetup-${{ steps.package.outputs.version }}.exe
+            installer\Output\${{ steps.installer.outputs.name }}
             installer\Output\MatteshotSetup.exe.sha256
           if-no-files-found: error
           retention-days: 1
@@ -161,6 +166,31 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: candidate-unverified-${{ needs.build.outputs.version }}
+
+      # The build job already checked these once, but that was on a different
+      # machine: re-check after the artifact hop rather than trusting that a
+      # truncated download, storage corruption, or tampering in between would
+      # have been caught some other way.
+      - name: Re-verify signature and hash after transfer
+        shell: pwsh
+        run: |
+          $installerPath = "installer\Output\${{ needs.build.outputs.installer-name }}"
+          $app = Get-AuthenticodeSignature 'target\release\matteshot.exe'
+          $installer = Get-AuthenticodeSignature $installerPath
+          if ($app.Status -ne 'Valid') {
+            Write-Error "App signature is $($app.Status) after transfer."
+            exit 1
+          }
+          if ($installer.Status -ne 'Valid') {
+            Write-Error "Installer signature is $($installer.Status) after transfer."
+            exit 1
+          }
+          $expected = ((Get-Content -Raw 'installer\Output\MatteshotSetup.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $installerPath).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            Write-Error "Installer hash changed after transfer. Expected $expected, got $actual."
+            exit 1
+          }
 
       # The video probes need something to decode. Record it here rather than
       # committing a fixture: the recording and encode path gets exercised as a
@@ -186,14 +216,14 @@ jobs:
             -Offline `
             -NoCapture `
             -Exe '${{ github.workspace }}\target\release\matteshot.exe' `
-            -SignedFile '${{ github.workspace }}\installer\Output\MatteshotSetup-${{ needs.build.outputs.version }}.exe'
+            -SignedFile '${{ github.workspace }}\installer\Output\${{ needs.build.outputs.installer-name }}'
 
       - name: Upload private signed candidate
         uses: actions/upload-artifact@v4
         with:
           name: Matteshot-${{ needs.build.outputs.version }}-signed-candidate
           path: |
-            installer\Output\MatteshotSetup-${{ needs.build.outputs.version }}.exe
+            installer\Output\${{ needs.build.outputs.installer-name }}
             installer\Output\MatteshotSetup.exe.sha256
           if-no-files-found: error
           retention-days: 14
