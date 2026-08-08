@@ -271,6 +271,11 @@ struct State {
     /// Bumped on every scrub request so frames for a position the user has
     /// already left can be discarded on arrival.
     scrub_generation: u64,
+    /// True while a share upload is in flight. Deliberately separate from
+    /// `status` — that string gets overwritten by unrelated handlers (export
+    /// progress, playback) while a share runs in the background, which would
+    /// silently defeat a guard built on top of it.
+    sharing: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -2421,6 +2426,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
             if let Some(state) = state_of(hwnd) {
+                state.sharing = false;
                 state.status = Some(match outcome {
                     Ok(url) => match crate::output::text_to_clipboard(&url) {
                         Ok(()) => "link copied to clipboard".into(),
@@ -3058,8 +3064,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // A second click while one upload is already in
                             // flight would start a redundant upload and let
                             // whichever WM_SHARE_COMPLETE lands last silently
-                            // win.
-                            if state.status.as_deref() != Some("Sharing\u{2026}") {
+                            // win. A dedicated flag rather than checking
+                            // `status` directly: that string gets overwritten
+                            // by unrelated handlers while the upload runs.
+                            if !state.sharing {
+                                state.sharing = true;
                                 state.status = Some("Sharing\u{2026}".into());
                                 let _ = InvalidateRect(hwnd, None, false);
                                 crate::share::share_in_background(hwnd, state.mp4.clone());
@@ -3727,6 +3736,7 @@ pub fn show(
         resume_after_drag: false,
         scrub_tx: None,
         scrub_generation: 0,
+        sharing: false,
     });
     recompose_preview(&mut state);
     let state = Box::into_raw(state);
