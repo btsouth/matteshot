@@ -3077,13 +3077,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
             if let Some(state) = state_of(hwnd) {
                 state.copy_hint = match outcome {
-                    Ok(url) => match crate::output::text_to_clipboard(&url) {
-                        Ok(()) => Some(("Link copied".into(), std::time::Instant::now())),
-                        Err(error) => {
-                            show_output_error(hwnd, "The share link could not be copied.", &error, false);
-                            None
+                    Ok(url) => {
+                        // Opening the page is the visible confirmation that
+                        // something happened; the clipboard copy alone was
+                        // easy to miss entirely.
+                        crate::output::open_url(&url);
+                        match crate::output::text_to_clipboard(&url) {
+                            Ok(()) => Some(("Link copied".into(), std::time::Instant::now())),
+                            Err(error) => {
+                                show_output_error(
+                                    hwnd,
+                                    "The share link could not be copied.",
+                                    &error,
+                                    false,
+                                );
+                                None
+                            }
                         }
-                    },
+                    }
                     Err(message) => {
                         show_output_error(
                             hwnd,

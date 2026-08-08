@@ -769,16 +769,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         crate::share::WM_SHARE_COMPLETE => {
             let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
             match outcome {
-                Ok(url) => match crate::output::text_to_clipboard(&url) {
-                    Ok(()) => {
-                        if let Some(state) = state_of(hwnd) {
-                            state.status =
-                                Some(("Link copied to clipboard".to_string(), std::time::Instant::now()));
-                            let _ = InvalidateRect(hwnd, None, false);
+                Ok(url) => {
+                    // Opening the page is the visible confirmation that
+                    // something happened; the clipboard copy alone was easy
+                    // to miss entirely.
+                    crate::output::open_url(&url);
+                    match crate::output::text_to_clipboard(&url) {
+                        Ok(()) => {
+                            if let Some(state) = state_of(hwnd) {
+                                state.status = Some((
+                                    "Link copied to clipboard".to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                                let _ = InvalidateRect(hwnd, None, false);
+                            }
                         }
+                        Err(error) => warn(hwnd, "The share link could not be copied.", &error),
                     }
-                    Err(error) => warn(hwnd, "The share link could not be copied.", &error),
-                },
+                }
                 Err(message) => warn(hwnd, "This capture could not be shared.", &message),
             }
             LRESULT(0)

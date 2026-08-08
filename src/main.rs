@@ -344,6 +344,33 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             telemetry::report("matteshot_editor_opened");
             return tweak::open(raw, styles, i, monitor, capture_title);
         }
+        PickAction::Share(i) => {
+            // Same reasoning as Tweak: an in-flight auto-copy of a
+            // different variant must not land after this one uploads.
+            if let Some(p) = cancel_auto() {
+                let _ = std::fs::remove_file(p);
+            }
+            let styled = compose::export(
+                &raw,
+                &styles[i],
+                compose::DEFAULT_PAD_FACTOR,
+                None,
+                cfg.export_scale,
+            );
+            let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
+            let path = output::save_png(&styled, styles[i].name, &cfg.save_dir())?;
+            let url = share::share_file(&path).context("could not share this capture")?;
+            output::open_url(&url);
+            // The share itself already succeeded and the link is already
+            // open in the browser; a clipboard miss here is a lesser,
+            // recoverable failure and must not read as "sharing failed".
+            if let Err(error) = output::text_to_clipboard(&url) {
+                eprintln!("share link clipboard copy failed: {error:#}");
+            }
+            Config::update(|cfg| cfg.last_style = i);
+            eprintln!("shared [{}]: {}", styles[i].name, url);
+            return Ok(());
+        }
         PickAction::Reshoot(sel, mon) => {
             // PrtScn mid-pick: the user re-snipped; replace the pending shot
             // (and its auto-copy — the new capture makes its own).

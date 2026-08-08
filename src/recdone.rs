@@ -2430,14 +2430,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 state.sharing = false;
                 let message = match outcome {
-                    Ok(url) => match crate::output::text_to_clipboard(&url) {
-                        Ok(()) => "link copied to clipboard".into(),
-                        Err(error) => {
-                            crate::diagnostics::log("share link clipboard copy failed");
-                            eprintln!("share link clipboard copy failed: {error:#}");
-                            format!("shared, but the link could not be copied: {url}")
+                    Ok(url) => {
+                        // Opening the page is the visible confirmation that
+                        // something happened; the clipboard copy alone was
+                        // easy to miss entirely.
+                        crate::output::open_url(&url);
+                        match crate::output::text_to_clipboard(&url) {
+                            Ok(()) => "link copied to clipboard".into(),
+                            Err(error) => {
+                                crate::diagnostics::log("share link clipboard copy failed");
+                                eprintln!("share link clipboard copy failed: {error:#}");
+                                format!("shared, but the link could not be copied: {url}")
+                            }
                         }
-                    },
+                    }
                     Err(message) => {
                         crate::diagnostics::log("video share failed");
                         format!("could not share: {message}")
