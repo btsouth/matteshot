@@ -60,12 +60,18 @@ jobs:
         run: .\scripts\verify-code.ps1
 
       # GitHub-hosted images ship the Azure CLI preinstalled; this self-hosted
-      # one does not.
+      # one does not. The runner service's own process PATH predates any
+      # install, so a fresh choco install is invisible to later steps unless
+      # its directory is added to GITHUB_PATH explicitly.
       - name: Install Azure CLI
         shell: pwsh
         run: |
           if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
             choco install azure-cli -y --no-progress
+          }
+          $azDir = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin"
+          if (Test-Path $azDir) {
+            $azDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
       - name: Sign in to Azure with GitHub OIDC
