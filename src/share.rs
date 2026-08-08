@@ -120,11 +120,17 @@ pub fn share_file(path: &Path) -> Result<String> {
 
     let (status, response_body) = post_multipart(SHARE_PATH, &boundary, &body)?;
     let parsed: ShareResponse = serde_json::from_slice(&response_body).unwrap_or_default();
-    if status == 200 {
-        parsed.url.context("the share response had no link")
-    } else {
+    if status != 200 {
         bail!(parsed.error.unwrap_or_else(|| format!("share request failed ({status})")));
     }
+    let url = parsed.url.context("the share response had no link")?;
+    // Every caller either opens this in a browser or hands it to the
+    // clipboard as a link; the same guard update.rs already applies to its
+    // manifest URLs before treating a network response as actionable.
+    if !url.starts_with("https://") {
+        bail!("the share response returned an unexpected link");
+    }
+    Ok(url)
 }
 
 /// A timestamp alone is not a uniqueness guarantee — clock resolution varies
