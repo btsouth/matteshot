@@ -104,13 +104,19 @@ fn trim_entries(mut entries: Vec<Entry>, cap: usize, exists: impl Fn(&Path) -> b
     entries
 }
 
+/// A window title is not bounded by Windows the way a control's own text
+/// often is; capping it here (same reasoning as diagnostics.rs's own event
+/// log) keeps one pathological title from bloating every future read of the
+/// whole history file, not just its own entry.
+const MAX_SOURCE_CHARS: usize = 200;
+
 /// A blank or whitespace-only title is not useful to show later, so it's
 /// dropped to `None` here rather than carried through as an empty label.
 fn normalize_source(source: Option<&str>) -> Option<String> {
     source
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(|s| s.chars().take(MAX_SOURCE_CHARS).collect())
 }
 
 /// Record a successful save. Never fatal: history is a convenience index, not
@@ -226,6 +232,13 @@ mod persistence_tests {
         assert_eq!(normalize_source(Some("")), None);
         assert_eq!(normalize_source(Some("   ")), None);
         assert_eq!(normalize_source(Some("  Notepad  ")), Some("Notepad".to_string()));
+    }
+
+    #[test]
+    fn a_pathological_window_title_is_capped_before_it_reaches_the_log() {
+        let long = "x".repeat(MAX_SOURCE_CHARS + 50);
+        let normalized = normalize_source(Some(&long)).unwrap();
+        assert_eq!(normalized.chars().count(), MAX_SOURCE_CHARS);
     }
 }
 
@@ -555,7 +568,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
         // is the ratio at every scale.
         let label_band = state.cell_h - state.cell_img_h;
         let source_h = label_band * SOURCE_LABEL_H / (SOURCE_LABEL_H + LABEL_H);
-        let source_text = thumb.entry.source.as_deref().unwrap_or("\u{2014}");
+        // Re-normalize rather than trusting the stored value directly: an
+        // externally-edited or future-version history.json could carry an
+        // empty or whitespace-only string instead of the None a blank title
+        // normalizes to here today.
+        let normalized_source = normalize_source(thumb.entry.source.as_deref());
+        let source_text = normalized_source.as_deref().unwrap_or("\u{2014}");
 
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, if hovered { state.theme.text } else { state.theme.muted });
