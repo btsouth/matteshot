@@ -27,7 +27,10 @@ permissions:
 jobs:
   review:
     name: CodeRev (advisory)
-    runs-on: ubuntu-latest
+    # Self-hosted since the hosted-minutes pool ran out (2026-08). Reviews are
+    # ~99% waiting on model APIs, so the local CPU cost is nil; they do share
+    # the single runner with ci.yml and will queue behind builds.
+    runs-on: [self-hosted, windows, matteshot]
     continue-on-error: true
     timeout-minutes: 20
     # Fork PRs do not get repository secrets, and Dependabot-triggered runs get
