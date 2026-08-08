@@ -16,7 +16,7 @@ concurrency:
 jobs:
   validate:
     name: Test, lint and build
-    runs-on: windows-latest
+    runs-on: [self-hosted, windows, matteshot]
     steps:
       - uses: actions/checkout@v7
 
