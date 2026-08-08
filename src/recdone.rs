@@ -82,6 +82,7 @@ enum Act {
     Play,
     Reveal,
     Copy,
+    Share,
     Delete,
     SaveTrim,
 }
@@ -406,11 +407,12 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     }
     let mut controls = Vec::new();
     let by = ch - sc(52);
-    let labels: [(Act, &'static str, i32); 5] = [
+    let labels: [(Act, &'static str, i32); 6] = [
         (Act::SaveTrim, "Export edit", 108),
         (Act::Play, "Play", 82),
         (Act::Reveal, "Show in folder", 126),
         (Act::Copy, "Copy", 112),
+        (Act::Share, "Share", 90),
         (Act::Delete, "Delete", 80),
     ];
     let mut x = m;
@@ -2340,6 +2342,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
             "Show original"
         } else if *act == Act::Copy && original_only {
             "Copy original"
+        } else if *act == Act::Share && original_only {
+            "Share original"
         } else {
             label
         };
@@ -2408,6 +2412,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             if close {
                 let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        crate::share::WM_SHARE_COMPLETE => {
+            let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
+            if let Some(state) = state_of(hwnd) {
+                state.status = Some(match outcome {
+                    Ok(url) => match crate::output::text_to_clipboard(&url) {
+                        Ok(()) => "link copied to clipboard".into(),
+                        Err(error) => {
+                            crate::diagnostics::log("share link clipboard copy failed");
+                            eprintln!("share link clipboard copy failed: {error:#}");
+                            format!("shared, but the link could not be copied: {url}")
+                        }
+                    },
+                    Err(message) => {
+                        crate::diagnostics::log("video share failed");
+                        format!("could not share: {message}")
+                    }
+                });
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
@@ -3021,6 +3046,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 }
                             });
                             let _ = InvalidateRect(hwnd, None, false);
+                        }
+                        // Shares the original recording, same as Copy and Show
+                        // in folder always act on the original rather than an
+                        // edit export — the recorded file is what these three
+                        // buttons agree the "real" artifact is.
+                        Act::Share => {
+                            state.status = Some("Sharing\u{2026}".into());
+                            let _ = InvalidateRect(hwnd, None, false);
+                            crate::share::share_in_background(hwnd, state.mp4.clone());
                         }
                         Act::Delete => {
                             if state.exporting {
@@ -3880,6 +3914,29 @@ mod tests {
             // layout must remain valid while the window self-repairs.
             assert_layout_is_usable(scale, 320, 180);
         }
+    }
+
+    #[test]
+    fn share_sits_between_copy_and_delete_without_overlap() {
+        // Copy and Show in folder always act on the recorded original, and
+        // Share follows the same rule (see the click handler), so it belongs
+        // in the same row rather than the annotation tool panel.
+        let window = layout(1.0, 1280, 720, 7);
+        let find = |act: super::Act| {
+            window
+                .controls
+                .iter()
+                .find(|(_, a, _)| *a == act)
+                .unwrap_or_else(|| panic!("missing control"))
+        };
+        let (copy_rect, _, copy_label) = find(super::Act::Copy);
+        let (share_rect, _, share_label) = find(super::Act::Share);
+        let (delete_rect, _, _) = find(super::Act::Delete);
+        assert_eq!(*copy_label, "Copy");
+        assert_eq!(*share_label, "Share");
+        assert!(copy_rect.right < share_rect.left, "Share overlaps Copy");
+        assert!(share_rect.right < delete_rect.left, "Delete overlaps Share");
+        assert!(share_rect.right <= 1280, "Share runs off the minimum-width window");
     }
 
     #[test]
