@@ -110,13 +110,31 @@ fn trim_entries(mut entries: Vec<Entry>, cap: usize, exists: impl Fn(&Path) -> b
 /// whole history file, not just its own entry.
 const MAX_SOURCE_CHARS: usize = 200;
 
+/// A window's title is set by whatever app owns it, not by this app, so it
+/// gets the same treatment diagnostics.rs's event log gives untrusted text:
+/// control characters flattened to spaces rather than left to disturb the
+/// label's layout. Bidi override/isolate characters are dropped outright —
+/// spacing them out still leaves them able to reorder the surrounding text,
+/// which flattening alone does not fix.
+fn sanitize_source(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !matches!(*c,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        })
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// A blank or whitespace-only title is not useful to show later, so it's
 /// dropped to `None` here rather than carried through as an empty label.
 fn normalize_source(source: Option<&str>) -> Option<String> {
-    source
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.chars().take(MAX_SOURCE_CHARS).collect())
+    let sanitized = sanitize_source(source?);
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_SOURCE_CHARS).collect())
 }
 
 /// Record a successful save. Never fatal: history is a convenience index, not
@@ -239,6 +257,19 @@ mod persistence_tests {
         let long = "x".repeat(MAX_SOURCE_CHARS + 50);
         let normalized = normalize_source(Some(&long)).unwrap();
         assert_eq!(normalized.chars().count(), MAX_SOURCE_CHARS);
+    }
+
+    #[test]
+    fn control_and_bidi_override_characters_do_not_survive_normalization() {
+        // A tab/newline flattens to a space rather than disturbing the
+        // label's single-line layout; a bidi override is dropped outright,
+        // since spacing it out would still leave it able to reorder the
+        // surrounding text.
+        let normalized = normalize_source(Some("Left\t\u{202E}txet.exe\u{202C}")).unwrap();
+        assert!(!normalized.contains('\t'));
+        assert!(!normalized.contains('\u{202E}'));
+        assert!(!normalized.contains('\u{202C}'));
+        assert_eq!(normalized, "Left txet.exe");
     }
 }
 
