@@ -361,7 +361,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             let path = output::save_png(&styled, styles[i].name, &cfg.save_dir())?;
             let url = share::share_file(&path).context("could not share this capture")?;
             output::open_url(&url);
-            output::text_to_clipboard(&url).context("clipboard failed")?;
+            // The share itself already succeeded and the link is already
+            // open in the browser; a clipboard miss here is a lesser,
+            // recoverable failure and must not read as "sharing failed".
+            if let Err(error) = output::text_to_clipboard(&url) {
+                eprintln!("share link clipboard copy failed: {error:#}");
+            }
             Config::update(|cfg| cfg.last_style = i);
             eprintln!("shared [{}]: {}", styles[i].name, url);
             return Ok(());
