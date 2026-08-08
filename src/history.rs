@@ -112,17 +112,21 @@ const MAX_SOURCE_CHARS: usize = 200;
 
 /// A window's title is set by whatever app owns it, not by this app, so it
 /// gets the same treatment diagnostics.rs's event log gives untrusted text:
-/// control characters flattened to spaces rather than left to disturb the
-/// label's layout. Bidi override/isolate characters are dropped outright —
-/// spacing them out still leaves them able to reorder the surrounding text,
-/// which flattening alone does not fix.
+/// control characters (plus the Unicode line/paragraph separators, which
+/// `char::is_control` does not cover) flattened to spaces rather than left
+/// to disturb the label's layout. Bidi override/isolate and zero-width
+/// characters are dropped outright — spacing the former out would still
+/// leave them able to reorder the surrounding text, and the latter are
+/// invisible either way, including making an otherwise-blank title dodge
+/// the empty-string check below by being technically non-empty.
 fn sanitize_source(text: &str) -> String {
     text.chars()
         .filter(|c| {
             !matches!(*c,
-                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}')
         })
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c })
         .collect()
 }
 
@@ -271,6 +275,22 @@ mod persistence_tests {
         assert!(!normalized.contains('\u{202C}'));
         assert_eq!(normalized, "Left txet.exe");
     }
+
+    #[test]
+    fn a_title_made_entirely_of_zero_width_characters_normalizes_to_none() {
+        // Invisible either way, but without stripping them a title like this
+        // would pass the empty-string check and print as a blank line
+        // instead of the placeholder.
+        assert_eq!(normalize_source(Some("\u{200B}\u{200C}\u{FEFF}")), None);
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_flatten_like_a_newline_does() {
+        // Not `char::is_control` (they're categories Zl/Zp, not Cc), so this
+        // needs its own case rather than relying on the same check as \t/\n.
+        let normalized = normalize_source(Some("Left\u{2028}Right\u{2029}End")).unwrap();
+        assert_eq!(normalized, "Left Right End");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +432,11 @@ struct Thumb {
     bgra: Vec<u8>,
     img_w: i32,
     img_h: i32,
+    /// Normalized once here rather than on every WM_PAINT — hover alone
+    /// repaints the whole visible grid, so redoing this per thumbnail per
+    /// frame would be pure repeated allocation for a value that never
+    /// changes after the entry is loaded.
+    source_label: String,
 }
 
 fn to_bgra(img: &RgbaImage) -> Vec<u8> {
@@ -432,7 +457,15 @@ fn make_thumb(entry: &Entry, max_w: i32, max_h: i32) -> Option<Thumb> {
     let scale = (max_w as f32 / w).min(max_h as f32 / h);
     let (tw, th) = ((w * scale).round().max(1.0) as u32, (h * scale).round().max(1.0) as u32);
     let resized = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
-    Some(Thumb { entry: entry.clone(), bgra: to_bgra(&resized), img_w: tw as i32, img_h: th as i32 })
+    let source_label =
+        normalize_source(entry.source.as_deref()).unwrap_or_else(|| "\u{2014}".to_string());
+    Some(Thumb {
+        entry: entry.clone(),
+        bgra: to_bgra(&resized),
+        img_w: tw as i32,
+        img_h: th as i32,
+        source_label,
+    })
 }
 
 fn build_thumbs(entries: &[Entry], max_w: i32, max_h: i32) -> Vec<Thumb> {
@@ -599,16 +632,10 @@ unsafe fn paint(hdc: HDC, state: &State) {
         // is the ratio at every scale.
         let label_band = state.cell_h - state.cell_img_h;
         let source_h = label_band * SOURCE_LABEL_H / (SOURCE_LABEL_H + LABEL_H);
-        // Re-normalize rather than trusting the stored value directly: an
-        // externally-edited or future-version history.json could carry an
-        // empty or whitespace-only string instead of the None a blank title
-        // normalizes to here today.
-        let normalized_source = normalize_source(thumb.entry.source.as_deref());
-        let source_text = normalized_source.as_deref().unwrap_or("\u{2014}");
 
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, if hovered { state.theme.text } else { state.theme.muted });
-        let mut source_label = wide(source_text);
+        let mut source_label = wide(&thumb.source_label);
         let mut source_rect = RECT {
             left: cx + 6,
             top: cy + state.cell_img_h,
