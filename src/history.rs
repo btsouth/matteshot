@@ -21,8 +21,8 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
     InvalidateRect, MonitorFromPoint, MonitorFromWindow, RoundRect, SelectObject, SetBkMode,
     SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
-    DT_WORDBREAK,
+    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK,
     FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     SRCCOPY, TRANSPARENT,
 };
@@ -646,7 +646,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
             hdc,
             &mut source_label,
             &mut source_rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+            // DT_NOPREFIX: a window title is arbitrary text, not a menu
+            // label — a real title containing "&" (e.g. "Search & Rescue")
+            // would otherwise have it eaten as an accelerator-prefix marker
+            // by DrawTextW's default menu-string behavior.
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
         SetTextColor(hdc, if hovered { state.theme.accent } else { state.theme.muted });
