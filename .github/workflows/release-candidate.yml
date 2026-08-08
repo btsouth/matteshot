@@ -10,15 +10,20 @@ permissions:
   contents: read
 
 jobs:
-  candidate:
+  # Build, test and sign on the free self-hosted runner. Only the desktop
+  # probes in the job below need a real GitHub-hosted VM, so everything that
+  # doesn't is kept off billed minutes.
+  build:
     name: Build and sign private candidate
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: windows-latest
+    runs-on: [self-hosted, windows, matteshot]
     environment: release
     timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
+    outputs:
+      version: ${{ steps.package.outputs.version }}
     steps:
       - uses: actions/checkout@v7
 
@@ -92,7 +97,6 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Verify signatures and checksum
-        id: verify
         shell: pwsh
         run: |
           $app = Get-AuthenticodeSignature '${{ github.workspace }}\target\release\matteshot.exe'
@@ -106,10 +110,42 @@ jobs:
             exit 1
           }
           $hash = (Get-FileHash -Algorithm SHA256 '${{ steps.installer.outputs.path }}').Hash.ToLowerInvariant()
-          $checksum = Join-Path $env:RUNNER_TEMP 'MatteshotSetup.exe.sha256'
+          # Written next to the installer (workspace-relative), not RUNNER_TEMP,
+          # so it travels with the installer into the artifact below and is
+          # still there once the probe job downloads it on a different machine.
           "$hash  MatteshotSetup-${{ steps.package.outputs.version }}.exe" |
-            Set-Content -Encoding ascii -NoNewline $checksum
-          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+            Set-Content -Encoding ascii -NoNewline 'installer\Output\MatteshotSetup.exe.sha256'
+
+      # Handed to the probe job below, which needs a real GitHub-hosted desktop
+      # session the self-hosted runner cannot provide.
+      - name: Upload unverified candidate for probing
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-unverified-${{ steps.package.outputs.version }}
+          path: |
+            target\release\matteshot.exe
+            installer\Output\MatteshotSetup-${{ steps.package.outputs.version }}.exe
+            installer\Output\MatteshotSetup.exe.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # A real interactive desktop session is the one thing a Windows *service*
+  # (what the self-hosted runner is) fundamentally cannot provide, no matter
+  # which account it runs as — Session 0 has no desktop to record. This job
+  # exists only for the two steps that need one, so billed time here is a
+  # couple of minutes rather than the ~10 the whole candidate used to take.
+  probe:
+    name: Probe the signed candidate
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download unverified candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-unverified-${{ needs.build.outputs.version }}
 
       # The video probes need something to decode. Record it here rather than
       # committing a fixture: the recording and encode path gets exercised as a
@@ -135,14 +171,14 @@ jobs:
             -Offline `
             -NoCapture `
             -Exe '${{ github.workspace }}\target\release\matteshot.exe' `
-            -SignedFile '${{ steps.installer.outputs.path }}'
+            -SignedFile '${{ github.workspace }}\installer\Output\MatteshotSetup-${{ needs.build.outputs.version }}.exe'
 
       - name: Upload private signed candidate
         uses: actions/upload-artifact@v4
         with:
-          name: Matteshot-${{ steps.package.outputs.version }}-signed-candidate
+          name: Matteshot-${{ needs.build.outputs.version }}-signed-candidate
           path: |
-            ${{ steps.installer.outputs.path }}
-            ${{ steps.verify.outputs.checksum }}
+            installer\Output\MatteshotSetup-${{ needs.build.outputs.version }}.exe
+            installer\Output\MatteshotSetup.exe.sha256
           if-no-files-found: error
           retention-days: 14
