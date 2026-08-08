@@ -28,6 +28,7 @@ mod overlay;
 mod picker;
 mod prtscn;
 mod settings;
+mod share;
 mod spike;
 mod style;
 mod theme;

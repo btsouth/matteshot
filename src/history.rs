@@ -584,6 +584,14 @@ unsafe fn reveal_entry(entry: &Entry) {
     crate::output::reveal_in_explorer(&entry.path);
 }
 
+unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
+    if let Some(state) = state_of(hwnd) {
+        state.status = Some(("Sharing\u{2026}".to_string(), std::time::Instant::now()));
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+    crate::share::share_in_background(hwnd, entry.path.clone());
+}
+
 unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
     let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let prompt = HSTRING::from(format!("Delete {name}? This cannot be undone."));
@@ -628,7 +636,8 @@ unsafe fn context_menu(hwnd: HWND, entry: Entry) {
     let _ = AppendMenuW(menu, MF_STRING, 1, w!("Copy"));
     let _ = AppendMenuW(menu, MF_STRING, 2, w!("Open in editor"));
     let _ = AppendMenuW(menu, MF_STRING, 3, w!("Show in folder"));
-    let _ = AppendMenuW(menu, MF_STRING, 4, w!("Delete\u{2026}"));
+    let _ = AppendMenuW(menu, MF_STRING, 4, w!("Share link"));
+    let _ = AppendMenuW(menu, MF_STRING, 5, w!("Delete\u{2026}"));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
@@ -638,7 +647,8 @@ unsafe fn context_menu(hwnd: HWND, entry: Entry) {
         1 => copy_entry(hwnd, &entry),
         2 => open_in_editor(hwnd, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &entry),
         3 => reveal_entry(&entry),
-        4 => delete_entry(hwnd, &entry),
+        4 => share_entry(hwnd, &entry),
+        5 => delete_entry(hwnd, &entry),
         _ => {}
     }
 }
@@ -753,6 +763,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        crate::share::WM_SHARE_COMPLETE => {
+            let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
+            match outcome {
+                Ok(url) => match crate::output::text_to_clipboard(&url) {
+                    Ok(()) => {
+                        if let Some(state) = state_of(hwnd) {
+                            state.status =
+                                Some(("Link copied to clipboard".to_string(), std::time::Instant::now()));
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    Err(error) => warn(hwnd, "The share link could not be copied.", &error),
+                },
+                Err(message) => warn(hwnd, "This capture could not be shared.", &message),
             }
             LRESULT(0)
         }
