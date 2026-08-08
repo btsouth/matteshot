@@ -216,7 +216,10 @@ pub fn to_clipboard(img: &RgbaImage, file: Option<&Path>) -> Result<()> {
     }
 }
 
-pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path) -> Result<PathBuf> {
+/// `source` is whatever the capture is already labeled by — the captured
+/// window's title, or a region's size — purely for the history browser to
+/// show later; it never affects the file itself.
+pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path, source: Option<&str>) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let name = format!(
         "matteshot-{}-{}.png",
@@ -225,7 +228,7 @@ pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path) -> Result<PathBuf
     );
     let path = dir.join(name);
     img.save(&path).context("write png")?;
-    crate::history::record(&path, img.width(), img.height(), style_name);
+    crate::history::record(&path, img.width(), img.height(), style_name, source);
     Ok(path)
 }
 

@@ -21,7 +21,8 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
     InvalidateRect, MonitorFromPoint, MonitorFromWindow, RoundRect, SelectObject, SetBkMode,
     SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
+    DT_WORDBREAK,
     FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     SRCCOPY, TRANSPARENT,
 };
@@ -56,6 +57,11 @@ pub struct Entry {
     pub width: u32,
     pub height: u32,
     pub style: String,
+    /// The captured window's title, or a region's size — whatever the
+    /// editor tab was already labeled at save time. Absent for entries
+    /// recorded before this field existed.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -98,9 +104,18 @@ fn trim_entries(mut entries: Vec<Entry>, cap: usize, exists: impl Fn(&Path) -> b
     entries
 }
 
+/// A blank or whitespace-only title is not useful to show later, so it's
+/// dropped to `None` here rather than carried through as an empty label.
+fn normalize_source(source: Option<&str>) -> Option<String> {
+    source
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Record a successful save. Never fatal: history is a convenience index, not
 /// something a capture should fail over, so every error is swallowed here.
-pub fn record(path: &Path, width: u32, height: u32, style: &str) {
+pub fn record(path: &Path, width: u32, height: u32, style: &str, source: Option<&str>) {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
     let mut log = load_unlocked();
     log.entries.push(Entry {
@@ -109,6 +124,7 @@ pub fn record(path: &Path, width: u32, height: u32, style: &str) {
         width,
         height,
         style: style.to_string(),
+        source: normalize_source(source),
     });
     log.entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
     save_unlocked(&log);
@@ -143,7 +159,7 @@ pub fn remove(path: &Path) -> Result<()> {
 
 fn format_when(saved_at: i64) -> String {
     match Local.timestamp_opt(saved_at, 0).single() {
-        Some(dt) => dt.format("%b %-d, %H:%M").to_string(),
+        Some(dt) => dt.format("%b %-d, %-I:%M %p").to_string(),
         None => String::new(),
     }
 }
@@ -153,7 +169,14 @@ mod persistence_tests {
     use super::*;
 
     fn entry(path: &str) -> Entry {
-        Entry { path: PathBuf::from(path), saved_at: 0, width: 10, height: 10, style: "Deep".into() }
+        Entry {
+            path: PathBuf::from(path),
+            saved_at: 0,
+            width: 10,
+            height: 10,
+            style: "Deep".into(),
+            source: None,
+        }
     }
 
     #[test]
@@ -184,6 +207,26 @@ mod persistence_tests {
         assert!(!format_when(1_700_000_000).is_empty());
         assert_eq!(format_when(i64::MAX), "");
     }
+
+    #[test]
+    fn the_displayed_time_is_12_hour_with_a_meridiem_not_24_hour() {
+        // Every local time in 12-hour format carries AM or PM; 24-hour format
+        // never does, regardless of which timezone this test happens to run
+        // in — so this holds without pinning a specific hour.
+        let formatted = format_when(1_700_000_000);
+        assert!(
+            formatted.contains("AM") || formatted.contains("PM"),
+            "expected a 12-hour time with AM/PM, got {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn a_blank_source_normalizes_to_none_but_a_real_title_is_kept_trimmed() {
+        assert_eq!(normalize_source(None), None);
+        assert_eq!(normalize_source(Some("")), None);
+        assert_eq!(normalize_source(Some("   ")), None);
+        assert_eq!(normalize_source(Some("  Notepad  ")), Some("Notepad".to_string()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +237,11 @@ const MARGIN: i32 = 16;
 const GAP: i32 = 14;
 const CELL_W: i32 = 176;
 const CELL_IMG_H: i32 = 118;
+/// Source app / window title — the more identifying of the two lines, so it
+/// sits above the timestamp.
+const SOURCE_LABEL_H: i32 = 18;
 const LABEL_H: i32 = 20;
-const CELL_H: i32 = CELL_IMG_H + LABEL_H;
+const CELL_H: i32 = CELL_IMG_H + SOURCE_LABEL_H + LABEL_H;
 const WIN_W: i32 = 860;
 const WIN_H: i32 = 620;
 const WHEEL_STEP: i32 = 90;
@@ -504,12 +550,34 @@ unsafe fn paint(hdc: HDC, state: &State) {
             SRCCOPY,
         );
 
+        // Split the already DPI-scaled label band proportionally rather than
+        // storing a second scaled field: SOURCE_LABEL_H : LABEL_H at 1x scale
+        // is the ratio at every scale.
+        let label_band = state.cell_h - state.cell_img_h;
+        let source_h = label_band * SOURCE_LABEL_H / (SOURCE_LABEL_H + LABEL_H);
+        let source_text = thumb.entry.source.as_deref().unwrap_or("\u{2014}");
+
         SelectObject(hdc, state.font_small);
+        SetTextColor(hdc, if hovered { state.theme.text } else { state.theme.muted });
+        let mut source_label = wide(source_text);
+        let mut source_rect = RECT {
+            left: cx + 6,
+            top: cy + state.cell_img_h,
+            right: cx + state.cell_w - 6,
+            bottom: cy + state.cell_img_h + source_h,
+        };
+        DrawTextW(
+            hdc,
+            &mut source_label,
+            &mut source_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+
         SetTextColor(hdc, if hovered { state.theme.accent } else { state.theme.muted });
         let mut label = wide(&format_when(thumb.entry.saved_at));
         let mut label_rect = RECT {
             left: cx + 6,
-            top: cy + state.cell_img_h,
+            top: cy + state.cell_img_h + source_h,
             right: cx + state.cell_w - 6,
             bottom: cy + state.cell_h,
         };

@@ -257,6 +257,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 let style = styles[preselect].clone();
                 let (scale, max_edge, dir) =
                     (cfg.export_scale, cfg.output_max_edge, cfg.save_dir());
+                let source = capture_title.clone();
                 let worker = std::thread::spawn(move || {
                     let styled = compose::export(
                         &raw,
@@ -270,7 +271,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                     if st.canceled {
                         return;
                     }
-                    if let Ok(path) = output::save_png(&styled, style.name, &dir) {
+                    if let Ok(path) = output::save_png(&styled, style.name, &dir, Some(&source)) {
                         match output::to_clipboard(&styled, Some(&path)) {
                             Ok(()) => {
                                 eprintln!("auto-copy [{}]: {}", style.name, path.display());
@@ -358,7 +359,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 cfg.export_scale,
             );
             let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
-            let path = output::save_png(&styled, styles[i].name, &cfg.save_dir())?;
+            let path = output::save_png(&styled, styles[i].name, &cfg.save_dir(), Some(&capture_title))?;
             let url = share::share_file(&path).context("could not share this capture")?;
             output::open_url(&url);
             // The share itself already succeeded and the link is already
@@ -441,7 +442,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         cfg.export_scale,
     );
     let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
-    let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir())?;
+    let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir(), Some(&capture_title))?;
     output::to_clipboard(&styled, Some(&path)).context("clipboard failed")?;
     // A different pick supersedes the auto-copied file.
     if let Some(old) = auto_path {
