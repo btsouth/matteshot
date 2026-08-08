@@ -1741,7 +1741,7 @@ unsafe fn copy_image(hwnd: HWND, state: &mut State) {
     let cfg = Config::load();
     let style_name = state.doc().styles[state.doc().sel].name;
     match persist_and_copy_with(
-        || output::save_png(&img, style_name, &cfg.save_dir()),
+        || output::save_png(&img, style_name, &cfg.save_dir(), Some(&state.doc().title)),
         |path| output::to_clipboard(&img, Some(path)),
     ) {
         Ok(_) => {
@@ -2295,7 +2295,12 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         Ctl::Save => {
             let img = final_image(state);
             let cfg = Config::load();
-            match output::save_png(&img, state.doc().styles[state.doc().sel].name, &cfg.save_dir()) {
+            match output::save_png(
+                &img,
+                state.doc().styles[state.doc().sel].name,
+                &cfg.save_dir(),
+                Some(&state.doc().title),
+            ) {
                 Ok(_) => {
                     let active = state.active;
                     close_tab(hwnd, state, active);
@@ -2323,7 +2328,7 @@ unsafe fn share_current(hwnd: HWND, state: &mut State) {
     let img = final_image(state);
     let cfg = Config::load();
     let style_name = state.doc().styles[state.doc().sel].name;
-    match output::save_png(&img, style_name, &cfg.save_dir()) {
+    match output::save_png(&img, style_name, &cfg.save_dir(), Some(&state.doc().title)) {
         Ok(path) => {
             state.copy_hint = Some(("Sharing\u{2026}".into(), std::time::Instant::now()));
             let _ = InvalidateRect(hwnd, None, false);

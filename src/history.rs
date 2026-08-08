@@ -21,7 +21,8 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
     InvalidateRect, MonitorFromPoint, MonitorFromWindow, RoundRect, SelectObject, SetBkMode,
     SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK,
     FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     SRCCOPY, TRANSPARENT,
 };
@@ -56,6 +57,11 @@ pub struct Entry {
     pub width: u32,
     pub height: u32,
     pub style: String,
+    /// The captured window's title, or a region's size — whatever the
+    /// editor tab was already labeled at save time. Absent for entries
+    /// recorded before this field existed.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -98,9 +104,46 @@ fn trim_entries(mut entries: Vec<Entry>, cap: usize, exists: impl Fn(&Path) -> b
     entries
 }
 
+/// A window title is not bounded by Windows the way a control's own text
+/// often is; capping it here (same reasoning as diagnostics.rs's own event
+/// log) keeps one pathological title from bloating every future read of the
+/// whole history file, not just its own entry.
+const MAX_SOURCE_CHARS: usize = 200;
+
+/// A window's title is set by whatever app owns it, not by this app, so it
+/// gets the same treatment diagnostics.rs's event log gives untrusted text:
+/// control characters (plus the Unicode line/paragraph separators, which
+/// `char::is_control` does not cover) flattened to spaces rather than left
+/// to disturb the label's layout. Bidi override/isolate and zero-width
+/// characters are dropped outright — spacing the former out would still
+/// leave them able to reorder the surrounding text, and the latter are
+/// invisible either way, including making an otherwise-blank title dodge
+/// the empty-string check below by being technically non-empty.
+fn sanitize_source(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !matches!(*c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}')
+        })
+        .map(|c| if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c })
+        .collect()
+}
+
+/// A blank or whitespace-only title is not useful to show later, so it's
+/// dropped to `None` here rather than carried through as an empty label.
+fn normalize_source(source: Option<&str>) -> Option<String> {
+    let sanitized = sanitize_source(source?);
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_SOURCE_CHARS).collect())
+}
+
 /// Record a successful save. Never fatal: history is a convenience index, not
 /// something a capture should fail over, so every error is swallowed here.
-pub fn record(path: &Path, width: u32, height: u32, style: &str) {
+pub fn record(path: &Path, width: u32, height: u32, style: &str, source: Option<&str>) {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
     let mut log = load_unlocked();
     log.entries.push(Entry {
@@ -109,6 +152,7 @@ pub fn record(path: &Path, width: u32, height: u32, style: &str) {
         width,
         height,
         style: style.to_string(),
+        source: normalize_source(source),
     });
     log.entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
     save_unlocked(&log);
@@ -143,7 +187,7 @@ pub fn remove(path: &Path) -> Result<()> {
 
 fn format_when(saved_at: i64) -> String {
     match Local.timestamp_opt(saved_at, 0).single() {
-        Some(dt) => dt.format("%b %-d, %H:%M").to_string(),
+        Some(dt) => dt.format("%b %-d, %-I:%M %p").to_string(),
         None => String::new(),
     }
 }
@@ -153,7 +197,14 @@ mod persistence_tests {
     use super::*;
 
     fn entry(path: &str) -> Entry {
-        Entry { path: PathBuf::from(path), saved_at: 0, width: 10, height: 10, style: "Deep".into() }
+        Entry {
+            path: PathBuf::from(path),
+            saved_at: 0,
+            width: 10,
+            height: 10,
+            style: "Deep".into(),
+            source: None,
+        }
     }
 
     #[test]
@@ -184,6 +235,62 @@ mod persistence_tests {
         assert!(!format_when(1_700_000_000).is_empty());
         assert_eq!(format_when(i64::MAX), "");
     }
+
+    #[test]
+    fn the_displayed_time_is_12_hour_with_a_meridiem_not_24_hour() {
+        // Every local time in 12-hour format carries AM or PM; 24-hour format
+        // never does, regardless of which timezone this test happens to run
+        // in — so this holds without pinning a specific hour.
+        let formatted = format_when(1_700_000_000);
+        assert!(
+            formatted.contains("AM") || formatted.contains("PM"),
+            "expected a 12-hour time with AM/PM, got {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn a_blank_source_normalizes_to_none_but_a_real_title_is_kept_trimmed() {
+        assert_eq!(normalize_source(None), None);
+        assert_eq!(normalize_source(Some("")), None);
+        assert_eq!(normalize_source(Some("   ")), None);
+        assert_eq!(normalize_source(Some("  Notepad  ")), Some("Notepad".to_string()));
+    }
+
+    #[test]
+    fn a_pathological_window_title_is_capped_before_it_reaches_the_log() {
+        let long = "x".repeat(MAX_SOURCE_CHARS + 50);
+        let normalized = normalize_source(Some(&long)).unwrap();
+        assert_eq!(normalized.chars().count(), MAX_SOURCE_CHARS);
+    }
+
+    #[test]
+    fn control_and_bidi_override_characters_do_not_survive_normalization() {
+        // A tab/newline flattens to a space rather than disturbing the
+        // label's single-line layout; a bidi override is dropped outright,
+        // since spacing it out would still leave it able to reorder the
+        // surrounding text.
+        let normalized = normalize_source(Some("Left\t\u{202E}txet.exe\u{202C}")).unwrap();
+        assert!(!normalized.contains('\t'));
+        assert!(!normalized.contains('\u{202E}'));
+        assert!(!normalized.contains('\u{202C}'));
+        assert_eq!(normalized, "Left txet.exe");
+    }
+
+    #[test]
+    fn a_title_made_entirely_of_zero_width_characters_normalizes_to_none() {
+        // Invisible either way, but without stripping them a title like this
+        // would pass the empty-string check and print as a blank line
+        // instead of the placeholder.
+        assert_eq!(normalize_source(Some("\u{200B}\u{200C}\u{FEFF}")), None);
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_flatten_like_a_newline_does() {
+        // Not `char::is_control` (they're categories Zl/Zp, not Cc), so this
+        // needs its own case rather than relying on the same check as \t/\n.
+        let normalized = normalize_source(Some("Left\u{2028}Right\u{2029}End")).unwrap();
+        assert_eq!(normalized, "Left Right End");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +301,11 @@ const MARGIN: i32 = 16;
 const GAP: i32 = 14;
 const CELL_W: i32 = 176;
 const CELL_IMG_H: i32 = 118;
+/// Source app / window title — the more identifying of the two lines, so it
+/// sits above the timestamp.
+const SOURCE_LABEL_H: i32 = 18;
 const LABEL_H: i32 = 20;
-const CELL_H: i32 = CELL_IMG_H + LABEL_H;
+const CELL_H: i32 = CELL_IMG_H + SOURCE_LABEL_H + LABEL_H;
 const WIN_W: i32 = 860;
 const WIN_H: i32 = 620;
 const WHEEL_STEP: i32 = 90;
@@ -322,6 +432,11 @@ struct Thumb {
     bgra: Vec<u8>,
     img_w: i32,
     img_h: i32,
+    /// Normalized once here rather than on every WM_PAINT — hover alone
+    /// repaints the whole visible grid, so redoing this per thumbnail per
+    /// frame would be pure repeated allocation for a value that never
+    /// changes after the entry is loaded.
+    source_label: String,
 }
 
 fn to_bgra(img: &RgbaImage) -> Vec<u8> {
@@ -342,7 +457,15 @@ fn make_thumb(entry: &Entry, max_w: i32, max_h: i32) -> Option<Thumb> {
     let scale = (max_w as f32 / w).min(max_h as f32 / h);
     let (tw, th) = ((w * scale).round().max(1.0) as u32, (h * scale).round().max(1.0) as u32);
     let resized = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
-    Some(Thumb { entry: entry.clone(), bgra: to_bgra(&resized), img_w: tw as i32, img_h: th as i32 })
+    let source_label =
+        normalize_source(entry.source.as_deref()).unwrap_or_else(|| "\u{2014}".to_string());
+    Some(Thumb {
+        entry: entry.clone(),
+        bgra: to_bgra(&resized),
+        img_w: tw as i32,
+        img_h: th as i32,
+        source_label,
+    })
 }
 
 fn build_thumbs(entries: &[Entry], max_w: i32, max_h: i32) -> Vec<Thumb> {
@@ -504,12 +627,37 @@ unsafe fn paint(hdc: HDC, state: &State) {
             SRCCOPY,
         );
 
+        // Split the already DPI-scaled label band proportionally rather than
+        // storing a second scaled field: SOURCE_LABEL_H : LABEL_H at 1x scale
+        // is the ratio at every scale.
+        let label_band = state.cell_h - state.cell_img_h;
+        let source_h = label_band * SOURCE_LABEL_H / (SOURCE_LABEL_H + LABEL_H);
+
         SelectObject(hdc, state.font_small);
+        SetTextColor(hdc, if hovered { state.theme.text } else { state.theme.muted });
+        let mut source_label = wide(&thumb.source_label);
+        let mut source_rect = RECT {
+            left: cx + 6,
+            top: cy + state.cell_img_h,
+            right: cx + state.cell_w - 6,
+            bottom: cy + state.cell_img_h + source_h,
+        };
+        DrawTextW(
+            hdc,
+            &mut source_label,
+            &mut source_rect,
+            // DT_NOPREFIX: a window title is arbitrary text, not a menu
+            // label — a real title containing "&" (e.g. "Search & Rescue")
+            // would otherwise have it eaten as an accelerator-prefix marker
+            // by DrawTextW's default menu-string behavior.
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+
         SetTextColor(hdc, if hovered { state.theme.accent } else { state.theme.muted });
         let mut label = wide(&format_when(thumb.entry.saved_at));
         let mut label_rect = RECT {
             left: cx + 6,
-            top: cy + state.cell_img_h,
+            top: cy + state.cell_img_h + source_h,
             right: cx + state.cell_w - 6,
             bottom: cy + state.cell_h,
         };
