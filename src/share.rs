@@ -31,8 +31,9 @@ const SHARE_PATH: &str = "/v1/share";
 const MAX_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
 
 /// Posted to whichever window started a share once `share_in_background`'s
-/// worker thread finishes. `lparam` is a boxed `ShareOutcome` — `Box::from_raw`
-/// it back, exactly once, in the receiving wndproc.
+/// worker thread finishes. `lparam` is a boxed `ShareCompletion` —
+/// `Box::from_raw` it back exactly once in the receiving wndproc, even when
+/// its request ID is stale.
 pub const WM_SHARE_COMPLETE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10;
 
 pub type ShareOutcome = Result<String, String>;
