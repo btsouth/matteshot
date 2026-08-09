@@ -8,6 +8,7 @@
 //! locally before any bytes are sent.
 
 use std::ffi::c_void;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -18,8 +19,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpWriteData, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -30,11 +31,27 @@ const SHARE_PATH: &str = "/v1/share";
 const MAX_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
 
 /// Posted to whichever window started a share once `share_in_background`'s
-/// worker thread finishes. `lparam` is a boxed `ShareOutcome` — `Box::from_raw`
-/// it back, exactly once, in the receiving wndproc.
+/// worker thread finishes. `lparam` is a boxed `ShareCompletion` —
+/// `Box::from_raw` it back exactly once in the receiving wndproc, even when
+/// its request ID is stale.
 pub const WM_SHARE_COMPLETE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10;
 
 pub type ShareOutcome = Result<String, String>;
+
+pub struct ShareCompletion {
+    pub request_id: u64,
+    pub outcome: ShareOutcome,
+}
+
+static SHARE_REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn accept_completion(pending: &mut Option<u64>, request_id: u64) -> bool {
+    if *pending != Some(request_id) {
+        return false;
+    }
+    *pending = None;
+    true
+}
 
 fn share_content_type(path: &Path) -> Result<&'static str> {
     match path.extension().and_then(|extension| extension.to_str()) {
@@ -63,11 +80,15 @@ fn validate_share_url(url: &str) -> Result<()> {
 /// instead of each spawning and posting for itself, matching the pattern
 /// update.rs already uses to notify the tray window from its own background
 /// download thread.
-pub fn share_in_background(hwnd: HWND, path: PathBuf) {
+pub fn share_in_background(hwnd: HWND, path: PathBuf) -> u64 {
+    let request_id = SHARE_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let hwnd_value = hwnd.0 as isize;
     std::thread::spawn(move || {
         let outcome: ShareOutcome = share_file(&path).map_err(|error| format!("{error:#}"));
-        let raw = Box::into_raw(Box::new(outcome));
+        let raw = Box::into_raw(Box::new(ShareCompletion {
+            request_id,
+            outcome,
+        }));
         let posted = unsafe {
             PostMessageW(
                 HWND(hwnd_value as *mut c_void),
@@ -82,6 +103,7 @@ pub fn share_in_background(hwnd: HWND, path: PathBuf) {
             }
         }
     });
+    request_id
 }
 
 struct InternetHandle(*mut c_void);
@@ -119,25 +141,31 @@ pub fn share_file(path: &Path) -> Result<String> {
     let device_id = crate::license::device_id();
 
     let content_type = share_content_type(path)?;
-    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("capture");
-    let bytes = std::fs::read(path).context("read the file to share")?;
-    validate_upload_size(bytes.len() as u64)?;
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("capture");
+    let file_len = std::fs::metadata(path)
+        .context("read the file to share")?
+        .len();
+    validate_upload_size(file_len)?;
 
     let boundary = format!("matteshot-{}", boundary_suffix());
-    let body = build_multipart(
+    let parts = multipart_parts(
         &boundary,
         &certificate,
         &signature,
         &device_id,
         filename,
         content_type,
-        &bytes,
     );
 
-    let (status, response_body) = post_multipart(SHARE_PATH, &boundary, &body)?;
+    let (status, response_body) = post_multipart(SHARE_PATH, &boundary, path, file_len, &parts)?;
     let parsed: ShareResponse = serde_json::from_slice(&response_body).unwrap_or_default();
     if status != 200 {
-        bail!(parsed.error.unwrap_or_else(|| format!("share request failed ({status})")));
+        bail!(parsed
+            .error
+            .unwrap_or_else(|| format!("share request failed ({status})")));
     }
     let url = parsed.url.context("the share response had no link")?;
     // Every caller either opens this in a browser or hands it to the
@@ -155,7 +183,10 @@ static BOUNDARY_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomi
 fn boundary_suffix() -> String {
     use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let count = BOUNDARY_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}-{}-{count:x}", std::process::id())
 }
@@ -164,44 +195,81 @@ fn boundary_suffix() -> String {
 /// fixed-shape request, and the rest of this app already hand-rolls its own
 /// HTTP calls over WinHTTP with no client library at all.
 #[allow(clippy::too_many_arguments)]
-fn build_multipart(
+struct MultipartParts {
+    before_file: Vec<u8>,
+    after_file: Vec<u8>,
+}
+
+fn multipart_parts(
     boundary: &str,
     certificate: &str,
     signature: &str,
     device_id: &str,
     filename: &str,
     content_type: &str,
-    file_bytes: &[u8],
-) -> Vec<u8> {
-    let mut body = Vec::with_capacity(file_bytes.len() + 512);
+) -> MultipartParts {
+    let mut before_file = Vec::with_capacity(1024);
     for (name, value) in [
         ("certificate", certificate),
         ("signature", signature),
         ("device_id", device_id),
     ] {
-        body.extend_from_slice(
+        before_file.extend_from_slice(
             format!(
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
             )
             .as_bytes(),
         );
     }
-    body.extend_from_slice(
+    before_file.extend_from_slice(
         format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
         )
         .as_bytes(),
     );
-    body.extend_from_slice(file_bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    body
+    MultipartParts {
+        before_file,
+        after_file: format!("\r\n--{boundary}--\r\n").into_bytes(),
+    }
 }
 
-fn post_multipart(path: &str, boundary: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
+unsafe fn write_request_bytes(request: *mut c_void, bytes: &[u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let amount = (bytes.len() - offset).min(u32::MAX as usize) as u32;
+        let mut written = 0u32;
+        WinHttpWriteData(
+            request,
+            Some(bytes[offset..].as_ptr() as *const c_void),
+            amount,
+            &mut written,
+        )
+        .context("write share request")?;
+        if written == 0 {
+            bail!("write share request made no progress");
+        }
+        offset += written as usize;
+    }
+    Ok(())
+}
+
+fn post_multipart(
+    path: &str,
+    boundary: &str,
+    file_path: &Path,
+    file_len: u64,
+    parts: &MultipartParts,
+) -> Result<(u32, Vec<u8>)> {
     unsafe {
         let agent = HSTRING::from(concat!("Matteshot/", env!("CARGO_PKG_VERSION")));
         let session = InternetHandle::new(
-            WinHttpOpen(&agent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0),
+            WinHttpOpen(
+                &agent,
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                0,
+            ),
             "open share connection",
         )?;
         // A large recording needs real headroom on the send side; the
@@ -232,15 +300,32 @@ fn post_multipart(path: &str, boundary: &str, body: &[u8]) -> Result<(u32, Vec<u
             format!("Content-Type: multipart/form-data; boundary={boundary}\r\n")
                 .encode_utf16()
                 .collect();
-        WinHttpSendRequest(
-            request.0,
-            Some(&headers),
-            Some(body.as_ptr() as *const c_void),
-            body.len() as u32,
-            body.len() as u32,
-            0,
-        )
-        .context("send share request")?;
+        let total_len = (parts.before_file.len() as u64)
+            .checked_add(file_len)
+            .and_then(|length| length.checked_add(parts.after_file.len() as u64))
+            .filter(|length| *length <= u32::MAX as u64)
+            .context("share request is too large")? as u32;
+        WinHttpSendRequest(request.0, Some(&headers), None, 0, total_len, 0)
+            .context("send share request")?;
+        write_request_bytes(request.0, &parts.before_file)?;
+        let mut file = std::fs::File::open(file_path).context("open the file to share")?;
+        let mut chunk = [0u8; 64 * 1024];
+        let mut remaining = file_len;
+        while remaining > 0 {
+            let wanted = chunk.len().min(remaining as usize);
+            let read = file
+                .read(&mut chunk[..wanted])
+                .context("read the file to share")?;
+            if read == 0 {
+                bail!("the file changed while it was being shared");
+            }
+            write_request_bytes(request.0, &chunk[..read])?;
+            remaining -= read as u64;
+        }
+        if file.read(&mut chunk[..1]).context("check the file size")? != 0 {
+            bail!("the file changed while it was being shared");
+        }
+        write_request_bytes(request.0, &parts.after_file)?;
         WinHttpReceiveResponse(request.0, ptr::null_mut()).context("receive share response")?;
 
         let mut status = 0u32;
@@ -282,23 +367,24 @@ mod tests {
 
     #[test]
     fn multipart_body_carries_every_field_and_the_file_between_boundaries() {
-        let body = build_multipart(
+        let parts = multipart_parts(
             "BOUND",
             "cert-value",
             "sig-value",
             "device-value",
             "shot.png",
             "image/png",
-            b"\x89PNGraw",
         );
+        let mut body = parts.before_file;
+        body.extend_from_slice(b"\x89PNGraw");
+        body.extend_from_slice(&parts.after_file);
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("--BOUND\r\n"));
         assert!(text.contains("name=\"certificate\"\r\n\r\ncert-value\r\n"));
         assert!(text.contains("name=\"signature\"\r\n\r\nsig-value\r\n"));
         assert!(text.contains("name=\"device_id\"\r\n\r\ndevice-value\r\n"));
-        assert!(text.contains(
-            "name=\"file\"; filename=\"shot.png\"\r\nContent-Type: image/png\r\n\r\n"
-        ));
+        assert!(text
+            .contains("name=\"file\"; filename=\"shot.png\"\r\nContent-Type: image/png\r\n\r\n"));
         assert!(text.ends_with("--BOUND--\r\n"));
         // The raw bytes must survive untouched inside the body, not just the
         // lossily-decoded text used above to check the surrounding structure.
@@ -306,18 +392,56 @@ mod tests {
     }
 
     #[test]
+    fn multipart_metadata_stays_bounded_independent_of_file_size() {
+        let parts = multipart_parts(
+            "BOUND",
+            "cert-value",
+            "sig-value",
+            "device-value",
+            "recording.mp4",
+            "video/mp4",
+        );
+        assert!(parts.before_file.len() + parts.after_file.len() < 2048);
+    }
+
+    #[test]
+    fn only_the_latest_share_completion_is_accepted() {
+        let mut pending = Some(2);
+        assert!(!accept_completion(&mut pending, 1));
+        assert_eq!(
+            pending,
+            Some(2),
+            "a stale result cleared the current request"
+        );
+        assert!(accept_completion(&mut pending, 2));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
     fn boundary_suffix_never_collides_with_itself_in_quick_succession() {
         let a = boundary_suffix();
         let b = boundary_suffix();
-        assert_ne!(a, b, "two boundaries generated back to back must still differ");
+        assert_ne!(
+            a, b,
+            "two boundaries generated back to back must still differ"
+        );
     }
 
     #[test]
     fn share_preflight_accepts_only_supported_file_types() {
-        assert_eq!(share_content_type(Path::new("shot.png")).unwrap(), "image/png");
-        assert_eq!(share_content_type(Path::new("clip.mp4")).unwrap(), "video/mp4");
+        assert_eq!(
+            share_content_type(Path::new("shot.png")).unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            share_content_type(Path::new("clip.mp4")).unwrap(),
+            "video/mp4"
+        );
         for path in ["capture.gif", "payload.exe", "capture", "capture.PNG"] {
-            assert!(share_content_type(Path::new(path)).is_err(), "accepted {path}");
+            assert!(
+                share_content_type(Path::new(path)).is_err(),
+                "accepted {path}"
+            );
         }
     }
 
@@ -330,7 +454,12 @@ mod tests {
     #[test]
     fn share_preflight_accepts_only_https_links() {
         assert!(validate_share_url("https://share.example/x").is_ok());
-        for url in ["", "http://share.example/x", "file:///capture.png", "javascript:alert(1)"] {
+        for url in [
+            "",
+            "http://share.example/x",
+            "file:///capture.png",
+            "javascript:alert(1)",
+        ] {
             assert!(validate_share_url(url).is_err(), "accepted {url}");
         }
     }

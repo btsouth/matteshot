@@ -68,8 +68,10 @@ pub fn partial_video_path(destination: &Path, id: u64) -> PathBuf {
     ))
 }
 
-fn partial_video_owner(name: &str) -> Option<u32> {
-    let without_extension = name.strip_suffix(".mp4")?;
+fn partial_recording_owner(name: &str) -> Option<u32> {
+    let without_extension = name
+        .strip_suffix(".mp4")
+        .or_else(|| name.strip_suffix(".gif"))?;
     let (_, owner_and_id) = without_extension.rsplit_once(".partial-")?;
     let (owner, id) = owner_and_id.split_once('-')?;
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -104,11 +106,11 @@ fn cleanup_stale_partials(dir: &Path, owner_of: fn(&str) -> Option<u32>) -> usiz
     removed
 }
 
-/// Remove only Matteshot's unmistakable incomplete-video names. A partial
+/// Remove only Matteshot's unmistakable incomplete-recording names. A partial
 /// from this process may belong to another open editor, so it is retained
 /// unless it is old enough to be from a reused process ID.
 pub fn cleanup_stale_video_partials(dir: &Path) -> usize {
-    cleanup_stale_partials(dir, partial_video_owner)
+    cleanup_stale_partials(dir, partial_recording_owner)
 }
 
 struct ClipboardGuard;
@@ -407,10 +409,12 @@ mod tests {
 
     #[test]
     fn partial_video_names_are_narrow_and_owner_aware() {
-        assert_eq!(partial_video_owner("clip.partial-123-9.mp4"), Some(123));
-        assert_eq!(partial_video_owner("clip.partial-nope-9.mp4"), None);
-        assert_eq!(partial_video_owner("clip.partial-123-x.mp4"), None);
-        assert_eq!(partial_video_owner("clip.mp4"), None);
+        assert_eq!(partial_recording_owner("clip.partial-123-9.mp4"), Some(123));
+        assert_eq!(partial_recording_owner("clip.partial-123-9.gif"), Some(123));
+        assert_eq!(partial_recording_owner("clip.partial-nope-9.mp4"), None);
+        assert_eq!(partial_recording_owner("clip.partial-123-x.gif"), None);
+        assert_eq!(partial_recording_owner("clip.mp4"), None);
+        assert_eq!(partial_recording_owner("clip.gif"), None);
     }
 
     #[test]
@@ -487,18 +491,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let other_pid = std::process::id().wrapping_add(1).max(1);
         let stale = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
+        let stale_gif = dir.join(format!("clip.partial-{other_pid}-2.gif"));
         let live = partial_video_path(&dir.join("live.mp4"), 2);
+        let live_gif = dir.join(format!(
+            "live.partial-{}-3.gif",
+            std::process::id()
+        ));
         let normal = dir.join("normal.mp4");
         std::fs::write(&stale, b"stale").unwrap();
+        std::fs::write(&stale_gif, b"stale gif").unwrap();
         std::fs::write(&live, b"live").unwrap();
+        std::fs::write(&live_gif, b"live gif").unwrap();
         std::fs::write(&normal, b"normal").unwrap();
 
-        assert_eq!(cleanup_stale_video_partials(&dir), 1);
+        assert_eq!(cleanup_stale_video_partials(&dir), 2);
         assert!(!stale.exists());
+        assert!(!stale_gif.exists());
         assert!(live.exists());
+        assert!(live_gif.exists());
         assert!(normal.exists());
 
         std::fs::remove_file(live).unwrap();
+        std::fs::remove_file(live_gif).unwrap();
         std::fs::remove_file(normal).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }

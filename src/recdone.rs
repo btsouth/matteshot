@@ -341,6 +341,8 @@ struct State {
     /// progress, playback) while a share runs in the background, which would
     /// silently defeat a guard built on top of it.
     sharing: bool,
+    /// Guards against a completion posted to a destroyed/reused HWND.
+    share_request_id: Option<u64>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -2491,10 +2493,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if lparam.0 == 0 {
                 return LRESULT(0);
             }
-            let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
+            let completion = *Box::from_raw(lparam.0 as *mut crate::share::ShareCompletion);
+            let is_current = state_of(hwnd).is_some_and(|state| {
+                crate::share::accept_completion(&mut state.share_request_id, completion.request_id)
+            });
+            if !is_current {
+                return LRESULT(0);
+            }
             if let Some(state) = state_of(hwnd) {
                 state.sharing = false;
-                let message = match outcome {
+                let message = match completion.outcome {
                     Ok(url) => {
                         // Opening the page is the visible confirmation that
                         // something happened; the clipboard copy alone was
@@ -3151,7 +3159,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 state.sharing = true;
                                 state.status = Some("Sharing\u{2026}".into());
                                 let _ = InvalidateRect(hwnd, None, false);
-                                crate::share::share_in_background(hwnd, state.mp4.clone());
+                                state.share_request_id = Some(crate::share::share_in_background(
+                                    hwnd,
+                                    state.mp4.clone(),
+                                ));
                             }
                         }
                         Act::Delete => {
@@ -3837,6 +3848,7 @@ pub fn show(
         scrub_tx: None,
         scrub_generation: 0,
         sharing: false,
+        share_request_id: None,
     });
     recompose_preview(&mut state);
     let state = Box::into_raw(state);

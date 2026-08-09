@@ -304,6 +304,8 @@ struct State {
     /// Copy keeps the tab open, so the confirmation replaces the old cue of
     /// the tab closing.
     copy_hint: Option<(String, std::time::Instant)>,
+    /// Correlates asynchronous Share completions with the latest click.
+    pending_share: Option<u64>,
     /// Caret blink phase while editing; one timer serves the window.
     caret_on: bool,
     font: HFONT,
@@ -2332,7 +2334,7 @@ unsafe fn share_current(hwnd: HWND, state: &mut State) {
         Ok(path) => {
             state.copy_hint = Some(("Sharing\u{2026}".into(), std::time::Instant::now()));
             let _ = InvalidateRect(hwnd, None, false);
-            crate::share::share_in_background(hwnd, path);
+            state.pending_share = Some(crate::share::share_in_background(hwnd, path));
         }
         Err(error) => show_output_error(
             hwnd,
@@ -3079,9 +3081,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // PrtScn mid-tweak: nested overlay; the frozen image includes this
         // window, so it's snippable. Esc there returns here untouched.
         crate::share::WM_SHARE_COMPLETE => {
-            let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
+            let completion = *Box::from_raw(lparam.0 as *mut crate::share::ShareCompletion);
+            let is_current = state_of(hwnd).is_some_and(|state| {
+                crate::share::accept_completion(&mut state.pending_share, completion.request_id)
+            });
+            if !is_current {
+                return LRESULT(0);
+            }
             if let Some(state) = state_of(hwnd) {
-                state.copy_hint = match outcome {
+                state.copy_hint = match completion.outcome {
                     Ok(url) => {
                         // Opening the page is the visible confirmation that
                         // something happened; the clipboard copy alone was
@@ -3683,6 +3694,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         caption_box_opacity: 0.68,
         custom_size_edit: None,
         copy_hint: None,
+        pending_share: None,
         font: unsafe { make_font(-sc(14), 400) },
         font_small: unsafe { make_font(-sc(12), 400) },
         scale: dpi_scale,

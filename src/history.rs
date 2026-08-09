@@ -525,6 +525,8 @@ struct State {
     /// it first — otherwise every double-click would also copy, once for
     /// each of a double-click's two WM_LBUTTONUP events.
     pending_click: Option<usize>,
+    /// Only the latest Share click may update the browser or clipboard.
+    pending_share: Option<u64>,
 }
 
 /// Singleton like Settings: reopening focuses the existing window instead of
@@ -737,7 +739,10 @@ unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
         state.status = Some(("Sharing\u{2026}".to_string(), std::time::Instant::now()));
         let _ = InvalidateRect(hwnd, None, false);
     }
-    crate::share::share_in_background(hwnd, entry.path.clone());
+    let request_id = crate::share::share_in_background(hwnd, entry.path.clone());
+    if let Some(state) = state_of(hwnd) {
+        state.pending_share = Some(request_id);
+    }
 }
 
 unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
@@ -915,8 +920,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         crate::share::WM_SHARE_COMPLETE => {
-            let outcome = *Box::from_raw(lparam.0 as *mut crate::share::ShareOutcome);
-            match outcome {
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
+            let completion = *Box::from_raw(lparam.0 as *mut crate::share::ShareCompletion);
+            let is_current = state_of(hwnd).is_some_and(|state| {
+                crate::share::accept_completion(&mut state.pending_share, completion.request_id)
+            });
+            if !is_current {
+                return LRESULT(0);
+            }
+            match completion.outcome {
                 Ok(url) => {
                     // Opening the page is the visible confirmation that
                     // something happened; the clipboard copy alone was easy
@@ -1023,6 +1037,7 @@ pub fn open() -> Result<()> {
             theme: crate::theme::current(),
             status: None,
             pending_click: None,
+            pending_share: None,
         });
 
         let hinstance = GetModuleHandleW(None).context("get app module for history")?;
