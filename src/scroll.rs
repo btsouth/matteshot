@@ -852,7 +852,7 @@ fn static_edges(prev: &RgbaImage, next: &RgbaImage) -> (u32, u32) {
         bottom += 1;
     }
     // Degenerate (nothing moved anywhere, or uniform content): trust none.
-    if top + bottom > h / 2 {
+    if top + bottom >= h / 2 {
         return (0, 0);
     }
     (top, bottom)
@@ -1212,6 +1212,65 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_markers(width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_fn(width, height, |x, y| {
+            Rgba([
+                (y * 17 + x * 3) as u8,
+                (y * 29 + x * 5) as u8,
+                (y * 43 + x * 7) as u8,
+                255,
+            ])
+        })
+    }
+
+    fn shifted_up(previous: &RgbaImage, shift: u32) -> RgbaImage {
+        RgbaImage::from_fn(previous.width(), previous.height(), |x, y| {
+            if y + shift < previous.height() {
+                *previous.get_pixel(x, y + shift)
+            } else {
+                Rgba([241, (x * 13 + y) as u8, 17, 255])
+            }
+        })
+    }
+
+    #[test]
+    fn shift_measurement_finds_known_vertical_motion() {
+        let previous = row_markers(96, 160);
+        let next = shifted_up(&previous, 18);
+        let measured = motion(&previous, &next, 160, 0, 160);
+
+        assert_eq!(measured.shift, 18);
+        assert!(measured.score < 0.01, "unexpected match score: {}", measured.score);
+        assert!(measured.score < measured.idle * 0.5);
+        assert!(stitchable(measured, None));
+    }
+
+    #[test]
+    fn stitchability_rejects_idle_and_weak_periodic_matches() {
+        let frame = row_markers(96, 160);
+        assert!(!stitchable(motion(&frame, &frame, 160, 0, 160), None));
+
+        let weak = Motion { idle: 20.0, shift: 16, score: 12.0, ceiling: 80 };
+        assert!(!stitchable(weak, None));
+
+        let consistent = Motion { score: 10.0, ..weak };
+        assert!(stitchable(consistent, Some(16)));
+    }
+
+    #[test]
+    fn static_edges_report_only_contiguous_unchanged_chrome() {
+        let previous = row_markers(96, 120);
+        let mut next = previous.clone();
+        for y in 8..114 {
+            for x in 0..next.width() {
+                next.put_pixel(x, y, Rgba([250, (x + y) as u8, 3, 255]));
+            }
+        }
+
+        assert_eq!(static_edges(&previous, &next), (8, 6));
+        assert_eq!(static_edges(&previous, &previous), (0, 0));
+    }
 
     #[test]
     fn only_a_deliberate_stop_or_a_real_bottom_hands_back_the_canvas() {

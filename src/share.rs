@@ -36,6 +36,28 @@ pub const WM_SHARE_COMPLETE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_A
 
 pub type ShareOutcome = Result<String, String>;
 
+fn share_content_type(path: &Path) -> Result<&'static str> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("png") => Ok("image/png"),
+        Some("mp4") => Ok("video/mp4"),
+        _ => bail!("This file type cannot be shared."),
+    }
+}
+
+fn validate_upload_size(len: u64) -> Result<()> {
+    if len > MAX_UPLOAD_BYTES {
+        bail!("This file is too large to share.");
+    }
+    Ok(())
+}
+
+fn validate_share_url(url: &str) -> Result<()> {
+    if !url.starts_with("https://") {
+        bail!("the share response returned an unexpected link");
+    }
+    Ok(())
+}
+
 /// Upload on a worker thread and post `WM_SHARE_COMPLETE` to `hwnd` with the
 /// result. Every caller (picker, tweak editor, history browser) shares this
 /// instead of each spawning and posting for itself, matching the pattern
@@ -96,16 +118,10 @@ pub fn share_file(path: &Path) -> Result<String> {
         .context("Sharing needs an active Matteshot license.")?;
     let device_id = crate::license::device_id();
 
-    let content_type = match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("mp4") => "video/mp4",
-        _ => bail!("This file type cannot be shared."),
-    };
+    let content_type = share_content_type(path)?;
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("capture");
     let bytes = std::fs::read(path).context("read the file to share")?;
-    if bytes.len() as u64 > MAX_UPLOAD_BYTES {
-        bail!("This file is too large to share.");
-    }
+    validate_upload_size(bytes.len() as u64)?;
 
     let boundary = format!("matteshot-{}", boundary_suffix());
     let body = build_multipart(
@@ -127,9 +143,7 @@ pub fn share_file(path: &Path) -> Result<String> {
     // Every caller either opens this in a browser or hands it to the
     // clipboard as a link; the same guard update.rs already applies to its
     // manifest URLs before treating a network response as actionable.
-    if !url.starts_with("https://") {
-        bail!("the share response returned an unexpected link");
-    }
+    validate_share_url(&url)?;
     Ok(url)
 }
 
@@ -296,5 +310,28 @@ mod tests {
         let a = boundary_suffix();
         let b = boundary_suffix();
         assert_ne!(a, b, "two boundaries generated back to back must still differ");
+    }
+
+    #[test]
+    fn share_preflight_accepts_only_supported_file_types() {
+        assert_eq!(share_content_type(Path::new("shot.png")).unwrap(), "image/png");
+        assert_eq!(share_content_type(Path::new("clip.mp4")).unwrap(), "video/mp4");
+        for path in ["capture.gif", "payload.exe", "capture", "capture.PNG"] {
+            assert!(share_content_type(Path::new(path)).is_err(), "accepted {path}");
+        }
+    }
+
+    #[test]
+    fn share_preflight_rejects_only_files_over_the_limit() {
+        assert!(validate_upload_size(MAX_UPLOAD_BYTES).is_ok());
+        assert!(validate_upload_size(MAX_UPLOAD_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn share_preflight_accepts_only_https_links() {
+        assert!(validate_share_url("https://share.example/x").is_ok());
+        for url in ["", "http://share.example/x", "file:///capture.png", "javascript:alert(1)"] {
+            assert!(validate_share_url(url).is_err(), "accepted {url}");
+        }
     }
 }
