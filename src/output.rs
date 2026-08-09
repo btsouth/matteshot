@@ -4,7 +4,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use image::RgbaImage;
+use image::{ImageFormat, RgbaImage};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows::Win32::System::DataExchange::{
@@ -78,10 +78,7 @@ fn partial_video_owner(name: &str) -> Option<u32> {
     owner.parse().ok()
 }
 
-/// Remove only Matteshot's unmistakable incomplete-video names. A partial
-/// from this process may belong to another open editor, so it is retained
-/// unless it is old enough to be from a reused process ID.
-pub fn cleanup_stale_video_partials(dir: &Path) -> usize {
+fn cleanup_stale_partials(dir: &Path, owner_of: fn(&str) -> Option<u32>) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -91,7 +88,7 @@ pub fn cleanup_stale_video_partials(dir: &Path) -> usize {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(owner) = partial_video_owner(name) else {
+        let Some(owner) = owner_of(name) else {
             continue;
         };
         let old = entry
@@ -105,6 +102,13 @@ pub fn cleanup_stale_video_partials(dir: &Path) -> usize {
         }
     }
     removed
+}
+
+/// Remove only Matteshot's unmistakable incomplete-video names. A partial
+/// from this process may belong to another open editor, so it is retained
+/// unless it is old enough to be from a reused process ID.
+pub fn cleanup_stale_video_partials(dir: &Path) -> usize {
+    cleanup_stale_partials(dir, partial_video_owner)
 }
 
 struct ClipboardGuard;
@@ -219,6 +223,56 @@ pub fn to_clipboard(img: &RgbaImage, file: Option<&Path>) -> Result<()> {
 /// `source` is whatever the capture is already labeled by — the captured
 /// window's title, or a region's size — purely for the history browser to
 /// show later; it never affects the file itself.
+fn partial_png_path(destination: &Path) -> PathBuf {
+    let name = destination.file_name().and_then(|name| name.to_str()).unwrap_or("capture.png");
+    destination.with_file_name(format!(
+        "{name}.partial-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+fn partial_png_owner(name: &str) -> Option<u32> {
+    let (finished_name, owner_and_id) = name.rsplit_once(".partial-")?;
+    if !finished_name.ends_with(".png") {
+        return None;
+    }
+    let (owner, id) = owner_and_id.split_once('-')?;
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    owner.parse().ok()
+}
+
+/// A killed encoder can leave only the unmistakable staging name, never a
+/// finished PNG. Remove staging files whose owning process is gone (or whose
+/// PID has been reused after a day) when the resident starts again.
+pub fn cleanup_stale_png_partials(dir: &Path) -> usize {
+    cleanup_stale_partials(dir, partial_png_owner)
+}
+
+fn publish_png(img: &RgbaImage, destination: &Path) -> Result<()> {
+    let partial = partial_png_path(destination);
+    let result = (|| {
+        img.save_with_format(&partial, ImageFormat::Png).context("write partial png")?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&partial)
+            .context("open partial png for flush")?
+            .sync_all()
+            .context("flush partial png")?;
+        std::fs::rename(&partial, destination).context("publish png")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
 pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path, source: Option<&str>) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let name = format!(
@@ -227,7 +281,7 @@ pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path, source: Option<&s
         style_name.to_lowercase()
     );
     let path = dir.join(name);
-    img.save(&path).context("write png")?;
+    publish_png(img, &path)?;
     crate::history::record(&path, img.width(), img.height(), style_name, source);
     Ok(path)
 }
@@ -309,7 +363,7 @@ pub fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgba;
+    use image::{GenericImageView, Rgba};
 
     fn image(width: u32, height: u32) -> RgbaImage {
         RgbaImage::from_pixel(width, height, Rgba([30, 60, 90, 255]))
@@ -350,6 +404,35 @@ mod tests {
     }
 
     #[test]
+    fn partial_png_names_are_narrow_and_owner_aware() {
+        assert_eq!(partial_png_owner("capture.png.partial-123-9"), Some(123));
+        assert_eq!(partial_png_owner("capture.jpg.partial-123-9"), None);
+        assert_eq!(partial_png_owner("capture.png.partial-nope-9"), None);
+        assert_eq!(partial_png_owner("capture.png"), None);
+    }
+
+    #[test]
+    fn png_is_complete_before_the_finished_name_appears() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-png-publish-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("capture.png");
+
+        publish_png(&image(17, 11), &destination).unwrap();
+
+        assert_eq!(image::open(&destination).unwrap().dimensions(), (17, 11));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn stale_partial_cleanup_does_not_touch_normal_or_live_files() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -375,6 +458,31 @@ mod tests {
 
         std::fs::remove_file(live).unwrap();
         std::fs::remove_file(normal).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_png_partial_cleanup_does_not_touch_finished_captures() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-png-partial-cleanup-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let other_pid = std::process::id().wrapping_add(1).max(1);
+        let stale = dir.join(format!("capture.png.partial-{other_pid}-1"));
+        let finished = dir.join("capture.png");
+        std::fs::write(&stale, b"partial").unwrap();
+        std::fs::write(&finished, b"finished").unwrap();
+
+        assert_eq!(cleanup_stale_png_partials(&dir), 1);
+        assert!(!stale.exists());
+        assert!(finished.exists());
+
+        std::fs::remove_file(finished).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 }

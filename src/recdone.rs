@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use image::RgbaImage;
-use windows::core::w;
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
@@ -27,11 +27,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
     GetCursorPos, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW, WINDOW_STYLE, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_MAXIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    GWLP_USERDATA, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW, WINDOW_STYLE, WS_CAPTION,
+    WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 const WM_EXPORT_PROGRESS: u32 = WM_APP + 20;
@@ -46,6 +46,26 @@ const WM_PROBE_READY: u32 = WM_APP + 25;
 /// The scrub decoder produced the exact frame under the playhead.
 const WM_SCRUB_FRAME: u32 = WM_APP + 26;
 static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn recording_delete_prompt(path: &std::path::Path) -> String {
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "this recording".into());
+    format!("Delete {name}?\n\nThis permanently removes the recording and cannot be undone.")
+}
+
+fn delete_recording_files(mp4: &std::path::Path, gif: Option<&std::path::Path>) -> Result<()> {
+    if let Some(gif) = gif {
+        match std::fs::remove_file(gif) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("delete recording GIF"),
+        }
+    }
+    match std::fs::remove_file(mp4) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("delete recording"),
+    }
+}
 
 const ASPECTS: [(&str, Option<f32>); 5] = [
     ("Auto", None),
@@ -3096,10 +3116,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let _ = InvalidateRect(hwnd, None, false);
                                 return LRESULT(0);
                             }
+                            let prompt = HSTRING::from(recording_delete_prompt(&state.mp4));
+                            let confirmed = MessageBoxW(
+                                hwnd,
+                                PCWSTR(prompt.as_ptr()),
+                                w!("Matteshot"),
+                                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                            ) == IDYES;
+                            if !confirmed {
+                                return LRESULT(0);
+                            }
                             stop_playback(state);
-                            let _ = std::fs::remove_file(&state.mp4);
-                            if let Some(g) = &state.gif {
-                                let _ = std::fs::remove_file(g);
+                            if let Err(error) = delete_recording_files(
+                                &state.mp4,
+                                state.gif.as_deref(),
+                            ) {
+                                crate::diagnostics::log(&format!(
+                                    "recording could not be deleted: {error:#}"
+                                ));
+                                state.status = Some("could not delete recording · original kept".into());
+                                let _ = InvalidateRect(hwnd, None, false);
+                                return LRESULT(0);
                             }
                             let _ = DestroyWindow(hwnd);
                         }
@@ -3874,8 +3911,8 @@ pub fn show(
 mod tests {
     use super::{
         add_chip_label, annotation_preview_time, apply_caption_input, available_export_path,
-        layout, minimum_client_size, next_counter_number, tool_after_pick, CaptionInput,
-        NEXT_EXPORT_ID, VIDEO_TOOLS,
+        delete_recording_files, layout, minimum_client_size, next_counter_number,
+        recording_delete_prompt, tool_after_pick, CaptionInput, NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
     use std::sync::atomic::Ordering;
 
@@ -4116,6 +4153,33 @@ mod tests {
         );
 
         std::fs::remove_file(original).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn recording_delete_confirmation_names_the_irrecoverable_file() {
+        let prompt = recording_delete_prompt(std::path::Path::new("C:\\Videos\\demo.mp4"));
+        assert!(prompt.contains("demo.mp4"));
+        assert!(prompt.contains("cannot be undone"));
+    }
+
+    #[test]
+    fn confirmed_recording_delete_removes_mp4_and_gif() {
+        let id = NEXT_EXPORT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-recording-delete-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp4 = dir.join("recording.mp4");
+        let gif = dir.join("recording.gif");
+        std::fs::write(&mp4, b"video").unwrap();
+        std::fs::write(&gif, b"gif").unwrap();
+
+        delete_recording_files(&mp4, Some(&gif)).unwrap();
+
+        assert!(!mp4.exists());
+        assert!(!gif.exists());
         std::fs::remove_dir(dir).unwrap();
     }
 }
