@@ -544,7 +544,13 @@ pub fn render_with_metric(
 mod tests {
     use image::{Rgba, RgbaImage};
 
-    use super::{render, Annotation, Shape, TextStyle};
+    use super::{pixelate, render, Annotation, Shape, TextStyle};
+
+    fn patterned_image() -> RgbaImage {
+        RgbaImage::from_fn(12, 12, |x, y| {
+            Rgba([(x * 17 + y * 3) as u8, (y * 19 + x * 5) as u8, (x * 11 + y * 7) as u8, 255])
+        })
+    }
 
     #[test]
     fn freehand_strokes_render_every_segment() {
@@ -563,5 +569,32 @@ mod tests {
 
         assert!(image.get_pixel(20, 8)[0] > 0);
         assert!(image.get_pixel(32, 28)[0] > 0);
+    }
+
+    #[test]
+    fn pixelation_destroys_detail_inside_the_rect_only() {
+        let original = patterned_image();
+        let mut forward = original.clone();
+        let mut reversed = original.clone();
+
+        // A requested block smaller than four still uses the privacy floor.
+        pixelate(&mut forward, (2.0, 2.0), (10.0, 10.0), 1);
+        pixelate(&mut reversed, (10.0, 10.0), (2.0, 2.0), 1);
+
+        assert_eq!(forward, reversed, "reversing the box corners changed the redaction");
+        assert_eq!(forward.get_pixel(0, 0), original.get_pixel(0, 0));
+        assert_eq!(forward.get_pixel(11, 11), original.get_pixel(11, 11));
+        assert_ne!(forward.get_pixel(2, 2), original.get_pixel(2, 2));
+
+        for block_y in [2, 6] {
+            for block_x in [2, 6] {
+                let expected = *forward.get_pixel(block_x, block_y);
+                for y in block_y..block_y + 4 {
+                    for x in block_x..block_x + 4 {
+                        assert_eq!(*forward.get_pixel(x, y), expected, "detail survived at ({x}, {y})");
+                    }
+                }
+            }
+        }
     }
 }
