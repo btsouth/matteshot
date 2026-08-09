@@ -1,6 +1,7 @@
 //! Persistent settings at %APPDATA%\matteshot\config.json.
 
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -116,11 +117,20 @@ fn config_path() -> Option<PathBuf> {
 
 const CONFIG_MUTEX: &str = "Local\\Matteshot.Config.State";
 
-fn load_unlocked() -> Config {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn load_from(path: &Path) -> anyhow::Result<Config> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(serde_json::from_str(&body)?)
+}
+
+fn load_unlocked() -> anyhow::Result<Config> {
+    let Some(path) = config_path() else {
+        return Ok(Config::default());
+    };
+    load_from(&path)
 }
 
 fn save_unlocked(config: &Config) {
@@ -136,14 +146,22 @@ fn save_unlocked(config: &Config) {
 impl Config {
     pub fn load() -> Config {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
-        load_unlocked()
+        load_unlocked().unwrap_or_else(|error| {
+            crate::diagnostics::log(&format!("config could not be loaded: {error:#}"));
+            Config::default()
+        })
     }
 
     /// Atomically update only the fields owned by one action. This prevents a
     /// long-lived Settings window from overwriting a newer last-used matte.
     pub fn update(change: impl FnOnce(&mut Config)) -> Config {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
-        let mut config = load_unlocked();
+        let Ok(mut config) = load_unlocked() else {
+            crate::diagnostics::log(
+                "config update skipped because existing state could not be loaded",
+            );
+            return Config::default();
+        };
         change(&mut config);
         save_unlocked(&config);
         config
@@ -170,6 +188,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "matteshot-config-{name}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn a_missing_config_is_a_fresh_install() {
+        let path = temporary_path("missing");
+        let config = load_from(&path).expect("missing config uses defaults");
+        assert_eq!(config.capture_hotkey, crate::hotkey::DEFAULT);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_corrupt_config_is_not_mistaken_for_defaults() {
+        let path = temporary_path("corrupt");
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+        assert!(load_from(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ definitely not json");
+        let _ = std::fs::remove_file(path);
+    }
 
     /// The whole point: a fresh install must not report anything before the
     /// question has been answered.
