@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
@@ -55,12 +56,17 @@ pub enum Status {
     Trial {
         days_left: u32,
     },
+    /// Persistent state is corrupt or could not be read before any valid
+    /// status was cached. This is distinct from an ended trial so activation
+    /// remains an explicit recovery path, but capture stays blocked because
+    /// the app cannot prove an entitlement from damaged state.
+    Unavailable,
     Expired,
 }
 
 impl Status {
     pub fn can_capture(&self) -> bool {
-        !matches!(self, Status::Expired)
+        !matches!(self, Status::Expired | Status::Unavailable)
     }
 
     /// How long this license is entitled to new versions, in words.
@@ -92,6 +98,7 @@ impl Status {
             Status::TrialNotStarted => "14-day trial ready".into(),
             Status::Trial { days_left: 1 } => "Trial: 1 day left".into(),
             Status::Trial { days_left } => format!("Trial: {days_left} days left"),
+            Status::Unavailable => "License state temporarily unavailable".into(),
             Status::Expired => "Trial ended".into(),
         }
     }
@@ -219,11 +226,50 @@ fn state_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|dir| dir.join("matteshot").join("license.json"))
 }
 
-fn load_state() -> State {
-    state_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|body| serde_json::from_str(&body).ok())
+fn load_state_from(path: &std::path::Path) -> Result<State> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+        Err(error) => return Err(error).context("read license state"),
+    };
+    serde_json::from_str(&body).context("parse license state")
+}
+
+fn load_state() -> Result<State> {
+    let path = state_path().context("Windows has no application data directory")?;
+    load_state_from(&path)
+}
+
+fn corrupt_state_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("json.corrupt-{unique}"))
+}
+
+/// A newly verified paid certificate is the one safe recovery point for a
+/// corrupt local state file. Preserve the bad bytes for support, then replace
+/// them with the server-verified activation; transient I/O errors still fail
+/// without touching anything on disk.
+fn load_state_for_activation_from(path: &std::path::Path) -> Result<State> {
+    match load_state_from(path) {
+        Ok(state) => Ok(state),
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            let backup = corrupt_state_backup_path(path);
+            std::fs::rename(path, &backup).context("quarantine corrupt license state")?;
+            crate::diagnostics::log(
+                "corrupt license state was quarantined after verifying a replacement activation",
+            );
+            Ok(State::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_state_for_activation() -> Result<State> {
+    let path = state_path().context("Windows has no application data directory")?;
+    load_state_for_activation_from(&path)
 }
 
 fn save_state(state: &State) -> Result<()> {
@@ -233,6 +279,31 @@ fn save_state(state: &State) -> Result<()> {
     }
     let body = serde_json::to_vec_pretty(state).context("serialize license state")?;
     crate::state_lock::atomic_write(&path, &body).context("replace license state")
+}
+
+static LAST_VALID_STATUS: OnceLock<Mutex<Option<Status>>> = OnceLock::new();
+
+fn remember_status(status: Status) -> Status {
+    if let Ok(mut cached) = LAST_VALID_STATUS.get_or_init(|| Mutex::new(None)).lock() {
+        *cached = Some(status.clone());
+    }
+    status
+}
+
+fn remembered_status() -> Option<Status> {
+    LAST_VALID_STATUS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|cached| cached.clone())
+}
+
+fn status_after_load_error(error: &anyhow::Error, cached: Option<Status>) -> Status {
+    if error.downcast_ref::<serde_json::Error>().is_some() {
+        Status::Unavailable
+    } else {
+        cached.unwrap_or(Status::Unavailable)
+    }
 }
 
 fn same_activation(state: &State, expected: &StoredLicense) -> bool {
@@ -382,14 +453,22 @@ pub fn status() -> Status {
         return forced;
     }
     let _guard = crate::state_lock::lock(LICENSE_MUTEX).ok();
-    let mut state = load_state();
+    let mut state = match load_state() {
+        Ok(state) => state,
+        Err(error) => {
+            crate::diagnostics::log(&format!(
+                "license state could not be loaded; leaving it untouched: {error:#}"
+            ));
+            return status_after_load_error(&error, remembered_status());
+        }
+    };
     let device = device_id();
     if let Some(stored) = state.license.as_ref() {
         if let Ok(certificate) = verify(stored, &device) {
-            return Status::Licensed {
+            return remember_status(Status::Licensed {
                 customer_email: certificate.customer_email,
                 updates_until: certificate.updates_until,
-            };
+            });
         }
         state.license = None;
         let _ = save_state(&state);
@@ -431,7 +510,7 @@ pub fn status() -> Status {
             set_registry_time(REGISTRY_TRIAL_START, started);
             set_registry_time(REGISTRY_LAST_SEEN, effective_now);
             let _ = save_state(&state);
-            return trial_status_at(Some(started), previous_seen, now);
+            return remember_status(trial_status_at(Some(started), previous_seen, now));
         }
         state.trial = None;
         let _ = save_state(&state);
@@ -445,7 +524,7 @@ pub fn status() -> Status {
     state.last_seen_at = Some(effective_now);
     set_registry_time(REGISTRY_LAST_SEEN, effective_now);
     let _ = save_state(&state);
-    trial_status_at(started, previous_seen, now)
+    remember_status(trial_status_at(started, previous_seen, now))
 }
 
 /// The signed certificate + signature this device's license holds, for
@@ -454,7 +533,12 @@ pub fn status() -> Status {
 /// `status()` would currently return `Licensed`, so a caller never attaches
 /// a certificate this device already knows is stale or mismatched.
 pub fn signed_certificate() -> Option<(String, String)> {
-    let state = load_state();
+    let state = load_state().map_err(|error| {
+        crate::diagnostics::log(&format!(
+            "signed license certificate could not be loaded: {error:#}"
+        ));
+        error
+    }).ok()?;
     let stored = state.license.as_ref()?;
     verify(stored, &device_id()).ok()?;
     Some((stored.certificate.clone(), stored.signature.clone()))
@@ -469,7 +553,12 @@ pub fn record_successful_capture() {
         return;
     }
     let _guard = crate::state_lock::lock(LICENSE_MUTEX).ok();
-    let mut state = load_state();
+    let Ok(mut state) = load_state() else {
+        crate::diagnostics::log(
+            "capture state update skipped because license state could not be loaded",
+        );
+        return;
+    };
     let has_server_trial = state.trial.is_some();
     let began_now = state.trial_started_at.is_none() && registry_time(REGISTRY_TRIAL_START).is_none();
     let now = Utc::now().timestamp();
@@ -526,7 +615,7 @@ pub fn activate(license_key: &str) -> Result<Status> {
     };
     let certificate = verify(&stored, &device).context("verify activation certificate")?;
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
-    let mut state = load_state();
+    let mut state = load_state_for_activation()?;
     close_trial_after_activation(&mut state, Utc::now().timestamp());
     state.license = Some(stored);
     save_state(&state)?;
@@ -540,7 +629,7 @@ pub fn activate(license_key: &str) -> Result<Status> {
 pub fn refresh_once() -> Result<Status> {
     let stored = {
         let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
-        load_state()
+        load_state()?
             .license
             .context("Matteshot is not activated")?
     };
@@ -551,7 +640,7 @@ pub fn refresh_once() -> Result<Status> {
     let (status_code, response) = post_json(LICENSE_PATH_REFRESH, &serde_json::to_vec(&request)?)?;
     if status_code == 403 {
         let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
-        let mut state = load_state();
+        let mut state = load_state()?;
         if same_activation(&state, &stored) {
             state.license = None;
             save_state(&state)?;
@@ -577,7 +666,7 @@ pub fn refresh_once() -> Result<Status> {
     };
     let certificate = verify(&replacement, &device_id())?;
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
-    let mut state = load_state();
+    let mut state = load_state()?;
     if !same_activation(&state, &stored) {
         bail!("activation changed while it was being refreshed");
     }
@@ -592,14 +681,17 @@ pub fn refresh_once() -> Result<Status> {
 /// The earliest local time that suggests the trial has begun, if any. Absent
 /// on a machine that has never completed a capture.
 fn trial_grace_start() -> Option<i64> {
-    let state = load_state();
+    let state = load_state().map_err(|error| {
+        crate::diagnostics::log(&format!("trial state could not be loaded: {error:#}"));
+        error
+    }).ok()?;
     earliest(state.trial_started_at, registry_time(REGISTRY_TRIAL_START))
 }
 
 fn store_trial_certificate(stored: StoredTrial, device: &str) -> Result<()> {
     verify_trial(&stored, device).context("verify server trial certificate")?;
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
-    let mut state = load_state();
+    let mut state = load_state()?;
     state.trial = Some(stored);
     save_state(&state)
 }
@@ -684,7 +776,7 @@ pub fn start_background_refresh() {
 pub fn deactivate() -> Result<()> {
     let stored = {
         let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
-        load_state()
+        load_state()?
             .license
             .context("Matteshot is not activated")?
     };
@@ -701,7 +793,7 @@ pub fn deactivate() -> Result<()> {
         );
     }
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
-    let mut state = load_state();
+    let mut state = load_state()?;
     if same_activation(&state, &stored) {
         state.license = None;
         save_state(&state)?;
@@ -904,6 +996,101 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
 mod tests {
     use super::*;
 
+    fn temporary_state_path(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "matteshot-license-{name}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn a_missing_license_state_is_a_fresh_install() {
+        let path = temporary_state_path("missing");
+        let state = load_state_from(&path).expect("missing state uses defaults");
+        assert!(state.license.is_none());
+        assert!(state.trial.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn corrupt_license_state_is_not_mistaken_for_an_empty_install() {
+        let path = temporary_state_path("corrupt");
+        std::fs::write(&path, b"{ paid activation interrupted").unwrap();
+        assert!(load_state_from(&path).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{ paid activation interrupted"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn verified_activation_can_recover_without_destroying_corrupt_state() {
+        let path = temporary_state_path("recover");
+        let corrupt = b"{ paid activation interrupted";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let state = load_state_for_activation_from(&path)
+            .expect("quarantine state after replacement certificate verification");
+        assert!(state.license.is_none());
+        assert!(!path.exists());
+
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(
+                        "{}.corrupt-",
+                        path.file_name().unwrap().to_string_lossy()
+                    ))
+            })
+            .expect("corrupt backup");
+        assert_eq!(std::fs::read(backup.path()).unwrap(), corrupt);
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
+    fn corrupt_state_never_reuses_a_cached_entitlement() {
+        let parse_error: anyhow::Error = serde_json::from_str::<State>("{")
+            .err()
+            .expect("invalid state")
+            .into();
+        let cached = Status::Licensed {
+            customer_email: None,
+            updates_until: None,
+        };
+        assert_eq!(
+            status_after_load_error(&parse_error, Some(cached)),
+            Status::Unavailable
+        );
+        assert!(!Status::Unavailable.can_capture());
+        assert_eq!(
+            Status::Unavailable.tray_label(),
+            "License state temporarily unavailable"
+        );
+    }
+
+    #[test]
+    fn transient_read_failure_keeps_the_last_verified_status() {
+        let io_error: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "temporarily locked").into();
+        let cached = Status::Licensed {
+            customer_email: None,
+            updates_until: None,
+        };
+        assert_eq!(
+            status_after_load_error(&io_error, Some(cached.clone())),
+            cached
+        );
+    }
+
     #[test]
     fn the_update_term_is_stated_in_plain_words() {
         let licensed = Status::Licensed {
@@ -931,6 +1118,7 @@ mod tests {
             },
             Status::Trial { days_left: 7 },
             Status::TrialNotStarted,
+            Status::Unavailable,
             Status::Expired,
         ] {
             assert_eq!(status.updates_note(), None, "for {status:?}");

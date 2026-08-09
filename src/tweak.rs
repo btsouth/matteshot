@@ -1745,7 +1745,7 @@ unsafe fn copy_image(hwnd: HWND, state: &mut State) {
         |path| output::to_clipboard(&img, Some(path)),
     ) {
         Ok(_) => {
-            Config::update(|cfg| cfg.last_style = state.doc_mut().sel);
+            let _ = Config::update(|cfg| cfg.last_style = state.doc_mut().sel);
             if cfg.keep_editor_open {
                 state.copy_hint = Some(("copied".into(), std::time::Instant::now()));
                 let _ = InvalidateRect(hwnd, None, false);

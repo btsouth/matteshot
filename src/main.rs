@@ -368,7 +368,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             if let Err(error) = output::text_to_clipboard(&url) {
                 eprintln!("share link clipboard copy failed: {error:#}");
             }
-            Config::update(|cfg| cfg.last_style = i);
+            let _ = Config::update(|cfg| cfg.last_style = i);
             eprintln!("shared [{}]: {}", styles[i].name, url);
             return Ok(());
         }
@@ -411,7 +411,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                     // overlay's own timing log (freeze_ms) must not include
                     // config I/O.
                     if seconds != cfg.capture_delay_secs {
-                        Config::update(|cfg| cfg.capture_delay_secs = seconds);
+                        let _ = Config::update(|cfg| cfg.capture_delay_secs = seconds);
                     }
                     if note_failure("delay", delay::countdown(seconds))? {
                         shoot_overlay_delayed()
@@ -428,7 +428,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     let auto_path = cancel_auto();
     if chosen == preselect {
         if let Some(path) = &auto_path {
-            Config::update(|cfg| cfg.last_style = chosen);
+            let _ = Config::update(|cfg| cfg.last_style = chosen);
             eprintln!("done [{}] (auto-copy reused): {}", styles[chosen].name, path.display());
             return Ok(());
         }
@@ -450,7 +450,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             let _ = std::fs::remove_file(old);
         }
     }
-    Config::update(|cfg| cfg.last_style = chosen);
+    let _ = Config::update(|cfg| cfg.last_style = chosen);
     eprintln!(
         "done [{}]: {}x{} -> clipboard + {}",
         styles[chosen].name,
@@ -487,7 +487,7 @@ fn shoot_overlay_from(start_delayed: bool) -> Result<()> {
                 // shows up in freeze_ms).
                 if chosen != seconds {
                     seconds = chosen;
-                    Config::update(|cfg| cfg.capture_delay_secs = chosen);
+                    let _ = Config::update(|cfg| cfg.capture_delay_secs = chosen);
                 }
                 // Escape during the countdown abandons the capture rather than
                 // bringing the overlay back.
@@ -814,7 +814,7 @@ fn run_app() -> Result<()> {
                 "Matteshot is ready",
                 "Press PrtScn to capture. Right-click the tray icon for settings.",
             );
-            Config::update(|cfg| cfg.onboarded = true);
+            let _ = Config::update(|cfg| cfg.onboarded = true);
         }
     }
     update::start(tray.hwnd);

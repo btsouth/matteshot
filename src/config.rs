@@ -1,6 +1,7 @@
 //! Persistent settings at %APPDATA%\matteshot\config.json.
 
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -116,37 +117,81 @@ fn config_path() -> Option<PathBuf> {
 
 const CONFIG_MUTEX: &str = "Local\\Matteshot.Config.State";
 
-fn load_unlocked() -> Config {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn load_from(path: &Path) -> anyhow::Result<Config> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(serde_json::from_str(&body)?)
 }
 
-fn save_unlocked(config: &Config) {
-    let Some(path) = config_path() else { return };
+fn load_unlocked() -> anyhow::Result<Config> {
+    let Some(path) = config_path() else {
+        return Ok(Config::default());
+    };
+    load_from(&path)
+}
+
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("json.corrupt-{unique}"))
+}
+
+fn load_for_update_from(path: &Path) -> anyhow::Result<Config> {
+    match load_from(path) {
+        Ok(config) => Ok(config),
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            let backup = corrupt_backup_path(path);
+            std::fs::rename(path, &backup)?;
+            crate::diagnostics::log("corrupt config was quarantined before resetting settings");
+            Ok(Config::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_for_update_unlocked() -> anyhow::Result<Config> {
+    let Some(path) = config_path() else {
+        return Ok(Config::default());
+    };
+    load_for_update_from(&path)
+}
+
+fn save_unlocked(config: &Config) -> anyhow::Result<()> {
+    let Some(path) = config_path() else { return Ok(()) };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
-    if let Ok(json) = serde_json::to_vec_pretty(config) {
-        let _ = crate::state_lock::atomic_write(&path, &json);
-    }
+    let json = serde_json::to_vec_pretty(config)?;
+    crate::state_lock::atomic_write(&path, &json)
 }
 
 impl Config {
     pub fn load() -> Config {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
-        load_unlocked()
+        load_unlocked().unwrap_or_else(|error| {
+            crate::diagnostics::log(&format!("config could not be loaded: {error:#}"));
+            Config::default()
+        })
     }
 
     /// Atomically update only the fields owned by one action. This prevents a
     /// long-lived Settings window from overwriting a newer last-used matte.
-    pub fn update(change: impl FnOnce(&mut Config)) -> Config {
+    pub fn update(change: impl FnOnce(&mut Config)) -> anyhow::Result<Config> {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
-        let mut config = load_unlocked();
+        let mut config = load_for_update_unlocked().map_err(|error| {
+            crate::diagnostics::log(&format!(
+                "config update failed because existing state could not be loaded: {error:#}"
+            ));
+            error
+        })?;
         change(&mut config);
-        save_unlocked(&config);
-        config
+        save_unlocked(&config)?;
+        Ok(config)
     }
 
     pub fn save_dir(&self) -> PathBuf {
@@ -170,6 +215,65 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "matteshot-config-{name}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn a_missing_config_is_a_fresh_install() {
+        let path = temporary_path("missing");
+        let config = load_from(&path).expect("missing config uses defaults");
+        assert_eq!(config.capture_hotkey, crate::hotkey::DEFAULT);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_corrupt_config_is_not_mistaken_for_defaults() {
+        let path = temporary_path("corrupt");
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+        assert!(load_from(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ definitely not json");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_a_corrupt_config_quarantines_it_before_resetting() {
+        let path = temporary_path("recover");
+        let corrupt = b"{ definitely not json";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let mut config = load_for_update_from(&path).expect("quarantine corrupt config");
+        config.capture_hotkey = "Ctrl+Shift+F9".into();
+        let json = serde_json::to_vec_pretty(&config).unwrap();
+        crate::state_lock::atomic_write(&path, &json).unwrap();
+
+        let recovered = load_from(&path).expect("read recovered config");
+        assert_eq!(recovered.capture_hotkey, "Ctrl+Shift+F9");
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(
+                        "{}.corrupt-",
+                        path.file_name().unwrap().to_string_lossy()
+                    ))
+            })
+            .expect("corrupt backup");
+        assert_eq!(std::fs::read(backup.path()).unwrap(), corrupt);
+        let _ = std::fs::remove_file(backup.path());
+        let _ = std::fs::remove_file(path);
+    }
 
     /// The whole point: a fresh install must not report anything before the
     /// question has been answered.
