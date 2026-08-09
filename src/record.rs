@@ -21,8 +21,8 @@ use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::Media::MediaFoundation::{
     IMFSinkWriter, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFCreateSinkWriterFromURL, MFStartup, MFVideoFormat_H264, MFVideoFormat_RGB32,
-    MFVideoInterlace_Progressive, MFMediaType_Video, MFSTARTUP_FULL, MF_MT_AVG_BITRATE,
+    MFCreateSinkWriterFromURL, MFMediaType_Video, MFStartup, MFVideoFormat_H264,
+    MFVideoFormat_RGB32, MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_MT_AVG_BITRATE,
     MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
     MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
     MF_VERSION,
@@ -184,9 +184,8 @@ pub unsafe fn make_sink_for_content(
     // Optional AAC audio track fed with float PCM.
     let audio_stream = if let Some(fmt) = audio {
         use windows::Win32::Media::MediaFoundation::{
-            MFAudioFormat_AAC, MFMediaType_Audio,
-            MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
-            MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
+            MFAudioFormat_AAC, MFMediaType_Audio, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+            MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
             MF_MT_AUDIO_SAMPLES_PER_SECOND,
         };
         let aout = MFCreateMediaType()?;
@@ -321,7 +320,10 @@ fn capture_loop(
         &winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
         2,
-        SizeInt32 { Width: item_size.Width.max(2), Height: item_size.Height.max(2) },
+        SizeInt32 {
+            Width: item_size.Width.max(2),
+            Height: item_size.Height.max(2),
+        },
     )?;
     let session = pool.CreateCaptureSession(&item)?;
     let _ = session.SetIsCursorCaptureEnabled(true);
@@ -361,7 +363,10 @@ fn capture_loop(
             let _ = watcher.join();
         });
         audio_rx = Some(rx);
-        audio_fmt = Some(crate::audio::Format { rate: enc.rate, channels: enc.channels });
+        audio_fmt = Some(crate::audio::Format {
+            rate: enc.rate,
+            channels: enc.channels,
+        });
     }
     let mut audio_cursor: i64 = 0;
 
@@ -554,8 +559,8 @@ fn capture_loop(
                 let sy = (y as f32 / scale) as u32;
                 for x in 0..gw {
                     let sx = (x as f32 / scale) as u32;
-                    let i = (sy.min(out_h - 1) as usize * row_bytes)
-                        + (sx.min(out_w - 1) as usize * 4);
+                    let i =
+                        (sy.min(out_h - 1) as usize * row_bytes) + (sx.min(out_w - 1) as usize * 4);
                     rgba.extend_from_slice(&[buf[i + 2], buf[i + 1], buf[i], 255]);
                 }
             }
@@ -574,7 +579,14 @@ fn capture_loop(
                 // Finalize() runs right after this, so audio_cursor's last
                 // real use was the loop above.
                 unsafe {
-                    write_pcm(&writer, astream, &tail, fmt.rate, fmt.channels, audio_cursor)?;
+                    write_pcm(
+                        &writer,
+                        astream,
+                        &tail,
+                        fmt.rate,
+                        fmt.channels,
+                        audio_cursor,
+                    )?;
                 }
             }
         }
@@ -595,15 +607,68 @@ fn write_gif(frames: &[(Vec<u8>, u32, u32)], path: &std::path::Path) -> Result<(
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::{Delay, Frame, RgbaImage};
 
-    let file = std::fs::File::create(path)?;
-    let mut enc = GifEncoder::new_with_speed(file, 12);
-    enc.set_repeat(Repeat::Infinite)?;
-    let delay = Delay::from_numer_denom_ms(1000 * GIF_EVERY, FPS);
-    for (buf, w, h) in frames {
-        let Some(img) = RgbaImage::from_raw(*w, *h, buf.clone()) else { continue };
-        enc.encode_frame(Frame::from_parts(img, 0, 0, delay))?;
+    let mut file = std::fs::File::create(path)?;
+    {
+        let mut enc = GifEncoder::new_with_speed(&mut file, 12);
+        enc.set_repeat(Repeat::Infinite)?;
+        let delay = Delay::from_numer_denom_ms(1000 * GIF_EVERY, FPS);
+        for (buf, w, h) in frames {
+            let Some(img) = RgbaImage::from_raw(*w, *h, buf.clone()) else {
+                continue;
+            };
+            enc.encode_frame(Frame::from_parts(img, 0, 0, delay))?;
+        }
     }
+    file.sync_all().context("flush gif")?;
     Ok(())
+}
+
+fn partial_gif_path(destination: &std::path::Path, id: u64) -> std::path::PathBuf {
+    let parent = destination
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let stem = destination
+        .file_stem()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    parent.join(format!("{stem}.partial-{}-{id}.gif", std::process::id()))
+}
+
+fn publish_recording_with(
+    partial: &std::path::Path,
+    destination: &std::path::Path,
+    rename: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<()> {
+    // Validation has already succeeded, so the partial is user data now.
+    // Never remove it on a publication error: its explicit path is the
+    // recovery mechanism for a destination collision or transient lock.
+    rename(partial, destination).with_context(|| {
+        format!(
+            "publish finalized recording; recovery file kept at {}",
+            partial.display()
+        )
+    })
+}
+
+fn publish_gif_with(
+    frames: &[(Vec<u8>, u32, u32)],
+    destination: &std::path::Path,
+    id: u64,
+    rename: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let partial = partial_gif_path(destination, id);
+    let _ = std::fs::remove_file(&partial);
+    let staged = (|| {
+        write_gif(frames, &partial).context("encode gif")?;
+        image::open(&partial).context("validate gif")?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&partial);
+        return Err(error);
+    }
+    rename(&partial, destination)
+        .with_context(|| format!("publish gif; recovery file kept at {}", partial.display()))
 }
 
 /// Record `target` until the user stops. Blocks on the caller's (main)
@@ -661,18 +726,20 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     let worker = {
         let progress = progress.clone();
         let partial_mp4 = partial_mp4.clone();
-        std::thread::spawn(move || match capture_loop(
-            target,
-            partial_mp4,
-            want_gif,
-            audio_source,
-            progress.clone(),
-        ) {
-            Ok(frames) => frames,
-            Err(e) => {
-                *progress.error.lock().unwrap() = Some(format!("{e:#}"));
-                progress.stop.store(true, Ordering::Relaxed);
-                None
+        std::thread::spawn(move || {
+            match capture_loop(
+                target,
+                partial_mp4,
+                want_gif,
+                audio_source,
+                progress.clone(),
+            ) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    *progress.error.lock().unwrap() = Some(format!("{e:#}"));
+                    progress.stop.store(true, Ordering::Relaxed);
+                    None
+                }
             }
         })
     };
@@ -722,32 +789,51 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         let _ = std::fs::remove_file(&gif);
         return Err(error).context("recording failed its final integrity check");
     }
-    if let Err(error) = std::fs::rename(&partial_mp4, &mp4) {
+    if let Err(error) =
+        publish_recording_with(&partial_mp4, &mp4, |from, to| std::fs::rename(from, to))
+    {
         crate::diagnostics::log("recording publish failed");
-        let _ = std::fs::remove_file(&partial_mp4);
         let _ = std::fs::remove_file(&gif);
-        return Err(error).context("publish finalized recording");
+        return Err(error);
     }
 
     let mut gif_saved = None;
+    let mut gif_failed = false;
     if let Some(frames) = gif_frames {
-        if !frames.is_empty() && write_gif(&frames, &gif).is_ok() {
-            gif_saved = Some(gif);
+        if !frames.is_empty() {
+            match publish_gif_with(&frames, &gif, record_id, |from, to| {
+                std::fs::rename(from, to)
+            }) {
+                Ok(()) => gif_saved = Some(gif),
+                Err(error) => {
+                    gif_failed = true;
+                    crate::diagnostics::log("recording gif failed");
+                    eprintln!("recording gif failed: {error:#}");
+                }
+            }
         }
     }
     let frames = progress.frames.load(Ordering::Relaxed);
     let secs = progress.started.elapsed().as_secs();
-    crate::diagnostics::log(&format!("recording complete frames={frames} seconds={secs}"));
+    crate::diagnostics::log(&format!(
+        "recording complete frames={frames} seconds={secs}"
+    ));
     eprintln!("recorded {frames} frames -> {}", mp4.display());
     // The file itself on the clipboard: paste straight into chat or a ticket.
-    let initial_status = match crate::output::file_to_clipboard(&mp4) {
-        Ok(()) => None,
+    let mut notices = Vec::new();
+    if gif_failed {
+        notices.push("GIF unavailable");
+    }
+    match crate::output::file_to_clipboard(&mp4) {
+        Ok(()) => {}
         Err(error) => {
             crate::diagnostics::log("recording clipboard copy failed");
             eprintln!("recording clipboard copy failed: {error:#}");
-            Some("recording saved · clipboard unavailable".into())
+            notices.push("clipboard unavailable");
         }
-    };
+    }
+    let initial_status =
+        (!notices.is_empty()).then(|| format!("recording saved · {}", notices.join(" · ")));
     // And a review window so stopping never feels like the recording vanished.
     let _ = crate::recdone::show(mp4, gif_saved, frames, secs, initial_status);
     Ok(())
@@ -756,6 +842,61 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "matteshot-record-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn validated_recording_survives_a_publish_failure() {
+        let dir = temp_dir("publish-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("capture.partial.mp4");
+        let destination = dir.join("capture.mp4");
+        std::fs::write(&partial, b"validated recording").unwrap();
+
+        let result = publish_recording_with(&partial, &destination, |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "locked",
+            ))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&partial).unwrap(), b"validated recording");
+        assert!(!destination.exists());
+        std::fs::remove_file(partial).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn gif_publish_failure_keeps_a_valid_recovery_file() {
+        let dir = temp_dir("gif-publish-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("capture.gif");
+        let frames = vec![(vec![255, 0, 0, 255], 1, 1)];
+
+        let result = publish_gif_with(&frames, &destination, 7, |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "locked",
+            ))
+        });
+        let partial = partial_gif_path(&destination, 7);
+
+        assert!(result.is_err());
+        assert!(image::open(&partial).is_ok());
+        assert!(!destination.exists());
+        std::fs::remove_file(partial).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn high_refresh_frames_share_one_thirty_fps_slot() {
