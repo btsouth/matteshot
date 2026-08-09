@@ -751,7 +751,9 @@ fn run_app() -> Result<()> {
     };
     telemetry::init();
     telemetry::report("matteshot_launch");
-    let cleaned = output::cleanup_stale_video_partials(&Config::load().video_dir());
+    let config = Config::load();
+    let cleaned = output::cleanup_stale_video_partials(&config.video_dir())
+        + output::cleanup_stale_png_partials(&config.save_dir());
     if cleaned > 0 {
         diagnostics::log(&format!("recovered stale partials count={cleaned}"));
     }
