@@ -52,19 +52,60 @@ fn recording_delete_prompt(path: &std::path::Path) -> String {
     format!("Delete {name}?\n\nThis permanently removes the recording and cannot be undone.")
 }
 
-fn delete_recording_files(mp4: &std::path::Path, gif: Option<&std::path::Path>) -> Result<()> {
-    if let Some(gif) = gif {
-        match std::fs::remove_file(gif) {
-            Ok(()) => {}
+fn recording_delete_stage_path(path: &std::path::Path) -> PathBuf {
+    let name = path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+    path.with_file_name(format!(
+        "{name}.matteshot-delete-{}-{}",
+        std::process::id(),
+        NEXT_EXPORT_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn delete_recording_files_with(
+    mp4: &std::path::Path,
+    gif: Option<&std::path::Path>,
+    mut rename: impl FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (source, label) in gif
+        .into_iter()
+        .map(|path| (path, "recording GIF"))
+        .chain(std::iter::once((mp4, "recording")))
+    {
+        let temporary = recording_delete_stage_path(source);
+        match rename(source, &temporary) {
+            Ok(()) => staged.push((source.to_owned(), temporary)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("delete recording GIF"),
+            Err(error) => {
+                let mut rollback_failed = false;
+                for (original, temporary) in staged.iter().rev() {
+                    if rename(temporary, original).is_err() {
+                        rollback_failed = true;
+                    }
+                }
+                if rollback_failed {
+                    crate::diagnostics::log("recording delete staging rollback failed");
+                }
+                return Err(error).with_context(|| format!("stage {label} for deletion"));
+            }
         }
     }
-    match std::fs::remove_file(mp4) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("delete recording"),
+
+    // Once every source has moved, the deletion is committed from the user's
+    // perspective. Cleanup failures leave only Matteshot-specific staging
+    // names and must not claim the originals were preserved.
+    for (_, temporary) in staged {
+        if let Err(error) = std::fs::remove_file(&temporary) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                crate::diagnostics::log("a staged recording deletion needs later cleanup");
+            }
+        }
     }
+    Ok(())
+}
+
+fn delete_recording_files(mp4: &std::path::Path, gif: Option<&std::path::Path>) -> Result<()> {
+    delete_recording_files_with(mp4, gif, |from, to| std::fs::rename(from, to))
 }
 
 const ASPECTS: [(&str, Option<f32>); 5] = [
@@ -3911,8 +3952,9 @@ pub fn show(
 mod tests {
     use super::{
         add_chip_label, annotation_preview_time, apply_caption_input, available_export_path,
-        delete_recording_files, layout, minimum_client_size, next_counter_number,
-        recording_delete_prompt, tool_after_pick, CaptionInput, NEXT_EXPORT_ID, VIDEO_TOOLS,
+        delete_recording_files, delete_recording_files_with, layout, minimum_client_size,
+        next_counter_number, recording_delete_prompt, tool_after_pick, CaptionInput,
+        NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
     use std::sync::atomic::Ordering;
 
@@ -4180,6 +4222,39 @@ mod tests {
 
         assert!(!mp4.exists());
         assert!(!gif.exists());
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_recording_delete_staging_restores_every_original() {
+        let id = NEXT_EXPORT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-recording-delete-rollback-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp4 = dir.join("recording.mp4");
+        let gif = dir.join("recording.gif");
+        std::fs::write(&mp4, b"video").unwrap();
+        std::fs::write(&gif, b"gif").unwrap();
+
+        let result = delete_recording_files_with(&mp4, Some(&gif), |from, to| {
+            if from == mp4 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "recording is in use",
+                ))
+            } else {
+                std::fs::rename(from, to)
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&mp4).unwrap(), b"video");
+        assert_eq!(std::fs::read(&gif).unwrap(), b"gif");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_file(mp4).unwrap();
+        std::fs::remove_file(gif).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 }

@@ -226,7 +226,7 @@ pub fn to_clipboard(img: &RgbaImage, file: Option<&Path>) -> Result<()> {
 fn partial_png_path(destination: &Path) -> PathBuf {
     let name = destination.file_name().and_then(|name| name.to_str()).unwrap_or("capture.png");
     destination.with_file_name(format!(
-        "{name}.partial-{}-{}",
+        "{name}.matteshot-partial-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -236,7 +236,7 @@ fn partial_png_path(destination: &Path) -> PathBuf {
 }
 
 fn partial_png_owner(name: &str) -> Option<u32> {
-    let (finished_name, owner_and_id) = name.rsplit_once(".partial-")?;
+    let (finished_name, owner_and_id) = name.rsplit_once(".matteshot-partial-")?;
     if !finished_name.ends_with(".png") {
         return None;
     }
@@ -405,9 +405,10 @@ mod tests {
 
     #[test]
     fn partial_png_names_are_narrow_and_owner_aware() {
-        assert_eq!(partial_png_owner("capture.png.partial-123-9"), Some(123));
-        assert_eq!(partial_png_owner("capture.jpg.partial-123-9"), None);
-        assert_eq!(partial_png_owner("capture.png.partial-nope-9"), None);
+        assert_eq!(partial_png_owner("capture.png.matteshot-partial-123-9"), Some(123));
+        assert_eq!(partial_png_owner("capture.jpg.matteshot-partial-123-9"), None);
+        assert_eq!(partial_png_owner("capture.png.matteshot-partial-nope-9"), None);
+        assert_eq!(partial_png_owner("capture.png.partial-123-9"), None);
         assert_eq!(partial_png_owner("capture.png"), None);
     }
 
@@ -473,7 +474,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let other_pid = std::process::id().wrapping_add(1).max(1);
-        let stale = dir.join(format!("capture.png.partial-{other_pid}-1"));
+        let stale = dir.join(format!("capture.png.matteshot-partial-{other_pid}-1"));
         let finished = dir.join("capture.png");
         std::fs::write(&stale, b"partial").unwrap();
         std::fs::write(&finished, b"finished").unwrap();
