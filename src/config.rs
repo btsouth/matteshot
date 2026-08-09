@@ -133,14 +133,41 @@ fn load_unlocked() -> anyhow::Result<Config> {
     load_from(&path)
 }
 
-fn save_unlocked(config: &Config) {
-    let Some(path) = config_path() else { return };
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("json.corrupt-{unique}"))
+}
+
+fn load_for_update_from(path: &Path) -> anyhow::Result<Config> {
+    match load_from(path) {
+        Ok(config) => Ok(config),
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            let backup = corrupt_backup_path(path);
+            std::fs::rename(path, &backup)?;
+            crate::diagnostics::log("corrupt config was quarantined before resetting settings");
+            Ok(Config::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_for_update_unlocked() -> anyhow::Result<Config> {
+    let Some(path) = config_path() else {
+        return Ok(Config::default());
+    };
+    load_for_update_from(&path)
+}
+
+fn save_unlocked(config: &Config) -> anyhow::Result<()> {
+    let Some(path) = config_path() else { return Ok(()) };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
-    if let Ok(json) = serde_json::to_vec_pretty(config) {
-        let _ = crate::state_lock::atomic_write(&path, &json);
-    }
+    let json = serde_json::to_vec_pretty(config)?;
+    crate::state_lock::atomic_write(&path, &json)
 }
 
 impl Config {
@@ -154,17 +181,17 @@ impl Config {
 
     /// Atomically update only the fields owned by one action. This prevents a
     /// long-lived Settings window from overwriting a newer last-used matte.
-    pub fn update(change: impl FnOnce(&mut Config)) -> Config {
+    pub fn update(change: impl FnOnce(&mut Config)) -> anyhow::Result<Config> {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
-        let Ok(mut config) = load_unlocked() else {
-            crate::diagnostics::log(
-                "config update skipped because existing state could not be loaded",
-            );
-            return Config::default();
-        };
+        let mut config = load_for_update_unlocked().map_err(|error| {
+            crate::diagnostics::log(&format!(
+                "config update failed because existing state could not be loaded: {error:#}"
+            ));
+            error
+        })?;
         change(&mut config);
-        save_unlocked(&config);
-        config
+        save_unlocked(&config)?;
+        Ok(config)
     }
 
     pub fn save_dir(&self) -> PathBuf {
@@ -214,6 +241,37 @@ mod tests {
         std::fs::write(&path, b"{ definitely not json").unwrap();
         assert!(load_from(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{ definitely not json");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_a_corrupt_config_quarantines_it_before_resetting() {
+        let path = temporary_path("recover");
+        let corrupt = b"{ definitely not json";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let mut config = load_for_update_from(&path).expect("quarantine corrupt config");
+        config.capture_hotkey = "Ctrl+Shift+F9".into();
+        let json = serde_json::to_vec_pretty(&config).unwrap();
+        crate::state_lock::atomic_write(&path, &json).unwrap();
+
+        let recovered = load_from(&path).expect("read recovered config");
+        assert_eq!(recovered.capture_hotkey, "Ctrl+Shift+F9");
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(
+                        "{}.corrupt-",
+                        path.file_name().unwrap().to_string_lossy()
+                    ))
+            })
+            .expect("corrupt backup");
+        assert_eq!(std::fs::read(backup.path()).unwrap(), corrupt);
+        let _ = std::fs::remove_file(backup.path());
         let _ = std::fs::remove_file(path);
     }
 

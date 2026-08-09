@@ -582,7 +582,12 @@ fn record_consent(state: &State) {
             cfg.telemetry = Some(allowed);
         }
     });
-    crate::telemetry::set_enabled(settled.telemetry_enabled());
+    match settled {
+        Ok(settled) => crate::telemetry::set_enabled(settled.telemetry_enabled()),
+        Err(error) => crate::diagnostics::log(&format!(
+            "telemetry consent could not be saved: {error:#}"
+        )),
+    }
 }
 unsafe fn activate(hwnd: HWND, action: u8) {
     ACTION.store(action, Ordering::SeqCst);
@@ -824,7 +829,7 @@ fn open(mark_seen: bool) -> Result<()> {
         let _ = UpdateWindow(hwnd);
 
         if mark_seen {
-            Config::update(|config| config.onboarded = true);
+            let _ = Config::update(|config| config.onboarded = true);
         }
         Ok(())
     }

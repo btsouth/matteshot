@@ -724,29 +724,56 @@ unsafe fn pick_folder(hwnd: HWND) -> Option<String> {
     path
 }
 
+unsafe fn update_config(
+    hwnd: HWND,
+    state: &mut State,
+    change: impl FnOnce(&mut Config),
+) -> bool {
+    match Config::update(change) {
+        Ok(config) => {
+            state.cfg = config;
+            true
+        }
+        Err(error) => {
+            let message = format!(
+                "Matteshot could not save that setting. Your existing settings were left unchanged.\n\n{error:#}"
+            );
+            let title: Vec<u16> = "Matteshot\0".encode_utf16().collect();
+            let message: Vec<u16> = format!("{message}\0").encode_utf16().collect();
+            let _ = MessageBoxW(
+                hwnd,
+                windows::core::PCWSTR(message.as_ptr()),
+                windows::core::PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+            false
+        }
+    }
+}
+
 unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
     match ctrl {
         Ctrl::ChangeDir => {
             if let Some(path) = pick_folder(hwnd) {
-                state.cfg = Config::update(|cfg| cfg.save_dir = Some(path.into()));
+                update_config(hwnd, state, |cfg| cfg.save_dir = Some(path.into()));
             }
         }
         Ctrl::OpenDir => crate::output::open_folder(&state.cfg.save_dir()),
         Ctrl::ChangeVideoDir => {
             if let Some(path) = pick_folder(hwnd) {
-                state.cfg = Config::update(|cfg| cfg.video_dir = Some(path.into()));
+                update_config(hwnd, state, |cfg| cfg.video_dir = Some(path.into()));
             }
         }
         Ctrl::OpenVideoDir => crate::output::open_folder(&state.cfg.video_dir()),
         Ctrl::Scale(n) => {
-            state.cfg = Config::update(|cfg| cfg.export_scale = n);
+            update_config(hwnd, state, |cfg| cfg.export_scale = n);
         }
         Ctrl::OutputSize(max_edge) => {
-            state.cfg = Config::update(|cfg| cfg.output_max_edge = max_edge);
+            update_config(hwnd, state, |cfg| cfg.output_max_edge = max_edge);
         }
         Ctrl::CustomSize => {
             if let Ok(Some(max_edge)) = crate::number_prompt::ask(hwnd, state.cfg.output_max_edge) {
-                state.cfg = Config::update(|cfg| cfg.output_max_edge = max_edge);
+                update_config(hwnd, state, |cfg| cfg.output_max_edge = max_edge);
             }
         }
         Ctrl::Autostart => {
@@ -754,8 +781,9 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
         }
         Ctrl::Prtscn => {
             let enabled = !state.cfg.capture_prtscn;
-            state.cfg = Config::update(|cfg| cfg.capture_prtscn = enabled);
-            prtscn::set_preferred(state.cfg.capture_prtscn);
+            if update_config(hwnd, state, |cfg| cfg.capture_prtscn = enabled) {
+                prtscn::set_preferred(state.cfg.capture_prtscn);
+            }
             if state.cfg.capture_prtscn {
                 let _ = prtscn::take(HOTKEY_ID_PRTSCN);
             } else {
@@ -766,29 +794,30 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             state.capturing = true;
         }
         Ctrl::CaptureDelay(seconds) => {
-            state.cfg = Config::update(|cfg| cfg.capture_delay_secs = seconds);
+            update_config(hwnd, state, |cfg| cfg.capture_delay_secs = seconds);
         }
         Ctrl::RecordGif => {
             let enabled = !state.cfg.record_gif;
-            state.cfg = Config::update(|cfg| cfg.record_gif = enabled);
+            update_config(hwnd, state, |cfg| cfg.record_gif = enabled);
         }
         Ctrl::AutoUpdate => {
             let enabled = !state.cfg.auto_update;
-            state.cfg = Config::update(|cfg| cfg.auto_update = enabled);
+            update_config(hwnd, state, |cfg| cfg.auto_update = enabled);
         }
         Ctrl::Telemetry => {
             // Toggling here answers the question too, so an install that
             // reaches Settings before the welcome screen is not asked twice.
             let enabled = !state.cfg.telemetry_enabled();
-            state.cfg = Config::update(|cfg| cfg.telemetry = Some(enabled));
-            crate::telemetry::set_enabled(enabled);
+            if update_config(hwnd, state, |cfg| cfg.telemetry = Some(enabled)) {
+                crate::telemetry::set_enabled(enabled);
+            }
         }
         Ctrl::KeepEditorOpen => {
             let enabled = !state.cfg.keep_editor_open;
-            state.cfg = Config::update(|cfg| cfg.keep_editor_open = enabled);
+            update_config(hwnd, state, |cfg| cfg.keep_editor_open = enabled);
         }
         Ctrl::Audio(mode) => {
-            state.cfg = Config::update(|cfg| cfg.record_audio = mode.to_string());
+            update_config(hwnd, state, |cfg| cfg.record_audio = mode.to_string());
         }
         Ctrl::Diagnostics => match crate::diagnostics::copy_report() {
             Ok(()) => {
@@ -963,9 +992,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if crate::hotkey::parse(&text).is_none() {
                     return LRESULT(0);
                 }
-                state.cfg = Config::update(|cfg| cfg.capture_hotkey = text);
-                state.capturing = false;
-                crate::rebind_capture_hotkey();
+                if update_config(hwnd, state, |cfg| cfg.capture_hotkey = text) {
+                    state.capturing = false;
+                    crate::rebind_capture_hotkey();
+                }
                 let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
