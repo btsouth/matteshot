@@ -254,9 +254,13 @@ pub fn cleanup_stale_png_partials(dir: &Path) -> usize {
     cleanup_stale_partials(dir, partial_png_owner)
 }
 
-fn publish_png(img: &RgbaImage, destination: &Path) -> Result<()> {
+fn publish_png_with(
+    img: &RgbaImage,
+    destination: &Path,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let partial = partial_png_path(destination);
-    let result = (|| {
+    let staged = (|| {
         img.save_with_format(&partial, ImageFormat::Png).context("write partial png")?;
         std::fs::OpenOptions::new()
             .write(true)
@@ -264,13 +268,19 @@ fn publish_png(img: &RgbaImage, destination: &Path) -> Result<()> {
             .context("open partial png for flush")?
             .sync_all()
             .context("flush partial png")?;
-        std::fs::rename(&partial, destination).context("publish png")?;
         Ok(())
     })();
-    if result.is_err() {
+    if let Err(error) = staged {
         let _ = std::fs::remove_file(&partial);
+        return Err(error);
     }
-    result
+    // The encoded, flushed capture is user data now. If publication fails,
+    // preserve the unmistakable partial so recovery remains possible.
+    rename(&partial, destination).context("publish png")
+}
+
+fn publish_png(img: &RgbaImage, destination: &Path) -> Result<()> {
+    publish_png_with(img, destination, |from, to| std::fs::rename(from, to))
 }
 
 pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path, source: Option<&str>) -> Result<PathBuf> {
@@ -430,6 +440,37 @@ mod tests {
         assert_eq!(image::open(&destination).unwrap().dimensions(), (17, 11));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn a_publish_failure_preserves_the_complete_partial() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-png-publish-failure-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("capture.png");
+
+        let result = publish_png_with(&image(17, 11), &destination, |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "destination is locked",
+            ))
+        });
+
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        let partial = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(
+            image::load_from_memory(&std::fs::read(&partial).unwrap()).unwrap().dimensions(),
+            (17, 11)
+        );
+        std::fs::remove_file(partial).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 

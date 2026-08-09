@@ -47,9 +47,13 @@ const WM_PROBE_READY: u32 = WM_APP + 25;
 const WM_SCRUB_FRAME: u32 = WM_APP + 26;
 static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(1);
 
-fn recording_delete_prompt(path: &std::path::Path) -> String {
-    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "this recording".into());
-    format!("Delete {name}?\n\nThis permanently removes the recording and cannot be undone.")
+fn recording_delete_prompt(mp4: &std::path::Path, gif: Option<&std::path::Path>) -> String {
+    let mp4_name = mp4.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "this recording".into());
+    let names = gif
+        .and_then(|path| path.file_name())
+        .map(|name| format!("{mp4_name} and {}", name.to_string_lossy()))
+        .unwrap_or(mp4_name);
+    format!("Delete {names}?\n\nThis permanently removes the recording files and cannot be undone.")
 }
 
 fn recording_delete_stage_path(path: &std::path::Path) -> PathBuf {
@@ -3157,7 +3161,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let _ = InvalidateRect(hwnd, None, false);
                                 return LRESULT(0);
                             }
-                            let prompt = HSTRING::from(recording_delete_prompt(&state.mp4));
+                            let prompt = HSTRING::from(recording_delete_prompt(
+                                &state.mp4,
+                                state.gif.as_deref(),
+                            ));
                             let confirmed = MessageBoxW(
                                 hwnd,
                                 PCWSTR(prompt.as_ptr()),
@@ -4200,8 +4207,12 @@ mod tests {
 
     #[test]
     fn recording_delete_confirmation_names_the_irrecoverable_file() {
-        let prompt = recording_delete_prompt(std::path::Path::new("C:\\Videos\\demo.mp4"));
+        let prompt = recording_delete_prompt(
+            std::path::Path::new("C:\\Videos\\demo.mp4"),
+            Some(std::path::Path::new("C:\\Videos\\demo.gif")),
+        );
         assert!(prompt.contains("demo.mp4"));
+        assert!(prompt.contains("demo.gif"));
         assert!(prompt.contains("cannot be undone"));
     }
 
