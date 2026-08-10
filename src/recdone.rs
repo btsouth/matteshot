@@ -1550,21 +1550,43 @@ fn speed_time_map(state: &State) -> Option<crate::video_speed::TimeMap> {
     crate::video_speed::TimeMap::new(state.trim_start, state.trim_end, &state.speed_ranges).ok()
 }
 
+fn speed_gap(
+    ranges: &[crate::video_speed::SpeedRange],
+    index: usize,
+    trim_start: i64,
+    trim_end: i64,
+    replacing: bool,
+) -> (i64, i64) {
+    let lower = index
+        .checked_sub(1)
+        .and_then(|previous| ranges.get(previous))
+        .map_or(trim_start, |range| range.end.max(trim_start));
+    let next = if replacing { index + 1 } else { index };
+    let upper = ranges
+        .get(next)
+        .map_or(trim_end, |range| range.start.min(trim_end));
+    (lower, upper)
+}
+
 fn set_speed_handle(state: &mut State, index: usize, handle: Handle, x: i32) {
     const MIN: i64 = 3_000_000;
     if index >= state.speed_ranges.len() {
         return;
     }
     let time = timeline_time(state, x);
-    let lower = index
-        .checked_sub(1)
-        .and_then(|previous| state.speed_ranges.get(previous))
-        .map_or(0, |range| range.end);
-    let upper = state
-        .speed_ranges
-        .get(index + 1)
-        .map_or(state.duration, |range| range.start);
+    let (lower, upper) = speed_gap(
+        &state.speed_ranges,
+        index,
+        state.trim_start,
+        state.trim_end,
+        true,
+    );
+    if upper - lower < MIN {
+        return;
+    }
     let range = &mut state.speed_ranges[index];
+    range.start = range.start.clamp(lower, upper - MIN);
+    range.end = range.end.clamp(range.start + MIN, upper);
     match handle {
         Handle::Start => range.start = time.clamp(lower, range.end - MIN),
         Handle::End => range.end = time.clamp(range.start + MIN, upper),
@@ -1582,14 +1604,16 @@ fn set_new_speed_range(state: &mut State, index: usize, anchor: i64, x: i32) {
         return;
     }
     let time = timeline_time(state, x);
-    let lower = index
-        .checked_sub(1)
-        .and_then(|previous| state.speed_ranges.get(previous))
-        .map_or(0, |range| range.end);
-    let upper = state
-        .speed_ranges
-        .get(index + 1)
-        .map_or(state.duration, |range| range.start);
+    let (lower, upper) = speed_gap(
+        &state.speed_ranges,
+        index,
+        state.trim_start,
+        state.trim_end,
+        true,
+    );
+    if upper - lower < MIN {
+        return;
+    }
     let mut start = anchor.min(time).clamp(lower, upper);
     let mut end = anchor.max(time).clamp(lower, upper);
     if end - start < MIN {
@@ -1610,14 +1634,13 @@ fn add_speed_range(state: &mut State, anchor: i64) -> Option<usize> {
     let insertion = state
         .speed_ranges
         .partition_point(|range| range.start < anchor);
-    let lower = insertion
-        .checked_sub(1)
-        .and_then(|previous| state.speed_ranges.get(previous))
-        .map_or(0, |range| range.end);
-    let upper = state
-        .speed_ranges
-        .get(insertion)
-        .map_or(state.duration, |range| range.start);
+    let (lower, upper) = speed_gap(
+        &state.speed_ranges,
+        insertion,
+        state.trim_start,
+        state.trim_end,
+        false,
+    );
     if upper - lower < MIN {
         return None;
     }
@@ -4333,10 +4356,25 @@ mod tests {
     use super::{
         add_chip_label, annotation_preview_time, apply_caption_input, available_export_path,
         delete_recording_files, delete_recording_files_with, layout, minimum_client_size,
-        next_counter_number, recording_delete_prompt, tool_after_pick, CaptionInput,
+        next_counter_number, recording_delete_prompt, speed_gap, tool_after_pick, CaptionInput,
         NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn speed_section_gaps_are_bounded_by_the_active_trim() {
+        use crate::video_speed::SpeedRange;
+
+        let ranges = [
+            SpeedRange::new(0, 15, 2),
+            SpeedRange::new(25, 35, 4),
+            SpeedRange::new(45, 100, 8),
+        ];
+        assert_eq!(speed_gap(&ranges, 0, 10, 80, true), (10, 25));
+        assert_eq!(speed_gap(&ranges, 1, 10, 80, true), (15, 45));
+        assert_eq!(speed_gap(&ranges, 2, 10, 80, true), (35, 80));
+        assert_eq!(speed_gap(&ranges, 1, 10, 80, false), (15, 25));
+    }
 
     #[test]
     fn maximized_1080p_layout_keeps_the_preview_dominant() {

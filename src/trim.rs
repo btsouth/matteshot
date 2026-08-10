@@ -11,9 +11,11 @@ use rayon::prelude::*;
 use windows::core::{HSTRING, PROPVARIANT};
 use windows::Win32::Media::MediaFoundation::{
     IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio,
-    MFMediaType_Video, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_FULL, MF_MT_AUDIO_NUM_CHANNELS,
-    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    MFMediaType_Video, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_FULL,
+    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
+    MF_SOURCE_READER_FIRST_AUDIO_STREAM,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
 };
 
@@ -138,12 +140,37 @@ fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u
 
         if with_audio {
             use windows::Win32::Media::MediaFoundation::MFAudioFormat_PCM;
-            let at = MFCreateMediaType()?;
-            at.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-            at.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
-            // Missing audio stream is fine.
-            let _ =
-                reader.SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, None, &at);
+            // Missing audio is fine. When it exists, fully request the 16-bit
+            // layout that retime_pcm and the sink both consume.
+            if let Ok(native) =
+                reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)
+            {
+                let channels = native.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)?;
+                let rate = native.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)?;
+                let block = channels * 2;
+                let at = MFCreateMediaType()?;
+                at.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                at.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+                at.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate)?;
+                at.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels)?;
+                at.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                at.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block)?;
+                at.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * block)?;
+                reader
+                    .SetCurrentMediaType(
+                        MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32,
+                        None,
+                        &at,
+                    )
+                    .context("set 16-bit PCM audio decode type")?;
+                let resolved =
+                    reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)?;
+                anyhow::ensure!(
+                    resolved.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)? == 16
+                        && resolved.GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT)? == block,
+                    "audio decoder did not provide 16-bit interleaved PCM"
+                );
+            }
         }
 
         let cur = reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)?;
@@ -726,6 +753,21 @@ fn retime_pcm(
     Some((output, time_map.output_time(first), output_duration.max(1)))
 }
 
+fn retime_video_sample(
+    timestamp: i64,
+    duration: i64,
+    frame_interval: i64,
+    time_map: &crate::video_speed::TimeMap,
+) -> (i64, i64, Option<i64>) {
+    let output_time = time_map.output_time(timestamp);
+    if time_map.rate_at(timestamp) == 1 {
+        let output_end = time_map.output_time(timestamp.saturating_add(duration.max(1)));
+        return (output_time, (output_end - output_time).max(1), None);
+    }
+    let slot = output_time / frame_interval.max(1);
+    (slot * frame_interval, frame_interval.max(1), Some(slot))
+}
+
 // The cancel-aware form deliberately mirrors the established export API and
 // adds one synchronization primitive; grouping these strongly typed inputs
 // into a bag would make call sites less explicit.
@@ -881,14 +923,13 @@ pub fn cut_with_speed_edit_progress_cancel(
                 continue;
             }
             if is_video {
-                let output_slot = (!time_map.is_empty())
-                    .then(|| time_map.output_time(ts) / frame_interval);
+                let source_duration = sample.GetSampleDuration().unwrap_or(frame_interval);
+                let (output_time, output_duration, output_slot) =
+                    retime_video_sample(ts, source_duration, frame_interval, &time_map);
                 if output_slot.is_some() && last_video_slot == output_slot {
                     continue;
                 }
-                if output_slot.is_some() {
-                    last_video_slot = output_slot;
-                }
+                last_video_slot = output_slot;
                 // Repack to tight top-down rows for the sink.
                 let buf = sample.ConvertToContiguousBuffer()?;
                 let mut ptr = std::ptr::null_mut();
@@ -968,13 +1009,8 @@ pub fn cut_with_speed_edit_progress_cancel(
                 mb.SetCurrentLength(out.len() as u32)?;
                 let s = MFCreateSample()?;
                 s.AddBuffer(&mb)?;
-                s.SetSampleTime(output_slot.map_or(rel, |slot| slot * frame_interval))?;
-                s.SetSampleDuration(
-                    output_slot.map_or_else(
-                        || sample.GetSampleDuration().unwrap_or(frame_interval),
-                        |_| frame_interval,
-                    ),
-                )?;
+                s.SetSampleTime(output_time)?;
+                s.SetSampleDuration(output_duration)?;
                 writer.WriteSample(vstream, &s)?;
                 let span = (end - start).max(1);
                 progress(((rel * 100 / span).clamp(0, 99)) as u32);
@@ -983,23 +1019,23 @@ pub fn cut_with_speed_edit_progress_cancel(
                 let mut ptr = std::ptr::null_mut();
                 let mut len = 0u32;
                 buf.Lock(&mut ptr, None, Some(&mut len))?;
-                let source_bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+                let source_bytes =
+                    std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec();
+                buf.Unlock()?;
                 let retimed = if time_map.is_empty() {
                     Some((
-                        source_bytes.to_vec(),
+                        source_bytes,
                         rel,
                         sample.GetSampleDuration().unwrap_or(100_000),
                     ))
                 } else {
                     let audio_fmt =
                         audio_fmt.as_ref().context("audio stream has no PCM format")?;
-                    retime_pcm(source_bytes, ts, audio_fmt, &time_map)
+                    retime_pcm(&source_bytes, ts, audio_fmt, &time_map)
                 };
                 let Some((bytes, output_time, output_duration)) = retimed else {
-                    buf.Unlock()?;
                     continue;
                 };
-                buf.Unlock()?;
 
                 use windows::Win32::Media::MediaFoundation::{
                     MFCreateMemoryBuffer, MFCreateSample,
@@ -1029,7 +1065,8 @@ pub fn cut_with_speed_edit_progress_cancel(
 #[cfg(test)]
 mod tests {
     use super::{
-        bgra_to_rgba, fit_inside, retime_pcm, rgba_to_bgra, scrub_cache_plan, validate_video,
+        bgra_to_rgba, fit_inside, retime_pcm, retime_video_sample, rgba_to_bgra,
+        scrub_cache_plan, validate_video,
     };
 
     #[test]
@@ -1050,6 +1087,31 @@ mod tests {
         assert_eq!(&output[..20 * 2], &source[..20 * 2]);
         assert!(output[20 * 2..30 * 2].iter().all(|byte| *byte == 0));
         assert_eq!(&output[30 * 2..], &source[60 * 2..]);
+    }
+
+    #[test]
+    fn mixed_speed_video_preserves_normal_sample_timing() {
+        const SECOND: i64 = 10_000_000;
+        let interval = SECOND / 30;
+        let duration = 500_000;
+        let map = crate::video_speed::TimeMap::new(
+            0,
+            6 * SECOND,
+            &[crate::video_speed::SpeedRange::new(2 * SECOND, 4 * SECOND, 2)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            retime_video_sample(SECOND, duration, interval, &map),
+            (SECOND, duration, None)
+        );
+        let sped = retime_video_sample(2 * SECOND + 2_000_000, duration, interval, &map);
+        assert_eq!(sped.1, interval);
+        assert_eq!(sped.2, Some(sped.0 / interval));
+        assert_eq!(
+            retime_video_sample(5 * SECOND, duration, interval, &map),
+            (4 * SECOND, duration, None)
+        );
     }
 
     #[test]

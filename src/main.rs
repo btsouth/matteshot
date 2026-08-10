@@ -1581,9 +1581,9 @@ fn main() -> Result<()> {
             )?;
             trim::validate_video(&dst)?;
             let actual = trim::probe_opening(&dst, 320, 180)?.duration_100ns;
-            let tolerance = 1_000_000;
+            const DURATION_TOLERANCE: i64 = 1_000_000; // 100ms in 100ns ticks.
             anyhow::ensure!(
-                (actual - expected).abs() <= tolerance,
+                (actual - expected).abs() <= DURATION_TOLERANCE,
                 "speed export duration was {:.2}s; expected {:.2}s",
                 actual as f64 / 1e7,
                 expected as f64 / 1e7
