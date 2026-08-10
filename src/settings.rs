@@ -50,6 +50,7 @@ enum Ctrl {
     Autostart,
     Prtscn,
     RecordGif,
+    FrameRate(u32),
     AutoUpdate,
     Telemetry,
     KeepEditorOpen,
@@ -76,6 +77,7 @@ enum Chrome {
     RenderQualityHeader,
     ScreenshotSizeHeader,
     AudioLabel,
+    FrameRateLabel,
     HotkeyLabel,
     DelayLabel,
     UpdateTerm,
@@ -337,6 +339,13 @@ fn build_layout(scale: f32, cw: i32, license: &crate::license::Status) -> LaidOu
     l.gap(4);
     l.checkbox(Ctrl::RecordGif);
 
+    // Frame rate stays intentionally constrained: 30 for efficiency, 60 for
+    // smooth motion without turning Settings into an encoder control panel.
+    l.gap(4);
+    let frame_rate_top = l.y;
+    l.chips(&[Ctrl::FrameRate(30), Ctrl::FrameRate(60)], 104, 112, 150, 28);
+    l.chrome_at(frame_rate_top, 28, 145, Chrome::FrameRateLabel);
+
     // Recording audio: the label shares its line with the chips.
     l.gap(4);
     let audio_top = l.y;
@@ -486,6 +495,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Chrome::AudioLabel => {
                 draw_text_in(hdc, state.font, state.theme.text, *r, "Recording audio", 0)
             }
+            Chrome::FrameRateLabel => {
+                draw_text_in(hdc, state.font, state.theme.text, *r, "Frame rate", 0)
+            }
             Chrome::HotkeyLabel => {
                 draw_text_in(hdc, state.font, state.theme.text, *r, "Capture shortcut", 0)
             }
@@ -606,6 +618,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 "Also save a GIF when recording",
                 state,
                 state.cfg.record_gif,
+                hot,
+            ),
+            Ctrl::FrameRate(fps) => draw_chip_button(
+                hdc,
+                *r,
+                if *fps == 60 { "Smooth 60" } else { "Standard 30" },
+                state,
+                state.cfg.record_fps() == *fps,
                 hot,
             ),
             Ctrl::AutoUpdate => draw_checkbox(
@@ -799,6 +819,9 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
         Ctrl::RecordGif => {
             let enabled = !state.cfg.record_gif;
             update_config(hwnd, state, |cfg| cfg.record_gif = enabled);
+        }
+        Ctrl::FrameRate(fps) => {
+            update_config(hwnd, state, |cfg| cfg.record_fps = fps);
         }
         Ctrl::AutoUpdate => {
             let enabled = !state.cfg.auto_update;

@@ -121,6 +121,7 @@ pub fn report() -> String {
          Capture folder: {}\r\n\
          Video folder: {}\r\n\
          Recording audio: {}\r\n\
+         Recording frame rate: {} FPS\r\n\
          Recording GIF: {}\r\n\
          Export scale: {}x\r\n\r\n\
          Recent lifecycle events:\r\n{}",
@@ -135,6 +136,7 @@ pub fn report() -> String {
         save_location,
         video_location,
         config.record_audio,
+        config.record_fps(),
         config.record_gif,
         config.export_scale,
         recent_events()
