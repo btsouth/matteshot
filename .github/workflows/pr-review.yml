@@ -11,7 +11,7 @@
 name: PR review
 
 on:
-  pull_request:
+  pull_request_target:
     # one-review-per-PR: synchronize removed 2026-08-08 — a review on
     # every push had agents in an endless fix-review loop. Reviews now
     # fire once when the PR opens and again if it is marked ready.
@@ -35,27 +35,30 @@ jobs:
     runs-on: [self-hosted, windows, matteshot, grok]
     continue-on-error: true
     timeout-minutes: 20
-    # Fork PRs do not get repository secrets, and Dependabot-triggered runs get
-    # the Dependabot secret store rather than the repository one, so in both
-    # cases the model call would fail with a confusing auth error rather than
-    # an obvious skip. Drafts are declared-unfinished work; the
-    # ready_for_review trigger picks the PR up the moment that changes.
+    # Only the owner's own same-repository branches may schedule the persistent
+    # local runner. pull_request_target keeps this workflow definition on the
+    # trusted base branch while CodeRev treats the pinned PR head as evidence.
     if: >-
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.actor == github.repository_owner &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]' &&
       github.event.pull_request.draft == false
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
-      # Tracks main during the shadow phase so reviewer fixes land without a
-      # release step. Pin to a tag once the shadow comparison earns it.
+      # Pin the reviewed action commit: mutable refs must not execute on a
+      # persistent self-hosted machine with repository secrets.
       - name: Review
-        uses: tsouth89/coderev@main
+        uses: tsouth89/coderev@4343c19eb746310259e13abfe5e3381c708385cf
         with:
           provider: exec
           model: grok-subscription
-          exec-command: grok
+          # Absolute path prevents the PR checkout from shadowing the CLI.
+          exec-command: 'C:\Users\tsout\.grok\bin\grok.exe'
           # Muse keeps the measured two-model recall diversity.
           find2-provider: meta
           find2-model: muse-spark-1.2-contributor
