@@ -171,6 +171,8 @@ mod tests {
     fn invalid_recording_rate_remains_visible_in_diagnostics() {
         let mut config = crate::config::Config::default();
         assert_eq!(recording_frame_rate(&config), "30 FPS");
+        config.record_fps = 60;
+        assert_eq!(recording_frame_rate(&config), "60 FPS");
         config.record_fps = 144;
         assert_eq!(recording_frame_rate(&config), "30 FPS (raw 144)");
     }
