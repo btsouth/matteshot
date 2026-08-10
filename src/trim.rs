@@ -14,7 +14,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFMediaType_Video, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_FULL,
     MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
     MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
     MF_SOURCE_READER_FIRST_AUDIO_STREAM,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
 };
@@ -116,7 +116,7 @@ fn scrub_cache_plan(
     (count, width, height)
 }
 
-fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u32, i32)> {
+fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u32, i32, u32)> {
     unsafe {
         // Without video processing the reader only emits the native format
         // (NV12); this lets it convert to RGB32 for us.
@@ -180,7 +180,15 @@ fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u
             .GetUINT32(&MF_MT_DEFAULT_STRIDE)
             .map(|v| v as i32)
             .unwrap_or((w * 4) as i32);
-        Ok((reader, w, h, stride))
+        let packed_rate = cur.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
+        let numerator = (packed_rate >> 32) as u32;
+        let denominator = (packed_rate & 0xFFFF_FFFF) as u32;
+        let fps = if denominator == 0 {
+            crate::record::DEFAULT_FPS
+        } else {
+            ((numerator as f64 / denominator as f64).round() as u32).clamp(1, 120)
+        };
+        Ok((reader, w, h, stride, fps))
     }
 }
 
@@ -247,7 +255,7 @@ pub fn preview_frame(
     max_h: u32,
 ) -> Result<(Vec<u8>, u32, u32)> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
-    let (reader, w, h, stride) = open_reader(path, false)?;
+    let (reader, w, h, stride, _) = open_reader(path, false)?;
     unsafe {
         let pv = PROPVARIANT::from(position.max(0));
         reader
@@ -292,7 +300,7 @@ pub fn scrub_worker(
     mut deliver: impl FnMut(u64, Vec<u8>, u32, u32) -> bool,
 ) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
-    let (reader, w, h, stride) = open_reader(path, false)?;
+    let (reader, w, h, stride, _) = open_reader(path, false)?;
     let (target_w, target_h) = fit_inside(w, h, max_w.max(2), max_h.max(2));
     while let Ok(mut request) = requests.recv() {
         while let Ok(newer) = requests.try_recv() {
@@ -356,7 +364,7 @@ pub fn playback_frames_with_speed(
     mut deliver: impl FnMut(PlaybackFrame) -> bool,
 ) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
-    let (reader, w, h, stride) = open_reader(path, false)?;
+    let (reader, w, h, stride, _) = open_reader(path, false)?;
     let time_map = crate::video_speed::TimeMap::new(start, end, speed_ranges)
         .map_err(anyhow::Error::msg)?;
     unsafe {
@@ -431,7 +439,7 @@ fn probe_impl(
     preview_bounds: Option<(u32, u32)>,
 ) -> Result<Probe> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
-    let (reader, w, h, stride) = open_reader(path, false)?;
+    let (reader, w, h, stride, _) = open_reader(path, false)?;
     let duration = duration_of(&reader)?;
     let mut thumbs = Vec::new();
     let mut previews = Vec::new();
@@ -526,7 +534,7 @@ pub fn probe(path: &Path, strip_w: u32, thumb_h: u32) -> Result<Probe> {
 /// editor take seconds, and get worse the longer the recording was.
 pub fn probe_opening(path: &Path, preview_w: u32, preview_h: u32) -> Result<OpeningProbe> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
-    let (reader, w, h, stride) = open_reader(path, false)?;
+    let (reader, w, h, stride, _) = open_reader(path, false)?;
     let duration = duration_of(&reader)?;
     let (bgra, _) = read_video_frame(&reader, w, h, stride)?
         .context("the finished recording has no decodable video frames")?;
@@ -808,7 +816,8 @@ pub fn cut_with_speed_edit_progress_cancel(
     mut progress: impl FnMut(u32),
 ) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
-    let (reader, w, h, stride) = open_reader(src, true)?;
+    let (reader, w, h, stride, source_fps) = open_reader(src, true)?;
+    let fps = crate::record::sanitize_fps(source_fps);
     let (video_idx, audio_idx) = stream_indices(&reader);
     let time_map = crate::video_speed::TimeMap::new(start, end, speed_ranges)
         .map_err(anyhow::Error::msg)?;
@@ -851,7 +860,15 @@ pub fn cut_with_speed_edit_progress_cancel(
         .map(|base| (even(base.width()), even(base.height())))
         .unwrap_or_else(|| (even(cw), even(ch)));
     let (writer, vstream, astream) = unsafe {
-        crate::record::make_sink_for_content(dst, ow, oh, even(cw), even(ch), audio_fmt.as_ref())?
+        crate::record::make_sink_for_content(
+            dst,
+            ow,
+            oh,
+            even(cw),
+            even(ch),
+            fps,
+            audio_fmt.as_ref(),
+        )?
     };
 
     unsafe {
@@ -877,7 +894,7 @@ pub fn cut_with_speed_edit_progress_cancel(
     } else {
         None
     };
-    let frame_interval = 10_000_000i64 / crate::record::FPS as i64;
+    let frame_interval = 10_000_000i64 / fps as i64;
     let mut last_video_slot = None;
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1065,9 +1082,10 @@ pub fn cut_with_speed_edit_progress_cancel(
 #[cfg(test)]
 mod tests {
     use super::{
-        bgra_to_rgba, fit_inside, retime_pcm, retime_video_sample, rgba_to_bgra,
-        scrub_cache_plan, validate_video,
+        bgra_to_rgba, cut_with_speed_edit_progress_cancel, fit_inside, open_reader, retime_pcm,
+        retime_video_sample, rgba_to_bgra, scrub_cache_plan, validate_video,
     };
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn sped_audio_becomes_shorter_silence_while_surrounding_pcm_is_preserved() {
@@ -1112,6 +1130,69 @@ mod tests {
             retime_video_sample(5 * SECOND, duration, interval, &map),
             (4 * SECOND, duration, None)
         );
+    }
+
+    #[test]
+    fn trim_preserves_sixty_fps_output() {
+        use windows::Win32::Media::MediaFoundation::{
+            MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MF_VERSION,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-60fps-trim-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        let output = dir.join("output.mp4");
+        const FPS: u32 = 60;
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 64;
+        let interval = 10_000_000i64 / FPS as i64;
+
+        unsafe {
+            MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+            let (writer, stream, _) =
+                crate::record::make_sink(&source, WIDTH, HEIGHT, FPS, None).unwrap();
+            let frame = vec![64u8; (WIDTH * HEIGHT * 4) as usize];
+            for index in 0..FPS {
+                let buffer = MFCreateMemoryBuffer(frame.len() as u32).unwrap();
+                let mut destination = std::ptr::null_mut();
+                buffer.Lock(&mut destination, None, None).unwrap();
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame.len());
+                buffer.Unlock().unwrap();
+                buffer.SetCurrentLength(frame.len() as u32).unwrap();
+                let sample = MFCreateSample().unwrap();
+                sample.AddBuffer(&buffer).unwrap();
+                sample.SetSampleTime(index as i64 * interval).unwrap();
+                sample.SetSampleDuration(interval).unwrap();
+                writer.WriteSample(stream, &sample).unwrap();
+            }
+            writer.Finalize().unwrap();
+        }
+
+        cut_with_speed_edit_progress_cancel(
+            &source,
+            &output,
+            0,
+            10_000_000,
+            None,
+            &[],
+            &[],
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let (_, _, _, _, output_fps) = open_reader(&output, false).unwrap();
+        assert_eq!(output_fps, FPS);
+
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

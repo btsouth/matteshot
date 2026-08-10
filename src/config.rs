@@ -27,6 +27,8 @@ pub struct Config {
     pub record_gif: bool,
     /// Recording audio source: "off", "system", or "mic".
     pub record_audio: String,
+    /// Recording frame rate. The UI intentionally offers only 30 or 60 FPS.
+    pub record_fps: u32,
     /// Where recordings go. Default: Videos\Matteshot.
     pub video_dir: Option<PathBuf>,
     /// Install updates in the background instead of only announcing them.
@@ -75,6 +77,7 @@ impl Default for Config {
             capture_prtscn: true,
             record_gif: false,
             record_audio: "off".into(),
+            record_fps: crate::record::DEFAULT_FPS,
             video_dir: None,
             auto_update: true,
             telemetry: None,
@@ -94,6 +97,11 @@ impl Config {
     /// Whether the consent question still needs asking.
     pub fn telemetry_unanswered(&self) -> bool {
         self.telemetry.is_none()
+    }
+
+    /// Keep malformed or future config values from reaching capture timing.
+    pub fn record_fps(&self) -> u32 {
+        crate::record::sanitize_fps(self.record_fps)
     }
 
     /// The capture shortcut to register, or `None` when it is unbound.
@@ -232,7 +240,18 @@ mod tests {
         let path = temporary_path("missing");
         let config = load_from(&path).expect("missing config uses defaults");
         assert_eq!(config.capture_hotkey, crate::hotkey::DEFAULT);
+        assert_eq!(config.record_fps(), crate::record::DEFAULT_FPS);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn recording_frame_rate_accepts_only_supported_values() {
+        let mut config = Config::default();
+        assert_eq!(config.record_fps(), 30);
+        config.record_fps = 60;
+        assert_eq!(config.record_fps(), 60);
+        config.record_fps = 144;
+        assert_eq!(config.record_fps(), 30);
     }
 
     #[test]

@@ -58,13 +58,41 @@ pub struct Progress {
     pub error: Mutex<Option<String>>,
 }
 
-pub(crate) const FPS: u32 = 30;
-/// GIF sampling: every Nth frame, capped so memory stays bounded.
-const GIF_EVERY: u32 = 3;
+pub(crate) const DEFAULT_FPS: u32 = 30;
+pub(crate) const SMOOTH_FPS: u32 = 60;
+const GIF_FPS: u32 = 10;
 const GIF_MAX_FRAMES: usize = 240;
 /// GIFs balloon fast (no interframe compression here) — keep them share-sized.
 const GIF_MAX_WIDTH: u32 = 480;
 static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn sanitize_fps(fps: u32) -> u32 {
+    match fps {
+        SMOOTH_FPS => SMOOTH_FPS,
+        _ => DEFAULT_FPS,
+    }
+}
+
+fn gif_every(fps: u32) -> u32 {
+    (sanitize_fps(fps) / GIF_FPS).max(1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoEncoding {
+    fps: u32,
+    bitrate: u32,
+    keyframe_spacing: u32,
+}
+
+fn video_encoding(content_w: u32, content_h: u32, fps: u32) -> VideoEncoding {
+    let fps = sanitize_fps(fps);
+    let bitrate = ((content_w * content_h) as f32 * fps as f32 * 0.12) as u32;
+    VideoEncoding {
+        fps,
+        bitrate: bitrate.clamp(1_500_000, 40_000_000),
+        keyframe_spacing: fps,
+    }
+}
 
 fn even(v: i32) -> u32 {
     (v.max(2) as u32) & !1
@@ -115,9 +143,10 @@ pub unsafe fn make_sink(
     path: &std::path::Path,
     w: u32,
     h: u32,
+    fps: u32,
     audio: Option<&crate::audio::Format>,
 ) -> Result<(IMFSinkWriter, u32, Option<u32>)> {
-    make_sink_for_content(path, w, h, w, h, audio)
+    make_sink_for_content(path, w, h, w, h, fps, audio)
 }
 
 /// Create an H.264 sink whose bitrate follows the moving content rather than
@@ -129,8 +158,10 @@ pub unsafe fn make_sink_for_content(
     h: u32,
     content_w: u32,
     content_h: u32,
+    fps: u32,
     audio: Option<&crate::audio::Format>,
 ) -> Result<(IMFSinkWriter, u32, Option<u32>)> {
+    let encoding = video_encoding(content_w, content_h, fps);
     let writer: IMFSinkWriter =
         MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, None)
             .context("create sink writer")?;
@@ -138,20 +169,19 @@ pub unsafe fn make_sink_for_content(
     // Output: H.264. 0.12 bits per moving-content pixel per frame preserves
     // crisp UI and fast motion without treating static matte padding as if it
     // were another full frame of changing content.
-    let bitrate = ((content_w * content_h) as f32 * FPS as f32 * 0.12) as u32;
     let out = MFCreateMediaType()?;
     out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate.clamp(1_500_000, 40_000_000))?;
+    out.SetUINT32(&MF_MT_AVG_BITRATE, encoding.bitrate)?;
     out.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
-    out.SetUINT64(&MF_MT_FRAME_RATE, ((FPS as u64) << 32) | 1)?;
+    out.SetUINT64(&MF_MT_FRAME_RATE, ((encoding.fps as u64) << 32) | 1)?;
     out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
     // A keyframe every second. Seeking decodes forward from the preceding
     // keyframe, so the encoder's default spacing is what makes scrubbing,
     // filmstrip probing and export seeking slow. Best-effort: some encoders
     // ignore the hint, and it is not worth failing a recording over.
-    let _ = out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, FPS);
+    let _ = out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, encoding.keyframe_spacing);
     let stream = writer.AddStream(&out).context("add stream")?;
 
     // Input: BGRA32, top-down (positive stride).
@@ -159,7 +189,7 @@ pub unsafe fn make_sink_for_content(
     inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
     inp.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
-    inp.SetUINT64(&MF_MT_FRAME_RATE, ((FPS as u64) << 32) | 1)?;
+    inp.SetUINT64(&MF_MT_FRAME_RATE, ((encoding.fps as u64) << 32) | 1)?;
     inp.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
     inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4)?;
@@ -260,6 +290,7 @@ fn capture_loop(
     target: Target,
     path: std::path::PathBuf,
     want_gif: bool,
+    fps: u32,
     audio_source: Option<crate::audio::Source>,
     progress: Arc<Progress>,
 ) -> Result<Option<GifFrames>> {
@@ -331,7 +362,7 @@ fn capture_loop(
     session.StartCapture()?;
 
     let (writer, stream, audio_stream) =
-        unsafe { make_sink(&path, out_w, out_h, audio_enc.as_ref())? };
+        unsafe { make_sink(&path, out_w, out_h, fps, audio_enc.as_ref())? };
 
     // Audio worker feeds PCM over a channel; we mux on this thread at a
     // contiguous cursor, filling gaps with silence keyed to the video clock.
@@ -375,7 +406,8 @@ fn capture_loop(
     let mut latest_buf: Option<Vec<u8>> = None;
     let mut blank_frames = 0u32;
     let mut awaiting_first_content = window_target;
-    let frame_interval = 10_000_000i64 / FPS as i64;
+    let frame_interval = 10_000_000i64 / fps as i64;
+    let gif_every = gif_every(fps);
     let recording_clock = std::time::Instant::now();
     let mut staging: Option<ID3D11Texture2D> = None;
     let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
@@ -384,9 +416,9 @@ fn capture_loop(
     while !progress.stop.load(Ordering::Relaxed) {
         // The encoder owns the media clock. WGC is change-driven for some
         // windows and may supply only one frame while their content is static;
-        // duplicate the latest surface into each 30fps slot so real elapsed
-        // time and playback duration still match. High-refresh sources are
-        // naturally reduced to the same slot cadence.
+        // duplicate the latest surface into each configured frame slot so
+        // real elapsed time and playback duration still match. High-refresh
+        // sources are naturally reduced to the same slot cadence.
         let rel = (recording_clock.elapsed().as_nanos() / 100).min(i64::MAX as u128) as i64;
         let slot = encoder_slot(rel, frame_interval);
         if last_slot == Some(slot) {
@@ -478,7 +510,7 @@ fn capture_loop(
 
         if awaiting_first_content && nearly_blank_bgra(&buf) {
             blank_frames += 1;
-            if blank_frames >= FPS * 3 {
+            if blank_frames >= fps * 3 {
                 bail!(
                     "The selected window returned only blank frames for three seconds. Try recording a region of the monitor, or disable protected/hardware-overlay video in the target app."
                 );
@@ -548,7 +580,7 @@ fn capture_loop(
             }
         }
 
-        if want_gif && n.is_multiple_of(GIF_EVERY) && gif_frames.len() < GIF_MAX_FRAMES {
+        if want_gif && n.is_multiple_of(gif_every) && gif_frames.len() < GIF_MAX_FRAMES {
             let scale = (GIF_MAX_WIDTH as f32 / out_w as f32).min(1.0);
             let (gw, gh) = (
                 ((out_w as f32 * scale) as u32).max(2) & !1,
@@ -603,7 +635,7 @@ fn capture_loop(
 }
 
 /// Encode collected frames as an animated GIF next to the MP4.
-fn write_gif(frames: &[(Vec<u8>, u32, u32)], path: &std::path::Path) -> Result<()> {
+fn write_gif(frames: &[(Vec<u8>, u32, u32)], path: &std::path::Path, fps: u32) -> Result<()> {
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::{Delay, Frame, RgbaImage};
 
@@ -611,7 +643,7 @@ fn write_gif(frames: &[(Vec<u8>, u32, u32)], path: &std::path::Path) -> Result<(
     {
         let mut enc = GifEncoder::new_with_speed(&mut file, 12);
         enc.set_repeat(Repeat::Infinite)?;
-        let delay = Delay::from_numer_denom_ms(1000 * GIF_EVERY, FPS);
+        let delay = Delay::from_numer_denom_ms(1000 * gif_every(fps), sanitize_fps(fps));
         for (buf, w, h) in frames {
             let Some(img) = RgbaImage::from_raw(*w, *h, buf.clone()) else {
                 continue;
@@ -654,12 +686,13 @@ fn publish_gif_with(
     frames: &[(Vec<u8>, u32, u32)],
     destination: &std::path::Path,
     id: u64,
+    fps: u32,
     rename: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let partial = partial_gif_path(destination, id);
     let _ = std::fs::remove_file(&partial);
     let staged = (|| {
-        write_gif(frames, &partial).context("encode gif")?;
+        write_gif(frames, &partial, fps).context("encode gif")?;
         image::open(&partial).context("validate gif")?;
         Ok(())
     })();
@@ -683,13 +716,14 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         }
     }
     let cfg = crate::config::Config::load();
+    let fps = cfg.record_fps();
     let audio_source = match cfg.record_audio.as_str() {
         "system" => Some(crate::audio::Source::System),
         "mic" => Some(crate::audio::Source::Mic),
         _ => None,
     };
     crate::diagnostics::log(&format!(
-        "recording start target={} audio={} gif={want_gif}",
+        "recording start target={} audio={} gif={want_gif} fps={fps}",
         if matches!(target, Target::Window(_)) {
             "window"
         } else {
@@ -731,6 +765,7 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
                 target,
                 partial_mp4,
                 want_gif,
+                fps,
                 audio_source,
                 progress.clone(),
             ) {
@@ -801,7 +836,7 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     let mut gif_failed = false;
     if let Some(frames) = gif_frames {
         if !frames.is_empty() {
-            match publish_gif_with(&frames, &gif, record_id, |from, to| {
+            match publish_gif_with(&frames, &gif, record_id, fps, |from, to| {
                 std::fs::rename(from, to)
             }) {
                 Ok(()) => gif_saved = Some(gif),
@@ -843,6 +878,23 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recording_rates_are_constrained_and_gif_cadence_stays_constant() {
+        assert_eq!(sanitize_fps(30), 30);
+        assert_eq!(sanitize_fps(60), 60);
+        assert_eq!(sanitize_fps(144), 30);
+        assert_eq!(gif_every(30), 3);
+        assert_eq!(gif_every(60), 6);
+    }
+
+    #[test]
+    fn sixty_fps_configures_encoder_rate_bitrate_and_keyframes() {
+        assert_eq!(
+            video_encoding(1920, 1080, 60),
+            VideoEncoding { fps: 60, bitrate: 14_929_920, keyframe_spacing: 60 }
+        );
+    }
+
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -883,7 +935,7 @@ mod tests {
         let destination = dir.join("capture.gif");
         let frames = vec![(vec![255, 0, 0, 255], 1, 1)];
 
-        let result = publish_gif_with(&frames, &destination, 7, |_, _| {
+        let result = publish_gif_with(&frames, &destination, 7, DEFAULT_FPS, |_, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "locked",
