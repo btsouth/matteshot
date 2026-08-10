@@ -36,6 +36,7 @@ mod tray;
 mod tweak;
 mod update;
 mod video_edit;
+mod video_speed;
 mod welcome;
 mod window;
 mod telemetry;
@@ -1552,6 +1553,49 @@ fn main() -> Result<()> {
             eprintln!("video editor export (1:1, 14% padding) -> {}", dst.display());
             Ok(())
         }
+        // Speed-section export probe. Compresses the middle half to 4x and
+        // verifies the produced file reports the correspondingly shorter
+        // playable duration.
+        Some("--video-speed-test") => {
+            let src =
+                std::path::PathBuf::from(args.get(1).context("--video-speed-test <mp4>")?);
+            let source = trim::probe_opening(&src, 320, 180)?;
+            let duration = source.duration_100ns;
+            anyhow::ensure!(duration >= 10_000_000, "video must be at least one second");
+            let speed = video_speed::SpeedRange::new(duration / 4, duration * 3 / 4, 4);
+            let map = video_speed::TimeMap::new(0, duration, &[speed])
+                .map_err(anyhow::Error::msg)?;
+            let expected = map.output_duration();
+            let dst = src.with_extension("speed.mp4");
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            trim::cut_with_speed_edit_progress_cancel(
+                &src,
+                &dst,
+                0,
+                duration,
+                None,
+                &[],
+                &[speed],
+                &cancel,
+                |_| {},
+            )?;
+            trim::validate_video(&dst)?;
+            let actual = trim::probe_opening(&dst, 320, 180)?.duration_100ns;
+            let tolerance = 1_000_000;
+            anyhow::ensure!(
+                (actual - expected).abs() <= tolerance,
+                "speed export duration was {:.2}s; expected {:.2}s",
+                actual as f64 / 1e7,
+                expected as f64 / 1e7
+            );
+            eprintln!(
+                "video speed export: {:.2}s -> {:.2}s -> {}",
+                duration as f64 / 1e7,
+                actual as f64 / 1e7,
+                dst.display()
+            );
+            Ok(())
+        }
         // Paced editor-playback probe. Decodes three seconds at preview size,
         // never opens a window, writes a file, or touches the clipboard.
         Some("--playback-test") => {
@@ -1987,7 +2031,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --video-speed-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
         None => run_app(),
     };

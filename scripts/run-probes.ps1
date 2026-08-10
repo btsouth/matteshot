@@ -184,9 +184,10 @@ if ($Fixture -and (Test-Path $Fixture)) {
     # Forces a 1:1 aspect, which is what used to compose past the H.264 frame
     # limit and die with an unexplained media-type error.
     Invoke-Probe -Name 'annotated edit export' -ProbeArgs @('--video-edit-test', $Fixture) -Expect 'video editor export' | Out-Null
+    Invoke-Probe -Name 'speed section export' -ProbeArgs @('--video-speed-test', $Fixture) -Expect 'video speed export' | Out-Null
 
     # Clean up only what this run produced.
-    foreach ($suffix in @('.trim.mp4', '.matte.mp4', '.edit.mp4')) {
+    foreach ($suffix in @('.trim.mp4', '.matte.mp4', '.edit.mp4', '.speed.mp4')) {
         $spawned = [IO.Path]::ChangeExtension($Fixture, $null).TrimEnd('.') + $suffix
         Remove-Item $spawned -Force -ErrorAction SilentlyContinue
     }
