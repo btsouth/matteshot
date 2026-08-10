@@ -11,7 +11,7 @@
 name: PR review
 
 on:
-  pull_request:
+  pull_request_target:
     # one-review-per-PR: synchronize removed 2026-08-08 — a review on
     # every push had agents in an endless fix-review loop. Reviews now
     # fire once when the PR opens and again if it is marked ready.
@@ -35,26 +35,29 @@ jobs:
     runs-on: [self-hosted, windows, matteshot, grok]
     continue-on-error: true
     timeout-minutes: 20
-    # Fork PRs do not get repository secrets, and Dependabot-triggered runs get
-    # the Dependabot secret store rather than the repository one, so in both
-    # cases the model call would fail with a confusing auth error rather than
-    # an obvious skip. Drafts are declared-unfinished work; the
-    # ready_for_review trigger picks the PR up the moment that changes.
+    # Only the owner's own same-repository branches may schedule the persistent
+    # local runner. pull_request_target keeps this workflow definition on the
+    # trusted base branch while CodeRev treats the pinned PR head as evidence.
     if: >-
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.actor == github.repository_owner &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]' &&
       github.event.pull_request.draft == false
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
-      # Tracks main during the shadow phase so reviewer fixes land without a
-      # release step. Pin to a tag once the shadow comparison earns it.
+      # Pin the reviewed action commit: mutable refs must not execute on a
+      # persistent self-hosted machine with repository secrets.
       - name: Review
-        uses: tsouth89/coderev@main
+        uses: tsouth89/coderev@8e991699725889f99b02f4f940e521de12144da5
         with:
           provider: exec
           model: grok-subscription
+          # Activates CodeRev's pinned stdin-safe, one-turn Grok wrapper.
           exec-command: grok
           # Muse keeps the measured two-model recall diversity.
           find2-provider: meta
