@@ -77,6 +77,23 @@ fn gif_every(fps: u32) -> u32 {
     (sanitize_fps(fps) / GIF_FPS).max(1)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoEncoding {
+    fps: u32,
+    bitrate: u32,
+    keyframe_spacing: u32,
+}
+
+fn video_encoding(content_w: u32, content_h: u32, fps: u32) -> VideoEncoding {
+    let fps = sanitize_fps(fps);
+    let bitrate = ((content_w * content_h) as f32 * fps as f32 * 0.12) as u32;
+    VideoEncoding {
+        fps,
+        bitrate: bitrate.clamp(1_500_000, 40_000_000),
+        keyframe_spacing: fps,
+    }
+}
+
 fn even(v: i32) -> u32 {
     (v.max(2) as u32) & !1
 }
@@ -144,7 +161,7 @@ pub unsafe fn make_sink_for_content(
     fps: u32,
     audio: Option<&crate::audio::Format>,
 ) -> Result<(IMFSinkWriter, u32, Option<u32>)> {
-    let fps = sanitize_fps(fps);
+    let encoding = video_encoding(content_w, content_h, fps);
     let writer: IMFSinkWriter =
         MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, None)
             .context("create sink writer")?;
@@ -152,20 +169,19 @@ pub unsafe fn make_sink_for_content(
     // Output: H.264. 0.12 bits per moving-content pixel per frame preserves
     // crisp UI and fast motion without treating static matte padding as if it
     // were another full frame of changing content.
-    let bitrate = ((content_w * content_h) as f32 * fps as f32 * 0.12) as u32;
     let out = MFCreateMediaType()?;
     out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate.clamp(1_500_000, 40_000_000))?;
+    out.SetUINT32(&MF_MT_AVG_BITRATE, encoding.bitrate)?;
     out.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
-    out.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
+    out.SetUINT64(&MF_MT_FRAME_RATE, ((encoding.fps as u64) << 32) | 1)?;
     out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
     // A keyframe every second. Seeking decodes forward from the preceding
     // keyframe, so the encoder's default spacing is what makes scrubbing,
     // filmstrip probing and export seeking slow. Best-effort: some encoders
     // ignore the hint, and it is not worth failing a recording over.
-    let _ = out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps);
+    let _ = out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, encoding.keyframe_spacing);
     let stream = writer.AddStream(&out).context("add stream")?;
 
     // Input: BGRA32, top-down (positive stride).
@@ -173,7 +189,7 @@ pub unsafe fn make_sink_for_content(
     inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
     inp.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
-    inp.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
+    inp.SetUINT64(&MF_MT_FRAME_RATE, ((encoding.fps as u64) << 32) | 1)?;
     inp.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
     inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4)?;
@@ -869,6 +885,14 @@ mod tests {
         assert_eq!(sanitize_fps(144), 30);
         assert_eq!(gif_every(30), 3);
         assert_eq!(gif_every(60), 6);
+    }
+
+    #[test]
+    fn sixty_fps_configures_encoder_rate_bitrate_and_keyframes() {
+        assert_eq!(
+            video_encoding(1920, 1080, 60),
+            VideoEncoding { fps: 60, bitrate: 14_929_920, keyframe_spacing: 60 }
+        );
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {

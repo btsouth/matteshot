@@ -1082,9 +1082,10 @@ pub fn cut_with_speed_edit_progress_cancel(
 #[cfg(test)]
 mod tests {
     use super::{
-        bgra_to_rgba, fit_inside, retime_pcm, retime_video_sample, rgba_to_bgra,
-        scrub_cache_plan, validate_video,
+        bgra_to_rgba, cut_with_speed_edit_progress_cancel, fit_inside, open_reader, retime_pcm,
+        retime_video_sample, rgba_to_bgra, scrub_cache_plan, validate_video,
     };
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn sped_audio_becomes_shorter_silence_while_surrounding_pcm_is_preserved() {
@@ -1129,6 +1130,69 @@ mod tests {
             retime_video_sample(5 * SECOND, duration, interval, &map),
             (4 * SECOND, duration, None)
         );
+    }
+
+    #[test]
+    fn trim_preserves_sixty_fps_output() {
+        use windows::Win32::Media::MediaFoundation::{
+            MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MF_VERSION,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-60fps-trim-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        let output = dir.join("output.mp4");
+        const FPS: u32 = 60;
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 64;
+        let interval = 10_000_000i64 / FPS as i64;
+
+        unsafe {
+            MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+            let (writer, stream, _) =
+                crate::record::make_sink(&source, WIDTH, HEIGHT, FPS, None).unwrap();
+            let frame = vec![64u8; (WIDTH * HEIGHT * 4) as usize];
+            for index in 0..FPS {
+                let buffer = MFCreateMemoryBuffer(frame.len() as u32).unwrap();
+                let mut destination = std::ptr::null_mut();
+                buffer.Lock(&mut destination, None, None).unwrap();
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame.len());
+                buffer.Unlock().unwrap();
+                buffer.SetCurrentLength(frame.len() as u32).unwrap();
+                let sample = MFCreateSample().unwrap();
+                sample.AddBuffer(&buffer).unwrap();
+                sample.SetSampleTime(index as i64 * interval).unwrap();
+                sample.SetSampleDuration(interval).unwrap();
+                writer.WriteSample(stream, &sample).unwrap();
+            }
+            writer.Finalize().unwrap();
+        }
+
+        cut_with_speed_edit_progress_cancel(
+            &source,
+            &output,
+            0,
+            10_000_000,
+            None,
+            &[],
+            &[],
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let (_, _, _, _, output_fps) = open_reader(&output, false).unwrap();
+        assert_eq!(output_fps, FPS);
+
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

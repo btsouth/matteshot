@@ -121,7 +121,7 @@ pub fn report() -> String {
          Capture folder: {}\r\n\
          Video folder: {}\r\n\
          Recording audio: {}\r\n\
-         Recording frame rate: {} FPS\r\n\
+         Recording frame rate: {}\r\n\
          Recording GIF: {}\r\n\
          Export scale: {}x\r\n\r\n\
          Recent lifecycle events:\r\n{}",
@@ -136,11 +136,20 @@ pub fn report() -> String {
         save_location,
         video_location,
         config.record_audio,
-        config.record_fps(),
+        recording_frame_rate(&config),
         config.record_gif,
         config.export_scale,
         recent_events()
     )
+}
+
+fn recording_frame_rate(config: &crate::config::Config) -> String {
+    let safe = config.record_fps();
+    if safe == config.record_fps {
+        format!("{safe} FPS")
+    } else {
+        format!("{safe} FPS (raw {})", config.record_fps)
+    }
 }
 
 pub fn copy_report() -> Result<()> {
@@ -156,6 +165,14 @@ mod tests {
     #[test]
     fn event_cleanup_keeps_the_log_one_line() {
         assert_eq!(clean_event("one\r\ntwo\tthree"), "one  two three");
+    }
+
+    #[test]
+    fn invalid_recording_rate_remains_visible_in_diagnostics() {
+        let mut config = crate::config::Config::default();
+        assert_eq!(recording_frame_rate(&config), "30 FPS");
+        config.record_fps = 144;
+        assert_eq!(recording_frame_rate(&config), "30 FPS (raw 144)");
     }
 
     #[test]
