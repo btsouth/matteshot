@@ -214,6 +214,14 @@ enum TimingChoice {
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
     Trim(Handle),
+    Speed {
+        index: usize,
+        handle: Handle,
+    },
+    SpeedNew {
+        index: usize,
+        anchor: i64,
+    },
     Playhead,
     Padding,
     CaptionSize,
@@ -232,6 +240,12 @@ enum Drag {
         handle: crate::video_edit::ShapeHandle,
         undo_pushed: bool,
     },
+}
+
+#[derive(Clone)]
+struct EditSnapshot {
+    annotations: Vec<crate::video_edit::Item>,
+    speed_ranges: Vec<crate::video_speed::SpeedRange>,
 }
 
 struct TextEntry {
@@ -255,6 +269,9 @@ struct WindowLayout {
     timing_controls: Vec<(RECT, TimingChoice)>,
     undo_control: RECT,
     delete_control: RECT,
+    speed_add_control: RECT,
+    speed_rate_controls: Vec<(RECT, u32)>,
+    speed_remove_control: RECT,
     preview: RECT,
     strip: RECT,
 }
@@ -295,7 +312,10 @@ struct State {
     padding_slider: RECT,
     aspect_controls: Vec<(RECT, usize)>,
     annotations: Vec<crate::video_edit::Item>,
-    undo: Vec<Vec<crate::video_edit::Item>>,
+    speed_ranges: Vec<crate::video_speed::SpeedRange>,
+    selected_speed: Option<usize>,
+    speed_armed: bool,
+    undo: Vec<EditSnapshot>,
     selected: Option<usize>,
     tools_open: bool,
     tool: Option<Tool>,
@@ -315,6 +335,9 @@ struct State {
     timing_controls: Vec<(RECT, TimingChoice)>,
     undo_control: RECT,
     delete_control: RECT,
+    speed_add_control: RECT,
+    speed_rate_controls: Vec<(RECT, u32)>,
+    speed_remove_control: RECT,
     status: Option<String>,
     /// Last successful edit export. The action buttons keep pointing at the
     /// original recording; this only drives their labels and the reveal on
@@ -617,6 +640,33 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         right: panel_left + sc(372),
         bottom: panel_top + sc(140),
     };
+    let speed_row_top = strip.bottom + sc(3);
+    let speed_remove_control = RECT {
+        left: strip.right - sc(64),
+        top: speed_row_top,
+        right: strip.right,
+        bottom: speed_row_top + sc(24),
+    };
+    let mut speed_rate_controls = Vec::new();
+    let rate_right = speed_remove_control.left - sc(6);
+    for (index, rate) in [2u32, 4, 8, 16].into_iter().enumerate() {
+        let left = rate_right - sc(38 * (4 - index) as i32);
+        speed_rate_controls.push((
+            RECT {
+                left,
+                top: speed_row_top,
+                right: left + sc(34),
+                bottom: speed_row_top + sc(24),
+            },
+            rate,
+        ));
+    }
+    let speed_add_control = RECT {
+        left: strip.right - sc(104),
+        top: speed_row_top,
+        right: strip.right,
+        bottom: speed_row_top + sc(24),
+    };
     WindowLayout {
         controls,
         matte_controls,
@@ -632,6 +682,9 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         timing_controls,
         undo_control,
         delete_control,
+        speed_add_control,
+        speed_rate_controls,
+        speed_remove_control,
         preview,
         strip,
     }
@@ -886,18 +939,20 @@ fn start_playback(hwnd: HWND, state: &mut State) {
     let source = state.mp4.clone();
     let start = state.playhead;
     let end = state.trim_end;
+    let speed_ranges = state.speed_ranges.clone();
     let max_w = ((state.preview_rect.right - state.preview_rect.left).max(2) as u32).min(1440);
     let max_h = ((state.preview_rect.bottom - state.preview_rect.top).max(2) as u32).min(900);
     let mailbox = state.playback_mailbox.clone();
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
         let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let result = crate::trim::playback_frames(
+        let result = crate::trim::playback_frames_with_speed(
             &source,
             start,
             end,
             max_w,
             max_h,
+            &speed_ranges,
             &cancel,
             |frame| {
                 let should_post = {
@@ -1104,10 +1159,14 @@ fn has_edits(state: &State) -> bool {
         || state.trim_start > 0
         || state.trim_end < state.duration
         || !state.annotations.is_empty()
+        || !state.speed_ranges.is_empty()
 }
 
 fn push_undo(state: &mut State) {
-    state.undo.push(state.annotations.clone());
+    state.undo.push(EditSnapshot {
+        annotations: state.annotations.clone(),
+        speed_ranges: state.speed_ranges.clone(),
+    });
     if state.undo.len() > 40 {
         state.undo.remove(0);
     }
@@ -1115,14 +1174,25 @@ fn push_undo(state: &mut State) {
 
 fn undo(state: &mut State) {
     if let Some(previous) = state.undo.pop() {
-        state.annotations = previous;
+        state.annotations = previous.annotations;
+        state.speed_ranges = previous.speed_ranges;
         state.selected = None;
+        state.selected_speed = None;
         state.text_entry = None;
         recompose_preview(state);
     }
 }
 
 fn delete_selected(state: &mut State) {
+    if let Some(index) = state
+        .selected_speed
+        .filter(|index| *index < state.speed_ranges.len())
+    {
+        push_undo(state);
+        state.speed_ranges.remove(index);
+        state.selected_speed = None;
+        return;
+    }
     if let Some(index) = state
         .selected
         .filter(|index| *index < state.annotations.len())
@@ -1351,6 +1421,8 @@ fn tool_after_pick(current: Option<Tool>, picked: Tool) -> Option<Tool> {
 fn select_annotation_tool(state: &mut State, tool: Tool) {
     stop_playback(state);
     state.text_entry = None;
+    state.selected_speed = None;
+    state.speed_armed = false;
     state.tool = tool_after_pick(state.tool, tool);
     if state.tool.is_none() {
         return;
@@ -1466,6 +1538,129 @@ fn set_handle(state: &mut State, h: Handle, x: i32) {
         Handle::Start => state.trim_start = t.min(state.trim_end - MIN).max(0),
         Handle::End => state.trim_end = t.max(state.trim_start + MIN).min(state.duration),
     }
+}
+
+fn timeline_time(state: &State, x: i32) -> i64 {
+    let span = (state.strip.right - state.strip.left).max(1) as f64;
+    ((((x - state.strip.left) as f64 / span) * state.duration as f64) as i64)
+        .clamp(0, state.duration)
+}
+
+fn speed_time_map(state: &State) -> Option<crate::video_speed::TimeMap> {
+    crate::video_speed::TimeMap::new(state.trim_start, state.trim_end, &state.speed_ranges).ok()
+}
+
+fn speed_gap(
+    ranges: &[crate::video_speed::SpeedRange],
+    index: usize,
+    trim_start: i64,
+    trim_end: i64,
+    replacing: bool,
+) -> (i64, i64) {
+    let lower = index
+        .checked_sub(1)
+        .and_then(|previous| ranges.get(previous))
+        .map_or(trim_start, |range| range.end.max(trim_start));
+    let next = if replacing { index + 1 } else { index };
+    let upper = ranges
+        .get(next)
+        .map_or(trim_end, |range| range.start.min(trim_end));
+    (lower, upper)
+}
+
+fn set_speed_handle(state: &mut State, index: usize, handle: Handle, x: i32) {
+    const MIN: i64 = 3_000_000;
+    if index >= state.speed_ranges.len() {
+        return;
+    }
+    let time = timeline_time(state, x);
+    let (lower, upper) = speed_gap(
+        &state.speed_ranges,
+        index,
+        state.trim_start,
+        state.trim_end,
+        true,
+    );
+    if upper - lower < MIN {
+        return;
+    }
+    let range = &mut state.speed_ranges[index];
+    range.start = range.start.clamp(lower, upper - MIN);
+    range.end = range.end.clamp(range.start + MIN, upper);
+    match handle {
+        Handle::Start => range.start = time.clamp(lower, range.end - MIN),
+        Handle::End => range.end = time.clamp(range.start + MIN, upper),
+    }
+    state.playhead = match handle {
+        Handle::Start => range.start,
+        Handle::End => range.end,
+    };
+    refresh_preview(state);
+}
+
+fn set_new_speed_range(state: &mut State, index: usize, anchor: i64, x: i32) {
+    const MIN: i64 = 3_000_000;
+    if index >= state.speed_ranges.len() {
+        return;
+    }
+    let time = timeline_time(state, x);
+    let (lower, upper) = speed_gap(
+        &state.speed_ranges,
+        index,
+        state.trim_start,
+        state.trim_end,
+        true,
+    );
+    if upper - lower < MIN {
+        return;
+    }
+    let mut start = anchor.min(time).clamp(lower, upper);
+    let mut end = anchor.max(time).clamp(lower, upper);
+    if end - start < MIN {
+        if start + MIN <= upper {
+            end = start + MIN;
+        } else {
+            start = (end - MIN).max(lower);
+        }
+    }
+    state.speed_ranges[index].start = start;
+    state.speed_ranges[index].end = end;
+    state.playhead = time.clamp(start, end);
+    refresh_preview(state);
+}
+
+fn add_speed_range(state: &mut State, anchor: i64) -> Option<usize> {
+    const MIN: i64 = 3_000_000;
+    let insertion = state
+        .speed_ranges
+        .partition_point(|range| range.start < anchor);
+    let (lower, upper) = speed_gap(
+        &state.speed_ranges,
+        insertion,
+        state.trim_start,
+        state.trim_end,
+        false,
+    );
+    if upper - lower < MIN {
+        return None;
+    }
+    let start = anchor.clamp(lower, upper - MIN);
+    state.speed_ranges.insert(
+        insertion,
+        crate::video_speed::SpeedRange::new(start, start + MIN, 8),
+    );
+    Some(insertion)
+}
+
+fn speed_range_at(state: &State, x: i32, y: i32) -> Option<usize> {
+    if y < state.strip.top || y > state.strip.top + s(state, 22) || state.duration <= 0 {
+        return None;
+    }
+    let time = timeline_time(state, x);
+    state
+        .speed_ranges
+        .iter()
+        .position(|range| time >= range.start && time <= range.end)
 }
 
 fn s(state: &State, v: i32) -> i32 {
@@ -2215,6 +2410,46 @@ unsafe fn paint(hdc: HDC, state: &State) {
         };
         let (sx, ex) = (to_x(state.trim_start), to_x(state.trim_end));
 
+        // Speed sections live in source time, so their bands stay attached to
+        // the recorded moments even though the resulting output is shorter.
+        for (index, range) in state.speed_ranges.iter().enumerate() {
+            let left = to_x(range.start).max(strip.left);
+            let right = to_x(range.end).min(strip.right);
+            if right <= left {
+                continue;
+            }
+            let selected = state.selected_speed == Some(index);
+            let brush = CreateSolidBrush(if selected {
+                state.theme.accent
+            } else {
+                state.theme.chip_line
+            });
+            FillRect(
+                hdc,
+                &RECT {
+                    left,
+                    top: strip.top,
+                    right,
+                    bottom: strip.top + s(state, 20),
+                },
+                brush,
+            );
+            let _ = DeleteObject(brush);
+            SelectObject(hdc, state.font_small);
+            SetTextColor(
+                hdc,
+                if selected { state.theme.accent_text } else { state.theme.text },
+            );
+            let mut text = wide(&format!("{}\u{00d7}", range.rate));
+            let mut rect = RECT {
+                left: left + s(state, 4),
+                top: strip.top,
+                right: right - s(state, 4),
+                bottom: strip.top + s(state, 20),
+            };
+            DrawTextW(hdc, &mut text, &mut rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        }
+
         // Dim the trimmed-away ends with a 50% wash so frames stay visible.
         let shade = CreateSolidBrush(state.theme.bg);
         for r in [
@@ -2317,8 +2552,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
         // Playhead + selected-range label.
         let whole_secs = |t: i64| (t / 10_000_000) as u64;
         let tenths = |t: i64| ((t.max(0) / 1_000_000) % 10) as u64;
+        let selected_seconds = whole_secs(state.trim_end - state.trim_start).max(1);
+        let duration_tail = speed_time_map(state)
+            .filter(|map| !map.is_empty())
+            .map(|map| format!("{selected_seconds}s \u{2192} {}s output", whole_secs(map.output_duration()).max(1)))
+            .unwrap_or_else(|| format!("{selected_seconds}s selected"));
         let label = format!(
-            "{:02}:{:02}.{}     Trim  {:02}:{:02} \u{2013} {:02}:{:02}     {}s selected",
+            "{:02}:{:02}.{}     Trim  {:02}:{:02} \u{2013} {:02}:{:02}     {}",
             whole_secs(state.playhead) / 60,
             whole_secs(state.playhead) % 60,
             tenths(state.playhead),
@@ -2326,7 +2566,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
             whole_secs(state.trim_start) % 60,
             whole_secs(state.trim_end) / 60,
             whole_secs(state.trim_end) % 60,
-            whole_secs(state.trim_end - state.trim_start).max(1)
+            duration_tail
         );
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, state.theme.muted);
@@ -2334,10 +2574,25 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let mut lr = RECT {
             left: strip.left,
             top: strip.bottom + s(state, 6),
-            right: strip.right,
+            right: if state.selected_speed.is_some() {
+                state.speed_rate_controls.first().map_or(strip.right, |(rect, _)| rect.left)
+                    - s(state, 8)
+            } else {
+                state.speed_add_control.left - s(state, 8)
+            },
             bottom: strip.bottom + s(state, 28),
         };
         DrawTextW(hdc, &mut l, &mut lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        if let Some(index) = state.selected_speed.filter(|index| *index < state.speed_ranges.len()) {
+            let selected_rate = state.speed_ranges[index].rate;
+            for (rect, rate) in &state.speed_rate_controls {
+                paint_chip(hdc, *rect, &format!("{rate}\u{00d7}"), *rate == selected_rate, state);
+            }
+            paint_chip(hdc, state.speed_remove_control, "Remove", false, state);
+        } else {
+            paint_chip(hdc, state.speed_add_control, "+ Speed", state.speed_armed, state);
+        }
 
     }
 
@@ -2671,6 +2926,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.playhead = state.playhead.clamp(state.trim_start, state.trim_end);
                             refresh_preview(state);
                         }
+                        Drag::Speed { index, handle } => set_speed_handle(state, index, handle, x),
+                        Drag::SpeedNew { index, anchor } => {
+                            set_new_speed_range(state, index, anchor, x)
+                        }
                         Drag::Playhead => set_playhead(state, x),
                         Drag::Padding => update_padding(state, x),
                         Drag::CaptionSize => update_caption_size(state, x),
@@ -2766,6 +3025,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if state.text_entry.is_some() {
                     commit_text(state);
                 }
+                if state.selected_speed.is_none() && contains(state.speed_add_control, x, y) {
+                    stop_playback(state);
+                    state.speed_armed = !state.speed_armed;
+                    state.tool = None;
+                    state.tools_open = false;
+                    state.selected = None;
+                    state.status = state
+                        .speed_armed
+                        .then(|| "drag across the timeline to speed up that section".into());
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+                if let Some(index) = state
+                    .selected_speed
+                    .filter(|index| *index < state.speed_ranges.len())
+                {
+                    if let Some((_, rate)) = state
+                        .speed_rate_controls
+                        .iter()
+                        .find(|(rect, _)| contains(*rect, x, y))
+                        .copied()
+                    {
+                        stop_playback(state);
+                        if state.speed_ranges[index].rate != rate {
+                            push_undo(state);
+                            state.speed_ranges[index].rate = rate;
+                        }
+                        state.status = Some("sped sections are muted during export".into());
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if contains(state.speed_remove_control, x, y) {
+                        stop_playback(state);
+                        push_undo(state);
+                        state.speed_ranges.remove(index);
+                        state.selected_speed = None;
+                        state.status = None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                }
                 if contains(state.padding_slider, x, y) {
                     state.dragging = Some(Drag::Padding);
                     update_padding(state, x);
@@ -2775,6 +3075,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if contains(state.add_control, x, y) {
                     stop_playback(state);
+                    state.selected_speed = None;
+                    state.speed_armed = false;
                     state.tools_open = !state.tools_open;
                     if !state.tools_open {
                         state.tool = None;
@@ -2915,6 +3217,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
                 if let Some(point) = screen_to_preview(state, x, y) {
                     stop_playback(state);
+                    state.selected_speed = None;
+                    state.speed_armed = false;
                     if let Some(tool) = state.tool {
                         if tool == Tool::Text {
                             state.text_entry = Some(TextEntry {
@@ -3007,6 +3311,59 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     };
                     let (sx, ex) = (to_x(state.trim_start), to_x(state.trim_end));
                     let grab = s(state, 10);
+                    if state.speed_armed {
+                        stop_playback(state);
+                        let anchor = timeline_time(state, x).clamp(state.trim_start, state.trim_end);
+                        push_undo(state);
+                        if let Some(index) = add_speed_range(state, anchor) {
+                            state.selected_speed = Some(index);
+                            state.speed_armed = false;
+                            state.status = Some("sped sections are muted during export".into());
+                            state.dragging = Some(Drag::SpeedNew { index, anchor });
+                            windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                        } else {
+                            state.undo.pop();
+                            state.status = Some("there is no room for another speed section here".into());
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                    if y <= strip.top + s(state, 22) {
+                        if let Some(index) = state
+                            .selected_speed
+                            .filter(|index| *index < state.speed_ranges.len())
+                        {
+                            let range = state.speed_ranges[index];
+                            let start_x = to_x(range.start);
+                            let end_x = to_x(range.end);
+                            let handle = if (x - start_x).abs() <= grab {
+                                Some(Handle::Start)
+                            } else if (x - end_x).abs() <= grab {
+                                Some(Handle::End)
+                            } else {
+                                None
+                            };
+                            if let Some(handle) = handle {
+                                stop_playback(state);
+                                push_undo(state);
+                                state.dragging = Some(Drag::Speed { index, handle });
+                                windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                                let _ = InvalidateRect(hwnd, None, false);
+                                return LRESULT(0);
+                            }
+                        }
+                        if let Some(index) = speed_range_at(state, x, y) {
+                            stop_playback(state);
+                            state.selected_speed = Some(index);
+                            state.selected = None;
+                            state.playhead = timeline_time(state, x);
+                            refresh_preview(state);
+                            request_scrub_frame(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                    }
+                    state.selected_speed = None;
                     let drag = if (x - sx).abs() <= grab {
                         Drag::Trim(Handle::Start)
                     } else if (x - ex).abs() <= grab {
@@ -3064,7 +3421,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 if let Some(drag) = state.dragging.take() {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-                    if matches!(drag, Drag::Trim(_) | Drag::Playhead) {
+                    if matches!(
+                        drag,
+                        Drag::Trim(_)
+                            | Drag::Speed { .. }
+                            | Drag::SpeedNew { .. }
+                            | Drag::Playhead
+                    ) {
                         // The decoder is already chasing this position, so
                         // releasing no longer blocks on a fresh seek.
                         request_scrub_frame(state);
@@ -3215,6 +3578,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let has_trim = state.trim_start > 0 || state.trim_end < state.duration;
                             let style_slug = style.name.to_ascii_lowercase();
                             let has_annotations = !state.annotations.is_empty();
+                            let has_speed = !state.speed_ranges.is_empty();
                             let mut suffix = match (has_matte, has_trim) {
                                 (true, true) => format!("{style_slug}-trim"),
                                 (true, false) => style_slug,
@@ -3223,6 +3587,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             };
                             if has_annotations {
                                 suffix.push_str("-edit");
+                            }
+                            if has_speed {
+                                suffix.push_str("-speed");
                             }
                             let dst = available_export_path(state.mp4.with_file_name(format!(
                                 "{}-{suffix}.mp4",
@@ -3246,10 +3613,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 String::new()
                             };
                             state.status = Some(format!(
-                                "exporting {}{}{} \u{00b7} 0%",
+                                "exporting {}{}{}{} \u{00b7} 0%",
                                 style.name,
                                 if has_trim { " + trim" } else { "" },
-                                annotation_label
+                                annotation_label,
+                                if has_speed { " + speed sections" } else { "" }
                             ));
                             state.exporting = true;
                             crate::diagnostics::log("video export start");
@@ -3265,6 +3633,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let start = state.trim_start;
                             let end = state.trim_end;
                             let annotations = state.annotations.clone();
+                            let speed_ranges = state.speed_ranges.clone();
                             let compose_opts = state_compose_opts(state);
                             let hwnd_raw = hwnd.0 as isize;
                             let activity = Arc::new(Mutex::new(std::time::Instant::now()));
@@ -3300,13 +3669,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let temporary = crate::output::partial_video_path(&dst, export_id);
                                 let _ = std::fs::remove_file(&temporary);
                                 let mut last_progress = u32::MAX;
-                                let result = crate::trim::cut_with_edit_progress_cancel(
+                                let result = crate::trim::cut_with_speed_edit_progress_cancel(
                                     &src,
                                     &temporary,
                                     start,
                                     end,
                                     Some((&style, &compose_opts)),
                                     &annotations,
+                                    &speed_ranges,
                                     &export_cancel,
                                     |percent| {
                                         *activity.lock().unwrap() = std::time::Instant::now();
@@ -3438,6 +3808,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         } else if state.text_entry.is_some() {
                             state.text_entry = None;
                             recompose_preview(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        } else if state.speed_armed || state.selected_speed.is_some() {
+                            state.speed_armed = false;
+                            state.selected_speed = None;
+                            state.status = None;
                             let _ = InvalidateRect(hwnd, None, false);
                         } else if state.tool.is_some() || state.tools_open {
                             state.tool = None;
@@ -3588,6 +3963,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.timing_controls = next.timing_controls;
                     state.undo_control = next.undo_control;
                     state.delete_control = next.delete_control;
+                    state.speed_add_control = next.speed_add_control;
+                    state.speed_rate_controls = next.speed_rate_controls;
+                    state.speed_remove_control = next.speed_remove_control;
                     state.preview_rect = next.preview;
                     state.strip = next.strip;
                     let _ = InvalidateRect(hwnd, None, true);
@@ -3813,6 +4191,9 @@ pub fn show(
         padding_slider: initial.padding_slider,
         aspect_controls: initial.aspect_controls,
         annotations: Vec::new(),
+        speed_ranges: Vec::new(),
+        selected_speed: None,
+        speed_armed: false,
         undo: Vec::new(),
         selected: None,
         tools_open: false,
@@ -3833,6 +4214,9 @@ pub fn show(
         timing_controls: initial.timing_controls,
         undo_control: initial.undo_control,
         delete_control: initial.delete_control,
+        speed_add_control: initial.speed_add_control,
+        speed_rate_controls: initial.speed_rate_controls,
+        speed_remove_control: initial.speed_remove_control,
         status: initial_status,
         exported: None,
         exporting: false,
@@ -3972,10 +4356,25 @@ mod tests {
     use super::{
         add_chip_label, annotation_preview_time, apply_caption_input, available_export_path,
         delete_recording_files, delete_recording_files_with, layout, minimum_client_size,
-        next_counter_number, recording_delete_prompt, tool_after_pick, CaptionInput,
+        next_counter_number, recording_delete_prompt, speed_gap, tool_after_pick, CaptionInput,
         NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn speed_section_gaps_are_bounded_by_the_active_trim() {
+        use crate::video_speed::SpeedRange;
+
+        let ranges = [
+            SpeedRange::new(0, 15, 2),
+            SpeedRange::new(25, 35, 4),
+            SpeedRange::new(45, 100, 8),
+        ];
+        assert_eq!(speed_gap(&ranges, 0, 10, 80, true), (10, 25));
+        assert_eq!(speed_gap(&ranges, 1, 10, 80, true), (15, 45));
+        assert_eq!(speed_gap(&ranges, 2, 10, 80, true), (35, 80));
+        assert_eq!(speed_gap(&ranges, 1, 10, 80, false), (15, 25));
+    }
 
     #[test]
     fn maximized_1080p_layout_keeps_the_preview_dominant() {
@@ -4026,6 +4425,18 @@ mod tests {
             rect.top >= window.preview.top && rect.bottom <= window.preview.bottom
         }));
         assert!(window.strip.bottom < window.controls[0].0.top);
+        assert!(window.speed_add_control.top > window.strip.bottom);
+        assert!(window.speed_add_control.bottom <= window.controls[0].0.top);
+        assert_eq!(
+            window.speed_rate_controls.iter().map(|(_, rate)| *rate).collect::<Vec<_>>(),
+            vec![2, 4, 8, 16]
+        );
+        assert!(window.speed_rate_controls.windows(2).all(|pair| pair[0].0.right < pair[1].0.left));
+        assert!(window
+            .speed_rate_controls
+            .last()
+            .is_some_and(|(rect, _)| rect.right < window.speed_remove_control.left));
+        assert!(window.speed_remove_control.right <= width);
         assert!(window.controls.iter().all(|(rect, ..)| rect.bottom <= height));
         assert!(window
             .matte_controls

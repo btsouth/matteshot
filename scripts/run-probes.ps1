@@ -178,18 +178,17 @@ if (-not $Fixture -or -not (Test-Path $Fixture)) {
 
 if ($Fixture -and (Test-Path $Fixture)) {
     Write-Host "Video fixture: $(Split-Path -Leaf $Fixture)" -ForegroundColor DarkGray
-    Invoke-Probe -Name 'playback decode' -ProbeArgs @('--playback-test', $Fixture) -Expect 'frames through' | Out-Null
-    Invoke-Probe -Name 'trim export' -ProbeArgs @('--trim-test', $Fixture, '0', '20000000') -Expect 'exported ->' | Out-Null
-    Invoke-Probe -Name 'trim + matte export' -ProbeArgs @('--trim-test', $Fixture, '0', '20000000', '3') -Expect 'exported ->' | Out-Null
+    # Every export chooses a sibling of its input. Work from a private copy so
+    # cleanup can never remove an edit the user already made beside $Fixture.
+    $probeFixture = Join-Path $work 'fixture.mp4'
+    Copy-Item -LiteralPath $Fixture -Destination $probeFixture
+    Invoke-Probe -Name 'playback decode' -ProbeArgs @('--playback-test', $probeFixture) -Expect 'frames through' | Out-Null
+    Invoke-Probe -Name 'trim export' -ProbeArgs @('--trim-test', $probeFixture, '0', '20000000') -Expect 'exported ->' | Out-Null
+    Invoke-Probe -Name 'trim + matte export' -ProbeArgs @('--trim-test', $probeFixture, '0', '20000000', '3') -Expect 'exported ->' | Out-Null
     # Forces a 1:1 aspect, which is what used to compose past the H.264 frame
     # limit and die with an unexplained media-type error.
-    Invoke-Probe -Name 'annotated edit export' -ProbeArgs @('--video-edit-test', $Fixture) -Expect 'video editor export' | Out-Null
-
-    # Clean up only what this run produced.
-    foreach ($suffix in @('.trim.mp4', '.matte.mp4', '.edit.mp4')) {
-        $spawned = [IO.Path]::ChangeExtension($Fixture, $null).TrimEnd('.') + $suffix
-        Remove-Item $spawned -Force -ErrorAction SilentlyContinue
-    }
+    Invoke-Probe -Name 'annotated edit export' -ProbeArgs @('--video-edit-test', $probeFixture) -Expect 'video editor export' | Out-Null
+    Invoke-Probe -Name 'speed section export' -ProbeArgs @('--video-speed-test', $probeFixture) -Expect 'video speed export' | Out-Null
 } else {
     $results += [pscustomobject]@{
         Probe = 'video probes'; Result = 'SKIP'; Seconds = 0; Detail = 'no recording available'

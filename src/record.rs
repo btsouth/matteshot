@@ -58,7 +58,7 @@ pub struct Progress {
     pub error: Mutex<Option<String>>,
 }
 
-const FPS: u32 = 30;
+pub(crate) const FPS: u32 = 30;
 /// GIF sampling: every Nth frame, capped so memory stays bounded.
 const GIF_EVERY: u32 = 3;
 const GIF_MAX_FRAMES: usize = 240;
