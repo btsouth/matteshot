@@ -727,14 +727,23 @@ fn matte_thumbs(
     raw: &[(Vec<u8>, u32, u32)],
     style: &crate::style::Style,
     opts: &crate::compose::ComposeOpts,
+    crop: crate::video_edit::Crop,
 ) -> Vec<(Vec<u8>, u32, u32)> {
-    if crate::compose::is_plain(style) {
+    let cropped = crop != crate::video_edit::Crop::FULL;
+    if crate::compose::is_plain(style) && !cropped {
         return raw.to_vec();
+    }
+    if crate::compose::is_plain(style) {
+        return raw
+            .iter()
+            .map(|(bytes, w, h)| image_thumb(&crop_frame(&thumb_image(bytes, *w, *h), crop)))
+            .collect();
     }
     let mut bases = std::collections::HashMap::<(u32, u32), RgbaImage>::new();
     raw.iter()
         .map(|(bytes, w, h)| {
-            let image = thumb_image(bytes, *w, *h);
+            let image = crop_frame(&thumb_image(bytes, *w, *h), crop);
+            let (w, h) = (&image.width(), &image.height());
             let base = bases
                 .entry((*w, *h))
                 .or_insert_with(|| crate::compose::compose_base(*w as usize, *h as usize, style, opts));
@@ -799,13 +808,34 @@ fn editor_style() -> WINDOW_STYLE {
     WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME | WS_MAXIMIZEBOX
 }
 
+/// Reduce a frame to the crop.
+///
+/// Preview frames and filmstrip thumbnails are both scaled copies of the whole
+/// recording, so a crop normalized to the source applies to either directly,
+/// whatever size it happens to have been decoded at.
+fn crop_frame(image: &RgbaImage, crop: crate::video_edit::Crop) -> RgbaImage {
+    if crop == crate::video_edit::Crop::FULL {
+        return image.clone();
+    }
+    let (width, height) = (image.width(), image.height());
+    let span = |origin: f32, size: f32, limit: u32| {
+        let limit_f = limit as f32;
+        let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
+        let size = ((size * limit_f).round().clamp(1.0, limit_f)) as u32;
+        (origin.min(limit.saturating_sub(size)), size)
+    };
+    let (x, w) = span(crop.x, crop.w, width);
+    let (y, h) = span(crop.y, crop.h, height);
+    image::imageops::crop_imm(image, x, y, w, h).to_image()
+}
+
 fn recompose_preview(state: &mut State) {
     let opts = state_compose_opts(state);
     let Some(frame) = state.preview_raw.as_ref() else {
         state.preview = None;
         return;
     };
-    let mut raw = thumb_image(&frame.0, frame.1, frame.2);
+    let mut raw = crop_frame(&thumb_image(&frame.0, frame.1, frame.2), state.crop);
     // Padding changes the canvas geometry, so the matte has to be rebuilt from
     // scratch on every mouse move. Drag at quarter the pixels; the mouse-up
     // handler recomposes at full quality.
@@ -903,6 +933,7 @@ fn refresh_matte_thumbs(state: &mut State) {
         &state.raw_thumbs,
         &state.styles[state.matte_index],
         &opts,
+        state.crop,
     );
 }
 
@@ -3649,6 +3680,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let annotations = state.annotations.clone();
                             let speed_ranges = state.speed_ranges.clone();
                             let compose_opts = state_compose_opts(state);
+                            let crop = state.crop;
                             let hwnd_raw = hwnd.0 as isize;
                             let activity = Arc::new(Mutex::new(std::time::Instant::now()));
                             let finished = Arc::new(AtomicBool::new(false));
@@ -3691,6 +3723,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     Some((&style, &compose_opts)),
                                     &annotations,
                                     &speed_ranges,
+                                    crop,
                                     &export_cancel,
                                     |percent| {
                                         *activity.lock().unwrap() = std::time::Instant::now();
@@ -4147,7 +4180,7 @@ pub fn show(
     let pad_factor = crate::compose::DEFAULT_PAD_FACTOR;
     let aspect_idx = 0;
     let opts = compose_opts(pad_factor, aspect_idx);
-    let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index], &opts);
+    let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index], &opts, crate::video_edit::Crop::FULL);
 
     let size_mb = std::fs::metadata(&mp4)
         .map(|m| m.len() as f64 / 1_048_576.0)

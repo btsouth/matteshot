@@ -82,11 +82,6 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The whole recording at `content` pixels.
-    pub fn whole(content: (u32, u32)) -> Self {
-        Frame { crop: Crop::FULL, content }
-    }
-
     fn size(&self) -> (f32, f32) {
         (self.content.0.max(1) as f32, self.content.1.max(1) as f32)
     }
@@ -456,6 +451,12 @@ mod tests {
     };
     use image::{Rgba, RgbaImage};
 
+    /// The whole recording at `content` pixels — what every caller passed
+    /// before cropping existed, and the baseline these tests compare against.
+    fn whole(content: (u32, u32)) -> Frame {
+        Frame { crop: Crop::FULL, content }
+    }
+
     fn arrow() -> Item {
         Item {
             shape: Shape::Arrow {
@@ -475,7 +476,7 @@ mod tests {
     fn an_uncropped_frame_maps_exactly_as_a_bare_content_size_did() {
         // The whole point of `Crop::FULL`: every existing path keeps its
         // arithmetic to the pixel, so nothing moves until somebody crops.
-        let frame = Frame::whole((1920, 1080));
+        let frame = whole((1920, 1080));
         assert_eq!(frame.crop, Crop::FULL);
         for p in [(0.0, 0.0), (0.25, 0.75), (1.0, 1.0), (0.5, 0.5)] {
             let mapped = frame.to_pixels(p);
@@ -615,11 +616,11 @@ mod tests {
                 std::slice::from_ref(&item),
                 10,
                 None,
-                Frame::whole((320, 180)),
+                whole((320, 180)),
                 (0.0, 0.0),
             );
             assert!(image.pixels().any(|pixel| pixel[0] > 0));
-            assert!(hit(&item, hit_point, 0.03, Frame::whole((320, 180))));
+            assert!(hit(&item, hit_point, 0.03, whole((320, 180))));
         }
     }
 
@@ -636,7 +637,7 @@ mod tests {
             caption_style: CaptionStyle::Shadow,
             caption_box_opacity: 0.68,
         };
-        translate(&mut item, 0.2, 0.3, Frame::whole((1920, 1080)));
+        translate(&mut item, 0.2, 0.3, whole((1920, 1080)));
         let Shape::Freehand { points } = item.shape else {
             panic!("expected freehand path");
         };
@@ -652,10 +653,10 @@ mod tests {
     #[test]
     fn arrow_hit_testing_and_translation_use_normalized_space() {
         let mut item = arrow();
-        assert!(hit(&item, (0.3, 0.4), 0.01, Frame::whole((1920, 1080))));
-        assert!(!hit(&item, (0.8, 0.2), 0.01, Frame::whole((1920, 1080))));
-        translate(&mut item, 0.7, 0.7, Frame::whole((1920, 1080)));
-        let (x0, y0, x1, y1) = bounds(&item, Frame::whole((1920, 1080)));
+        assert!(hit(&item, (0.3, 0.4), 0.01, whole((1920, 1080))));
+        assert!(!hit(&item, (0.8, 0.2), 0.01, whole((1920, 1080))));
+        translate(&mut item, 0.7, 0.7, whole((1920, 1080)));
+        let (x0, y0, x1, y1) = bounds(&item, whole((1920, 1080)));
         for (actual, expected) in [x0, y0, x1, y1].into_iter().zip([0.6, 0.6, 1.0, 1.0]) {
             assert!((actual - expected).abs() < 0.00001);
         }
@@ -665,11 +666,11 @@ mod tests {
     fn arrow_endpoints_can_be_redirected_without_moving_the_other_end() {
         let mut item = arrow();
         assert_eq!(
-            hit_handle(&item, (0.102, 0.202), 0.025, Frame::whole((1920, 1080))),
+            hit_handle(&item, (0.102, 0.202), 0.025, whole((1920, 1080))),
             Some(ShapeHandle::First)
         );
         assert_eq!(
-            hit_handle(&item, (0.498, 0.598), 0.025, Frame::whole((1920, 1080))),
+            hit_handle(&item, (0.498, 0.598), 0.025, whole((1920, 1080))),
             Some(ShapeHandle::Second)
         );
         assert_eq!(handles(&item).unwrap()[1].1, (0.5, 0.6));
@@ -734,7 +735,7 @@ mod tests {
             caption_box_opacity: 0.68,
         };
         let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
-        render_at(&mut image, &[item], 10, None, Frame::whole((100, 100)), (50.0, 50.0));
+        render_at(&mut image, &[item], 10, None, whole((100, 100)), (50.0, 50.0));
 
         assert!(image
             .enumerate_pixels()
@@ -767,7 +768,7 @@ mod tests {
             &[item],
             10,
             None,
-            Frame::whole((1000, 400)),
+            whole((1000, 400)),
             (100.0, 100.0),
         );
 
@@ -803,12 +804,12 @@ mod tests {
             std::slice::from_ref(&item),
             10,
             None,
-            Frame::whole((400, 200)),
+            whole((400, 200)),
             (0.0, 0.0),
         );
         let mut shadow_item = item;
         shadow_item.caption_style = CaptionStyle::Shadow;
-        render_at(&mut shadow, &[shadow_item], 10, None, Frame::whole((400, 200)), (0.0, 0.0));
+        render_at(&mut shadow, &[shadow_item], 10, None, whole((400, 200)), (0.0, 0.0));
 
         // The box extends left of the text origin; shadow-only text does not.
         assert!(boxed.get_pixel(94, 52)[0] < shadow.get_pixel(94, 52)[0]);
@@ -829,7 +830,7 @@ mod tests {
             caption_style: CaptionStyle::Box,
             caption_box_opacity: 0.68,
         };
-        let (x0, y0, x1, y1) = bounds(&item, Frame::whole(content_size));
+        let (x0, y0, x1, y1) = bounds(&item, whole(content_size));
         let (text_w, text_h) = crate::annotate::caption_text_size(
             "BATTLE",
             item.size,
@@ -862,11 +863,11 @@ mod tests {
             std::slice::from_ref(&item),
             10,
             None,
-            Frame::whole((400, 200)),
+            whole((400, 200)),
             (0.0, 0.0),
         );
         item.caption_box_opacity = 0.90;
-        render_at(&mut solid, &[item], 10, None, Frame::whole((400, 200)), (0.0, 0.0));
+        render_at(&mut solid, &[item], 10, None, whole((400, 200)), (0.0, 0.0));
 
         // This pixel sits on the plate padding, outside the caption glyphs.
         assert!(solid.get_pixel(95, 52)[0] < light.get_pixel(95, 52)[0]);
@@ -886,8 +887,8 @@ mod tests {
             caption_style: CaptionStyle::Box,
             caption_box_opacity: 0.68,
         };
-        translate(&mut item, 0.15, 0.1, Frame::whole((1920, 1080)));
-        translate(&mut item, 0.1, 0.2, Frame::whole((1920, 1080)));
+        translate(&mut item, 0.15, 0.1, whole((1920, 1080)));
+        translate(&mut item, 0.1, 0.2, whole((1920, 1080)));
         let Shape::Text { pos, .. } = item.shape else {
             panic!("caption changed shape");
         };

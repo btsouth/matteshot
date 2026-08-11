@@ -1576,6 +1576,7 @@ fn main() -> Result<()> {
                 None,
                 &[],
                 &[speed],
+                video_edit::Crop::FULL,
                 &cancel,
                 |_| {},
             )?;
