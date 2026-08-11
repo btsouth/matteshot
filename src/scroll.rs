@@ -519,7 +519,17 @@ fn wait_for_esc_release() {
 /// outright is now the picker's job: Esc there closes it, so the way out is
 /// the same key twice.
 fn stop_requested(stop: &StopSignal) -> bool {
-    esc_pressed() || stop.load(Ordering::Relaxed)
+    esc_pressed() || signal_raised(stop)
+}
+
+/// The half of `stop_requested` the stop pill controls.
+///
+/// Named separately because the other half reads live keyboard state, which
+/// makes anything going through `stop_requested` depend on what the keyboard
+/// happens to be doing. A test asserting it reads false fails whenever Esc is
+/// down as the suite runs — including when another test injects one.
+fn signal_raised(stop: &StopSignal) -> bool {
+    stop.load(Ordering::Relaxed)
 }
 
 fn grab(target: Target) -> Result<RgbaImage> {
@@ -1336,13 +1346,17 @@ mod tests {
         }
     }
 
-    // Esc's half of `stop_requested` reads real key state and so is not
-    // reachable from a test; the signal the pill raises is.
+    // Only the signal half is a property of this code. Asserting that
+    // `stop_requested` reads false went through `esc_pressed`, so it failed at
+    // random whenever Esc was down as the suite ran — a real key press, or
+    // another test injecting one.
     #[test]
     fn a_raised_stop_signal_ends_the_loop() {
         let stop: StopSignal = Arc::new(AtomicBool::new(false));
-        assert!(!stop_requested(&stop));
+        assert!(!signal_raised(&stop));
         stop.store(true, Ordering::Relaxed);
+        assert!(signal_raised(&stop));
+        // And a raised signal stops the loop whatever the keyboard is doing.
         assert!(stop_requested(&stop));
     }
 
