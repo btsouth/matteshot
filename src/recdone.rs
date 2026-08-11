@@ -294,6 +294,11 @@ struct State {
     raw_thumbs: Vec<(Vec<u8>, u32, u32)>,
     scrub_previews: Vec<(Vec<u8>, u32, u32)>,
     source_size: (u32, u32),
+    /// The window of the recording being kept, normalized to the source.
+    /// `Crop::FULL` is the whole thing. Annotations stay normalized to the
+    /// source, so this moves the picture under them rather than invalidating
+    /// them — the same model the photo editor uses.
+    crop: crate::video_edit::Crop,
     thumbs: Vec<(Vec<u8>, u32, u32)>,
     preview_raw: Option<(Vec<u8>, u32, u32)>,
     preview: Option<(Vec<u8>, u32, u32)>,
@@ -852,8 +857,8 @@ fn recompose_preview(state: &mut State) {
         &state.annotations,
         annotation_time,
         skip,
-        content_size,
-        state.source_size,
+        crate::video_edit::Frame { crop: state.crop, content: content_size },
+        cropped_source_size(state),
         content_offset,
     );
     if let Some(entry) = &state.text_entry {
@@ -875,8 +880,8 @@ fn recompose_preview(state: &mut State) {
             std::slice::from_ref(&draft),
             annotation_time,
             None,
-            content_size,
-            state.source_size,
+            crate::video_edit::Frame { crop: state.crop, content: content_size },
+            cropped_source_size(state),
             content_offset,
         );
     }
@@ -1255,12 +1260,26 @@ fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
     ))
 }
 
-fn annotation_content_size(state: &State) -> (u32, u32) {
-    (state.source_size.0.max(1), state.source_size.1.max(1))
+/// The recording window annotations are addressed against: the crop, at the
+/// pixel size it will be exported at. Identical to the source while uncropped.
+fn annotation_frame(state: &State) -> crate::video_edit::Frame {
+    crate::video_edit::Frame {
+        crop: state.crop,
+        content: cropped_source_size(state),
+    }
+}
+
+/// Source pixels the crop keeps.
+fn cropped_source_size(state: &State) -> (u32, u32) {
+    let (width, height) = (state.source_size.0.max(1), state.source_size.1.max(1));
+    (
+        ((width as f32 * state.crop.w).round() as u32).max(1),
+        ((height as f32 * state.crop.h).round() as u32).max(1),
+    )
 }
 
 fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
-    let content_size = annotation_content_size(state);
+    let frame = annotation_frame(state);
     let time = current_annotation_time(state);
     state
         .annotations
@@ -1269,7 +1288,7 @@ fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
         .rev()
         .find(|(_, item)| {
             item.active_at(time)
-                && crate::video_edit::hit(item, point, 0.018, content_size)
+                && crate::video_edit::hit(item, point, 0.018, frame)
         })
         .map(|(index, _)| index)
 }
@@ -1278,14 +1297,14 @@ fn hit_annotation_handle(
     state: &State,
     point: (f32, f32),
 ) -> Option<(usize, crate::video_edit::ShapeHandle)> {
-    let content_size = annotation_content_size(state);
+    let frame = annotation_frame(state);
     let time = current_annotation_time(state);
     let index = state.selected.filter(|index| *index < state.annotations.len())?;
     let item = &state.annotations[index];
     if !item.active_at(time) {
         return None;
     }
-    crate::video_edit::hit_handle(item, point, 0.026, content_size)
+    crate::video_edit::hit_handle(item, point, 0.026, frame)
         .map(|handle| (index, handle))
 }
 
@@ -1843,7 +1862,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 let image_rect = preview_content_rect(state)
                     .unwrap_or_else(|| preview_image_rect(state, frame));
                 let (x0, y0, x1, y1) =
-                    crate::video_edit::bounds(item, annotation_content_size(state));
+                    crate::video_edit::bounds(item, annotation_frame(state));
                 let map_x = |x: f32| {
                     image_rect.left
                         + (x.clamp(0.0, 1.0) * (image_rect.right - image_rect.left) as f32) as i32
@@ -2954,14 +2973,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 if moved && !undo_pushed {
                                     push_undo(state);
                                 }
-                                let content_size = annotation_content_size(state);
+                                let frame = annotation_frame(state);
                                 if let Some(item) = state.annotations.get_mut(index) {
-                                    crate::video_edit::translate(
-                                        item,
-                                        dx,
-                                        dy,
-                                        content_size,
-                                    );
+                                    crate::video_edit::translate(item, dx, dy, frame);
                                 }
                                 state.dragging = Some(Drag::Move {
                                     index,
@@ -4173,6 +4187,7 @@ pub fn show(
         raw_thumbs,
         scrub_previews,
         source_size,
+        crop: crate::video_edit::Crop::FULL,
         thumbs,
         preview_raw,
         preview: None,
