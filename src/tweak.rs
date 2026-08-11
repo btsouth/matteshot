@@ -68,6 +68,9 @@ enum Ctl {
     CustomSizeDone,
     CustomSizeCancel,
     Slider,
+    /// The crop button. Its own control rather than `Tool(CROP_TOOL)` so the
+    /// chip loop over `TOOLS` can never be asked to label it.
+    Crop,
     Tool(usize),
     Color(usize),
     Size(usize),
@@ -83,6 +86,116 @@ const TOOLS: [&str; 9] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur"
 const SIZES: [f32; 3] = [0.7, 1.0, 1.4];
 const STEP_TOOL: usize = 7;
 const PEN_TOOL: usize = 8;
+/// Crop arms like a tool — it takes over the preview and Esc puts it away —
+/// but it reshapes the capture rather than drawing on it, so it lives with
+/// padding and aspect instead of in the annotation grid. This index is one
+/// past the palette on purpose: `state.tool` carries it so the whole
+/// arm/disarm ladder works unchanged, while nothing iterating `TOOLS` ever
+/// produces a chip for it.
+const CROP_TOOL: usize = TOOLS.len();
+
+/// A crop in raw-capture pixels. Always inside the capture and never empty.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Crop {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// The smallest crop worth having. Below this the preview has nothing to show
+/// and the matte has nothing to frame.
+const MIN_CROP: u32 = 16;
+
+impl Crop {
+    fn full(width: u32, height: u32) -> Self {
+        Crop { x: 0, y: 0, w: width.max(1), h: height.max(1) }
+    }
+
+    fn is_full(&self, width: u32, height: u32) -> bool {
+        self.x == 0 && self.y == 0 && self.w == width && self.h == height
+    }
+
+    /// Corners in raw-capture coordinates, in the `Grab::Corner` order the
+    /// annotation handles already use: top-left, top-right, bottom-right,
+    /// bottom-left.
+    fn corners(&self) -> [(f32, f32); 4] {
+        let (x0, y0) = (self.x as f32, self.y as f32);
+        let (x1, y1) = ((self.x + self.w) as f32, (self.y + self.h) as f32);
+        [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    }
+}
+
+/// Build a crop from two dragged corners, clamped inside the capture and
+/// widened to `MIN_CROP` rather than rejected — a slightly-too-small drag
+/// should give you a small crop, not nothing.
+fn crop_from_points(a: (f32, f32), b: (f32, f32), width: u32, height: u32) -> Crop {
+    let clamp = |v: f32, hi: u32| v.round().clamp(0.0, hi as f32) as u32;
+    let (x0, x1) = (clamp(a.0.min(b.0), width), clamp(a.0.max(b.0), width));
+    let (y0, y1) = (clamp(a.1.min(b.1), height), clamp(a.1.max(b.1), height));
+    let w = (x1 - x0).max(MIN_CROP.min(width));
+    let h = (y1 - y0).max(MIN_CROP.min(height));
+    Crop {
+        x: x0.min(width.saturating_sub(w)),
+        y: y0.min(height.saturating_sub(h)),
+        w,
+        h,
+    }
+}
+
+/// Slide a crop by a raw-pixel delta without letting it leave the capture. The
+/// size never changes, so dragging into an edge stops rather than shrinking.
+fn move_crop(crop: Crop, dx: f32, dy: f32, width: u32, height: u32) -> Crop {
+    let limit_x = width.saturating_sub(crop.w) as f32;
+    let limit_y = height.saturating_sub(crop.h) as f32;
+    Crop {
+        x: (crop.x as f32 + dx).round().clamp(0.0, limit_x) as u32,
+        y: (crop.y as f32 + dy).round().clamp(0.0, limit_y) as u32,
+        ..crop
+    }
+}
+
+/// Which corner of a rectangle `point` is, given the corner pinned opposite it.
+/// In `Crop::corners` order: 0 top-left, 1 top-right, 2 bottom-right, 3
+/// bottom-left.
+fn corner_index(point: (f32, f32), opposite: (f32, f32)) -> u8 {
+    match (point.0 > opposite.0, point.1 > opposite.1) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+        (false, true) => 3,
+    }
+}
+
+/// Drag one corner of a crop to `point`, keeping the opposite corner pinned.
+///
+/// Returns the new crop and which corner is now being held: dragging a corner
+/// past its opposite flips it into the one it crossed to, and without that the
+/// next mouse move would pin the wrong point and the rectangle would stick.
+fn resize_crop(
+    crop: Crop,
+    corner: u8,
+    point: (f32, f32),
+    width: u32,
+    height: u32,
+) -> (Crop, u8) {
+    let opposite = crop.corners()[((corner as usize) + 2) % 4];
+    (
+        crop_from_points(opposite, point, width, height),
+        corner_index(point, opposite),
+    )
+}
+
+/// What a drag on the crop rectangle is doing.
+#[derive(Clone, Copy, PartialEq)]
+enum CropDrag {
+    /// Sweeping a brand new rectangle from the point it started at.
+    New((f32, f32)),
+    /// Sliding the whole rectangle; the point is where the cursor was last.
+    Move((f32, f32)),
+    /// Pulling one corner, in `Crop::corners` order.
+    Corner(u8),
+}
 
 /// What part of an annotation a selector-mode drag grabbed.
 #[derive(Clone, Copy, PartialEq)]
@@ -145,6 +258,23 @@ struct Document {
     /// Tab label: the captured window's title, or the region's size.
     title: String,
     raw: RgbaImage,
+    /// The kept part of `raw`, in raw-capture pixels. `None` is the whole
+    /// capture. Cropping is not destructive: `raw` stays whole, so a crop can
+    /// be reopened and nudged, cleared outright, or undone, and annotations
+    /// that fall outside it are hidden rather than discarded.
+    crop: Option<Crop>,
+    /// `raw` reduced to `crop`. Rebuilt only when the crop changes, and absent
+    /// while there is no crop so an uncropped capture never carries a second
+    /// copy of itself.
+    cropped: Option<RgbaImage>,
+    /// The crop being adjusted while the Crop tool is armed. For its duration
+    /// the preview shows the whole capture, which is the only way to pull an
+    /// edge back out once it has been brought in.
+    crop_edit: Option<Crop>,
+    /// The crop changed, so the working bitmaps below no longer come from the
+    /// right pixels. `ensure_preview_source` only grows on its own, and a crop
+    /// usually shrinks.
+    content_dirty: bool,
     small: RgbaImage,
     preview_metric: f32,
     /// Half-scale preview source. Dragging the padding slider changes the
@@ -201,6 +331,10 @@ struct Document {
 struct Snapshot {
     anns: Vec<crate::annotate::Annotation>,
     counter_next: u32,
+    /// The crop travels with the annotations so Ctrl+Z steps back through
+    /// framing and drawing in the one order they were done in. It is four
+    /// integers, so carrying it on every step costs nothing.
+    crop: Option<Crop>,
 }
 
 /// How many edits back you can go. Deep enough that nobody hits the wall in a
@@ -216,8 +350,13 @@ struct History {
 }
 
 impl History {
-    fn push(&mut self, anns: &[crate::annotate::Annotation], counter_next: u32) {
-        self.steps.push(Snapshot { anns: anns.to_vec(), counter_next });
+    fn push(
+        &mut self,
+        anns: &[crate::annotate::Annotation],
+        counter_next: u32,
+        crop: Option<Crop>,
+    ) {
+        self.steps.push(Snapshot { anns: anns.to_vec(), counter_next, crop });
         if self.steps.len() > HISTORY_LIMIT {
             self.steps.remove(0);
         }
@@ -242,7 +381,7 @@ impl History {
 impl Document {
     /// Record the current annotations as an undo point. Call before mutating.
     fn push_history(&mut self) {
-        self.history.push(&self.anns, self.counter_next);
+        self.history.push(&self.anns, self.counter_next, self.crop);
     }
 
     fn discard_history(&mut self) {
@@ -263,11 +402,60 @@ impl Document {
         };
         self.anns = snapshot.anns;
         self.counter_next = snapshot.counter_next;
+        self.set_crop(snapshot.crop);
         self.selected = None;
         self.hover_ann = None;
         self.editing = None;
         self.editing_original = None;
         true
+    }
+
+    /// The pixels every preview, measurement and export works from: the crop
+    /// when there is one, the whole capture otherwise.
+    fn content(&self) -> &RgbaImage {
+        // While the crop is being adjusted the whole capture is on screen, so
+        // an edge that was brought in can be pulled back out.
+        if self.crop_edit.is_some() {
+            return &self.raw;
+        }
+        self.cropped.as_ref().unwrap_or(&self.raw)
+    }
+
+    /// What the exported content will measure. Not always `content()`'s size:
+    /// while the crop tool is armed the whole capture is on screen, but the
+    /// size readout should be describing the frame the user is dragging.
+    fn content_dimensions(&self) -> (u32, u32) {
+        match self.crop_edit {
+            Some(pending) => (pending.w, pending.h),
+            None => self.content().dimensions(),
+        }
+    }
+
+    /// Where `content()`'s top-left sits in raw-capture coordinates.
+    /// Annotations are stored in raw coordinates and this is what puts them
+    /// back in the right place once the picture around them has moved.
+    fn content_origin(&self) -> (f32, f32) {
+        match self.crop {
+            Some(crop) if self.crop_edit.is_none() => (crop.x as f32, crop.y as f32),
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// Adopt a crop and rebuild the cropped pixels. A crop covering the whole
+    /// capture is stored as `None`, so "cropped back to full" and "never
+    /// cropped" cannot drift apart.
+    fn set_crop(&mut self, crop: Option<Crop>) {
+        let (width, height) = self.raw.dimensions();
+        let crop = crop.filter(|crop| !crop.is_full(width, height));
+        if crop == self.crop {
+            return;
+        }
+        self.crop = crop;
+        self.cropped = crop.map(|crop| {
+            image::imageops::crop_imm(&self.raw, crop.x, crop.y, crop.w, crop.h).to_image()
+        });
+        self.content_dirty = true;
+        self.base_cache = None;
     }
 }
 
@@ -306,6 +494,10 @@ struct State {
     copy_hint: Option<(String, std::time::Instant)>,
     /// Correlates asynchronous Share completions with the latest click.
     pending_share: Option<u64>,
+    /// The crop drag in flight. Lives on the window rather than the document
+    /// because, like the slider drags, it belongs to the mouse rather than to
+    /// the picture.
+    crop_drag: Option<CropDrag>,
     /// Caret blink phase while editing; one timer serves the window.
     caret_on: bool,
     font: HFONT,
@@ -426,6 +618,51 @@ fn annotation_tool_index(shape: &crate::annotate::Shape) -> usize {
 /// run of boxes or arrows takes one trip to the palette.
 fn tool_after_pick(current: Option<usize>, picked: usize) -> Option<usize> {
     (current != Some(picked)).then_some(picked)
+}
+
+/// Arm the crop tool: the whole capture comes back on screen with the current
+/// crop drawn over it, so its edges can be pulled either way.
+fn enter_crop(state: &mut State) {
+    commit_editing(state);
+    state.doc_mut().text_select = None;
+    state.doc_mut().selected = None;
+    state.doc_mut().hover_ann = None;
+    state.doc_mut().moving = None;
+    state.crop_drag = None;
+    let (width, height) = state.doc().raw.dimensions();
+    let pending = state.doc().crop.unwrap_or(Crop::full(width, height));
+    state.doc_mut().crop_edit = Some(pending);
+    state.doc_mut().content_dirty = true;
+    state.doc_mut().base_cache = None;
+}
+
+/// Take the pending crop and put the tool away. Nothing is recorded when the
+/// crop did not actually change, so arming the tool and thinking better of it
+/// does not eat an undo step.
+fn commit_crop(state: &mut State) {
+    let Some(pending) = state.doc_mut().crop_edit.take() else {
+        return;
+    };
+    state.crop_drag = None;
+    let (width, height) = state.doc().raw.dimensions();
+    let pending = (!pending.is_full(width, height)).then_some(pending);
+    if pending != state.doc().crop {
+        // Recorded against the pre-crop state, which `crop_edit` was masking
+        // until the line above cleared it.
+        state.doc_mut().push_history();
+        state.doc_mut().set_crop(pending);
+    }
+    state.doc_mut().content_dirty = true;
+    state.doc_mut().base_cache = None;
+}
+
+/// Leave the crop tool without keeping the pending rectangle.
+fn cancel_crop(state: &mut State) {
+    if state.doc_mut().crop_edit.take().is_some() {
+        state.crop_drag = None;
+        state.doc_mut().content_dirty = true;
+        state.doc_mut().base_cache = None;
+    }
 }
 
 fn text_context(state: &State) -> bool {
@@ -551,15 +788,18 @@ fn preview_sources(raw: &RgbaImage, target_edge: u32) -> (RgbaImage, f32, RgbaIm
 /// WM_SIZE arrives continuously, so this has to be cheap to call and quiet
 /// when nothing is needed.
 fn ensure_preview_source(state: &mut State) -> bool {
-    let (raw_w, raw_h) = (state.doc().raw.width(), state.doc().raw.height());
-    let target = preview_target_edge(state.preview_box, raw_w, raw_h);
+    let (content_w, content_h) = state.doc().content().dimensions();
+    let target = preview_target_edge(state.preview_box, content_w, content_h);
     let current = state.doc().small.width().max(state.doc().small.height());
-    // A few pixels either way is not worth a full resize of the capture.
-    if target <= (current as f32 * 1.05) as u32 {
+    // A few pixels either way is not worth a full resize of the capture. A
+    // changed crop is not optional though: the working bitmaps come from the
+    // wrong pixels until they are rebuilt, however big they happen to be.
+    if !state.doc().content_dirty && target <= (current as f32 * 1.05) as u32 {
         return false;
     }
-    let (small, metric, small_fast, metric_fast) = preview_sources(&state.doc().raw, target);
+    let (small, metric, small_fast, metric_fast) = preview_sources(state.doc().content(), target);
     let doc = state.doc_mut();
+    doc.content_dirty = false;
     doc.small = small;
     doc.preview_metric = metric;
     doc.small_fast = small_fast;
@@ -648,25 +888,34 @@ fn view_params(state: &State) -> (i32, i32, f32, f32, f32) {
 
 /// Map a window point into raw-capture coordinates. None if far outside the
 /// content area.
+///
+/// Raw, not content: annotations and OCR words are stored against the original
+/// capture so that changing the crop moves the picture under them instead of
+/// invalidating them. The crop origin is what converts between the two.
 fn to_raw(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
     let (dx, dy, draw_scale, pad_x, pad_y) = view_params(state);
     let cx = (x - dx) as f32 / draw_scale;
     let cy = (y - dy) as f32 / draw_scale;
     let metric = preview_source(state).1;
-    let rx = (cx - pad_x) / metric;
-    let ry = (cy - pad_y) / metric;
-    let (rw, rh) = (state.doc().raw.width() as f32, state.doc().raw.height() as f32);
-    if rx < -40.0 || ry < -40.0 || rx > rw + 40.0 || ry > rh + 40.0 {
+    let (ox, oy) = state.doc().content_origin();
+    let rx = (cx - pad_x) / metric + ox;
+    let ry = (cy - pad_y) / metric + oy;
+    let (cw, ch) = state.doc().content().dimensions();
+    let (x0, y0) = (ox, oy);
+    let (x1, y1) = (ox + cw as f32, oy + ch as f32);
+    if rx < x0 - 40.0 || ry < y0 - 40.0 || rx > x1 + 40.0 || ry > y1 + 40.0 {
         return None;
     }
-    Some((rx.clamp(0.0, rw), ry.clamp(0.0, rh)))
+    Some((rx.clamp(x0, x1), ry.clamp(y0, y1)))
 }
 
 fn raw_to_screen(state: &State, p: (f32, f32)) -> (i32, i32) {
     let (dx, dy, draw_scale, pad_x, pad_y) = view_params(state);
+    let (ox, oy) = state.doc().content_origin();
+    let metric = preview_source(state).1;
     (
-        dx + ((p.0 * preview_source(state).1 + pad_x) * draw_scale) as i32,
-        dy + ((p.1 * preview_source(state).1 + pad_y) * draw_scale) as i32,
+        dx + (((p.0 - ox) * metric + pad_x) * draw_scale) as i32,
+        dy + (((p.1 - oy) * metric + pad_y) * draw_scale) as i32,
     )
 }
 
@@ -859,7 +1108,11 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
     });
     rebuild_preview(state);
 
-    let raw = state.doc_mut().raw.clone();
+    // Only the visible content is worth reading: text the crop removed is not
+    // in the picture any more, and offering it for selection would be a lie.
+    // The words come back in content coordinates and are shifted to raw ones
+    // on arrival, which is the space the rest of the editor works in.
+    let raw = state.doc().content().clone();
     let target = hwnd.0 as isize;
     std::thread::spawn(move || {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
@@ -963,11 +1216,14 @@ fn rebuild_preview(state: &mut State) {
         (off_x, off_y) = (l.pad_x as f32, l.pad_y as f32);
     }
     // Annotations stamp directly onto the composite at the content offset.
+    // They are in raw-capture coordinates, so a crop shifts them by its origin
+    // and the renderer clips whatever now falls outside.
+    let (ox, oy) = state.doc().content_origin();
     crate::annotate::render(
         &mut img,
         &state.doc_mut().anns,
         metric,
-        (off_x, off_y),
+        (off_x - ox * metric, off_y - oy * metric),
         caret,
     );
     state.doc_mut().last_rebuild = std::time::Instant::now();
@@ -985,41 +1241,71 @@ fn rebuild_preview(state: &mut State) {
 
 /// Full-quality result with the current tweaks and annotations applied.
 fn final_image(state: &State) -> RgbaImage {
-    let raw = &state.doc().raw;
-    let plain = compose::is_plain(&state.doc().styles[state.doc().sel]);
-    let scale = if plain || raw.width().max(raw.height()) >= 1600 {
+    render_final(
+        state.doc().content(),
+        &state.doc().anns,
+        state.doc().content_origin(),
+        &state.doc().styles[state.doc().sel],
+        (state.doc().pad_factor, ASPECTS[state.doc().aspect_idx].1),
+        state.export_scale,
+        state.doc().output_max_edge,
+    )
+}
+
+/// Compose the finished image from content that has already been cropped.
+///
+/// Split out from `final_image` because this is where a crop has to line up.
+/// Annotations are stored against the original capture, so `origin` — the
+/// crop's top-left — is what brings them back over the content that is
+/// actually being exported. Getting that offset wrong is invisible until
+/// somebody crops and saves, which is exactly why it is reachable from a test.
+fn render_final(
+    content: &RgbaImage,
+    anns: &[crate::annotate::Annotation],
+    origin: (f32, f32),
+    style: &Style,
+    matte: (f32, Option<f32>),
+    export_scale: u32,
+    output_max_edge: u32,
+) -> RgbaImage {
+    let plain = compose::is_plain(style);
+    let scale = if plain || content.width().max(content.height()) >= 1600 {
         1
     } else {
-        state.export_scale.clamp(1, 4)
+        export_scale.clamp(1, 4)
     };
-    let mut content = if scale > 1 {
+    let mut scaled = if scale > 1 {
         image::imageops::resize(
-            raw,
-            raw.width() * scale,
-            raw.height() * scale,
+            content,
+            content.width() * scale,
+            content.height() * scale,
             image::imageops::FilterType::Lanczos3,
         )
     } else {
-        raw.clone()
+        content.clone()
     };
-    crate::annotate::render(&mut content, &state.doc().anns, scale as f32, (0.0, 0.0), None);
+    let (ox, oy) = origin;
+    crate::annotate::render(
+        &mut scaled,
+        anns,
+        scale as f32,
+        (-ox * scale as f32, -oy * scale as f32),
+        None,
+    );
     let finished = if plain {
-        content
+        scaled
     } else {
-        let opts = ComposeOpts {
-            metric_scale: scale as f32,
-            pad_factor: state.doc().pad_factor,
-            aspect: ASPECTS[state.doc().aspect_idx].1,
-        };
-        compose::compose_with(&content, &state.doc().styles[state.doc().sel], &opts)
+        let (pad_factor, aspect) = matte;
+        let opts = ComposeOpts { metric_scale: scale as f32, pad_factor, aspect };
+        compose::compose_with(&scaled, style, &opts)
     };
-    output::resize_to_max_edge(&finished, state.doc().output_max_edge)
+    output::resize_to_max_edge(&finished, output_max_edge)
 }
 
 /// Exact matte dimensions before the optional output-size cap, without
 /// rendering the full-size image.
 fn composed_dimensions(state: &State) -> (u32, u32) {
-    let (mut width, mut height) = state.doc().raw.dimensions();
+    let (mut width, mut height) = state.doc().content_dimensions();
     if !compose::is_plain(&state.doc().styles[state.doc().sel]) {
         let scale = if width.max(height) >= 1600 {
             1
@@ -1303,6 +1589,70 @@ unsafe fn paint(hdc: HDC, state: &State) {
         SRCCOPY,
     );
 
+    // Crop overlay: everything the crop would discard is washed out, and the
+    // kept rectangle carries the frame, corner handles and a size readout.
+    // Screen-space, so dragging it never recomposes the preview.
+    if let Some(pending) = state.doc().crop_edit {
+        let (kx0, ky0) = raw_to_screen(state, (pending.x as f32, pending.y as f32));
+        let (kx1, ky1) = raw_to_screen(
+            state,
+            ((pending.x + pending.w) as f32, (pending.y + pending.h) as f32),
+        );
+        let (fx0, fy0) = raw_to_screen(state, (0.0, 0.0));
+        let (raw_w, raw_h) = state.doc().raw.dimensions();
+        let (fx1, fy1) = raw_to_screen(state, (raw_w as f32, raw_h as f32));
+        wash_all(
+            hdc,
+            state.theme.bg,
+            &[
+                (RECT { left: fx0, top: fy0, right: fx1, bottom: ky0 }, 170),
+                (RECT { left: fx0, top: ky1, right: fx1, bottom: fy1 }, 170),
+                (RECT { left: fx0, top: ky0, right: kx0, bottom: ky1 }, 170),
+                (RECT { left: kx1, top: ky0, right: fx1, bottom: ky1 }, 170),
+            ],
+        );
+        let pen = CreatePen(PS_SOLID, 1, state.theme.accent);
+        let op = SelectObject(hdc, pen);
+        let ob = SelectObject(
+            hdc,
+            windows::Win32::Graphics::Gdi::GetStockObject(
+                windows::Win32::Graphics::Gdi::HOLLOW_BRUSH,
+            ),
+        );
+        let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, kx0, ky0, kx1, ky1);
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        let _ = DeleteObject(pen);
+
+        let fill = CreateSolidBrush(state.theme.accent);
+        let edge = CreatePen(PS_SOLID, 1, state.theme.bg);
+        let ob = SelectObject(hdc, fill);
+        let op = SelectObject(hdc, edge);
+        for corner in pending.corners() {
+            let (sx, sy) = raw_to_screen(state, corner);
+            let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, sx - 5, sy - 5, sx + 6, sy + 6);
+        }
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        let _ = DeleteObject(fill);
+        let _ = DeleteObject(edge);
+
+        // The readout sits just inside the top-left corner, and flips below the
+        // rectangle when the crop is pushed against the top of the pane.
+        let readout_y = if ky0 - state.preview_box.top < (22.0 * state.scale) as i32 {
+            ky0 + (6.0 * state.scale) as i32
+        } else {
+            ky0 - (20.0 * state.scale) as i32
+        };
+        label(
+            hdc,
+            state,
+            kx0 + (4.0 * state.scale) as i32,
+            readout_y,
+            &format!("{} \u{00d7} {} px", pending.w, pending.h),
+        );
+    }
+
     // Selection / hover overlay (screen-space, no recompose).
     if state.tool.is_none() {
         for (idx, solid) in [(state.doc().selected, true), (state.doc().hover_ann, false)] {
@@ -1428,6 +1778,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
         Some("type a size to preview it live   \u{00b7}   the other dimension adjusts automatically   \u{00b7}   Enter finishes   \u{00b7}   Esc restores")
     } else if state.doc().editing.is_some() {
         Some("type your caption   \u{00b7}   click anywhere to place   \u{00b7}   Esc cancel")
+    } else if state.doc().crop_edit.is_some() {
+        Some("drag to frame   \u{00b7}   pull a corner to resize   \u{00b7}   drag inside to move   \u{00b7}   Del uncrops   \u{00b7}   Enter applies   \u{00b7}   Esc cancels")
     } else if state.tool == Some(PEN_TOOL) {
         Some("drag on the preview to draw   \u{00b7}   Pen stays active   \u{00b7}   P or Esc exits")
     } else if state.tool == Some(STEP_TOOL) {
@@ -1566,6 +1918,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
             Ctl::Share => chip(hdc, *r, "Share", state, false, hot),
+            Ctl::Crop => {
+                // Says what it will do rather than what it is called: with a
+                // crop already applied, the button is how you get back to the
+                // whole capture.
+                let label = if state.doc().crop.is_some() { "Crop \u{00b7} adjust" } else { "Crop" };
+                chip(hdc, *r, label, state, state.tool == Some(CROP_TOOL), hot)
+            }
             Ctl::Tool(n) => {
                 let property_tool = if state.tool.is_none() {
                     state.doc()
@@ -1940,6 +2299,47 @@ fn commit_custom_size(state: &mut State) -> bool {
     }
 }
 
+/// Which corner handle of the pending crop is under `p`, in raw-capture units.
+fn crop_corner_at(crop: Crop, p: (f32, f32), tolerance: f32) -> Option<u8> {
+    crop.corners()
+        .into_iter()
+        .enumerate()
+        .find(|(_, corner)| {
+            (p.0 - corner.0).abs() <= tolerance && (p.1 - corner.1).abs() <= tolerance
+        })
+        .map(|(index, _)| index as u8)
+}
+
+fn crop_contains(crop: Crop, p: (f32, f32)) -> bool {
+    p.0 >= crop.x as f32
+        && p.0 <= (crop.x + crop.w) as f32
+        && p.1 >= crop.y as f32
+        && p.1 <= (crop.y + crop.h) as f32
+}
+
+/// Decide what a press at `p` starts.
+///
+/// Corners win over the interior so the handles stay reachable on a crop that
+/// fills the frame. A crop that covers everything sweeps a new rectangle
+/// instead of moving: there is nowhere for it to move to, and "drag a box
+/// round the part you want" is the whole gesture on a crop you have not
+/// narrowed yet.
+fn crop_drag_for(
+    crop: Crop,
+    p: (f32, f32),
+    tolerance: f32,
+    width: u32,
+    height: u32,
+) -> CropDrag {
+    if let Some(corner) = crop_corner_at(crop, p, tolerance) {
+        CropDrag::Corner(corner)
+    } else if crop_contains(crop, p) && !crop.is_full(width, height) {
+        CropDrag::Move(p)
+    } else {
+        CropDrag::New(p)
+    }
+}
+
 fn dist_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len2 = (dx * dx + dy * dy).max(1e-6);
@@ -2174,10 +2574,37 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
     // Reaching for an annotation tool leaves select-text mode. Matte, padding
     // and aspect are safe to keep it: word boxes live in capture coordinates,
     // so the overlay follows the new layout on its own.
-    if matches!(ctl, Ctl::Tool(_) | Ctl::Undo | Ctl::Clear) {
+    if matches!(ctl, Ctl::Tool(_) | Ctl::Crop | Ctl::Undo | Ctl::Clear) {
         state.doc_mut().text_select = None;
     }
+    // Any control but the Crop button itself settles a pending crop first, so
+    // Copy and Save produce the frame that is on screen rather than the whole
+    // capture. Pressing Crop again is its own toggle, handled below.
+    if state.doc().crop_edit.is_some() && ctl != Ctl::Crop {
+        commit_crop(state);
+        state.tool = None;
+        rebuild_preview(state);
+    }
     match ctl {
+        // Arms and disarms like a tool, so it goes through the same ladder.
+        // Pressing it again is the Apply; only Esc throws the frame away.
+        Ctl::Crop => {
+            commit_editing(state);
+            match tool_after_pick(state.tool, CROP_TOOL) {
+                Some(_) => {
+                    state.tool = Some(CROP_TOOL);
+                    state.doc_mut().selected = None;
+                    enter_crop(state);
+                }
+                None => {
+                    commit_crop(state);
+                    state.tool = None;
+                }
+            }
+            rebuild_preview(state);
+            let _ = InvalidateRect(hwnd, None, false);
+            return;
+        }
         Ctl::Tool(n) => {
             commit_editing(state);
             state.tool = tool_after_pick(state.tool, n);
@@ -2382,6 +2809,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(select) = state.doc_mut().text_select.as_mut() {
                         if focus.is_some() && select.focus != focus {
                             select.focus = focus;
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                if let Some(drag) = state.crop_drag {
+                    if let Some(p) = to_raw(state, x, y) {
+                        let (width, height) = state.doc().raw.dimensions();
+                        let Some(pending) = state.doc().crop_edit else {
+                            return LRESULT(0);
+                        };
+                        let (next, drag) = match drag {
+                            CropDrag::New(start) => (
+                                crop_from_points(start, p, width, height),
+                                CropDrag::New(start),
+                            ),
+                            CropDrag::Move(last) => (
+                                move_crop(pending, p.0 - last.0, p.1 - last.1, width, height),
+                                CropDrag::Move(p),
+                            ),
+                            CropDrag::Corner(corner) => {
+                                let (next, held) =
+                                    resize_crop(pending, corner, p, width, height);
+                                (next, CropDrag::Corner(held))
+                            }
+                        };
+                        state.crop_drag = Some(drag);
+                        if state.doc().crop_edit != Some(next) {
+                            state.doc_mut().crop_edit = Some(next);
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                     }
@@ -2612,6 +3068,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     commit_editing(state);
                     rebuild_preview(state);
                 }
+                // Cropping owns the preview while it is armed: no annotation is
+                // created or selected until the frame is settled.
+                if let Some(pending) = state.doc().crop_edit {
+                    if in_rect(&state.preview_box, x, y) {
+                        if let Some(p) = to_raw(state, x, y) {
+                            let tolerance = (10.0 / state.doc().preview_metric).max(8.0);
+                            let (width, height) = state.doc().raw.dimensions();
+                            state.crop_drag =
+                                Some(crop_drag_for(pending, p, tolerance, width, height));
+                            SetCapture(hwnd);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                        return LRESULT(0);
+                    }
+                }
                 if in_rect(&grab, x, y) {
                     commit_editing(state);
                     state.dragging = Some(SliderDrag::Padding);
@@ -2620,7 +3091,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.doc_mut().fast_preview = true;
                     SetCapture(hwnd);
                     slider_update(hwnd, state, x);
-                } else if let (Some(tool), Some(p)) = (state.tool, to_raw(state, x, y)) {
+                } else if let (Some(tool), Some(p)) =
+                    // Crop is in the palette but draws nothing; without this it
+                    // would fall through to the catch-all and place a caption.
+                    (state.tool.filter(|tool| *tool != CROP_TOOL), to_raw(state, x, y))
+                {
                     commit_editing(state);
                     let color = state.color_idx;
                     let size = SIZES[state.size_idx];
@@ -2726,6 +3201,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
+                if state.crop_drag.take().is_some() {
+                    let _ = ReleaseCapture();
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
                 if state.dragging.take().is_some() {
                     let _ = ReleaseCapture();
                     end_fast_preview(hwnd, state);
@@ -2801,6 +3281,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                // Right-click reaches for an annotation's properties, which
+                // means putting the tool away. While a crop is pending that
+                // would strand the frame with nothing left to apply it, so the
+                // crop keeps the preview to itself.
+                if state.doc().crop_edit.is_some() {
+                    return LRESULT(0);
+                }
                 if state.doc_mut().editing.is_some() {
                     commit_editing(state);
                 }
@@ -2959,6 +3446,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
+                    }
+                }
+                // Cropping owns Esc, Enter, Delete and Ctrl+Z while it is
+                // armed. Esc throws the pending frame away rather than peeling
+                // one layer off the editor, because that rectangle is the only
+                // thing the user is looking at. This sits above Ctrl+C so a
+                // keyboard copy settles the frame first, exactly as the Copy
+                // chip does.
+                if state.doc().crop_edit.is_some() {
+                    match wparam.0 as u16 {
+                        v if v == VK_ESCAPE.0 || (ctrl_down && v == b'Z' as u16) => {
+                            cancel_crop(state);
+                            state.tool = None;
+                            rebuild_preview(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        v if v == VK_RETURN.0 => {
+                            commit_crop(state);
+                            state.tool = None;
+                            rebuild_preview(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        // Delete / Backspace: back to the whole capture, ready
+                        // to apply as "no crop" or to re-frame from scratch.
+                        0x2E | 0x08 => {
+                            let (width, height) = state.doc().raw.dimensions();
+                            state.doc_mut().crop_edit = Some(Crop::full(width, height));
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        v if ctrl_down && v == b'C' as u16 => {
+                            commit_crop(state);
+                            state.tool = None;
+                            rebuild_preview(state);
+                        }
+                        _ => {}
                     }
                 }
                 // Ctrl+C copies the finished image, exactly as the Copy chip
@@ -3133,6 +3658,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 lparam.0 as *mut std::result::Result<Vec<crate::ocr::Word>, String>,
             );
             if let Some(state) = state_of(hwnd) {
+                let (ox, oy) = state.doc().content_origin();
                 if let Some(select) = state.doc_mut().text_select.as_mut() {
                     // A stale result from a mode the user already left has
                     // nothing to attach to.
@@ -3142,7 +3668,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             Ok(words) if words.is_empty() => {
                                 select.message = Some("no text found in this capture".into());
                             }
-                            Ok(words) => select.words = words,
+                            Ok(mut words) => {
+                                // Recognized against the cropped content; the
+                                // editor addresses everything in raw-capture
+                                // coordinates.
+                                for word in &mut words {
+                                    word.rect.0 += ox;
+                                    word.rect.1 += oy;
+                                    word.rect.2 += ox;
+                                    word.rect.3 += oy;
+                                }
+                                select.words = words;
+                            }
                             Err(error) => {
                                 eprintln!("ocr failed: {error}");
                                 select.message =
@@ -3279,75 +3816,202 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 /// Column + preview layout for the given client size. Rerun on resize.
-fn layout_controls(
+/// The editor's client size for a monitor's work area.
+///
+/// It takes a generous share of a large screen and nearly all of a small one.
+/// The control column is a fixed stack of groups that cannot shrink past its
+/// labels, so on a short display the difference between 85% and this is the
+/// difference between the column fitting and running into Copy/Save/Share.
+fn editor_client_size(work_w: i32, work_h: i32, scale: f32) -> (i32, i32) {
+    let sc = |v: i32| (v as f32 * scale) as i32;
+    let share = if work_h < sc(1000) { 0.94 } else { 0.85 };
+    (
+        ((work_w as f32 * 0.85) as i32).clamp(sc(760).min(work_w - sc(40)), work_w - sc(40)),
+        ((work_h as f32 * share) as i32).clamp(sc(560).min(work_h - sc(40)), work_h - sc(40)),
+    )
+}
+
+/// The bottom of the control column: the last palette row, below which only
+/// the bottom-anchored action block lives.
+fn column_bottom(controls: &[(RECT, Ctl)]) -> i32 {
+    controls
+        .iter()
+        .filter(|(_, control)| matches!(control, Ctl::Size(_) | Ctl::Color(_) | Ctl::Clear))
+        .map(|(rect, _)| rect.bottom)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Clearance the output-size block needs above itself: it is captioned by two
+/// lines of text — the section name and the live result — drawn one line pitch
+/// apart above its first control.
+fn action_headroom(scale: f32) -> i32 {
+    2 * (20.0 * scale) as i32
+}
+
+/// Whether a laid-out column clears the bottom-anchored action block, captions
+/// and all. Measured from the layout itself rather than predicted, so the two
+/// can never be computed from different assumptions.
+fn column_clears_actions(layout: &WindowLayout, scale: f32) -> bool {
+    let action_top = layout
+        .controls
+        .iter()
+        .filter(|(_, control)| matches!(control, Ctl::OutputSize(_) | Ctl::CustomSize))
+        .map(|(rect, _)| rect.top)
+        .min()
+        .unwrap_or(i32::MAX);
+    column_bottom(&layout.controls) + action_headroom(scale) <= action_top
+}
+
+/// Lay the editor out, giving up spacing — and then column width — only as far
+/// as a short window forces it to.
+///
+/// The control column is a fixed stack of groups growing down from the tab
+/// strip while Copy/Save/Share stay pinned to the bottom, so on a small screen
+/// the two ran through each other. Two things are traded, in order of how
+/// little they cost:
+///
+/// 1. vertical rhythm, down to what the section labels need;
+/// 2. the matte grid's width — seven chips two-abreast is four rows with a
+///    ragged last one, and three-abreast is three rows with the same ragged
+///    row, so this buys a whole row back for nothing but narrower chips.
+///
+/// The first arrangement that fits wins, so anything roomy keeps wide chips at
+/// natural spacing and only a genuinely small screen ever sees the rest.
+fn layout_controls(scale: f32, cw: i32, ch: i32, n_styles: usize) -> WindowLayout {
+    for matte_columns in [2, 3] {
+        for step in 0..=10 {
+            let layout =
+                layout_column(scale, cw, ch, n_styles, matte_columns, step as f32 / 10.0);
+            if column_clears_actions(&layout, scale) {
+                return layout;
+            }
+        }
+    }
+    // Smaller than the controls can ever be. The tightest arrangement at least
+    // keeps the overlap to the captions rather than the buttons.
+    layout_column(scale, cw, ch, n_styles, 3, 1.0)
+}
+
+fn layout_column(
     scale: f32,
     cw: i32,
     ch: i32,
     n_styles: usize,
+    matte_columns: i32,
+    tighten: f32,
 ) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
+    // Vertical rhythm only: chip heights stay put so nothing becomes harder to
+    // read or to hit, and the horizontal grid never moves.
+    let tighten = tighten.clamp(0.0, 1.0);
+    let vs = |natural: i32, compact: i32| {
+        sc((natural as f32 + (compact - natural) as f32 * tighten) as i32)
+    };
+    // Compact values are floored by what the section labels need, not by how
+    // small the numbers can go: every group is headed by a line of text drawn
+    // `LABEL` above its first control, and squeezing past that puts the label
+    // through the row above it.
+    const LABEL: i32 = 20;
+    const CHIP: i32 = 30;
+    // The chips themselves shrink a little before the gaps give out, which is
+    // what keeps ten rows of them inside a short window.
+    let chip_h = vs(CHIP, 28);
+    let row = vs(38, 30);
+    let head = vs(22, LABEL);
+    // Clearance to the next label is the gap plus whatever the row pitch
+    // leaves under the chip, so these floors are `LABEL` less that slack.
+    let gap_matte = vs(30, LABEL - 2);
+    let gap_slider = vs(52, 22 + LABEL);
+    let gap_tools = vs(26, LABEL - 2);
+    let gap_colors = vs(8, 4);
+    let row_small = vs(34, 28);
     let m = sc(20);
+    // The window's own bottom margin is part of the budget: giving some of it
+    // back moves the action block down, which is worth as much to a short
+    // window as tightening the column above it.
+    let margin_v = vs(20, 12);
     let col_x = cw - sc(250);
     // The tab strip is always present, even with one capture open, so adding
     // a second one never reflows everything underneath it.
     let tab_strip = RECT { left: 0, top: 0, right: cw, bottom: sc(34) };
     let top = tab_strip.bottom + sc(10);
     // Bottom strip reserved for the contextual hint line.
-    let preview_box = RECT { left: m, top, right: col_x - sc(16), bottom: ch - m - sc(18) };
+    let preview_box = RECT { left: m, top, right: col_x - sc(16), bottom: ch - margin_v - sc(18) };
     let mut controls = Vec::new();
-    let mut y = top + sc(22);
+    let mut y = top + head;
+    // Matte chips fill the column at whatever width they are given, and a
+    // final row with fewer chips than the rest is centred rather than left
+    // hanging on the left edge.
+    let columns = matte_columns.max(1);
+    let (matte_w, matte_pitch) = if columns >= 3 { (sc(66), sc(74)) } else { (sc(104), sc(112)) };
+    let matte_rows = (n_styles as i32 + columns - 1) / columns;
+    let last_row_count = match n_styles as i32 % columns {
+        0 => columns,
+        remainder => remainder,
+    };
     for i in 0..n_styles {
-        let row = i as i32 / 2;
-        let colm = i as i32 % 2;
-        let x = if n_styles % 2 == 1 && i + 1 == n_styles {
-            col_x + sc(56)
-        } else {
-            col_x + colm * sc(112)
-        };
+        let line = i as i32 / columns;
+        let colm = i as i32 % columns;
+        let count = if line == matte_rows - 1 { last_row_count } else { columns };
+        let indent = (sc(216) - ((count - 1) * matte_pitch + matte_w)) / 2;
+        let x = col_x + if count == columns { 0 } else { indent } + colm * matte_pitch;
         controls.push((
             RECT {
                 left: x,
-                top: y + row * sc(38),
-                right: x + sc(104),
-                bottom: y + row * sc(38) + sc(30),
+                top: y + line * row,
+                right: x + matte_w,
+                bottom: y + line * row + chip_h,
             },
             Ctl::Matte(i),
         ));
     }
-    y += ((n_styles as i32 + 1) / 2) * sc(38) + sc(30);
+    y += matte_rows * row + gap_matte;
     let slider_rect = RECT { left: col_x, top: y, right: col_x + sc(216), bottom: y + sc(22) };
     controls.push((slider_rect, Ctl::Slider));
-    y += sc(52);
+    y += gap_slider;
     for i in 0..ASPECTS.len() {
-        let row = i as i32 / 3;
+        let line = i as i32 / 3;
         let colm = i as i32 % 3;
         controls.push((
             RECT {
                 left: col_x + colm * sc(74),
-                top: y + row * sc(38),
+                top: y + line * row,
                 right: col_x + colm * sc(74) + sc(66),
-                bottom: y + row * sc(38) + sc(30),
+                bottom: y + line * row + chip_h,
             },
             Ctl::Aspect(i),
         ));
     }
+    // Crop closes the "shape of the picture" group under the aspect presets,
+    // rather than sitting in the annotation grid where it would be a tenth
+    // chip stranded on a row of its own. Full column width so it reads as the
+    // mode it is, not as one more thing to draw with.
+    // A little air above it so it reads as its own control rather than a third
+    // row of aspect presets. This is the first thing to go when the window is
+    // short, because a slightly tighter group beats a group that does not fit.
+    let crop_y = y + row * 2 + vs(10, 0);
+    controls.push((
+        RECT { left: col_x, top: crop_y, right: col_x + sc(216), bottom: crop_y + chip_h },
+        Ctl::Crop,
+    ));
     // Annotation tools.
-    let tools_y = y + sc(38) * 2 + sc(26);
+    let tools_y = crop_y + row + gap_tools;
     for i in 0..TOOLS.len() {
-        let row = i as i32 / 3;
+        let line = i as i32 / 3;
         let colm = i as i32 % 3;
         controls.push((
             RECT {
                 left: col_x + colm * sc(74),
-                top: tools_y + row * sc(38),
+                top: tools_y + line * row,
                 right: col_x + colm * sc(74) + sc(66),
-                bottom: tools_y + row * sc(38) + sc(30),
+                bottom: tools_y + line * row + chip_h,
             },
             Ctl::Tool(i),
         ));
     }
     let tool_rows = (TOOLS.len() as i32 + 2) / 3;
-    let colors_y = tools_y + sc(38) * tool_rows + sc(8);
+    let colors_y = tools_y + row * tool_rows + gap_colors;
     for i in 0..crate::annotate::COLORS.len() {
         let x = col_x + i as i32 * sc(34);
         controls.push((
@@ -3355,7 +4019,7 @@ fn layout_controls(
             Ctl::Color(i),
         ));
     }
-    let uc_y = colors_y + sc(34);
+    let uc_y = colors_y + row_small;
     controls.push((
         RECT {
             left: col_x + sc(148),
@@ -3377,7 +4041,7 @@ fn layout_controls(
             Ctl::Size(i),
         ));
     }
-    let by = ch - m - sc(30);
+    let by = ch - margin_v - sc(30);
     let output_y = by - sc(114);
     let caption_size_slider = RECT {
         left: col_x + sc(64),
@@ -3503,6 +4167,10 @@ fn build_document(
     Document {
         title,
         raw,
+        crop: None,
+        cropped: None,
+        crop_edit: None,
+        content_dirty: false,
         small,
         preview_metric: scale,
         small_fast,
@@ -3555,6 +4223,10 @@ unsafe fn activate_tab(hwnd: HWND, state: &mut State, index: usize) {
         return;
     }
     cancel_custom_size(state);
+    // The pending crop belongs to the tab being left, and the tool is put away
+    // by the switch, so settle it here or that tab keeps a frame nothing can
+    // ever apply.
+    commit_crop(state);
     release_inactive(state);
     state.active = index;
     state.tool = None;
@@ -3668,8 +4340,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
     }
     let work_w = mi.rcWork.right - mi.rcWork.left;
     let work_h = mi.rcWork.bottom - mi.rcWork.top;
-    let cw = ((work_w as f32 * 0.85) as i32).clamp(sc(760).min(work_w - sc(40)), work_w - sc(40));
-    let ch = ((work_h as f32 * 0.85) as i32).clamp(sc(560).min(work_h - sc(40)), work_h - sc(40));
+    let (cw, ch) = editor_client_size(work_w, work_h, dpi_scale);
 
     let initial_layout = layout_controls(dpi_scale, cw, ch, document.styles.len());
     let mut state = Box::new(State {
@@ -3695,6 +4366,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         custom_size_edit: None,
         copy_hint: None,
         pending_share: None,
+        crop_drag: None,
         font: unsafe { make_font(-sc(14), 400) },
         font_small: unsafe { make_font(-sc(12), 400) },
         scale: dpi_scale,
@@ -3785,10 +4457,11 @@ mod tests {
         apply_text_input, custom_size_axis, custom_size_bounds, custom_size_result,
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
         output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
-        preview_sources, preview_target_edge, redacted, tab_for_digit,
-        tool_after_pick, History, HISTORY_LIMIT,
+        corner_index, crop_contains, crop_drag_for, crop_from_points, move_crop,
+        preview_sources, preview_target_edge, redacted, render_final, resize_crop, tab_for_digit,
+        tool_after_pick, Crop, CropDrag, History, HISTORY_LIMIT,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
-        TOOLS,
+        CROP_TOOL, MIN_CROP, TOOLS,
     };
     use image::{Rgba, RgbaImage};
     use windows::Win32::Foundation::RECT;
@@ -3892,9 +4565,9 @@ mod tests {
         let one = vec![blur((0.0, 0.0), (10.0, 10.0))];
         let two = vec![blur((0.0, 0.0), (10.0, 10.0)), blur((5.0, 5.0), (20.0, 20.0))];
 
-        history.push(&[], 1);
-        history.push(&one, 1);
-        history.push(&two, 3);
+        history.push(&[], 1, None);
+        history.push(&one, 1, None);
+        history.push(&two, 3, None);
         assert_eq!(history.depth(), 3);
 
         // Each undo hands back the state recorded before that edit, newest
@@ -3910,9 +4583,9 @@ mod tests {
     #[test]
     fn a_discarded_step_is_not_undoable() {
         let mut history = History::default();
-        history.push(&[], 1);
+        history.push(&[], 1, None);
         // A click that drew nothing pushes, then takes it back.
-        history.push(&[blur((0.0, 0.0), (1.0, 1.0))], 1);
+        history.push(&[blur((0.0, 0.0), (1.0, 1.0))], 1, None);
         history.discard();
         assert_eq!(history.depth(), 1);
         assert_eq!(history.undo().unwrap().anns.len(), 0);
@@ -3925,7 +4598,7 @@ mod tests {
     fn history_forgets_the_oldest_steps_past_the_limit() {
         let mut history = History::default();
         for n in 0..HISTORY_LIMIT + 10 {
-            history.push(&vec![blur((0.0, 0.0), (1.0, 1.0)); n], 1);
+            history.push(&vec![blur((0.0, 0.0), (1.0, 1.0)); n], 1, None);
         }
         assert_eq!(history.depth(), HISTORY_LIMIT);
         // The newest step survives; the oldest reachable one is the tenth.
@@ -3935,6 +4608,382 @@ mod tests {
             last = step.anns.len();
         }
         assert_eq!(last, 10);
+    }
+
+    /// Screen size to editor client size, through the same rule the window
+    /// creation path uses. Work area is the screen less the taskbar.
+    fn client_for_screen(width: i32, height: i32, scale: f32) -> (i32, i32) {
+        let sc = |v: i32| (v as f32 * scale) as i32;
+        super::editor_client_size(width, height - sc(48), scale)
+    }
+
+    #[test]
+    fn a_roomy_window_is_laid_out_at_natural_spacing() {
+        // Compression is a last resort, not the normal case: a 1440p editor
+        // must be pixel-identical to the uncompressed layout, or every screen
+        // would quietly get the tight one.
+        let (cw, ch) = client_for_screen(2560, 1440, 1.0);
+        let chosen = layout_controls(1.0, cw, ch, 7);
+        let natural = super::layout_column(1.0, cw, ch, 7, 2, 0.0);
+        assert!(
+            chosen
+                .controls
+                .iter()
+                .zip(&natural.controls)
+                .all(|((a, _), (b, _))| a == b),
+            "a roomy window was given the compressed layout"
+        );
+    }
+
+    #[test]
+    fn below_the_supported_floor_controls_still_never_overlap() {
+        // Past 1366x768 the captions above the output block lose their room,
+        // which is cosmetic. Buttons landing on top of each other would not
+        // be, so that is the line that has to hold all the way down.
+        for (screen_w, screen_h, scale) in
+            [(1280, 720, 1.0), (1920, 1080, 1.5), (1024, 768, 1.0)]
+        {
+            let (cw, ch) = client_for_screen(screen_w, screen_h, scale);
+            let layout = layout_controls(scale, cw, ch, 7);
+            let action_top = layout
+                .controls
+                .iter()
+                .filter(|(_, control)| {
+                    matches!(control, Ctl::OutputSize(_) | Ctl::CustomSize)
+                })
+                .map(|(rect, _)| rect.top)
+                .min()
+                .expect("the output-size row exists");
+            assert!(
+                super::column_bottom(&layout.controls) <= action_top,
+                "{screen_w}x{screen_h} @{scale}: the palette overlaps the output block"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_screens_keep_the_wide_matte_chips() {
+        // Narrowing the matte grid buys a row back on a small display, but the
+        // chips have to hold names like "Adaptive". Anything with room keeps
+        // the two-abreast grid, so this is never paid for by an ordinary user.
+        for (screen_w, screen_h, scale) in
+            [(1920, 1080, 1.0), (1920, 1080, 1.25), (2560, 1440, 1.0), (1600, 900, 1.0)]
+        {
+            let (cw, ch) = client_for_screen(screen_w, screen_h, scale);
+            let layout = layout_controls(scale, cw, ch, 7);
+            let widest = layout
+                .controls
+                .iter()
+                .filter(|(_, control)| matches!(control, Ctl::Matte(_)))
+                .map(|(rect, _)| rect.right - rect.left)
+                .max()
+                .expect("matte chips are laid out");
+            assert_eq!(
+                widest,
+                (104.0 * scale) as i32,
+                "{screen_w}x{screen_h} @{scale} lost the wide matte chips"
+            );
+        }
+    }
+
+    #[test]
+    fn section_labels_keep_their_line_even_in_the_tightest_layout() {
+        // Each group is captioned one line pitch above its first control, so
+        // compression must never pull a group up into the row above it.
+        let line = 20;
+        let tight = super::layout_column(1.0, 1161, 676, 7, 3, 1.0);
+        let first = |wanted: fn(&Ctl) -> bool| {
+            tight
+                .controls
+                .iter()
+                .filter(|(_, control)| wanted(control))
+                .map(|(rect, _)| *rect)
+                .min_by_key(|rect| rect.top)
+                .expect("control is laid out")
+        };
+        let matte = first(|c| matches!(c, Ctl::Matte(_)));
+        let aspect = first(|c| matches!(c, Ctl::Aspect(_)));
+        let tool = first(|c| matches!(c, Ctl::Tool(_)));
+        let last_matte = tight
+            .controls
+            .iter()
+            .filter(|(_, c)| matches!(c, Ctl::Matte(_)))
+            .map(|(rect, _)| rect.bottom)
+            .max()
+            .unwrap();
+
+        assert!(matte.top >= tight.tab_strip.bottom + line, "MATTE label has no line");
+        assert!(
+            tight.padding_slider.top >= last_matte + line,
+            "PADDING label runs into the matte chips"
+        );
+        assert!(
+            aspect.top >= tight.padding_slider.bottom + line,
+            "ASPECT label runs into the slider"
+        );
+        // Crop sits between them and is what ANNOTATE has to clear.
+        let crop = first(|c| matches!(c, Ctl::Crop));
+        assert!(tool.top >= crop.bottom + line, "ANNOTATE label runs into the crop button");
+    }
+
+    #[test]
+    fn the_control_column_does_not_collide_with_the_action_block() {
+        // Every screen the editor is expected to look right on. The column
+        // grows downward from the tab strip while Copy/Save/Share are pinned to
+        // the bottom, so anything added in the middle eats the gap between
+        // them — this is what says how much is left.
+        // 1366x768 — the smallest display in common use — is the floor this
+        // holds at. A 720p-sized workspace still keeps every button clear of
+        // every other; what it loses is the two caption lines above the output
+        // block, and buying those back would need matte chips too narrow to
+        // hold a name like "Adaptive".
+        for (screen_w, screen_h, scale) in [
+            (1920, 1080, 1.0),
+            (1920, 1080, 1.25),
+            (2560, 1440, 1.0),
+            (2560, 1440, 1.5),
+            (3840, 2160, 1.5),
+            (3840, 2160, 2.0),
+            (1600, 900, 1.0),
+            (1366, 768, 1.0),
+        ] {
+            let (cw, ch) = client_for_screen(screen_w, screen_h, scale);
+            let layout = layout_controls(scale, cw, ch, 7);
+            let column_bottom = layout
+                .controls
+                .iter()
+                .filter(|(_, control)| {
+                    matches!(control, Ctl::Size(_) | Ctl::Color(_) | Ctl::Clear)
+                })
+                .map(|(rect, _)| rect.bottom)
+                .max()
+                .expect("the palette rows exist");
+            let action_top = layout
+                .controls
+                .iter()
+                .filter(|(_, control)| {
+                    matches!(control, Ctl::OutputSize(_) | Ctl::CustomSize)
+                })
+                .map(|(rect, _)| rect.top)
+                .min()
+                .expect("the output-size row exists");
+            // Two label lines sit above the output block, so the gap has to
+            // clear them rather than merely not overlap.
+            let headroom = super::action_headroom(scale);
+            assert!(
+                column_bottom + headroom <= action_top,
+                "{screen_w}x{screen_h} @{scale}: column ends at {column_bottom}, \
+                 actions start at {action_top} (client {cw}x{ch})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_swept_crop_normalizes_and_stays_inside_the_capture() {
+        // Dragged up and to the left, and off the edge of the capture.
+        let crop = crop_from_points((900.0, 700.0), (-50.0, -30.0), 1000, 800);
+        assert_eq!(crop, Crop { x: 0, y: 0, w: 900, h: 700 });
+
+        let crop = crop_from_points((600.0, 400.0), (2000.0, 2000.0), 1000, 800);
+        assert_eq!(crop, Crop { x: 600, y: 400, w: 400, h: 400 });
+
+        // A flick rather than a drag gives a small crop, not an empty one, and
+        // is nudged back inside rather than hanging off the far edge.
+        let crop = crop_from_points((1000.0, 800.0), (1000.0, 800.0), 1000, 800);
+        assert_eq!((crop.w, crop.h), (MIN_CROP, MIN_CROP));
+        assert_eq!((crop.x + crop.w, crop.y + crop.h), (1000, 800));
+    }
+
+    #[test]
+    fn dragging_a_crop_into_an_edge_stops_it_instead_of_resizing_it() {
+        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        let moved = move_crop(crop, 50.0, -40.0, 1000, 800);
+        assert_eq!(moved, Crop { x: 150, y: 60, w: 400, h: 300 });
+
+        // Pushed hard into the bottom-right: it parks against the edge with
+        // its size intact.
+        let pinned = move_crop(crop, 9000.0, 9000.0, 1000, 800);
+        assert_eq!(pinned, Crop { x: 600, y: 500, w: 400, h: 300 });
+        let pinned = move_crop(crop, -9000.0, -9000.0, 1000, 800);
+        assert_eq!(pinned, Crop { x: 0, y: 0, w: 400, h: 300 });
+    }
+
+    #[test]
+    fn resizing_a_crop_pins_the_opposite_corner_and_survives_crossing_it() {
+        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        // Corner 0 is the top-left; the bottom-right at (500, 400) must not
+        // move while it is dragged.
+        let (resized, held) = resize_crop(crop, 0, (200.0, 250.0), 1000, 800);
+        assert_eq!(resized, Crop { x: 200, y: 250, w: 300, h: 150 });
+        assert_eq!(held, 0);
+
+        // Dragged past the pinned corner, the grabbed handle becomes the
+        // bottom-right one, so the next move still pins (500, 400).
+        let (crossed, held) = resize_crop(crop, 0, (700.0, 600.0), 1000, 800);
+        assert_eq!(crossed, Crop { x: 500, y: 400, w: 200, h: 200 });
+        assert_eq!(held, 2);
+        let (again, _) = resize_crop(crossed, held, (800.0, 700.0), 1000, 800);
+        assert_eq!(again, Crop { x: 500, y: 400, w: 300, h: 300 });
+
+        assert_eq!(corner_index((0.0, 0.0), (10.0, 10.0)), 0);
+        assert_eq!(corner_index((20.0, 0.0), (10.0, 10.0)), 1);
+        assert_eq!(corner_index((20.0, 20.0), (10.0, 10.0)), 2);
+        assert_eq!(corner_index((0.0, 20.0), (10.0, 10.0)), 3);
+    }
+
+    #[test]
+    fn a_press_on_the_crop_picks_the_handle_before_the_interior() {
+        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        // Right on the bottom-right corner, which is also inside the rect: the
+        // handle has to win or a full-frame crop could never be resized.
+        assert!(crop_contains(crop, (500.0, 400.0)));
+        assert!(matches!(
+            crop_drag_for(crop, (498.0, 398.0), 8.0, 1000, 800),
+            CropDrag::Corner(2)
+        ));
+        assert!(matches!(
+            crop_drag_for(crop, (300.0, 250.0), 8.0, 1000, 800),
+            CropDrag::Move(_)
+        ));
+        assert!(matches!(
+            crop_drag_for(crop, (900.0, 700.0), 8.0, 1000, 800),
+            CropDrag::New(_)
+        ));
+    }
+
+    #[test]
+    fn the_first_drag_on_an_uncropped_capture_sweeps_a_new_frame() {
+        // The opening state of the tool. Every point is inside it, so treating
+        // an interior press as a move would make the obvious gesture — drag a
+        // box round what you want — do nothing at all.
+        let full = Crop::full(1000, 800);
+        assert!(matches!(
+            crop_drag_for(full, (400.0, 300.0), 8.0, 1000, 800),
+            CropDrag::New(_)
+        ));
+        // Corners still resize, and once it has been narrowed the interior
+        // moves it again.
+        assert!(matches!(
+            crop_drag_for(full, (2.0, 3.0), 8.0, 1000, 800),
+            CropDrag::Corner(0)
+        ));
+        let narrowed = Crop { x: 0, y: 0, w: 999, h: 800 };
+        assert!(matches!(
+            crop_drag_for(narrowed, (400.0, 300.0), 8.0, 1000, 800),
+            CropDrag::Move(_)
+        ));
+    }
+
+    #[test]
+    fn exporting_a_crop_keeps_the_right_pixels_and_the_annotations_over_them() {
+        // A capture with one marked pixel column, so where it lands in the
+        // export says exactly how the crop was applied.
+        let mut raw = RgbaImage::from_pixel(400, 300, Rgba([0, 0, 0, 255]));
+        for y in 0..300 {
+            raw.put_pixel(250, y, Rgba([0, 255, 0, 255]));
+        }
+        let crop = Crop { x: 200, y: 100, w: 120, h: 90 };
+        let content =
+            image::imageops::crop_imm(&raw, crop.x, crop.y, crop.w, crop.h).to_image();
+        let plain = crate::style::Style {
+            name: "Plain",
+            backdrop: crate::style::Backdrop::Plain,
+        };
+
+        // A blur placed in raw coordinates directly over the marked column,
+        // which the crop's origin puts at content x=50, y=45..55.
+        let anns = vec![blur((245.0, 145.0), (255.0, 155.0))];
+        let exported = render_final(
+            &content,
+            &anns,
+            (crop.x as f32, crop.y as f32),
+            &plain,
+            (0.14, None),
+            1,
+            crate::output::OUTPUT_ORIGINAL,
+        );
+
+        assert_eq!(exported.dimensions(), (120, 90));
+        // The marked column was at raw x=250, so it must survive at x=50.
+        assert_eq!(exported.get_pixel(50, 5)[1], 255);
+        assert_eq!(exported.get_pixel(49, 5)[1], 0);
+        // And the blur landed over that column rather than 200px off the left
+        // edge — where an un-offset annotation would have fallen outside the
+        // cropped image entirely, leaving the column pristine all the way down.
+        assert_ne!(exported.get_pixel(50, 50), &Rgba([0, 255, 0, 255]));
+        assert_eq!(exported.get_pixel(50, 5), &Rgba([0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn an_uncropped_export_is_unchanged_by_the_crop_machinery() {
+        let mut raw = RgbaImage::from_pixel(120, 80, Rgba([10, 20, 30, 255]));
+        raw.put_pixel(7, 9, Rgba([255, 0, 0, 255]));
+        let plain = crate::style::Style {
+            name: "Plain",
+            backdrop: crate::style::Backdrop::Plain,
+        };
+        let exported = render_final(
+            &raw,
+            &[],
+            (0.0, 0.0),
+            &plain,
+            (0.14, None),
+            1,
+            crate::output::OUTPUT_ORIGINAL,
+        );
+        assert_eq!(exported.dimensions(), (120, 80));
+        assert_eq!(exported.get_pixel(7, 9), &Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn a_crop_covering_everything_reads_as_no_crop() {
+        assert!(Crop::full(1000, 800).is_full(1000, 800));
+        assert!(!Crop { x: 0, y: 0, w: 999, h: 800 }.is_full(1000, 800));
+        assert!(!Crop { x: 1, y: 0, w: 999, h: 800 }.is_full(1000, 800));
+    }
+
+    #[test]
+    fn crop_arms_like_a_tool_without_being_one_of_them() {
+        // It rides in `state.tool` so the arm/disarm ladder needs no special
+        // case, but it must never index the palette: nothing iterating TOOLS
+        // can be handed CROP_TOOL, and no annotation ever reports it.
+        assert_eq!(CROP_TOOL, TOOLS.len());
+        assert!(TOOLS.get(CROP_TOOL).is_none());
+        for shape in [
+            Shape::Arrow { from: (0.0, 0.0), to: (1.0, 1.0) },
+            Shape::Text { pos: (0.0, 0.0), text: String::new() },
+            Shape::Freehand { points: vec![(0.0, 0.0)] },
+        ] {
+            assert!(annotation_tool_index(&shape) < CROP_TOOL);
+        }
+    }
+
+    #[test]
+    fn crop_sits_with_the_framing_controls_and_spans_the_column() {
+        let layout = layout_controls(1.0, 1600, 900, 7);
+        let rect = |wanted: Ctl| {
+            layout
+                .controls
+                .iter()
+                .find(|(_, control)| *control == wanted)
+                .map(|(rect, _)| *rect)
+                .expect("control is laid out")
+        };
+        let crop = rect(Ctl::Crop);
+        let last_aspect = rect(Ctl::Aspect(ASPECTS.len() - 1));
+        let first_tool = rect(Ctl::Tool(0));
+
+        // Between the aspect presets and the annotation grid — the group that
+        // decides the shape of the picture, not the marks on it.
+        assert!(crop.top >= last_aspect.bottom, "crop must follow the aspect presets");
+        assert!(crop.bottom <= first_tool.top, "crop must precede the annotation tools");
+        // Full column width, so it reads as its own mode rather than a tenth
+        // chip stranded on a row of three.
+        assert_eq!(crop.left, rect(Ctl::Aspect(0)).left);
+        assert!(
+            crop.right - crop.left > (first_tool.right - first_tool.left) * 2,
+            "the crop button should be visibly wider than a tool chip"
+        );
     }
 
     fn blur(a: (f32, f32), b: (f32, f32)) -> Annotation {
