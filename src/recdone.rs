@@ -896,6 +896,23 @@ fn crop_frame(
 /// While the crop tool is armed the whole recording is on screen, so an edge
 /// that was brought in can be pulled back out; everywhere else it is the crop
 /// that has been applied.
+/// How close a click has to be to a crop corner to take hold of it, in the
+/// normalized units the crop is stored in, from a grab radius in screen pixels.
+///
+/// Measured in screen pixels rather than as a fraction of the source, which is
+/// what the photo editor does. A fraction sounds equivalent and is not: it makes
+/// the target an anisotropic rectangle that shrinks with the clip's aspect, so
+/// the old flat 0.02 gave ~14.6px horizontally but only ~8.2px vertically on a
+/// 16:9 preview, against a handle drawn ~11px wide and DPI-scaled. A click could
+/// land on a lit pixel of the handle and still miss it.
+fn crop_grab_tolerance(content: RECT, grab: i32) -> (f32, f32) {
+    let grab = grab as f32;
+    (
+        grab / ((content.right - content.left) as f32).max(1.0),
+        grab / ((content.bottom - content.top) as f32).max(1.0),
+    )
+}
+
 fn active_crop(state: &State) -> crate::video_edit::Crop {
     if state.crop_edit.is_some() {
         crate::video_edit::Crop::FULL
@@ -2657,8 +2674,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // "Cropped" would be describing something the user cannot see. Kept short
     // because the chip closes the settings row and has no width to spare, and
     // the accent fill already says the tool is armed.
-    let showing = state.crop_edit.unwrap_or(state.crop);
-    let crop_label = if showing != crate::video_edit::Crop::FULL {
+    let crop_label = if state.crop_edit.is_some() {
+        // Pressing it again is the Apply, and until this nothing said so: the
+        // accent fill announced that the tool was armed but never how to
+        // finish. Shorter than "Cropped", so the tight chip still fits it.
+        "Apply"
+    } else if state.crop != crate::video_edit::Crop::FULL {
         "Cropped"
     } else {
         "Crop"
@@ -3012,7 +3033,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
     }
 
-    if let Some(msg) = &state.status {
+    // A tool that arms and then waits has to say what it is waiting for. Both
+    // of these did neither: the chip filled with accent to show it was armed,
+    // and nothing named the gesture that follows or how to finish. A real
+    // status still wins — an export result or an error outranks a reminder.
+    let hint = if state.crop_edit.is_some() {
+        Some("drag to frame \u{00b7} Apply when done \u{00b7} Esc cancels")
+    } else if state.speed_armed {
+        Some("drag across the filmstrip to pick the stretch")
+    } else {
+        None
+    };
+    if let Some(msg) = state.status.as_deref().or(hint) {
         SelectObject(hdc, state.font_small);
         SetTextColor(hdc, state.theme.accent);
         let mut t = wide(msg);
@@ -3677,10 +3709,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // new rectangle rather than trying to move — there is
                         // nowhere for it to go, and "drag a box round the part
                         // you want" is the whole gesture on a fresh crop.
-                        let tolerance = 0.02;
+                        let (tol_x, tol_y) = preview_content_rect(state)
+                            .map(|content| crop_grab_tolerance(content, s(state, 10)))
+                            .unwrap_or((0.02, 0.02));
                         let corner = pending.corners().iter().position(|corner| {
-                            (point.0 - corner.0).abs() <= tolerance
-                                && (point.1 - corner.1).abs() <= tolerance
+                            (point.0 - corner.0).abs() <= tol_x
+                                && (point.1 - corner.1).abs() <= tol_y
                         });
                         state.crop_drag = Some(match corner {
                             Some(index) => CropDrag::Corner(index as u8),
@@ -5351,5 +5385,55 @@ mod tests {
         std::fs::remove_file(mp4).unwrap();
         std::fs::remove_file(gif).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// The grab zone has to be the same size in both directions on screen, at
+    /// every clip shape. Expressed as a flat fraction of the source it was not:
+    /// it stretched with the preview, and on anything wider than it was tall the
+    /// vertical reach fell below the handle actually drawn there.
+    #[test]
+    fn crop_grab_zone_is_square_on_screen_at_any_aspect() {
+        use super::crop_grab_tolerance;
+        use windows::Win32::Foundation::RECT;
+        for (w, h) in [(728, 568), (728, 410), (728, 312), (400, 900)] {
+            let content = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let (tol_x, tol_y) = crop_grab_tolerance(content, 10);
+            // Back into screen pixels, which is where "square" has to hold.
+            let across = tol_x * w as f32;
+            let down = tol_y * h as f32;
+            assert!(
+                (across - 10.0).abs() < 0.01 && (down - 10.0).abs() < 0.01,
+                "{w}x{h}: {across}px across, {down}px down"
+            );
+        }
+    }
+
+    /// The shape it replaced, kept as the reason the function exists: a flat
+    /// fraction reaches much further across a wide preview than down it.
+    #[test]
+    fn a_flat_fraction_would_not_have_been_square() {
+        let (w, h) = (728.0f32, 410.0f32);
+        assert!((0.02 * w - 14.56).abs() < 0.01);
+        assert!((0.02 * h - 8.2).abs() < 0.01);
+    }
+
+    /// A preview collapsed to nothing must not divide by zero.
+    #[test]
+    fn crop_grab_tolerance_survives_an_empty_preview() {
+        use super::crop_grab_tolerance;
+        use windows::Win32::Foundation::RECT;
+        let empty = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let (tol_x, tol_y) = crop_grab_tolerance(empty, 10);
+        assert!(tol_x.is_finite() && tol_y.is_finite());
     }
 }
