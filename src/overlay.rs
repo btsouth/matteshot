@@ -1190,6 +1190,12 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
     // only offer one if it is added by hand — at the top of the z-order, which
     // is where it was drawn. Captured as a frozen crop because the live window
     // is gone by the time anything is clicked.
+    //
+    // Added even when the dismissal timed out. It costs nothing if the flyout
+    // really is still up, because it is then covering that rect and taking
+    // those clicks itself; and if it closes a moment after the cap, this is
+    // what makes the freeze underneath clickable. Leaving it out would instead
+    // highlight whichever window happens to sit behind the flyout in the list.
     if let Some(flyout) = &flyout {
         let rect = clamp_to_overlay(flyout.rect, mrect, mw, mh);
         if rect.right > rect.left && rect.bottom > rect.top {

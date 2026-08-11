@@ -81,8 +81,14 @@ pub fn is_capture_candidate(hwnd: HWND) -> bool {
 /// Windows puts every top-level window in a z-band, and a band outranks
 /// `WS_EX_TOPMOST` absolutely: nothing an ordinary process creates is ever
 /// placed above a window in a higher one. Ordinary windows, the taskbar and
-/// Widgets all sit in `ZBID_DESKTOP`; the shell's flyouts do not.
-const ZBID_DESKTOP: u32 = 1;
+/// Widgets all sit in the desktop band; the shell's flyouts are in the
+/// immersive bands well above it.
+///
+/// The floor is the notification band rather than merely "above the desktop".
+/// `ZBID_UIACCESS` (2) and the immersive input host (3) also outrank a topmost
+/// window, but they belong to accessibility tools and the touch keyboard —
+/// things that must never be sent the Esc meant for a shell flyout.
+const ZBID_IMMERSIVE_NOTIFICATION: u32 = 4;
 
 type GetWindowBandFn = unsafe extern "system" fn(HWND, *mut u32) -> BOOL;
 
@@ -126,7 +132,7 @@ pub fn shell_flyout() -> Option<ShellFlyout> {
     if hwnd.is_invalid() || !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return None;
     }
-    if window_band(hwnd)? <= ZBID_DESKTOP {
+    if window_band(hwnd)? < ZBID_IMMERSIVE_NOTIFICATION {
         return None;
     }
     let mut rect = RECT::default();
@@ -161,6 +167,13 @@ pub fn dismiss_shell_flyout(flyout: &ShellFlyout) -> bool {
             },
         },
     };
+    // The flyout is noted before the freeze, and freezing every monitor takes
+    // long enough for the user to have dismissed it themselves or moved on.
+    // Injecting the key regardless would send an Esc to whichever application
+    // is in front now, cancelling whatever it happened to be doing.
+    if foreground().0 != flyout.hwnd.0 {
+        return true;
+    }
     unsafe {
         SendInput(
             &[escape(KEYBD_EVENT_FLAGS(0)), escape(KEYEVENTF_KEYUP)],
@@ -169,10 +182,12 @@ pub fn dismiss_shell_flyout(flyout: &ShellFlyout) -> bool {
     }
     let deadline = Instant::now() + CAP;
     loop {
-        // Compared against the flyout itself rather than "the foreground is
-        // now band 1": a momentarily null foreground during the handover would
-        // otherwise read as success while the panel is still on screen.
-        if foreground().0 != flyout.hwnd.0 {
+        // Something else has to be genuinely in front, not merely "not the
+        // flyout": the foreground goes briefly null during the handover, and
+        // taking that as success would put the overlay up while the panel is
+        // still on screen and still above it.
+        let front = foreground();
+        if !front.is_invalid() && front.0 != flyout.hwnd.0 {
             return true;
         }
         if Instant::now() >= deadline {

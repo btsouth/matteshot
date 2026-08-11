@@ -628,10 +628,38 @@ fn enter_crop(state: &mut State) {
     state.doc_mut().selected = None;
     state.doc_mut().hover_ann = None;
     state.doc_mut().moving = None;
-    state.crop_drag = None;
+    end_crop_drag(state);
     let (width, height) = state.doc().raw.dimensions();
     let pending = state.doc().crop.unwrap_or(Crop::full(width, height));
     state.doc_mut().crop_edit = Some(pending);
+    invalidate_content(state);
+}
+
+/// End any crop drag in flight and give the mouse back.
+///
+/// The drag takes the capture on button-down, but cropping can be ended by a
+/// key or another control while the button is still held — Esc, Enter, Ctrl+Z,
+/// a tab switch, the Crop button itself. Those paths have to release it too,
+/// or the mouse stays glued to the editor: the matching button-up finds
+/// `crop_drag` already cleared and falls straight through to the control
+/// handler without ever letting go.
+fn end_crop_drag(state: &mut State) {
+    if state.crop_drag.take().is_some() {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+}
+
+/// Arming or leaving the crop tool swaps `content()` between the cropped
+/// pixels and the whole capture, which is what the working bitmaps and the
+/// composite cache are built from. With no crop applied those are the same
+/// image, and rebuilding them costs a full Lanczos resize of the capture for
+/// nothing — so this only fires when there is actually a crop to swap.
+fn invalidate_content(state: &mut State) {
+    if state.doc().crop.is_none() {
+        return;
+    }
     state.doc_mut().content_dirty = true;
     state.doc_mut().base_cache = None;
 }
@@ -643,25 +671,24 @@ fn commit_crop(state: &mut State) {
     let Some(pending) = state.doc_mut().crop_edit.take() else {
         return;
     };
-    state.crop_drag = None;
+    end_crop_drag(state);
     let (width, height) = state.doc().raw.dimensions();
     let pending = (!pending.is_full(width, height)).then_some(pending);
     if pending != state.doc().crop {
         // Recorded against the pre-crop state, which `crop_edit` was masking
         // until the line above cleared it.
         state.doc_mut().push_history();
+        // `set_crop` marks the content dirty itself when it changes anything.
         state.doc_mut().set_crop(pending);
     }
-    state.doc_mut().content_dirty = true;
-    state.doc_mut().base_cache = None;
+    invalidate_content(state);
 }
 
 /// Leave the crop tool without keeping the pending rectangle.
 fn cancel_crop(state: &mut State) {
     if state.doc_mut().crop_edit.take().is_some() {
-        state.crop_drag = None;
-        state.doc_mut().content_dirty = true;
-        state.doc_mut().base_cache = None;
+        end_crop_drag(state);
+        invalidate_content(state);
     }
 }
 
@@ -1110,15 +1137,29 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
 
     // Only the visible content is worth reading: text the crop removed is not
     // in the picture any more, and offering it for selection would be a lie.
-    // The words come back in content coordinates and are shifted to raw ones
-    // on arrival, which is the space the rest of the editor works in.
+    // The words come back in content coordinates and are shifted to raw ones —
+    // the space the rest of the editor works in — here rather than on arrival,
+    // because the crop that made this bitmap is the one that has to undo it and
+    // an undo can change the document's crop while recognition is still
+    // running.
     let raw = state.doc().content().clone();
+    let (ox, oy) = state.doc().content_origin();
     let target = hwnd.0 as isize;
     std::thread::spawn(move || {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
         let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let payload = Box::into_raw(Box::new(
-            crate::ocr::recognize_words(&raw).map_err(|error| format!("{error:#}")),
+            crate::ocr::recognize_words(&raw)
+                .map(|mut words| {
+                    for word in &mut words {
+                        word.rect.0 += ox;
+                        word.rect.1 += oy;
+                        word.rect.2 += ox;
+                        word.rect.3 += oy;
+                    }
+                    words
+                })
+                .map_err(|error| format!("{error:#}")),
         ));
         if com.is_ok() {
             unsafe { CoUninitialize() };
@@ -3201,8 +3242,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
-                if state.crop_drag.take().is_some() {
-                    let _ = ReleaseCapture();
+                if state.crop_drag.is_some() {
+                    end_crop_drag(state);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -3658,7 +3699,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 lparam.0 as *mut std::result::Result<Vec<crate::ocr::Word>, String>,
             );
             if let Some(state) = state_of(hwnd) {
-                let (ox, oy) = state.doc().content_origin();
                 if let Some(select) = state.doc_mut().text_select.as_mut() {
                     // A stale result from a mode the user already left has
                     // nothing to attach to.
@@ -3668,18 +3708,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             Ok(words) if words.is_empty() => {
                                 select.message = Some("no text found in this capture".into());
                             }
-                            Ok(mut words) => {
-                                // Recognized against the cropped content; the
-                                // editor addresses everything in raw-capture
-                                // coordinates.
-                                for word in &mut words {
-                                    word.rect.0 += ox;
-                                    word.rect.1 += oy;
-                                    word.rect.2 += ox;
-                                    word.rect.3 += oy;
-                                }
-                                select.words = words;
-                            }
+                            // Already in raw-capture coordinates: the worker
+                            // applied the crop origin it was launched with,
+                            // which is the one that produced these boxes.
+                            Ok(words) => select.words = words,
                             Err(error) => {
                                 eprintln!("ocr failed: {error}");
                                 select.message =
@@ -4264,6 +4296,13 @@ unsafe fn close_tab(hwnd: HWND, state: &mut State, index: usize) {
         return;
     }
     cancel_custom_size(state);
+    // Closing another tab still puts the tool away, so a crop pending on the
+    // one that survives has to be settled here or it is left armed with no
+    // chip lit and no way to apply it. A crop on the tab being closed goes
+    // with it.
+    if index != state.active {
+        commit_crop(state);
+    }
     state.docs.remove(index);
     if state.docs.is_empty() {
         let _ = DestroyWindow(hwnd);
@@ -4310,6 +4349,11 @@ pub fn open(
                 // A further capture joins the window as its own tab rather
                 // than replacing what is already being edited.
                 cancel_custom_size(state);
+                // Same reason `activate_tab` settles it: the pending crop
+                // belongs to the tab being left and the tool is put away by the
+                // switch, so without this that tab keeps a frame nothing can
+                // ever apply.
+                commit_crop(state);
                 release_inactive(state);
                 state.docs.push(document);
                 state.active = state.docs.len() - 1;

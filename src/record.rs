@@ -655,6 +655,31 @@ fn write_gif(frames: &[(Vec<u8>, u32, u32)], path: &std::path::Path, fps: u32) -
     Ok(())
 }
 
+/// Decode every frame of a staged GIF.
+///
+/// `image::open` stops after the first one, so a file cut short by a full disk
+/// still opens and would be renamed over the destination as a corrupt
+/// recording. Walking the whole animation is what actually proves the write
+/// finished. The frames are stepped through rather than collected: the encoder
+/// still holds the source frames in memory, and gathering a second copy of a
+/// long recording to immediately drop it would double that for nothing.
+fn validate_gif(path: &std::path::Path) -> Result<()> {
+    use image::AnimationDecoder;
+
+    let file = std::fs::File::open(path).context("reopen gif")?;
+    let decoder = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file))
+        .context("read gif header")?;
+    let mut frames = 0usize;
+    for frame in decoder.into_frames() {
+        frame.context("decode gif frame")?;
+        frames += 1;
+    }
+    if frames == 0 {
+        bail!("gif has no frames");
+    }
+    Ok(())
+}
+
 fn partial_gif_path(destination: &std::path::Path, id: u64) -> std::path::PathBuf {
     let parent = destination
         .parent()
@@ -693,7 +718,7 @@ fn publish_gif_with(
     let _ = std::fs::remove_file(&partial);
     let staged = (|| {
         write_gif(frames, &partial, fps).context("encode gif")?;
-        image::open(&partial).context("validate gif")?;
+        validate_gif(&partial).context("validate gif")?;
         Ok(())
     })();
     if let Err(error) = staged {
@@ -947,6 +972,31 @@ mod tests {
         assert!(image::open(&partial).is_ok());
         assert!(!destination.exists());
         std::fs::remove_file(partial).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn a_gif_cut_short_by_a_full_disk_fails_validation() {
+        let dir = temp_dir("gif-truncated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let whole = dir.join("whole.gif");
+        let frames: Vec<(Vec<u8>, u32, u32)> = (0..6)
+            .map(|n| (vec![n * 40, 0, 255 - n * 40, 255], 1, 1))
+            .collect();
+        write_gif(&frames, &whole, DEFAULT_FPS).unwrap();
+        assert!(validate_gif(&whole).is_ok(), "a complete gif must validate");
+
+        // Same file with the tail lost, as a write that ran out of disk would
+        // leave it. The header and first frame survive, which is exactly why
+        // `image::open` was not enough to catch this.
+        let bytes = std::fs::read(&whole).unwrap();
+        let cut = dir.join("cut.gif");
+        std::fs::write(&cut, &bytes[..bytes.len() * 2 / 3]).unwrap();
+        assert!(image::open(&cut).is_ok(), "the weakness this guards is gone");
+        assert!(validate_gif(&cut).is_err(), "a truncated gif must not validate");
+
+        std::fs::remove_file(whole).unwrap();
+        std::fs::remove_file(cut).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
