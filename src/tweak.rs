@@ -920,20 +920,44 @@ fn view_params(state: &State) -> (i32, i32, f32, f32, f32) {
 /// capture so that changing the crop moves the picture under them instead of
 /// invalidating them. The crop origin is what converts between the two.
 fn to_raw(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
-    let (dx, dy, draw_scale, pad_x, pad_y) = view_params(state);
-    let cx = (x - dx) as f32 / draw_scale;
-    let cy = (y - dy) as f32 / draw_scale;
-    let metric = preview_source(state).1;
-    let (ox, oy) = state.doc().content_origin();
-    let rx = (cx - pad_x) / metric + ox;
-    let ry = (cy - pad_y) / metric + oy;
-    let (cw, ch) = state.doc().content().dimensions();
-    let (x0, y0) = (ox, oy);
-    let (x1, y1) = (ox + cw as f32, oy + ch as f32);
+    let (rx, ry) = to_raw_unbounded(state, x, y);
+    let (x0, y0, x1, y1) = content_bounds(state);
     if rx < x0 - 40.0 || ry < y0 - 40.0 || rx > x1 + 40.0 || ry > y1 + 40.0 {
         return None;
     }
     Some((rx.clamp(x0, x1), ry.clamp(y0, y1)))
+}
+
+/// The same mapping with no reject band, pinned to the capture's edges.
+///
+/// A crop drag holds the mouse, so sweeping well past the pane has to keep
+/// tracking: `to_raw` would give up out there and the rectangle would freeze
+/// at wherever it was when the cursor crossed the line, then jump when it came
+/// back. Every crop helper clamps its inputs anyway, so the honest answer for a
+/// point beyond the picture is the edge it is beyond.
+fn to_raw_for_crop(state: &State, x: i32, y: i32) -> (f32, f32) {
+    let (rx, ry) = to_raw_unbounded(state, x, y);
+    let (x0, y0, x1, y1) = content_bounds(state);
+    (rx.clamp(x0, x1), ry.clamp(y0, y1))
+}
+
+/// Window point to raw-capture coordinates, before any decision about whether
+/// it landed on the picture.
+fn to_raw_unbounded(state: &State, x: i32, y: i32) -> (f32, f32) {
+    let (dx, dy, draw_scale, pad_x, pad_y) = view_params(state);
+    let metric = preview_source(state).1;
+    let (ox, oy) = state.doc().content_origin();
+    (
+        ((x - dx) as f32 / draw_scale - pad_x) / metric + ox,
+        ((y - dy) as f32 / draw_scale - pad_y) / metric + oy,
+    )
+}
+
+/// The content's extent in raw-capture coordinates: `(left, top, right, bottom)`.
+fn content_bounds(state: &State) -> (f32, f32, f32, f32) {
+    let (ox, oy) = state.doc().content_origin();
+    let (cw, ch) = state.doc().content().dimensions();
+    (ox, oy, ox + cw as f32, oy + ch as f32)
 }
 
 fn raw_to_screen(state: &State, p: (f32, f32)) -> (i32, i32) {
@@ -2856,31 +2880,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return LRESULT(0);
                 }
                 if let Some(drag) = state.crop_drag {
-                    if let Some(p) = to_raw(state, x, y) {
-                        let (width, height) = state.doc().raw.dimensions();
-                        let Some(pending) = state.doc().crop_edit else {
-                            return LRESULT(0);
-                        };
-                        let (next, drag) = match drag {
-                            CropDrag::New(start) => (
-                                crop_from_points(start, p, width, height),
-                                CropDrag::New(start),
-                            ),
-                            CropDrag::Move(last) => (
-                                move_crop(pending, p.0 - last.0, p.1 - last.1, width, height),
-                                CropDrag::Move(p),
-                            ),
-                            CropDrag::Corner(corner) => {
-                                let (next, held) =
-                                    resize_crop(pending, corner, p, width, height);
-                                (next, CropDrag::Corner(held))
-                            }
-                        };
-                        state.crop_drag = Some(drag);
-                        if state.doc().crop_edit != Some(next) {
-                            state.doc_mut().crop_edit = Some(next);
-                            let _ = InvalidateRect(hwnd, None, false);
+                    // Pinned to the capture's edges rather than abandoned once
+                    // the cursor leaves the picture: the drag owns the mouse,
+                    // so a sweep past the pane has to keep following it.
+                    let p = to_raw_for_crop(state, x, y);
+                    let (width, height) = state.doc().raw.dimensions();
+                    let Some(pending) = state.doc().crop_edit else {
+                        return LRESULT(0);
+                    };
+                    let (next, drag) = match drag {
+                        CropDrag::New(start) => (
+                            crop_from_points(start, p, width, height),
+                            CropDrag::New(start),
+                        ),
+                        CropDrag::Move(last) => (
+                            move_crop(pending, p.0 - last.0, p.1 - last.1, width, height),
+                            CropDrag::Move(p),
+                        ),
+                        CropDrag::Corner(corner) => {
+                            let (next, held) = resize_crop(pending, corner, p, width, height);
+                            (next, CropDrag::Corner(held))
                         }
+                    };
+                    state.crop_drag = Some(drag);
+                    if state.doc().crop_edit != Some(next) {
+                        state.doc_mut().crop_edit = Some(next);
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
                     return LRESULT(0);
                 }
@@ -4977,6 +5002,27 @@ mod tests {
         );
         assert_eq!(exported.dimensions(), (120, 80));
         assert_eq!(exported.get_pixel(7, 9), &Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn a_sweep_past_the_edge_keeps_pinning_the_crop_to_the_capture() {
+        // What the drag path does with a point the cursor has taken well
+        // outside the picture: the helpers clamp, so the rectangle tracks up to
+        // the edge instead of freezing where the cursor crossed it.
+        let far_below_right = crop_from_points((400.0, 300.0), (99_999.0, 99_999.0), 1000, 800);
+        assert_eq!(far_below_right, Crop { x: 400, y: 300, w: 600, h: 500 });
+
+        let far_above_left = crop_from_points((400.0, 300.0), (-99_999.0, -99_999.0), 1000, 800);
+        assert_eq!(far_above_left, Crop { x: 0, y: 0, w: 400, h: 300 });
+
+        // Same for the two drags that adjust an existing frame.
+        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        let (resized, _) = resize_crop(crop, 0, (-5_000.0, -5_000.0), 1000, 800);
+        assert_eq!(resized, Crop { x: 0, y: 0, w: 500, h: 400 });
+        assert_eq!(
+            move_crop(crop, 50_000.0, 50_000.0, 1000, 800),
+            Crop { x: 600, y: 500, w: 400, h: 300 }
+        );
     }
 
     #[test]

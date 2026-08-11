@@ -129,12 +129,18 @@ pub enum Selection {
 }
 
 /// Virtual-screen rect to overlay-local, clipped to the overlay's own bounds.
+///
+/// Every edge is held inside the overlay, not just the one each is likely to
+/// escape from: a rect entirely off one side would otherwise keep a negative
+/// `right` or a `left` past `width` and come back inverted. Callers filter
+/// non-intersecting windows already, so this costs nothing on the real path —
+/// it just stops the answer depending on them having done so.
 fn clamp_to_overlay(r: RECT, bounds: RECT, width: i32, height: i32) -> RECT {
     RECT {
-        left: (r.left - bounds.left).max(0),
-        top: (r.top - bounds.top).max(0),
-        right: (r.right - bounds.left).min(width),
-        bottom: (r.bottom - bounds.top).min(height),
+        left: (r.left - bounds.left).clamp(0, width),
+        top: (r.top - bounds.top).clamp(0, height),
+        right: (r.right - bounds.left).clamp(0, width),
+        bottom: (r.bottom - bounds.top).clamp(0, height),
     }
 }
 
@@ -1455,6 +1461,29 @@ mod tests {
             h,
         );
         assert_eq!(edge, RECT { left: 0, top: 0, right: w, bottom: h });
+
+        // Rects that miss the overlay entirely collapse to an empty edge
+        // rather than coming back inverted, on every side.
+        for outside in [
+            RECT { left: -5000, top: 100, right: -4000, bottom: 700 },
+            RECT { left: 5000, top: 100, right: 6000, bottom: 700 },
+            RECT { left: -1000, top: -3000, right: -200, bottom: -2000 },
+            RECT { left: -1000, top: 3000, right: -200, bottom: 4000 },
+        ] {
+            let clipped = clamp_to_overlay(outside, bounds, w, h);
+            assert!(
+                clipped.left >= 0 && clipped.top >= 0,
+                "{clipped:?} escaped the overlay origin"
+            );
+            assert!(
+                clipped.right <= w && clipped.bottom <= h,
+                "{clipped:?} escaped the overlay extent"
+            );
+            assert!(
+                clipped.right >= clipped.left && clipped.bottom >= clipped.top,
+                "{clipped:?} is inverted"
+            );
+        }
     }
 
     #[test]
