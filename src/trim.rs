@@ -92,29 +92,10 @@ fn content_size_for_encoder(
     (even(cw), even(ch))
 }
 
-/// A normalized crop as a source-pixel rect: `(x, y, width, height)`.
-///
-/// Clamped inside the frame and rounded to even dimensions, because H.264
-/// rejects odd ones — doing it here means a real crop is a straight copy
-/// rather than a copy plus a one-pixel resample.
+/// A normalized crop as a source-pixel rect, from the one definition of that
+/// rounding on `Crop` — the editor reports the same size this encodes.
 fn crop_rect(crop: crate::video_edit::Crop, w: u32, h: u32) -> (u32, u32, u32, u32) {
-    // The whole recording is the whole recording, odd dimensions and all.
-    // Evening it here would shave a pixel off an odd source, report itself as a
-    // crop, and disagree with the preview — which keeps the frame untouched for
-    // `FULL`. The encoder evens its own input further down regardless.
-    if crop == crate::video_edit::Crop::FULL {
-        return (0, 0, w, h);
-    }
-    let even = |v: u32| (v.max(2)) & !1;
-    let span = |origin: f32, size: f32, limit: u32| {
-        let limit_f = limit as f32;
-        let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
-        let size = even(((size * limit_f).round().clamp(2.0, limit_f)) as u32);
-        (origin.min(limit.saturating_sub(size)), size)
-    };
-    let (x, width) = span(crop.x, crop.w, w);
-    let (y, height) = span(crop.y, crop.h, h);
-    (x, y, width, height)
+    crop.pixel_rect(w, h)
 }
 
 /// Copy a sub-rect out of a tightly packed BGRA frame.

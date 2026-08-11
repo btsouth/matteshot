@@ -99,6 +99,33 @@ impl Crop {
         Crop { x, y, w, h }
     }
 
+    /// The crop as a source-pixel rect: `(x, y, width, height)`.
+    ///
+    /// The one definition of that rounding. The editor reports this size and
+    /// the export encodes it, and when they each rounded for themselves they
+    /// disagreed by a pixel on odd sources — the readout promised 161 and the
+    /// file held 160.
+    ///
+    /// Real crops are evened because H.264 rejects odd dimensions. `FULL` is
+    /// returned untouched: the whole recording is the whole recording, and
+    /// evening it there would shave a pixel off an odd source and report
+    /// itself as a crop. The encoder evens its own input regardless.
+    pub fn pixel_rect(self, width: u32, height: u32) -> (u32, u32, u32, u32) {
+        if self == Crop::FULL {
+            return (0, 0, width, height);
+        }
+        let even = |v: u32| (v.max(2)) & !1;
+        let span = |origin: f32, size: f32, limit: u32| {
+            let limit_f = limit as f32;
+            let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
+            let size = even((size * limit_f).round().clamp(2.0, limit_f) as u32);
+            (origin.min(limit.saturating_sub(size)), size)
+        };
+        let (x, w) = span(self.x, self.w, width);
+        let (y, h) = span(self.y, self.h, height);
+        (x, y, w, h)
+    }
+
     /// Slide the crop without letting it leave the recording. The size never
     /// changes, so dragging into an edge stops rather than shrinking.
     pub fn moved(self, dx: f32, dy: f32) -> Crop {
@@ -528,6 +555,32 @@ mod tests {
             caption_style: CaptionStyle::Shadow,
             caption_box_opacity: 0.68,
         }
+    }
+
+    #[test]
+    fn the_pixel_rect_is_what_both_the_editor_and_the_encoder_get() {
+        // The whole recording is handed back untouched, odd dimensions and
+        // all: evening it here would shave a pixel off an odd source and
+        // report itself as a crop.
+        assert_eq!(Crop::FULL.pixel_rect(1920, 1080), (0, 0, 1920, 1080));
+        assert_eq!(Crop::FULL.pixel_rect(321, 241), (0, 0, 321, 241));
+
+        // A real crop is evened, because H.264 rejects odd dimensions — and
+        // this is the only place that decides it, so the size the editor shows
+        // is the size the export encodes. Half of 321 rounds to 161, which
+        // must come back as 160 rather than the editor promising a pixel the
+        // encoder was never going to keep.
+        let (x, y, w, h) = Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(321, 241);
+        assert_eq!((x, y), (0, 0));
+        assert_eq!((w, h), (160, 120));
+        assert_eq!((w % 2, h % 2), (0, 0));
+
+        // Never hanging off an edge, however the floats round.
+        let (x, y, w, h) = Crop { x: 0.9, y: 0.9, w: 0.2, h: 0.2 }.pixel_rect(641, 481);
+        assert!(x + w <= 641 && y + h <= 481, "crop {x},{y} {w}x{h} left the frame");
+        // And always something encodable.
+        let (_, _, w, h) = Crop { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }.pixel_rect(320, 240);
+        assert!(w >= 2 && h >= 2);
     }
 
     #[test]

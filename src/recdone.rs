@@ -873,6 +873,21 @@ fn active_crop(state: &State) -> crate::video_edit::Crop {
     }
 }
 
+/// End any crop drag in flight and give the mouse back.
+///
+/// The drag takes the capture on button-down, but cropping can be ended by a
+/// key while the button is still held — Esc, Enter, Del — and by the chip and
+/// every other control. Those paths have to release it too, or the mouse stays
+/// glued to the editor: the matching button-up finds `crop_drag` already
+/// cleared and returns without ever letting go.
+fn end_crop_drag(state: &mut State) {
+    if state.crop_drag.take().is_some() {
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+        }
+    }
+}
+
 /// Arm the crop tool: the whole recording comes back with the current crop
 /// drawn over it.
 fn enter_crop(state: &mut State) {
@@ -882,7 +897,7 @@ fn enter_crop(state: &mut State) {
     // The drawer is hit-tested before the preview, so leaving it open would
     // cover part of the crop rectangle and eat the clicks meant for it.
     state.tools_open = false;
-    state.crop_drag = None;
+    end_crop_drag(state);
     state.crop_edit = Some(state.crop);
     recompose_preview(state);
     refresh_matte_thumbs(state);
@@ -894,7 +909,7 @@ fn commit_crop(state: &mut State) {
     let Some(pending) = state.crop_edit.take() else {
         return;
     };
-    state.crop_drag = None;
+    end_crop_drag(state);
     if pending != state.crop {
         push_undo(state);
         state.crop = pending;
@@ -906,7 +921,7 @@ fn commit_crop(state: &mut State) {
 /// Leave the crop tool without keeping the pending rectangle.
 fn cancel_crop(state: &mut State) {
     if state.crop_edit.take().is_some() {
-        state.crop_drag = None;
+        end_crop_drag(state);
         recompose_preview(state);
         refresh_matte_thumbs(state);
     }
@@ -1388,12 +1403,13 @@ fn cropped_source_size(state: &State) -> (u32, u32) {
     cropped_source_size_for(state, active_crop(state))
 }
 
+/// What the export will actually produce, through the same rounding it uses.
+/// Deriving it separately had the readout promising a pixel the encoder was
+/// never going to keep.
 fn cropped_source_size_for(state: &State, crop: crate::video_edit::Crop) -> (u32, u32) {
     let (width, height) = (state.source_size.0.max(1), state.source_size.1.max(1));
-    (
-        ((width as f32 * crop.w).round() as u32).max(1),
-        ((height as f32 * crop.h).round() as u32).max(1),
-    )
+    let (_, _, kept_w, kept_h) = crop.pixel_rect(width, height);
+    (kept_w.max(1), kept_h.max(1))
 }
 
 fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
@@ -3757,8 +3773,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 // The crop drag holds the capture, so it has to give it back
                 // here as well as on the paths that end cropping by key.
-                if state.crop_drag.take().is_some() {
-                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                if state.crop_drag.is_some() {
+                    end_crop_drag(state);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
