@@ -564,6 +564,47 @@ mod tests {
         }
     }
 
+    /// The rule both editors implement for ending a crop drag, in the small
+    /// form that can actually be exercised: a drag owes a button-up, and
+    /// whatever ends it — the button, or a key while the button is still down
+    /// — that up belongs to the drag and must go no further. Missing it lets
+    /// the up land as a fresh click on whatever sits under the cursor.
+    fn end_drag(dragging: &mut bool, owed: &mut bool) {
+        if std::mem::take(dragging) {
+            *owed = true;
+        }
+    }
+
+    fn take_click(dragging: &mut bool, owed: &mut bool) -> bool {
+        let was_dragging = *dragging;
+        if was_dragging {
+            end_drag(dragging, owed);
+        }
+        std::mem::take(owed) || was_dragging
+    }
+
+    #[test]
+    fn a_drag_ended_by_a_key_still_swallows_its_button_up() {
+        // Ended by the button: the up is the drag's own.
+        let (mut dragging, mut owed) = (true, false);
+        assert!(take_click(&mut dragging, &mut owed));
+        assert!(!dragging && !owed, "nothing should be left owing");
+
+        // Ended by Esc/Enter/Del mid-drag, then the up arrives: still the
+        // drag's, and consumed exactly once.
+        let (mut dragging, mut owed) = (true, false);
+        end_drag(&mut dragging, &mut owed);
+        assert!(owed, "a key that ends a live drag leaves an up owing");
+        assert!(take_click(&mut dragging, &mut owed));
+        assert!(!take_click(&mut dragging, &mut owed), "consumed twice");
+
+        // A key pressed with no drag in flight owes nothing, so an unrelated
+        // click afterwards is not swallowed.
+        let (mut dragging, mut owed) = (false, false);
+        end_drag(&mut dragging, &mut owed);
+        assert!(!take_click(&mut dragging, &mut owed));
+    }
+
     #[test]
     fn the_pixel_rect_is_what_both_the_editor_and_the_encoder_get() {
         // The whole recording is handed back untouched, odd dimensions and

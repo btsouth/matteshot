@@ -331,6 +331,8 @@ struct State {
     padding_slider: RECT,
     aspect_controls: Vec<(RECT, usize)>,
     crop_control: RECT,
+    /// A button-up is still owed to a crop drag that a key already ended.
+    crop_click_owed: bool,
     /// The crop being adjusted. While it is set the preview shows the whole
     /// recording, which is the only way to pull an edge back out.
     crop_edit: Option<crate::video_edit::Crop>,
@@ -890,19 +892,32 @@ fn active_crop(state: &State) -> crate::video_edit::Crop {
     }
 }
 
-/// End any crop drag in flight and give the mouse back.
+/// End any crop drag in flight: give the mouse back, and see off the
+/// button-up that is still coming.
 ///
-/// The drag takes the capture on button-down, but cropping can be ended by a
-/// key while the button is still held — Esc, Enter, Del — and by the chip and
-/// every other control. Those paths have to release it too, or the mouse stays
-/// glued to the editor: the matching button-up finds `crop_drag` already
-/// cleared and returns without ever letting go.
+/// A drag can be ended by the button coming up, or by a key while it is still
+/// held — Esc, Enter, Del — or by any control. Each of those has to do two
+/// things, and forgetting either has its own failure. Not releasing the capture
+/// glues the mouse to the editor. Releasing without remembering that an up is
+/// still owed lets that up fall through as a fresh click on whatever sits under
+/// the cursor. Both belong here rather than at each exit.
 fn end_crop_drag(state: &mut State) {
     if state.crop_drag.take().is_some() {
+        state.crop_click_owed = true;
         unsafe {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
         }
     }
+}
+
+/// Consume a button-up that belongs to a crop drag, however that drag ended.
+/// True when the up was the drag's own and must go no further.
+fn take_crop_click(state: &mut State) -> bool {
+    let dragging = state.crop_drag.is_some();
+    if dragging {
+        end_crop_drag(state);
+    }
+    std::mem::take(&mut state.crop_click_owed) || dragging
 }
 
 /// Arm the crop tool: the whole recording comes back with the current crop
@@ -3793,10 +3808,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                // The crop drag holds the capture, so it has to give it back
-                // here as well as on the paths that end cropping by key.
-                if state.crop_drag.is_some() {
-                    end_crop_drag(state);
+                // The up belongs to the crop drag whether the drag ended here or
+                // was already ended by a key; either way it goes no further.
+                if take_crop_click(state) {
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -4630,6 +4644,7 @@ pub fn show(
         crop_control: initial.crop_control,
         crop_edit: None,
         crop_drag: None,
+        crop_click_owed: false,
         annotations: Vec::new(),
         speed_ranges: Vec::new(),
         selected_speed: None,

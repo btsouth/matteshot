@@ -498,6 +498,8 @@ struct State {
     /// because, like the slider drags, it belongs to the mouse rather than to
     /// the picture.
     crop_drag: Option<CropDrag>,
+    /// A button-up is still owed to a crop drag that a key already ended.
+    crop_click_owed: bool,
     /// Caret blink phase while editing; one timer serves the window.
     caret_on: bool,
     font: HFONT,
@@ -645,10 +647,26 @@ fn enter_crop(state: &mut State) {
 /// handler without ever letting go.
 fn end_crop_drag(state: &mut State) {
     if state.crop_drag.take().is_some() {
+        state.crop_click_owed = true;
         unsafe {
             let _ = ReleaseCapture();
         }
     }
+}
+
+/// Consume a button-up that belongs to a crop drag, however that drag ended.
+///
+/// Ending a drag has two obligations, and each has its own failure: not
+/// releasing the capture glues the mouse to the editor, and releasing without
+/// remembering that an up is still owed lets that up fall through as a fresh
+/// click on whatever sits under the cursor. True when the up was the drag's own
+/// and must go no further.
+fn take_crop_click(state: &mut State) -> bool {
+    let dragging = state.crop_drag.is_some();
+    if dragging {
+        end_crop_drag(state);
+    }
+    std::mem::take(&mut state.crop_click_owed) || dragging
 }
 
 /// Arming or leaving the crop tool swaps `content()` between the cropped
@@ -3267,8 +3285,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
-                if state.crop_drag.is_some() {
-                    end_crop_drag(state);
+                // The up belongs to the crop drag whether the drag ended here
+                // or was already ended by a key; either way it goes no further.
+                if take_crop_click(state) {
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -4440,6 +4459,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         copy_hint: None,
         pending_share: None,
         crop_drag: None,
+        crop_click_owed: false,
         font: unsafe { make_font(-sc(14), 400) },
         font_small: unsafe { make_font(-sc(12), 400) },
         scale: dpi_scale,
