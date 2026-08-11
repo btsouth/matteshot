@@ -3063,6 +3063,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                // Settled before anything else, because several controls below
+                // act on button-down and return: a drag ended by a key and
+                // released outside the window leaves an up that never arrives,
+                // and carrying that debt past here would let it swallow the
+                // release of whatever this press starts.
+                state.crop_click_owed = false;
                 // Tabs first: they sit above everything else.
                 if in_rect(&state.tab_strip, x, y) {
                     if let Some((index, tab)) = tab_rects(state)
@@ -3882,6 +3888,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let s = crate::dpi::scale_for_window(hwnd);
                 (*mmi).ptMinTrackSize.x = (760.0 * s) as i32;
                 (*mmi).ptMinTrackSize.y = (620.0 * s) as i32;
+            }
+            LRESULT(0)
+        }
+        // Alt+Tab or a system dialog can take the capture away mid-drag.
+        // Without this the pending rectangle keeps following a cursor with no
+        // button held, and the up that would have ended it never arrives.
+        windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
+            if let Some(state) = state_of(hwnd) {
+                if state.crop_drag.take().is_some() {
+                    state.crop_click_owed = false;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }

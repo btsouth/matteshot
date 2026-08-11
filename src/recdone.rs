@@ -1362,6 +1362,12 @@ fn push_undo(state: &mut State) {
 }
 
 fn undo(state: &mut State) {
+    // A live drag holds an index into `annotations`. Swapping the vector out
+    // underneath it would leave the rest of the drag moving whichever
+    // annotation happened to land at that index.
+    if state.dragging.is_some() || state.crop_drag.is_some() {
+        return;
+    }
     if let Some(previous) = state.undo.pop() {
         state.annotations = previous.annotations;
         state.speed_ranges = previous.speed_ranges;
@@ -1465,6 +1471,22 @@ fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
 fn screen_to_preview_clamped(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
     let rect = preview_content_rect(state)?;
     Some(preview_point(state, rect, x, y))
+}
+
+/// A recording coordinate back as a fraction of the picture on screen — the
+/// inverse of `preview_point`, and the only way anything should go that way.
+///
+/// The two directions are a pair: whatever the crop does to one it must undo
+/// on the other, and having them written apart is how the selection outline
+/// came to be drawn where its shape was not.
+fn preview_across(state: &State, x: f32) -> f32 {
+    let crop = active_crop(state);
+    ((x - crop.x) / crop.w.max(f32::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn preview_down(state: &State, y: f32) -> f32 {
+    let crop = active_crop(state);
+    ((y - crop.y) / crop.h.max(f32::EPSILON)).clamp(0.0, 1.0)
 }
 
 fn preview_point(state: &State, rect: RECT, x: i32, y: i32) -> (f32, f32) {
@@ -2128,13 +2150,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     .unwrap_or_else(|| preview_image_rect(state, frame));
                 let (x0, y0, x1, y1) =
                     crate::video_edit::bounds(item, annotation_frame(state));
+                // `bounds` is in the recording's coordinates, so it has to come
+                // back through the crop — the exact inverse of `preview_point`.
+                // Multiplying it straight into the picture on screen drew the
+                // outline and its handles somewhere the shape was not, and left
+                // the real (crop-correct) handles invisible but clickable.
                 let map_x = |x: f32| {
-                    image_rect.left
-                        + (x.clamp(0.0, 1.0) * (image_rect.right - image_rect.left) as f32) as i32
+                    let across = preview_across(state, x);
+                    image_rect.left + (across * (image_rect.right - image_rect.left) as f32) as i32
                 };
                 let map_y = |y: f32| {
-                    image_rect.top
-                        + (y.clamp(0.0, 1.0) * (image_rect.bottom - image_rect.top) as f32) as i32
+                    let down = preview_down(state, y);
+                    image_rect.top + (down * (image_rect.bottom - image_rect.top) as f32) as i32
                 };
                 let pen = CreatePen(windows::Win32::Graphics::Gdi::PS_DOT, 1, state.theme.accent);
                 let old_pen = SelectObject(hdc, pen);
@@ -3428,6 +3455,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                // Settled before anything else, because several controls below
+                // act on button-down and return: a drag ended by a key and
+                // released outside the window leaves an up that never arrives,
+                // and carrying that debt past here would let it swallow the
+                // release of whatever this press starts.
+                state.crop_click_owed = false;
                 // Clicking anywhere accepts the current caption, returns to
                 // Select, and then continues handling that same click. Enter
                 // remains a convenient shortcut, never a requirement.
@@ -3632,10 +3665,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
                 // Cropping owns the preview while it is armed: nothing is drawn
                 // or selected until the frame is settled.
-                // A fresh press settles any up still owed from a drag that was
-                // ended by a key and released outside the window: that up is
-                // never coming, and holding the debt would swallow this click.
-                state.crop_click_owed = false;
                 // Cropping owns the preview, but only the preview: returning
                 // for every click would leave the padding slider and anything
                 // else that acts on button-down dead until the frame is
@@ -4306,6 +4335,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
                         }
+                        // Ctrl+Z means "undo the frame I am drawing". Letting it
+                        // reach the editor's undo restored a crop the armed
+                        // preview cannot show, and putting the tool away then
+                        // re-applied the pending one over the top of it.
+                        key if key == 0x5A
+                            && windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+                                VK_CONTROL.0 as i32,
+                            ) < 0 =>
+                        {
+                            cancel_crop(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
                         // Cropping swallows every preview click, so an
                         // annotation tool armed from here could never draw:
                         // the chip would light up and nothing would happen.
@@ -4342,6 +4384,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     key if key == VK_SPACE.0 => {
                         if state.text_entry.is_none() {
+                            // Settles the frame first, as the Play chip does.
+                            // Otherwise the same gesture gets two answers, and
+                            // playback runs the whole recording underneath a
+                            // crop overlay that says otherwise.
+                            commit_crop(state);
                             toggle_playback(hwnd, state);
                         }
                     }
@@ -4502,6 +4549,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 (*mmi).ptMinTrackSize.x = outer.right - outer.left;
                 (*mmi).ptMinTrackSize.y = outer.bottom - outer.top;
+            }
+            LRESULT(0)
+        }
+        // Alt+Tab or a system dialog can take the capture away mid-drag.
+        // Without this the pending rectangle keeps following a cursor with no
+        // button held, and the up that would have ended it never arrives.
+        windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
+            if let Some(state) = state_of(hwnd) {
+                if state.crop_drag.take().is_some() {
+                    state.crop_click_owed = false;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }
