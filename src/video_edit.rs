@@ -116,6 +116,13 @@ impl Crop {
         }
         let even = |v: u32| (v.max(2)) & !1;
         let span = |origin: f32, size: f32, limit: u32| {
+            // An axis with fewer pixels than the even minimum keeps all of
+            // them. Asking for two out of one is not merely wrong: the clamp
+            // below would be given a floor above its ceiling, and `f32::clamp`
+            // panics on that rather than picking one.
+            if limit < 2 {
+                return (0, limit);
+            }
             let limit_f = limit as f32;
             let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
             let size = even((size * limit_f).round().clamp(2.0, limit_f) as u32);
@@ -574,6 +581,21 @@ mod tests {
         assert_eq!((x, y), (0, 0));
         assert_eq!((w, h), (160, 120));
         assert_eq!((w % 2, h % 2), (0, 0));
+
+        // A source with fewer pixels than the even minimum keeps what it has.
+        // Two out of one is not just wrong: it asks `f32::clamp` for a floor
+        // above its ceiling, which panics.
+        for limit in [0u32, 1, 2, 3] {
+            let (x, y, w, h) =
+                Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(limit, limit);
+            assert!(
+                x + w <= limit && y + h <= limit,
+                "a {limit}px source gave {w}x{h} at {x},{y}"
+            );
+        }
+        // Two pixels is the first size that can satisfy the even minimum.
+        assert_eq!(Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(1, 1), (0, 0, 1, 1));
+        assert_eq!(Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(2, 2), (0, 0, 2, 2));
 
         // Never hanging off an edge, however the floats round.
         let (x, y, w, h) = Crop { x: 0.9, y: 0.9, w: 0.2, h: 0.2 }.pixel_rect(641, 481);

@@ -3539,6 +3539,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Delete / Backspace: back to the whole capture, ready
                         // to apply as "no crop" or to re-frame from scratch.
                         0x2E | 0x08 => {
+                            // Ends the drag too: leaving it live would hold
+                            // the capture and let the next mouse move resize
+                            // the frame that was just reset.
+                            end_crop_drag(state);
                             let (width, height) = state.doc().raw.dimensions();
                             state.doc_mut().crop_edit = Some(Crop::full(width, height));
                             let _ = InvalidateRect(hwnd, None, false);

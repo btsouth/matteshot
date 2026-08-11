@@ -4193,6 +4193,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Back to the whole recording, ready to apply as "no
                         // crop" or to re-frame from scratch.
                         key if key == VK_DELETE.0 || key == 0x08 => {
+                            end_crop_drag(state);
                             state.crop_edit = Some(crate::video_edit::Crop::FULL);
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
