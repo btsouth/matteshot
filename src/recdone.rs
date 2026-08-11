@@ -879,6 +879,9 @@ fn enter_crop(state: &mut State) {
     commit_text(state);
     state.selected = None;
     state.tool = None;
+    // The drawer is hit-tested before the preview, so leaving it open would
+    // cover part of the crop rectangle and eat the clicks meant for it.
+    state.tools_open = false;
     state.crop_drag = None;
     state.crop_edit = Some(state.crop);
     recompose_preview(state);
@@ -2578,7 +2581,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
             let op = SelectObject(hdc, edge);
             for corner in pending.corners() {
                 let (hx, hy) = at(corner.0, corner.1);
-                let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, hx - 5, hy - 5, hx + 6, hy + 6);
+                let grab = s(state, 5);
+                let _ = windows::Win32::Graphics::Gdi::Rectangle(
+                    hdc,
+                    hx - grab,
+                    hy - grab,
+                    hx + grab + 1,
+                    hy + grab + 1,
+                );
             }
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
@@ -3829,6 +3839,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .iter()
                     .position(|(r, ..)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
                 {
+                    // Any action settles a pending crop first, so Export edit
+                    // produces the frame that is on screen rather than the last
+                    // committed one — the same rule the photo editor uses for
+                    // Copy and Save.
+                    commit_crop(state);
                     match state.controls[i].1 {
                         Act::Play => toggle_playback(hwnd, state),
                         Act::Reveal => crate::output::reveal_in_explorer(&state.mp4),
@@ -4158,6 +4173,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
                         }
+                        // Cropping swallows every preview click, so an
+                        // annotation tool armed from here could never draw:
+                        // the chip would light up and nothing would happen.
+                        // A/R/T/B/P, the tool shortcuts handled below.
+                        0x41 | 0x52 | 0x54 | 0x42 | 0x50 => return LRESULT(0),
                         _ => {}
                     }
                 }

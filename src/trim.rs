@@ -95,9 +95,16 @@ fn content_size_for_encoder(
 /// A normalized crop as a source-pixel rect: `(x, y, width, height)`.
 ///
 /// Clamped inside the frame and rounded to even dimensions, because H.264
-/// rejects odd ones — doing it here means the untouched case stays a true
-/// no-op rather than paying for a one-pixel resize on the way through.
+/// rejects odd ones — doing it here means a real crop is a straight copy
+/// rather than a copy plus a one-pixel resample.
 fn crop_rect(crop: crate::video_edit::Crop, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    // The whole recording is the whole recording, odd dimensions and all.
+    // Evening it here would shave a pixel off an odd source, report itself as a
+    // crop, and disagree with the preview — which keeps the frame untouched for
+    // `FULL`. The encoder evens its own input further down regardless.
+    if crop == crate::video_edit::Crop::FULL {
+        return (0, 0, w, h);
+    }
     let even = |v: u32| (v.max(2)) & !1;
     let span = |origin: f32, size: f32, limit: u32| {
         let limit_f = limit as f32;
@@ -889,7 +896,9 @@ pub fn cut_with_speed_edit_progress_cancel(
     let downscaled = (cw, ch) != (crop_w, crop_h);
     if downscaled {
         crate::diagnostics::log("export content scaled down to stay encodable");
-        eprintln!("export: content {w}x{h} -> {cw}x{ch} so the framed result fits H.264");
+        eprintln!(
+            "export: content {crop_w}x{crop_h} -> {cw}x{ch} so the framed result fits H.264"
+        );
     }
     let matte_base = matte
         .map(|style| crate::compose::compose_base(cw as usize, ch as usize, style, &matte_opts));
@@ -1351,6 +1360,10 @@ mod tests {
         // Even dimensions because H.264 rejects odd ones, and never hanging
         // off an edge however the floats round.
         assert_eq!(crop_rect(crate::video_edit::Crop::FULL, 1920, 1080), (0, 0, 1920, 1080));
+        // An odd source is left exactly alone. Evening it here would shave a
+        // pixel, report itself as a crop, and disagree with the preview, which
+        // keeps the frame untouched for FULL.
+        assert_eq!(crop_rect(crate::video_edit::Crop::FULL, 321, 241), (0, 0, 321, 241));
         assert_eq!(
             crop_rect(crate::video_edit::Crop { x: 0.5, y: 0.0, w: 0.5, h: 1.0 }, 320, 240),
             (160, 0, 160, 240)
