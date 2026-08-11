@@ -498,6 +498,8 @@ struct State {
     /// because, like the slider drags, it belongs to the mouse rather than to
     /// the picture.
     crop_drag: Option<CropDrag>,
+    /// A button-up is still owed to a crop drag that a key already ended.
+    crop_click_owed: bool,
     /// Caret blink phase while editing; one timer serves the window.
     caret_on: bool,
     font: HFONT,
@@ -645,10 +647,26 @@ fn enter_crop(state: &mut State) {
 /// handler without ever letting go.
 fn end_crop_drag(state: &mut State) {
     if state.crop_drag.take().is_some() {
+        state.crop_click_owed = true;
         unsafe {
             let _ = ReleaseCapture();
         }
     }
+}
+
+/// Consume a button-up that belongs to a crop drag, however that drag ended.
+///
+/// Ending a drag has two obligations, and each has its own failure: not
+/// releasing the capture glues the mouse to the editor, and releasing without
+/// remembering that an up is still owed lets that up fall through as a fresh
+/// click on whatever sits under the cursor. True when the up was the drag's own
+/// and must go no further.
+fn take_crop_click(state: &mut State) -> bool {
+    let dragging = state.crop_drag.is_some();
+    if dragging {
+        end_crop_drag(state);
+    }
+    std::mem::take(&mut state.crop_click_owed) || dragging
 }
 
 /// Arming or leaving the crop tool swaps `content()` between the cropped
@@ -1987,7 +2005,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 // Says what it will do rather than what it is called: with a
                 // crop already applied, the button is how you get back to the
                 // whole capture.
-                let label = if state.doc().crop.is_some() { "Crop \u{00b7} adjust" } else { "Crop" };
+                // Reads the frame on screen, not the committed one: pressing
+                // Del while armed shows the whole capture again, and a chip
+                // still saying "adjust" would describe something the user can
+                // no longer see.
+                let showing = match (state.doc().crop_edit, state.doc().crop) {
+                    (Some(pending), _) => {
+                        let (width, height) = state.doc().raw.dimensions();
+                        (!pending.is_full(width, height)).then_some(pending)
+                    }
+                    (None, committed) => committed,
+                };
+                let label = if showing.is_some() { "Crop \u{00b7} adjust" } else { "Crop" };
                 chip(hdc, *r, label, state, state.tool == Some(CROP_TOOL), hot)
             }
             Ctl::Tool(n) => {
@@ -3034,6 +3063,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                // Settled before anything else, because several controls below
+                // act on button-down and return: a drag ended by a key and
+                // released outside the window leaves an up that never arrives,
+                // and carrying that debt past here would let it swallow the
+                // release of whatever this press starts.
+                state.crop_click_owed = false;
                 // Tabs first: they sit above everything else.
                 if in_rect(&state.tab_strip, x, y) {
                     if let Some((index, tab)) = tab_rects(state)
@@ -3267,8 +3302,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
-                if state.crop_drag.is_some() {
-                    end_crop_drag(state);
+                // The up belongs to the crop drag whether the drag ended here
+                // or was already ended by a key; either way it goes no further.
+                if take_crop_click(state) {
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -3539,6 +3575,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Delete / Backspace: back to the whole capture, ready
                         // to apply as "no crop" or to re-frame from scratch.
                         0x2E | 0x08 => {
+                            // Ends the drag too: leaving it live would hold
+                            // the capture and let the next mouse move resize
+                            // the frame that was just reset.
+                            end_crop_drag(state);
                             let (width, height) = state.doc().raw.dimensions();
                             state.doc_mut().crop_edit = Some(Crop::full(width, height));
                             let _ = InvalidateRect(hwnd, None, false);
@@ -3848,6 +3888,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let s = crate::dpi::scale_for_window(hwnd);
                 (*mmi).ptMinTrackSize.x = (760.0 * s) as i32;
                 (*mmi).ptMinTrackSize.y = (620.0 * s) as i32;
+            }
+            LRESULT(0)
+        }
+        // Alt+Tab or a system dialog can take the capture away mid-drag.
+        // Without this the pending rectangle keeps following a cursor with no
+        // button held, and the up that would have ended it never arrives.
+        windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
+            if let Some(state) = state_of(hwnd) {
+                if state.crop_drag.take().is_some() {
+                    state.crop_click_owed = false;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }
@@ -4436,6 +4488,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         copy_hint: None,
         pending_share: None,
         crop_drag: None,
+        crop_click_owed: false,
         font: unsafe { make_font(-sc(14), 400) },
         font_small: unsafe { make_font(-sc(12), 400) },
         scale: dpi_scale,

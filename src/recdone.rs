@@ -259,6 +259,11 @@ enum Drag {
 struct EditSnapshot {
     annotations: Vec<crate::video_edit::Item>,
     speed_ranges: Vec<crate::video_speed::SpeedRange>,
+    /// The crop travels with the rest so Ctrl+Z steps back through framing
+    /// and drawing in the one order they were done. Without it, applying a
+    /// crop pushed a step that restored nothing and the press read as
+    /// swallowed.
+    crop: crate::video_edit::Crop,
 }
 
 struct TextEntry {
@@ -331,6 +336,13 @@ struct State {
     padding_slider: RECT,
     aspect_controls: Vec<(RECT, usize)>,
     crop_control: RECT,
+    /// Pixel size of the content the last compose actually used — the frame
+    /// after cropping, and after any draft-quality halving. Stored rather than
+    /// re-derived, because hit-testing deriving it a second time is how it
+    /// drifted from the composed picture in the first place.
+    preview_content_size: (u32, u32),
+    /// A button-up is still owed to a crop drag that a key already ended.
+    crop_click_owed: bool,
     /// The crop being adjusted. While it is set the preview shows the whole
     /// recording, which is the only way to pull an edge back out.
     crop_edit: Option<crate::video_edit::Crop>,
@@ -755,6 +767,7 @@ fn state_compose_opts(state: &State) -> crate::compose::ComposeOpts {
 }
 
 fn matte_thumbs(
+    source: (u32, u32),
     raw: &[(Vec<u8>, u32, u32)],
     style: &crate::style::Style,
     opts: &crate::compose::ComposeOpts,
@@ -767,13 +780,13 @@ fn matte_thumbs(
     if crate::compose::is_plain(style) {
         return raw
             .iter()
-            .map(|(bytes, w, h)| image_thumb(&crop_frame(&thumb_image(bytes, *w, *h), crop)))
+            .map(|(bytes, w, h)| image_thumb(&crop_frame(&thumb_image(bytes, *w, *h), crop, source)))
             .collect();
     }
     let mut bases = std::collections::HashMap::<(u32, u32), RgbaImage>::new();
     raw.iter()
         .map(|(bytes, w, h)| {
-            let image = crop_frame(&thumb_image(bytes, *w, *h), crop);
+            let image = crop_frame(&thumb_image(bytes, *w, *h), crop, source);
             let (w, h) = (&image.width(), &image.height());
             let base = bases
                 .entry((*w, *h))
@@ -844,19 +857,37 @@ fn editor_style() -> WINDOW_STYLE {
 /// Preview frames and filmstrip thumbnails are both scaled copies of the whole
 /// recording, so a crop normalized to the source applies to either directly,
 /// whatever size it happens to have been decoded at.
-fn crop_frame(image: &RgbaImage, crop: crate::video_edit::Crop) -> RgbaImage {
+fn crop_frame(
+    image: &RgbaImage,
+    crop: crate::video_edit::Crop,
+    source: (u32, u32),
+) -> RgbaImage {
     if crop == crate::video_edit::Crop::FULL {
         return image.clone();
     }
-    let (width, height) = (image.width(), image.height());
-    let span = |origin: f32, size: f32, limit: u32| {
-        let limit_f = limit as f32;
-        let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
-        let size = ((size * limit_f).round().clamp(1.0, limit_f)) as u32;
-        (origin.min(limit.saturating_sub(size)), size)
+    // Framed from the source-pixel rect the export will use, scaled to this
+    // frame — not by rounding the normalized crop against this frame's own
+    // dimensions. That would be a second rounding, and it drifts from the
+    // encoder's by up to a source pixel on an odd source, so the preview would
+    // show a sliver the file does not keep.
+    let (source_w, source_h) = (source.0.max(1), source.1.max(1));
+    let (kept_x, kept_y, kept_w, kept_h) = crop.pixel_rect(source_w, source_h);
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    let (scale_x, scale_y) = (
+        width as f32 / source_w as f32,
+        height as f32 / source_h as f32,
+    );
+    // Clamped the way the encoder clamps: hold the size and bring the origin
+    // back so it fits. Shrinking the size at the far edge instead would frame
+    // a different region from the one being encoded, which is the drift this
+    // whole function exists to remove.
+    let place = |origin: u32, size: u32, scale: f32, limit: u32| {
+        let size = ((size as f32 * scale).round() as u32).max(1).min(limit);
+        let origin = ((origin as f32 * scale).round() as u32).min(limit - size);
+        (origin, size)
     };
-    let (x, w) = span(crop.x, crop.w, width);
-    let (y, h) = span(crop.y, crop.h, height);
+    let (x, w) = place(kept_x, kept_w, scale_x, width);
+    let (y, h) = place(kept_y, kept_h, scale_y, height);
     image::imageops::crop_imm(image, x, y, w, h).to_image()
 }
 
@@ -873,6 +904,34 @@ fn active_crop(state: &State) -> crate::video_edit::Crop {
     }
 }
 
+/// End any crop drag in flight: give the mouse back, and see off the
+/// button-up that is still coming.
+///
+/// A drag can be ended by the button coming up, or by a key while it is still
+/// held — Esc, Enter, Del — or by any control. Each of those has to do two
+/// things, and forgetting either has its own failure. Not releasing the capture
+/// glues the mouse to the editor. Releasing without remembering that an up is
+/// still owed lets that up fall through as a fresh click on whatever sits under
+/// the cursor. Both belong here rather than at each exit.
+fn end_crop_drag(state: &mut State) {
+    if state.crop_drag.take().is_some() {
+        state.crop_click_owed = true;
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+        }
+    }
+}
+
+/// Consume a button-up that belongs to a crop drag, however that drag ended.
+/// True when the up was the drag's own and must go no further.
+fn take_crop_click(state: &mut State) -> bool {
+    let dragging = state.crop_drag.is_some();
+    if dragging {
+        end_crop_drag(state);
+    }
+    std::mem::take(&mut state.crop_click_owed) || dragging
+}
+
 /// Arm the crop tool: the whole recording comes back with the current crop
 /// drawn over it.
 fn enter_crop(state: &mut State) {
@@ -882,7 +941,7 @@ fn enter_crop(state: &mut State) {
     // The drawer is hit-tested before the preview, so leaving it open would
     // cover part of the crop rectangle and eat the clicks meant for it.
     state.tools_open = false;
-    state.crop_drag = None;
+    end_crop_drag(state);
     state.crop_edit = Some(state.crop);
     recompose_preview(state);
     refresh_matte_thumbs(state);
@@ -894,7 +953,7 @@ fn commit_crop(state: &mut State) {
     let Some(pending) = state.crop_edit.take() else {
         return;
     };
-    state.crop_drag = None;
+    end_crop_drag(state);
     if pending != state.crop {
         push_undo(state);
         state.crop = pending;
@@ -906,7 +965,7 @@ fn commit_crop(state: &mut State) {
 /// Leave the crop tool without keeping the pending rectangle.
 fn cancel_crop(state: &mut State) {
     if state.crop_edit.take().is_some() {
-        state.crop_drag = None;
+        end_crop_drag(state);
         recompose_preview(state);
         refresh_matte_thumbs(state);
     }
@@ -918,7 +977,11 @@ fn recompose_preview(state: &mut State) {
         state.preview = None;
         return;
     };
-    let mut raw = crop_frame(&thumb_image(&frame.0, frame.1, frame.2), active_crop(state));
+    let mut raw = crop_frame(
+        &thumb_image(&frame.0, frame.1, frame.2),
+        active_crop(state),
+        state.source_size,
+    );
     // Padding changes the canvas geometry, so the matte has to be rebuilt from
     // scratch on every mouse move. Drag at quarter the pixels; the mouse-up
     // handler recomposes at full quality.
@@ -931,6 +994,7 @@ fn recompose_preview(state: &mut State) {
         );
     }
     let content_size = (raw.width(), raw.height());
+    state.preview_content_size = content_size;
     let plain = crate::compose::is_plain(&state.styles[state.matte_index]);
     let content_offset = if plain {
         (0.0, 0.0)
@@ -1013,6 +1077,7 @@ fn update_padding(state: &mut State, x: i32) {
 fn refresh_matte_thumbs(state: &mut State) {
     let opts = state_compose_opts(state);
     state.thumbs = matte_thumbs(
+        state.source_size,
         &state.raw_thumbs,
         &state.styles[state.matte_index],
         &opts,
@@ -1279,12 +1344,17 @@ fn has_edits(state: &State) -> bool {
         || state.trim_end < state.duration
         || !state.annotations.is_empty()
         || !state.speed_ranges.is_empty()
+        // A crop-only edit is still an edit: without this, Copy and Show in
+        // folder keep the labels that promise the original and quietly hand
+        // over the uncropped recording.
+        || state.crop != crate::video_edit::Crop::FULL
 }
 
 fn push_undo(state: &mut State) {
     state.undo.push(EditSnapshot {
         annotations: state.annotations.clone(),
         speed_ranges: state.speed_ranges.clone(),
+        crop: state.crop,
     });
     if state.undo.len() > 40 {
         state.undo.remove(0);
@@ -1292,13 +1362,24 @@ fn push_undo(state: &mut State) {
 }
 
 fn undo(state: &mut State) {
+    // A live drag holds an index into `annotations`. Swapping the vector out
+    // underneath it would leave the rest of the drag moving whichever
+    // annotation happened to land at that index.
+    if state.dragging.is_some() || state.crop_drag.is_some() {
+        return;
+    }
     if let Some(previous) = state.undo.pop() {
         state.annotations = previous.annotations;
         state.speed_ranges = previous.speed_ranges;
+        let crop_changed = state.crop != previous.crop;
+        state.crop = previous.crop;
         state.selected = None;
         state.selected_speed = None;
         state.text_entry = None;
         recompose_preview(state);
+        if crop_changed {
+            refresh_matte_thumbs(state);
+        }
     }
 }
 
@@ -1346,32 +1427,78 @@ fn preview_image_rect(state: &State, frame: &(Vec<u8>, u32, u32)) -> RECT {
 
 fn preview_content_rect(state: &State) -> Option<RECT> {
     let frame = state.preview.as_ref()?;
-    let raw = state.preview_raw.as_ref()?;
     let output = preview_image_rect(state, frame);
     if crate::compose::is_plain(&state.styles[state.matte_index]) {
         return Some(output);
     }
+    // The size the last compose actually used, not the decoded frame's. Those
+    // are the same thing only until a crop is applied: the matte's padding is
+    // proportional to the content it frames, so laying it out from the whole
+    // frame put every click somewhere other than where the picture was drawn.
+    let (content_w, content_h) = state.preview_content_size;
     let opts = state_compose_opts(state);
-    let layout = crate::compose::layout(raw.1 as usize, raw.2 as usize, &opts);
+    let layout = crate::compose::layout(content_w as usize, content_h as usize, &opts);
     let scale = ((output.right - output.left) as f32 / frame.1.max(1) as f32)
         .min((output.bottom - output.top) as f32 / frame.2.max(1) as f32);
     Some(RECT {
         left: output.left + (layout.pad_x as f32 * scale).round() as i32,
         top: output.top + (layout.pad_y as f32 * scale).round() as i32,
-        right: output.left + ((layout.pad_x as u32 + raw.1) as f32 * scale).round() as i32,
-        bottom: output.top + ((layout.pad_y as u32 + raw.2) as f32 * scale).round() as i32,
+        right: output.left + ((layout.pad_x as u32 + content_w) as f32 * scale).round() as i32,
+        bottom: output.top + ((layout.pad_y as u32 + content_h) as f32 * scale).round() as i32,
     })
 }
 
+/// Where a window point falls in the recording, normalized to the whole
+/// source. `None` when it is not on the picture.
+///
+/// Source, not the picture on screen: annotations are stored against the
+/// recording so that reframing moves the picture under them, and this is the
+/// only way a click becomes a coordinate — so putting the crop here means no
+/// caller can be written that forgets it.
 fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
     let rect = preview_content_rect(state)?;
     if x < rect.left || x > rect.right || y < rect.top || y > rect.bottom {
         return None;
     }
-    Some((
-        ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0),
-        ((y - rect.top) as f32 / (rect.bottom - rect.top).max(1) as f32).clamp(0.0, 1.0),
-    ))
+    Some(preview_point(state, rect, x, y))
+}
+
+/// The same mapping with no reject, pinned to the edges of the picture.
+///
+/// A crop drag holds the mouse, so sweeping past the pane has to keep
+/// tracking: rejecting out there would freeze the rectangle where the cursor
+/// crossed the line and make it jump on the way back.
+fn screen_to_preview_clamped(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
+    let rect = preview_content_rect(state)?;
+    Some(preview_point(state, rect, x, y))
+}
+
+/// A recording coordinate back as a fraction of the picture on screen — the
+/// inverse of `preview_point`, and the only way anything should go that way.
+///
+/// The two directions are a pair: whatever the crop does to one it must undo
+/// on the other, and having them written apart is how the selection outline
+/// came to be drawn where its shape was not.
+fn preview_across(state: &State, x: f32) -> f32 {
+    let crop = active_crop(state);
+    ((x - crop.x) / crop.w.max(f32::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn preview_down(state: &State, y: f32) -> f32 {
+    let crop = active_crop(state);
+    ((y - crop.y) / crop.h.max(f32::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn preview_point(state: &State, rect: RECT, x: i32, y: i32) -> (f32, f32) {
+    let across =
+        ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0);
+    let down =
+        ((y - rect.top) as f32 / (rect.bottom - rect.top).max(1) as f32).clamp(0.0, 1.0);
+    // What is on screen is the crop, so a fraction of the picture is that
+    // fraction *of the crop*. `Crop::FULL` — including the whole time the crop
+    // tool is armed — leaves this an identity.
+    let crop = active_crop(state);
+    (crop.x + across * crop.w, crop.y + down * crop.h)
 }
 
 /// The recording window annotations are addressed against: the crop, at the
@@ -1388,12 +1515,13 @@ fn cropped_source_size(state: &State) -> (u32, u32) {
     cropped_source_size_for(state, active_crop(state))
 }
 
+/// What the export will actually produce, through the same rounding it uses.
+/// Deriving it separately had the readout promising a pixel the encoder was
+/// never going to keep.
 fn cropped_source_size_for(state: &State, crop: crate::video_edit::Crop) -> (u32, u32) {
     let (width, height) = (state.source_size.0.max(1), state.source_size.1.max(1));
-    (
-        ((width as f32 * crop.w).round() as u32).max(1),
-        ((height as f32 * crop.h).round() as u32).max(1),
-    )
+    let (_, _, kept_w, kept_h) = crop.pixel_rect(width, height);
+    (kept_w.max(1), kept_h.max(1))
 }
 
 fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
@@ -2022,13 +2150,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     .unwrap_or_else(|| preview_image_rect(state, frame));
                 let (x0, y0, x1, y1) =
                     crate::video_edit::bounds(item, annotation_frame(state));
+                // `bounds` is in the recording's coordinates, so it has to come
+                // back through the crop — the exact inverse of `preview_point`.
+                // Multiplying it straight into the picture on screen drew the
+                // outline and its handles somewhere the shape was not, and left
+                // the real (crop-correct) handles invisible but clickable.
                 let map_x = |x: f32| {
-                    image_rect.left
-                        + (x.clamp(0.0, 1.0) * (image_rect.right - image_rect.left) as f32) as i32
+                    let across = preview_across(state, x);
+                    image_rect.left + (across * (image_rect.right - image_rect.left) as f32) as i32
                 };
                 let map_y = |y: f32| {
-                    image_rect.top
-                        + (y.clamp(0.0, 1.0) * (image_rect.bottom - image_rect.top) as f32) as i32
+                    let down = preview_down(state, y);
+                    image_rect.top + (down * (image_rect.bottom - image_rect.top) as f32) as i32
                 };
                 let pen = CreatePen(windows::Win32::Graphics::Gdi::PS_DOT, 1, state.theme.accent);
                 let old_pen = SelectObject(hdc, pen);
@@ -3203,7 +3336,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
                 if let Some(drag) = state.crop_drag {
-                    if let Some(point) = screen_to_preview(state, x, y) {
+                    if let Some(point) = screen_to_preview_clamped(state, x, y) {
                         if let Some(pending) = state.crop_edit {
                             let (next, drag) = match drag {
                                 CropDrag::New(start) => {
@@ -3322,6 +3455,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                // Settled before anything else, because several controls below
+                // act on button-down and return: a drag ended by a key and
+                // released outside the window leaves an up that never arrives,
+                // and carrying that debt past here would let it swallow the
+                // release of whatever this press starts.
+                state.crop_click_owed = false;
                 // Clicking anywhere accepts the current caption, returns to
                 // Select, and then continues handling that same click. Enter
                 // remains a convenient shortcut, never a requirement.
@@ -3378,6 +3517,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if contains(state.add_control, x, y) {
                     stop_playback(state);
+                    // Settle the frame before opening the drawer over it.
+                    // `enter_crop` closes the drawer for a reason — it is
+                    // hit-tested ahead of the preview, so reopening it while
+                    // cropping would take the clicks meant for the rectangle
+                    // and arm a tool that could never draw.
+                    commit_crop(state);
                     state.selected_speed = None;
                     state.speed_armed = false;
                     state.tools_open = !state.tools_open;
@@ -3725,6 +3870,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_RBUTTONDOWN => {
             if let Some(state) = state_of(hwnd) {
+                // Cropping owns the preview. Without this a right-click puts
+                // the tool away and reopens the drawer over the rectangle,
+                // which is the guard the photo editor already has.
+                if state.crop_edit.is_some() {
+                    return LRESULT(0);
+                }
                 let _ = SetFocus(hwnd);
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
@@ -3755,10 +3906,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                // The crop drag holds the capture, so it has to give it back
-                // here as well as on the paths that end cropping by key.
-                if state.crop_drag.take().is_some() {
-                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                // The up belongs to the crop drag whether the drag ended here or
+                // was already ended by a key; either way it goes no further.
+                if take_crop_click(state) {
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -3949,6 +4099,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                             if has_speed {
                                 suffix.push_str("-speed");
+                            }
+                            if state.crop != crate::video_edit::Crop::FULL {
+                                suffix.push_str("-crop");
                             }
                             let dst = available_export_path(state.mp4.with_file_name(format!(
                                 "{}-{suffix}.mp4",
@@ -4177,7 +4330,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Back to the whole recording, ready to apply as "no
                         // crop" or to re-frame from scratch.
                         key if key == VK_DELETE.0 || key == 0x08 => {
+                            end_crop_drag(state);
                             state.crop_edit = Some(crate::video_edit::Crop::FULL);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        // Ctrl+Z means "undo the frame I am drawing". Letting it
+                        // reach the editor's undo restored a crop the armed
+                        // preview cannot show, and putting the tool away then
+                        // re-applied the pending one over the top of it.
+                        key if key == 0x5A
+                            && windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+                                VK_CONTROL.0 as i32,
+                            ) < 0 =>
+                        {
+                            cancel_crop(state);
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
                         }
@@ -4217,6 +4384,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     key if key == VK_SPACE.0 => {
                         if state.text_entry.is_none() {
+                            // Settles the frame first, as the Play chip does.
+                            // Otherwise the same gesture gets two answers, and
+                            // playback runs the whole recording underneath a
+                            // crop overlay that says otherwise.
+                            commit_crop(state);
                             toggle_playback(hwnd, state);
                         }
                     }
@@ -4380,6 +4552,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        // Alt+Tab or a system dialog can take the capture away mid-drag.
+        // Without this the pending rectangle keeps following a cursor with no
+        // button held, and the up that would have ended it never arrives.
+        windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
+            if let Some(state) = state_of(hwnd) {
+                if state.crop_drag.take().is_some() {
+                    state.crop_click_owed = false;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             if let Some(state) = state_of(hwnd) {
                 if state.exporting {
@@ -4524,7 +4708,13 @@ pub fn show(
     let pad_factor = crate::compose::DEFAULT_PAD_FACTOR;
     let aspect_idx = 0;
     let opts = compose_opts(pad_factor, aspect_idx);
-    let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index], &opts, crate::video_edit::Crop::FULL);
+    let thumbs = matte_thumbs(
+        source_size,
+        &raw_thumbs,
+        &styles[matte_index],
+        &opts,
+        crate::video_edit::Crop::FULL,
+    );
 
     let size_mb = std::fs::metadata(&mp4)
         .map(|m| m.len() as f64 / 1_048_576.0)
@@ -4585,6 +4775,8 @@ pub fn show(
         crop_control: initial.crop_control,
         crop_edit: None,
         crop_drag: None,
+        crop_click_owed: false,
+        preview_content_size: source_size,
         annotations: Vec::new(),
         speed_ranges: Vec::new(),
         selected_speed: None,
@@ -4748,6 +4940,40 @@ pub fn show(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_preview_frames_exactly_what_the_encoder_keeps() {
+        use image::{Rgba, RgbaImage};
+
+        // An odd source, where the encoder's even rounding and a naive
+        // proportional one disagree: half of 321 is 160.5, which the export
+        // keeps as 160. A preview that rounded for itself would show 161
+        // source pixels' worth and promise a sliver the file does not hold.
+        let source = (321u32, 241u32);
+        let crop = crate::video_edit::Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 };
+        let (_, _, kept_w, kept_h) = crop.pixel_rect(source.0, source.1);
+        assert_eq!((kept_w, kept_h), (160, 120), "the encoder's rounding");
+
+        // A preview decoded at the source's own size must frame exactly that.
+        let full = RgbaImage::from_pixel(source.0, source.1, Rgba([1, 2, 3, 255]));
+        let framed = super::crop_frame(&full, crop, source);
+        assert_eq!(framed.dimensions(), (kept_w, kept_h));
+
+        // And at half size it frames the same region, proportionally.
+        let half = RgbaImage::from_pixel(source.0 / 2, source.1 / 2, Rgba([1, 2, 3, 255]));
+        let framed = super::crop_frame(&half, crop, source);
+        let expected = (
+            (kept_w as f32 * (half.width() as f32 / source.0 as f32)).round() as u32,
+            (kept_h as f32 * (half.height() as f32 / source.1 as f32)).round() as u32,
+        );
+        assert_eq!(framed.dimensions(), expected);
+
+        // The whole recording is still handed back untouched.
+        assert_eq!(
+            super::crop_frame(&full, crate::video_edit::Crop::FULL, source).dimensions(),
+            source
+        );
+    }
+
     #[test]
     fn the_crop_chip_closes_the_settings_row_without_crowding_the_aspects() {
         // Real editor sizes, including the wide one this was first driven at.

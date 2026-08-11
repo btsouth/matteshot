@@ -99,6 +99,40 @@ impl Crop {
         Crop { x, y, w, h }
     }
 
+    /// The crop as a source-pixel rect: `(x, y, width, height)`.
+    ///
+    /// The one definition of that rounding. The editor reports this size and
+    /// the export encodes it, and when they each rounded for themselves they
+    /// disagreed by a pixel on odd sources — the readout promised 161 and the
+    /// file held 160.
+    ///
+    /// Real crops are evened because H.264 rejects odd dimensions. `FULL` is
+    /// returned untouched: the whole recording is the whole recording, and
+    /// evening it there would shave a pixel off an odd source and report
+    /// itself as a crop. The encoder evens its own input regardless.
+    pub fn pixel_rect(self, width: u32, height: u32) -> (u32, u32, u32, u32) {
+        if self == Crop::FULL {
+            return (0, 0, width, height);
+        }
+        let even = |v: u32| (v.max(2)) & !1;
+        let span = |origin: f32, size: f32, limit: u32| {
+            // An axis with fewer pixels than the even minimum keeps all of
+            // them. Asking for two out of one is not merely wrong: the clamp
+            // below would be given a floor above its ceiling, and `f32::clamp`
+            // panics on that rather than picking one.
+            if limit < 2 {
+                return (0, limit);
+            }
+            let limit_f = limit as f32;
+            let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
+            let size = even((size * limit_f).round().clamp(2.0, limit_f) as u32);
+            (origin.min(limit.saturating_sub(size)), size)
+        };
+        let (x, w) = span(self.x, self.w, width);
+        let (y, h) = span(self.y, self.h, height);
+        (x, y, w, h)
+    }
+
     /// Slide the crop without letting it leave the recording. The size never
     /// changes, so dragging into an edge stops rather than shrinking.
     pub fn moved(self, dx: f32, dy: f32) -> Crop {
@@ -528,6 +562,123 @@ mod tests {
             caption_style: CaptionStyle::Shadow,
             caption_box_opacity: 0.68,
         }
+    }
+
+    /// The rule both editors implement for ending a crop drag, in the small
+    /// form that can actually be exercised: a drag owes a button-up, and
+    /// whatever ends it — the button, or a key while the button is still down
+    /// — that up belongs to the drag and must go no further. Missing it lets
+    /// the up land as a fresh click on whatever sits under the cursor.
+    fn end_drag(dragging: &mut bool, owed: &mut bool) {
+        if std::mem::take(dragging) {
+            *owed = true;
+        }
+    }
+
+    fn take_click(dragging: &mut bool, owed: &mut bool) -> bool {
+        let was_dragging = *dragging;
+        if was_dragging {
+            end_drag(dragging, owed);
+        }
+        std::mem::take(owed) || was_dragging
+    }
+
+    #[test]
+    fn storing_a_click_and_drawing_it_are_exact_inverses() {
+        // The defect this pins: the editor stored a click as its fraction of
+        // the picture on screen, while the renderer treated the stored value
+        // as a fraction of the whole recording. They must be inverses, or an
+        // annotation placed after a crop is drawn somewhere else entirely —
+        // with a crop starting at x=0.5, a click in the centre came back at
+        // the left edge.
+        let crop = Crop { x: 0.5, y: 0.25, w: 0.5, h: 0.5 };
+        let frame = Frame { crop, content: (960, 540) };
+
+        for (across, down) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0), (0.25, 0.75)] {
+            // What the editor stores for a click at that fraction of the
+            // picture: `crop.x + fraction * crop.w`.
+            let stored = (crop.x + across * crop.w, crop.y + down * crop.h);
+            // Where the renderer then puts it, as a fraction of the drawn
+            // content.
+            let drawn = frame.to_pixels(stored);
+            let back = (
+                drawn.0 / frame.content.0 as f32,
+                drawn.1 / frame.content.1 as f32,
+            );
+            assert!(
+                (back.0 - across).abs() < 1e-5 && (back.1 - down).abs() < 1e-5,
+                "click at {across},{down} came back at {:?}",
+                back
+            );
+        }
+
+        // And with no crop the two are the plain identity they always were.
+        let whole = Frame { crop: Crop::FULL, content: (960, 540) };
+        let drawn = whole.to_pixels((0.25, 0.75));
+        assert!((drawn.0 - 240.0).abs() < 0.01 && (drawn.1 - 405.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_drag_ended_by_a_key_still_swallows_its_button_up() {
+        // Ended by the button: the up is the drag's own.
+        let (mut dragging, mut owed) = (true, false);
+        assert!(take_click(&mut dragging, &mut owed));
+        assert!(!dragging && !owed, "nothing should be left owing");
+
+        // Ended by Esc/Enter/Del mid-drag, then the up arrives: still the
+        // drag's, and consumed exactly once.
+        let (mut dragging, mut owed) = (true, false);
+        end_drag(&mut dragging, &mut owed);
+        assert!(owed, "a key that ends a live drag leaves an up owing");
+        assert!(take_click(&mut dragging, &mut owed));
+        assert!(!take_click(&mut dragging, &mut owed), "consumed twice");
+
+        // A key pressed with no drag in flight owes nothing, so an unrelated
+        // click afterwards is not swallowed.
+        let (mut dragging, mut owed) = (false, false);
+        end_drag(&mut dragging, &mut owed);
+        assert!(!take_click(&mut dragging, &mut owed));
+    }
+
+    #[test]
+    fn the_pixel_rect_is_what_both_the_editor_and_the_encoder_get() {
+        // The whole recording is handed back untouched, odd dimensions and
+        // all: evening it here would shave a pixel off an odd source and
+        // report itself as a crop.
+        assert_eq!(Crop::FULL.pixel_rect(1920, 1080), (0, 0, 1920, 1080));
+        assert_eq!(Crop::FULL.pixel_rect(321, 241), (0, 0, 321, 241));
+
+        // A real crop is evened, because H.264 rejects odd dimensions — and
+        // this is the only place that decides it, so the size the editor shows
+        // is the size the export encodes. Half of 321 rounds to 161, which
+        // must come back as 160 rather than the editor promising a pixel the
+        // encoder was never going to keep.
+        let (x, y, w, h) = Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(321, 241);
+        assert_eq!((x, y), (0, 0));
+        assert_eq!((w, h), (160, 120));
+        assert_eq!((w % 2, h % 2), (0, 0));
+
+        // A source with fewer pixels than the even minimum keeps what it has.
+        // Two out of one is not just wrong: it asks `f32::clamp` for a floor
+        // above its ceiling, which panics.
+        for limit in [0u32, 1, 2, 3] {
+            let (x, y, w, h) =
+                Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(limit, limit);
+            assert!(
+                x + w <= limit && y + h <= limit,
+                "a {limit}px source gave {w}x{h} at {x},{y}"
+            );
+        }
+        // Two pixels is the first size that can satisfy the even minimum.
+        assert_eq!(Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(1, 1), (0, 0, 1, 1));
+        assert_eq!(Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(2, 2), (0, 0, 2, 2));
+
+        // Never hanging off an edge, however the floats round.
+        let (x, y, w, h) = Crop { x: 0.9, y: 0.9, w: 0.2, h: 0.2 }.pixel_rect(641, 481);
+        assert!(x + w <= 641 && y + h <= 481, "crop {x},{y} {w}x{h} left the frame");
+        // And always something encodable.
+        let (_, _, w, h) = Crop { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }.pixel_rect(320, 240);
+        assert!(w >= 2 && h >= 2);
     }
 
     #[test]
