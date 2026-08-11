@@ -73,7 +73,12 @@ function Invoke-Probe {
         # enough: some probes report failure in their output.
         [string]$Expect,
         # Probe is expected to fail; used for the signature rejection checks.
-        [switch]$ExpectFailure
+        [switch]$ExpectFailure,
+        # Reports WARN instead of FAIL, so the run still exits 0. For probes
+        # that measure wall-clock time: on a shared runner the CPU available to
+        # us varies per run, so a threshold either sits so high it catches
+        # nothing or fails on other people's load. See issue #68.
+        [switch]$Advisory
     )
     $log = Join-Path $work ("{0}.log" -f ($Name -replace '[^\w]', '-'))
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -94,7 +99,7 @@ function Invoke-Probe {
     $detail = ($out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
     $script:results += [pscustomobject]@{
         Probe   = $Name
-        Result  = if ($ok) { 'PASS' } else { 'FAIL' }
+        Result  = if ($ok) { 'PASS' } elseif ($Advisory) { 'WARN' } else { 'FAIL' }
         Seconds = [math]::Round($timer.Elapsed.TotalSeconds, 1)
         Detail  = if ($detail) { $detail.Trim() } else { "exit $exit" }
     }
@@ -158,7 +163,7 @@ if ($NoCapture) {
 # nothing else here would notice it getting expensive. Synthetic input, so it
 # needs no window and is safe to run anywhere.
 Invoke-Probe -Name 'preview rebuild budget' -ProbeArgs @('--preview-bench', '2560') `
-    -Expect 'preview rebuild within budget' | Out-Null
+    -Expect 'preview rebuild within budget' -Advisory | Out-Null
 
 # ------------------------------------------------- recording and exporting ---
 if (-not $Fixture) {
@@ -246,6 +251,15 @@ $results | Format-Table -AutoSize
 
 $failed = @($results | Where-Object Result -eq 'FAIL')
 $skipped = @($results | Where-Object Result -eq 'SKIP')
+$warned = @($results | Where-Object Result -eq 'WARN')
+# Said out loud even though it does not fail the run: an advisory probe that
+# nobody ever reads is the same as one that was deleted.
+if ($warned.Count -gt 0) {
+    Write-Host (
+        "{0} advisory probe(s) reported a problem without failing the run: {1}" -f
+        $warned.Count, (($warned | ForEach-Object { $_.Probe }) -join ', ')
+    ) -ForegroundColor Yellow
+}
 if ($failed.Count -gt 0) {
     Write-Host ("{0} probe(s) failed." -f $failed.Count) -ForegroundColor Red
     exit 1
