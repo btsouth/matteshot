@@ -755,6 +755,7 @@ fn state_compose_opts(state: &State) -> crate::compose::ComposeOpts {
 }
 
 fn matte_thumbs(
+    source: (u32, u32),
     raw: &[(Vec<u8>, u32, u32)],
     style: &crate::style::Style,
     opts: &crate::compose::ComposeOpts,
@@ -767,13 +768,13 @@ fn matte_thumbs(
     if crate::compose::is_plain(style) {
         return raw
             .iter()
-            .map(|(bytes, w, h)| image_thumb(&crop_frame(&thumb_image(bytes, *w, *h), crop)))
+            .map(|(bytes, w, h)| image_thumb(&crop_frame(&thumb_image(bytes, *w, *h), crop, source)))
             .collect();
     }
     let mut bases = std::collections::HashMap::<(u32, u32), RgbaImage>::new();
     raw.iter()
         .map(|(bytes, w, h)| {
-            let image = crop_frame(&thumb_image(bytes, *w, *h), crop);
+            let image = crop_frame(&thumb_image(bytes, *w, *h), crop, source);
             let (w, h) = (&image.width(), &image.height());
             let base = bases
                 .entry((*w, *h))
@@ -844,19 +845,35 @@ fn editor_style() -> WINDOW_STYLE {
 /// Preview frames and filmstrip thumbnails are both scaled copies of the whole
 /// recording, so a crop normalized to the source applies to either directly,
 /// whatever size it happens to have been decoded at.
-fn crop_frame(image: &RgbaImage, crop: crate::video_edit::Crop) -> RgbaImage {
+fn crop_frame(
+    image: &RgbaImage,
+    crop: crate::video_edit::Crop,
+    source: (u32, u32),
+) -> RgbaImage {
     if crop == crate::video_edit::Crop::FULL {
         return image.clone();
     }
-    let (width, height) = (image.width(), image.height());
-    let span = |origin: f32, size: f32, limit: u32| {
-        let limit_f = limit as f32;
-        let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
-        let size = ((size * limit_f).round().clamp(1.0, limit_f)) as u32;
-        (origin.min(limit.saturating_sub(size)), size)
+    // Framed from the source-pixel rect the export will use, scaled to this
+    // frame — not by rounding the normalized crop against this frame's own
+    // dimensions. That would be a second rounding, and it drifts from the
+    // encoder's by up to a source pixel on an odd source, so the preview would
+    // show a sliver the file does not keep.
+    let (source_w, source_h) = (source.0.max(1), source.1.max(1));
+    let (kept_x, kept_y, kept_w, kept_h) = crop.pixel_rect(source_w, source_h);
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    let (scale_x, scale_y) = (
+        width as f32 / source_w as f32,
+        height as f32 / source_h as f32,
+    );
+    let place = |origin: u32, size: u32, scale: f32, limit: u32| {
+        let origin = ((origin as f32 * scale).round() as u32).min(limit.saturating_sub(1));
+        let size = ((size as f32 * scale).round() as u32)
+            .max(1)
+            .min(limit - origin);
+        (origin, size)
     };
-    let (x, w) = span(crop.x, crop.w, width);
-    let (y, h) = span(crop.y, crop.h, height);
+    let (x, w) = place(kept_x, kept_w, scale_x, width);
+    let (y, h) = place(kept_y, kept_h, scale_y, height);
     image::imageops::crop_imm(image, x, y, w, h).to_image()
 }
 
@@ -933,7 +950,11 @@ fn recompose_preview(state: &mut State) {
         state.preview = None;
         return;
     };
-    let mut raw = crop_frame(&thumb_image(&frame.0, frame.1, frame.2), active_crop(state));
+    let mut raw = crop_frame(
+        &thumb_image(&frame.0, frame.1, frame.2),
+        active_crop(state),
+        state.source_size,
+    );
     // Padding changes the canvas geometry, so the matte has to be rebuilt from
     // scratch on every mouse move. Drag at quarter the pixels; the mouse-up
     // handler recomposes at full quality.
@@ -1028,6 +1049,7 @@ fn update_padding(state: &mut State, x: i32) {
 fn refresh_matte_thumbs(state: &mut State) {
     let opts = state_compose_opts(state);
     state.thumbs = matte_thumbs(
+        state.source_size,
         &state.raw_thumbs,
         &state.styles[state.matte_index],
         &opts,
@@ -4541,7 +4563,13 @@ pub fn show(
     let pad_factor = crate::compose::DEFAULT_PAD_FACTOR;
     let aspect_idx = 0;
     let opts = compose_opts(pad_factor, aspect_idx);
-    let thumbs = matte_thumbs(&raw_thumbs, &styles[matte_index], &opts, crate::video_edit::Crop::FULL);
+    let thumbs = matte_thumbs(
+        source_size,
+        &raw_thumbs,
+        &styles[matte_index],
+        &opts,
+        crate::video_edit::Crop::FULL,
+    );
 
     let size_mb = std::fs::metadata(&mp4)
         .map(|m| m.len() as f64 / 1_048_576.0)
@@ -4765,6 +4793,40 @@ pub fn show(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_preview_frames_exactly_what_the_encoder_keeps() {
+        use image::{Rgba, RgbaImage};
+
+        // An odd source, where the encoder's even rounding and a naive
+        // proportional one disagree: half of 321 is 160.5, which the export
+        // keeps as 160. A preview that rounded for itself would show 161
+        // source pixels' worth and promise a sliver the file does not hold.
+        let source = (321u32, 241u32);
+        let crop = crate::video_edit::Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 };
+        let (_, _, kept_w, kept_h) = crop.pixel_rect(source.0, source.1);
+        assert_eq!((kept_w, kept_h), (160, 120), "the encoder's rounding");
+
+        // A preview decoded at the source's own size must frame exactly that.
+        let full = RgbaImage::from_pixel(source.0, source.1, Rgba([1, 2, 3, 255]));
+        let framed = super::crop_frame(&full, crop, source);
+        assert_eq!(framed.dimensions(), (kept_w, kept_h));
+
+        // And at half size it frames the same region, proportionally.
+        let half = RgbaImage::from_pixel(source.0 / 2, source.1 / 2, Rgba([1, 2, 3, 255]));
+        let framed = super::crop_frame(&half, crop, source);
+        let expected = (
+            (kept_w as f32 * (half.width() as f32 / source.0 as f32)).round() as u32,
+            (kept_h as f32 * (half.height() as f32 / source.1 as f32)).round() as u32,
+        );
+        assert_eq!(framed.dimensions(), expected);
+
+        // The whole recording is still handed back untouched.
+        assert_eq!(
+            super::crop_frame(&full, crate::video_edit::Crop::FULL, source).dimensions(),
+            source
+        );
+    }
+
     #[test]
     fn the_crop_chip_closes_the_settings_row_without_crowding_the_aspects() {
         // Real editor sizes, including the wide one this was first driven at.
