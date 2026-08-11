@@ -20,7 +20,8 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
+    GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN,
+    VK_RIGHT,
     VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -211,6 +212,18 @@ enum TimingChoice {
     ThreeSeconds,
 }
 
+/// What a drag on the crop rectangle is doing. Points are normalized to the
+/// recording, the same space the crop itself lives in.
+#[derive(Clone, Copy, PartialEq)]
+enum CropDrag {
+    /// Sweeping a new rectangle from the point it started at.
+    New((f32, f32)),
+    /// Sliding the whole rectangle; the point is where the cursor last was.
+    Move((f32, f32)),
+    /// Pulling one corner, in `Crop::corners` order.
+    Corner(u8),
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
     Trim(Handle),
@@ -259,6 +272,7 @@ struct WindowLayout {
     matte_controls: Vec<(RECT, usize)>,
     padding_slider: RECT,
     aspect_controls: Vec<(RECT, usize)>,
+    crop_control: RECT,
     add_control: RECT,
     tool_controls: Vec<(RECT, Tool, &'static str)>,
     color_controls: Vec<(RECT, usize)>,
@@ -316,6 +330,11 @@ struct State {
     aspect_idx: usize,
     padding_slider: RECT,
     aspect_controls: Vec<(RECT, usize)>,
+    crop_control: RECT,
+    /// The crop being adjusted. While it is set the preview shows the whole
+    /// recording, which is the only way to pull an edge back out.
+    crop_edit: Option<crate::video_edit::Crop>,
+    crop_drag: Option<CropDrag>,
     annotations: Vec<crate::video_edit::Item>,
     speed_ranges: Vec<crate::video_speed::SpeedRange>,
     selected_speed: Option<usize>,
@@ -487,11 +506,22 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         right: m + sc(258),
         bottom: settings_top + sc(26),
     };
+    // Crop closes the settings row, with padding and aspect — the group that
+    // decides the shape of the picture rather than the marks on it.
+    let crop_control = RECT {
+        left: cw - m - sc(62),
+        top: settings_top,
+        right: cw - m,
+        bottom: settings_top + sc(26),
+    };
     let mut aspect_controls = Vec::new();
     let aspect_start = m + sc(344);
     let aspect_gap = sc(6);
-    let aspect_available =
-        (cw - m - aspect_start - aspect_gap * (ASPECTS.len() as i32 - 1)).max(1);
+    let aspect_available = (crop_control.left
+        - sc(12)
+        - aspect_start
+        - aspect_gap * (ASPECTS.len() as i32 - 1))
+        .max(1);
     let aspect_width = (aspect_available / ASPECTS.len() as i32).max(sc(48));
     for index in 0..ASPECTS.len() {
         let left = aspect_start + index as i32 * (aspect_width + aspect_gap);
@@ -499,7 +529,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
             RECT {
                 left,
                 top: settings_top,
-                right: (left + aspect_width).min(cw - m),
+                right: (left + aspect_width).min(crop_control.left - sc(12)),
                 bottom: settings_top + sc(26),
             },
             index,
@@ -677,6 +707,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
         matte_controls,
         padding_slider,
         aspect_controls,
+        crop_control,
         add_control,
         tool_controls,
         color_controls,
@@ -829,13 +860,62 @@ fn crop_frame(image: &RgbaImage, crop: crate::video_edit::Crop) -> RgbaImage {
     image::imageops::crop_imm(image, x, y, w, h).to_image()
 }
 
+/// The crop the preview and the annotation frame should currently use.
+///
+/// While the crop tool is armed the whole recording is on screen, so an edge
+/// that was brought in can be pulled back out; everywhere else it is the crop
+/// that has been applied.
+fn active_crop(state: &State) -> crate::video_edit::Crop {
+    if state.crop_edit.is_some() {
+        crate::video_edit::Crop::FULL
+    } else {
+        state.crop
+    }
+}
+
+/// Arm the crop tool: the whole recording comes back with the current crop
+/// drawn over it.
+fn enter_crop(state: &mut State) {
+    commit_text(state);
+    state.selected = None;
+    state.tool = None;
+    state.crop_drag = None;
+    state.crop_edit = Some(state.crop);
+    recompose_preview(state);
+    refresh_matte_thumbs(state);
+}
+
+/// Take the pending crop and put the tool away. Nothing is recorded when it did
+/// not change, so arming the tool and thinking better of it costs no undo step.
+fn commit_crop(state: &mut State) {
+    let Some(pending) = state.crop_edit.take() else {
+        return;
+    };
+    state.crop_drag = None;
+    if pending != state.crop {
+        push_undo(state);
+        state.crop = pending;
+    }
+    recompose_preview(state);
+    refresh_matte_thumbs(state);
+}
+
+/// Leave the crop tool without keeping the pending rectangle.
+fn cancel_crop(state: &mut State) {
+    if state.crop_edit.take().is_some() {
+        state.crop_drag = None;
+        recompose_preview(state);
+        refresh_matte_thumbs(state);
+    }
+}
+
 fn recompose_preview(state: &mut State) {
     let opts = state_compose_opts(state);
     let Some(frame) = state.preview_raw.as_ref() else {
         state.preview = None;
         return;
     };
-    let mut raw = crop_frame(&thumb_image(&frame.0, frame.1, frame.2), state.crop);
+    let mut raw = crop_frame(&thumb_image(&frame.0, frame.1, frame.2), active_crop(state));
     // Padding changes the canvas geometry, so the matte has to be rebuilt from
     // scratch on every mouse move. Drag at quarter the pixels; the mouse-up
     // handler recomposes at full quality.
@@ -887,7 +967,7 @@ fn recompose_preview(state: &mut State) {
         &state.annotations,
         annotation_time,
         skip,
-        crate::video_edit::Frame { crop: state.crop, content: content_size },
+        crate::video_edit::Frame { crop: active_crop(state), content: content_size },
         cropped_source_size(state),
         content_offset,
     );
@@ -910,7 +990,7 @@ fn recompose_preview(state: &mut State) {
             std::slice::from_ref(&draft),
             annotation_time,
             None,
-            crate::video_edit::Frame { crop: state.crop, content: content_size },
+            crate::video_edit::Frame { crop: active_crop(state), content: content_size },
             cropped_source_size(state),
             content_offset,
         );
@@ -933,7 +1013,7 @@ fn refresh_matte_thumbs(state: &mut State) {
         &state.raw_thumbs,
         &state.styles[state.matte_index],
         &opts,
-        state.crop,
+        active_crop(state),
     );
 }
 
@@ -1295,17 +1375,21 @@ fn screen_to_preview(state: &State, x: i32, y: i32) -> Option<(f32, f32)> {
 /// pixel size it will be exported at. Identical to the source while uncropped.
 fn annotation_frame(state: &State) -> crate::video_edit::Frame {
     crate::video_edit::Frame {
-        crop: state.crop,
+        crop: active_crop(state),
         content: cropped_source_size(state),
     }
 }
 
 /// Source pixels the crop keeps.
 fn cropped_source_size(state: &State) -> (u32, u32) {
+    cropped_source_size_for(state, active_crop(state))
+}
+
+fn cropped_source_size_for(state: &State, crop: crate::video_edit::Crop) -> (u32, u32) {
     let (width, height) = (state.source_size.0.max(1), state.source_size.1.max(1));
     (
-        ((width as f32 * state.crop.w).round() as u32).max(1),
-        ((height as f32 * state.crop.h).round() as u32).max(1),
+        ((width as f32 * crop.w).round() as u32).max(1),
+        ((height as f32 * crop.h).round() as u32).max(1),
     )
 }
 
@@ -1772,6 +1856,47 @@ unsafe fn paint_bgra_fit(hdc: HDC, rect: RECT, frame: &(Vec<u8>, u32, u32), stat
         windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
         windows::Win32::Graphics::Gdi::SRCCOPY,
     );
+}
+
+/// Translucent fill over the preview. GDI has no alpha on `Rectangle`, so a
+/// 1x1 solid is stretched through `AlphaBlend`.
+unsafe fn wash(
+    hdc: HDC,
+    rect: RECT,
+    color: windows::Win32::Foundation::COLORREF,
+    alpha: u8,
+) {
+    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let mem = windows::Win32::Graphics::Gdi::CreateCompatibleDC(hdc);
+    let bmp = windows::Win32::Graphics::Gdi::CreateCompatibleBitmap(hdc, 1, 1);
+    let old = SelectObject(mem, bmp);
+    let brush = CreateSolidBrush(color);
+    FillRect(mem, &RECT { left: 0, top: 0, right: 1, bottom: 1 }, brush);
+    let _ = windows::Win32::Graphics::Gdi::AlphaBlend(
+        hdc,
+        rect.left,
+        rect.top,
+        w,
+        h,
+        mem,
+        0,
+        0,
+        1,
+        1,
+        windows::Win32::Graphics::Gdi::BLENDFUNCTION {
+            BlendOp: windows::Win32::Graphics::Gdi::AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: alpha,
+            AlphaFormat: 0,
+        },
+    );
+    SelectObject(mem, old);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteObject(brush);
+    let _ = windows::Win32::Graphics::Gdi::DeleteDC(mem);
 }
 
 unsafe fn paint_chip(hdc: HDC, rect: RECT, label: &str, selected: bool, state: &State) {
@@ -2389,6 +2514,100 @@ unsafe fn paint(hdc: HDC, state: &State) {
     for (rect, index) in &state.aspect_controls {
         paint_chip(hdc, *rect, ASPECTS[*index].0, state.aspect_idx == *index, state);
     }
+    // Says what it will do rather than what it is called: with a crop applied,
+    // this is how you get back to the whole recording.
+    // Kept short: the chip closes the settings row and has no width to spare,
+    // and the accent fill already says the tool is armed.
+    let crop_label = if state.crop != crate::video_edit::Crop::FULL {
+        "Cropped"
+    } else {
+        "Crop"
+    };
+    paint_chip(
+        hdc,
+        state.crop_control,
+        crop_label,
+        state.crop_edit.is_some(),
+        state,
+    );
+
+    // Crop overlay: everything the crop would discard is washed out, and the
+    // kept rectangle carries the frame, corner handles and a size readout.
+    // Screen-space, so dragging it never recomposes the preview.
+    if let Some(pending) = state.crop_edit {
+        if let Some(content) = preview_content_rect(state) {
+            let (cw, chh) = (
+                (content.right - content.left) as f32,
+                (content.bottom - content.top) as f32,
+            );
+            let at = |nx: f32, ny: f32| {
+                (
+                    content.left + (nx * cw).round() as i32,
+                    content.top + (ny * chh).round() as i32,
+                )
+            };
+            let (kx0, ky0) = at(pending.x, pending.y);
+            let (kx1, ky1) = at(pending.x + pending.w, pending.y + pending.h);
+            for band in [
+                RECT { left: content.left, top: content.top, right: content.right, bottom: ky0 },
+                RECT { left: content.left, top: ky1, right: content.right, bottom: content.bottom },
+                RECT { left: content.left, top: ky0, right: kx0, bottom: ky1 },
+                RECT { left: kx1, top: ky0, right: content.right, bottom: ky1 },
+            ] {
+                if band.right > band.left && band.bottom > band.top {
+                    wash(hdc, band, state.theme.bg, 170);
+                }
+            }
+
+            let pen = CreatePen(PS_SOLID, 1, state.theme.accent);
+            let old_pen = SelectObject(hdc, pen);
+            let old_brush = SelectObject(
+                hdc,
+                windows::Win32::Graphics::Gdi::GetStockObject(
+                    windows::Win32::Graphics::Gdi::HOLLOW_BRUSH,
+                ),
+            );
+            let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, kx0, ky0, kx1, ky1);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(pen);
+
+            let fill = CreateSolidBrush(state.theme.accent);
+            let edge = CreatePen(PS_SOLID, 1, state.theme.bg);
+            let ob = SelectObject(hdc, fill);
+            let op = SelectObject(hdc, edge);
+            for corner in pending.corners() {
+                let (hx, hy) = at(corner.0, corner.1);
+                let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, hx - 5, hy - 5, hx + 6, hy + 6);
+            }
+            SelectObject(hdc, ob);
+            SelectObject(hdc, op);
+            let _ = DeleteObject(fill);
+            let _ = DeleteObject(edge);
+
+            let (source_w, source_h) = cropped_source_size_for(state, pending);
+            SelectObject(hdc, state.font_small);
+            SetTextColor(hdc, state.theme.text);
+            let mut readout = wide(&format!("{source_w} \u{00d7} {source_h} px"));
+            let readout_top = if ky0 - content.top < s(state, 20) {
+                ky0 + s(state, 6)
+            } else {
+                ky0 - s(state, 18)
+            };
+            let mut readout_rect = RECT {
+                left: kx0 + s(state, 4),
+                top: readout_top,
+                right: kx0 + s(state, 160),
+                bottom: readout_top + s(state, 18),
+            };
+            DrawTextW(
+                hdc,
+                &mut readout,
+                &mut readout_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+        }
+    }
 
     // Filmstrip + trim handles.
     if !state.thumbs.is_empty() && state.duration > 0 {
@@ -2969,6 +3188,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                if let Some(drag) = state.crop_drag {
+                    if let Some(point) = screen_to_preview(state, x, y) {
+                        if let Some(pending) = state.crop_edit {
+                            let (next, drag) = match drag {
+                                CropDrag::New(start) => {
+                                    (crate::video_edit::Crop::from_points(start, point), drag)
+                                }
+                                CropDrag::Move(last) => (
+                                    pending.moved(point.0 - last.0, point.1 - last.1),
+                                    CropDrag::Move(point),
+                                ),
+                                CropDrag::Corner(corner) => {
+                                    let (next, held) = pending.resized(corner, point);
+                                    (next, CropDrag::Corner(held))
+                                }
+                            };
+                            state.crop_drag = Some(drag);
+                            if state.crop_edit != Some(next) {
+                                state.crop_edit = Some(next);
+                                let _ = InvalidateRect(hwnd, None, false);
+                            }
+                        }
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(drag) = state.dragging {
                     match drag {
                         Drag::Trim(handle) => {
@@ -3260,6 +3504,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
 
+                // Cropping owns the preview while it is armed: nothing is drawn
+                // or selected until the frame is settled.
+                if let Some(pending) = state.crop_edit {
+                    if let Some(point) = screen_to_preview(state, x, y) {
+                        stop_playback(state);
+                        // Corners win over the interior so the handles stay
+                        // reachable, and a crop covering everything sweeps a
+                        // new rectangle rather than trying to move — there is
+                        // nowhere for it to go, and "drag a box round the part
+                        // you want" is the whole gesture on a fresh crop.
+                        let tolerance = 0.02;
+                        let corner = pending.corners().iter().position(|corner| {
+                            (point.0 - corner.0).abs() <= tolerance
+                                && (point.1 - corner.1).abs() <= tolerance
+                        });
+                        state.crop_drag = Some(match corner {
+                            Some(index) => CropDrag::Corner(index as u8),
+                            None if pending.contains(point)
+                                && pending != crate::video_edit::Crop::FULL =>
+                            {
+                                CropDrag::Move(point)
+                            }
+                            None => CropDrag::New(point),
+                        });
+                        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(point) = screen_to_preview(state, x, y) {
                     stop_playback(state);
                     state.selected_speed = None;
@@ -3464,6 +3737,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                // The crop drag holds the capture, so it has to give it back
+                // here as well as on the paths that end cropping by key.
+                if state.crop_drag.take().is_some() {
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
                 if let Some(drag) = state.dragging.take() {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                     if matches!(
@@ -3516,6 +3796,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.status = None;
                         let _ = InvalidateRect(hwnd, None, false);
                     }
+                    return LRESULT(0);
+                }
+                if contains(state.crop_control, x, y) {
+                    // Pressing it again applies; only Esc throws the frame away.
+                    if state.crop_edit.is_some() {
+                        commit_crop(state);
+                    } else {
+                        enter_crop(state);
+                    }
+                    state.status = None;
+                    let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
                 if let Some((_, index)) = state
@@ -3846,6 +4137,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             if let Some(state) = state_of(hwnd) {
+                // Cropping owns Esc, Enter and Delete while it is armed: the
+                // rectangle on screen is the only thing the user is looking at.
+                if state.crop_edit.is_some() {
+                    match wparam.0 as u16 {
+                        key if key == VK_ESCAPE.0 => {
+                            cancel_crop(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        key if key == VK_RETURN.0 => {
+                            commit_crop(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        // Back to the whole recording, ready to apply as "no
+                        // crop" or to re-frame from scratch.
+                        key if key == VK_DELETE.0 || key == 0x08 => {
+                            state.crop_edit = Some(crate::video_edit::Crop::FULL);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        _ => {}
+                    }
+                }
                 match wparam.0 as u16 {
                     key if key == VK_ESCAPE.0 => {
                         if state.playing {
@@ -3996,6 +4311,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.width = w;
                     state.height = h;
                     let next = layout(state.scale, w, h, state.styles.len());
+                    state.crop_control = next.crop_control;
                     state.controls = next.controls;
                     state.matte_controls = next.matte_controls;
                     state.padding_slider = next.padding_slider;
@@ -4238,6 +4554,9 @@ pub fn show(
         aspect_idx,
         padding_slider: initial.padding_slider,
         aspect_controls: initial.aspect_controls,
+        crop_control: initial.crop_control,
+        crop_edit: None,
+        crop_drag: None,
         annotations: Vec::new(),
         speed_ranges: Vec::new(),
         selected_speed: None,
@@ -4401,6 +4720,46 @@ pub fn show(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_crop_chip_closes_the_settings_row_without_crowding_the_aspects() {
+        // Real editor sizes, including the wide one this was first driven at.
+        for (scale, cw, ch) in [(1.0, 1280, 760), (1.36, 2176, 1183), (1.0, 900, 640)] {
+            let l = super::layout(scale, cw, ch, 7);
+            let m = (20.0 * scale) as i32;
+            assert!(
+                l.crop_control.right <= cw - m,
+                "{cw}x{ch} @{scale}: crop chip runs off the right edge"
+            );
+            assert!(
+                l.crop_control.left > l.padding_slider.right,
+                "{cw}x{ch} @{scale}: crop chip overlaps the padding slider"
+            );
+            // It shares the settings row with the aspect presets and must not
+            // sit on top of the last one.
+            let last_aspect = l
+                .aspect_controls
+                .last()
+                .map(|(rect, _)| *rect)
+                .expect("aspect presets are laid out");
+            assert!(
+                last_aspect.right <= l.crop_control.left,
+                "{cw}x{ch} @{scale}: aspect chips run into the crop chip \
+                 ({} > {})",
+                last_aspect.right,
+                l.crop_control.left
+            );
+            assert_eq!(
+                l.crop_control.top, last_aspect.top,
+                "{cw}x{ch} @{scale}: crop chip is off the settings row"
+            );
+            // Below the preview, not over it.
+            assert!(
+                l.crop_control.top >= l.preview.bottom,
+                "{cw}x{ch} @{scale}: crop chip overlaps the preview"
+            );
+        }
+    }
+
     use super::{
         add_chip_label, annotation_preview_time, apply_caption_input, available_export_path,
         delete_recording_files, delete_recording_files_with, layout, minimum_client_size,
