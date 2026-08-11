@@ -128,6 +128,22 @@ pub enum Selection {
     ScrollRegion(RECT, HMONITOR, POINT),
 }
 
+/// Virtual-screen rect to overlay-local, clipped to the overlay's own bounds.
+///
+/// Every edge is held inside the overlay, not just the one each is likely to
+/// escape from: a rect entirely off one side would otherwise keep a negative
+/// `right` or a `left` past `width` and come back inverted. Callers filter
+/// non-intersecting windows already, so this costs nothing on the real path —
+/// it just stops the answer depending on them having done so.
+fn clamp_to_overlay(r: RECT, bounds: RECT, width: i32, height: i32) -> RECT {
+    RECT {
+        left: (r.left - bounds.left).clamp(0, width),
+        top: (r.top - bounds.top).clamp(0, height),
+        right: (r.right - bounds.left).clamp(0, width),
+        bottom: (r.bottom - bounds.top).clamp(0, height),
+    }
+}
+
 fn crop_frozen(frozen: &RgbaImage, r: RECT) -> RgbaImage {
     image::imageops::crop_imm(
         frozen,
@@ -1123,10 +1139,27 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
     let (vleft, vtop, vright, vbottom) = (mrect.left, mrect.top, mrect.right, mrect.bottom);
     let (mw, mh) = (vright - vleft, vbottom - vtop);
 
+    // Noted before the freeze, while it is still the thing the user is looking
+    // at. A shell flyout lives in a z-band above anything this process can
+    // create, so it has to be handled explicitly on both counts below.
+    let flyout = crate::window::shell_flyout();
+
     // Freeze every monitor into one combined image; gaps stay black.
     let t0 = std::time::Instant::now();
     let frozen = freeze_monitors(&mons, mrect, true)?;
     let t_freeze = t0.elapsed();
+
+    // The freeze now holds the flyout's pixels, so the live one can go. Left
+    // up it would render over the overlay and keep the hit test: the crosshair
+    // reverts to an arrow and drags land on a panel that is still scrolling
+    // and dismissing under the cursor, instead of on the frozen copy.
+    if let Some(flyout) = &flyout {
+        let dismissed = crate::window::dismiss_shell_flyout(flyout);
+        crate::diagnostics::log(&format!(
+            "overlay dismissed shell flyout ok={dismissed} elapsed_ms={}",
+            t0.elapsed().as_millis()
+        ));
+    }
 
     // Local (overlay-relative) monitor rects, for Screen/desktop targets.
     let local_monitors: Vec<RECT> = mons
@@ -1156,14 +1189,25 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
         .into_iter()
         .map(|(hwnd, r, is_shell)| WinEntry {
             hwnd: if is_shell { None } else { Some(hwnd) },
-            rect: RECT {
-                left: (r.left - mrect.left).max(0),
-                top: (r.top - mrect.top).max(0),
-                right: (r.right - mrect.left).min(mw),
-                bottom: (r.bottom - mrect.top).min(mh),
-            },
+            rect: clamp_to_overlay(r, mrect, mw, mh),
         })
         .collect();
+    // A shell flyout never comes back from EnumWindows, so Window mode can
+    // only offer one if it is added by hand — at the top of the z-order, which
+    // is where it was drawn. Captured as a frozen crop because the live window
+    // is gone by the time anything is clicked.
+    //
+    // Added even when the dismissal timed out. It costs nothing if the flyout
+    // really is still up, because it is then covering that rect and taking
+    // those clicks itself; and if it closes a moment after the cap, this is
+    // what makes the freeze underneath clickable. Leaving it out would instead
+    // highlight whichever window happens to sit behind the flyout in the list.
+    if let Some(flyout) = &flyout {
+        let rect = clamp_to_overlay(flyout.rect, mrect, mw, mh);
+        if rect.right > rect.left && rect.bottom > rect.top {
+            windows.insert(0, WinEntry { hwnd: None, rect });
+        }
+    }
     // Bottom of z-order: clicking bare desktop captures that monitor.
     for r in &local_monitors {
         windows.push(WinEntry { hwnd: None, rect: *r });
@@ -1388,9 +1432,59 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
 #[cfg(test)]
 mod tests {
     use super::{
-        delay_caret_rect, delay_list_rects, shortcut_bit, shortcut_button, write_overlay_layers,
-        Btn, RECT,
+        clamp_to_overlay, delay_caret_rect, delay_list_rects, shortcut_bit, shortcut_button,
+        write_overlay_layers, Btn, RECT,
     };
+
+    #[test]
+    fn window_rects_land_in_overlay_space_and_never_escape_it() {
+        // A virtual screen whose origin is not (0,0) — the case a left-hand
+        // second monitor creates, and the one an unclamped subtraction gets
+        // wrong.
+        let bounds = RECT { left: -1920, top: -200, right: 2560, bottom: 1440 };
+        let (w, h) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+
+        let inside = clamp_to_overlay(
+            RECT { left: -1000, top: 100, right: -200, bottom: 700 },
+            bounds,
+            w,
+            h,
+        );
+        assert_eq!(inside, RECT { left: 920, top: 300, right: 1720, bottom: 900 });
+
+        // A flyout flush against the screen edges must clip, not overflow the
+        // freeze frame it will be cropped out of.
+        let edge = clamp_to_overlay(
+            RECT { left: -3000, top: -500, right: 4000, bottom: 2000 },
+            bounds,
+            w,
+            h,
+        );
+        assert_eq!(edge, RECT { left: 0, top: 0, right: w, bottom: h });
+
+        // Rects that miss the overlay entirely collapse to an empty edge
+        // rather than coming back inverted, on every side.
+        for outside in [
+            RECT { left: -5000, top: 100, right: -4000, bottom: 700 },
+            RECT { left: 5000, top: 100, right: 6000, bottom: 700 },
+            RECT { left: -1000, top: -3000, right: -200, bottom: -2000 },
+            RECT { left: -1000, top: 3000, right: -200, bottom: 4000 },
+        ] {
+            let clipped = clamp_to_overlay(outside, bounds, w, h);
+            assert!(
+                clipped.left >= 0 && clipped.top >= 0,
+                "{clipped:?} escaped the overlay origin"
+            );
+            assert!(
+                clipped.right <= w && clipped.bottom <= h,
+                "{clipped:?} escaped the overlay extent"
+            );
+            assert!(
+                clipped.right >= clipped.left && clipped.bottom >= clipped.top,
+                "{clipped:?} is inverted"
+            );
+        }
+    }
 
     #[test]
     fn frozen_overlay_shortcuts_map_to_the_visible_toolbar() {
