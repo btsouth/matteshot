@@ -1,2 +1,8 @@
 /target
 /installer/Output
+
+# Local tool state, not shared configuration. Wrangler's cache in particular
+# stores the signed-in Cloudflare account id and the account's display name,
+# which is an email address.
+/.claude
+/.wrangler
