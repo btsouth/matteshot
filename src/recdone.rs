@@ -2519,9 +2519,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
     }
     // Says what it will do rather than what it is called: with a crop applied,
     // this is how you get back to the whole recording.
-    // Kept short: the chip closes the settings row and has no width to spare,
-    // and the accent fill already says the tool is armed.
-    let crop_label = if state.crop != crate::video_edit::Crop::FULL {
+    // Reads the frame that is on screen, not the committed one: pressing Del
+    // while armed shows the whole recording again, and a chip still saying
+    // "Cropped" would be describing something the user cannot see. Kept short
+    // because the chip closes the settings row and has no width to spare, and
+    // the accent fill already says the tool is armed.
+    let showing = state.crop_edit.unwrap_or(state.crop);
+    let crop_label = if showing != crate::video_edit::Crop::FULL {
         "Cropped"
     } else {
         "Crop"
@@ -3516,6 +3520,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
                 // Cropping owns the preview while it is armed: nothing is drawn
                 // or selected until the frame is settled.
+                // Cropping owns the preview, but only the preview: returning
+                // for every click would leave the padding slider and anything
+                // else that acts on button-down dead until the frame is
+                // settled.
                 if let Some(pending) = state.crop_edit {
                     if let Some(point) = screen_to_preview(state, x, y) {
                         stop_playback(state);
@@ -3540,8 +3548,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         });
                         windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                         let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
                     }
-                    return LRESULT(0);
                 }
                 if let Some(point) = screen_to_preview(state, x, y) {
                     stop_playback(state);
