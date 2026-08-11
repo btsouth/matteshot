@@ -584,6 +584,41 @@ mod tests {
     }
 
     #[test]
+    fn storing_a_click_and_drawing_it_are_exact_inverses() {
+        // The defect this pins: the editor stored a click as its fraction of
+        // the picture on screen, while the renderer treated the stored value
+        // as a fraction of the whole recording. They must be inverses, or an
+        // annotation placed after a crop is drawn somewhere else entirely —
+        // with a crop starting at x=0.5, a click in the centre came back at
+        // the left edge.
+        let crop = Crop { x: 0.5, y: 0.25, w: 0.5, h: 0.5 };
+        let frame = Frame { crop, content: (960, 540) };
+
+        for (across, down) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0), (0.25, 0.75)] {
+            // What the editor stores for a click at that fraction of the
+            // picture: `crop.x + fraction * crop.w`.
+            let stored = (crop.x + across * crop.w, crop.y + down * crop.h);
+            // Where the renderer then puts it, as a fraction of the drawn
+            // content.
+            let drawn = frame.to_pixels(stored);
+            let back = (
+                drawn.0 / frame.content.0 as f32,
+                drawn.1 / frame.content.1 as f32,
+            );
+            assert!(
+                (back.0 - across).abs() < 1e-5 && (back.1 - down).abs() < 1e-5,
+                "click at {across},{down} came back at {:?}",
+                back
+            );
+        }
+
+        // And with no crop the two are the plain identity they always were.
+        let whole = Frame { crop: Crop::FULL, content: (960, 540) };
+        let drawn = whole.to_pixels((0.25, 0.75));
+        assert!((drawn.0 - 240.0).abs() < 0.01 && (drawn.1 - 405.0).abs() < 0.01);
+    }
+
+    #[test]
     fn a_drag_ended_by_a_key_still_swallows_its_button_up() {
         // Ended by the button: the up is the drag's own.
         let (mut dragging, mut owed) = (true, false);

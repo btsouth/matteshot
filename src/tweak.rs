@@ -2005,7 +2005,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 // Says what it will do rather than what it is called: with a
                 // crop already applied, the button is how you get back to the
                 // whole capture.
-                let label = if state.doc().crop.is_some() { "Crop \u{00b7} adjust" } else { "Crop" };
+                // Reads the frame on screen, not the committed one: pressing
+                // Del while armed shows the whole capture again, and a chip
+                // still saying "adjust" would describe something the user can
+                // no longer see.
+                let showing = match (state.doc().crop_edit, state.doc().crop) {
+                    (Some(pending), _) => {
+                        let (width, height) = state.doc().raw.dimensions();
+                        (!pending.is_full(width, height)).then_some(pending)
+                    }
+                    (None, committed) => committed,
+                };
+                let label = if showing.is_some() { "Crop \u{00b7} adjust" } else { "Crop" };
                 chip(hdc, *r, label, state, state.tool == Some(CROP_TOOL), hot)
             }
             Ctl::Tool(n) => {
