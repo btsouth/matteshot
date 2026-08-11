@@ -997,12 +997,17 @@ pub fn cut_with_speed_edit_progress_cancel(
                     } else {
                         bgra_to_rgba_into(content, composed);
                     }
+                    // Whole recording: this path does not crop its frames yet,
+                    // so the content it composes is the full source. When a
+                    // crop reaches the export it has to arrive here too, or
+                    // annotations would be placed against a frame that no
+                    // longer matches what was cropped.
                     crate::video_edit::render_at(
                         composed,
                         annotations,
                         ts,
                         None,
-                        (cw, ch),
+                        crate::video_edit::Frame::whole((cw, ch)),
                         annotation_offset,
                     );
                     rgba_to_bgra_in_place(composed);

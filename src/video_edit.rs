@@ -1,5 +1,13 @@
-//! Time-ranged video annotations stored in normalized content coordinates.
-//! The same model drives the editor preview and full-resolution MP4 export.
+//! Time-ranged video annotations stored in coordinates normalized to the whole
+//! recording. The same model drives the editor preview and the full-resolution
+//! MP4 export.
+//!
+//! Against the recording rather than against whatever is currently framed, so
+//! that reframing moves the picture under an annotation instead of
+//! invalidating it. `Frame` is what converts between the two: which window of
+//! the source a drawn image shows, and how many pixels it occupies. Until
+//! something crops, every frame is `Crop::FULL` and the arithmetic is the
+//! plain `normalized * content_size` it has always been.
 
 use image::RgbaImage;
 
@@ -44,46 +52,100 @@ impl Item {
     }
 }
 
-fn point(point: (f32, f32), w: f32, h: f32) -> (f32, f32) {
-    (point.0 * w, point.1 * h)
+/// The window of the recording a drawn frame shows, normalized to the whole
+/// source. `Crop::FULL` is the whole thing and is what every path uses until
+/// somebody crops.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crop {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
-fn annotation(item: &Item, w: u32, h: u32) -> crate::annotate::Annotation {
-    let (wf, hf) = (w as f32, h as f32);
+impl Crop {
+    pub const FULL: Crop = Crop { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
+}
+
+/// How a drawn image relates to the recording: which window of the source it
+/// shows, and how many pixels that window occupies.
+///
+/// Annotations are stored normalized to the whole recording rather than to
+/// whatever is currently framed, so changing the crop moves the picture under
+/// them instead of invalidating them — the same model the photo editor uses.
+/// This is what converts between the two.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    pub crop: Crop,
+    /// Pixel size of the drawn content.
+    pub content: (u32, u32),
+}
+
+impl Frame {
+    /// The whole recording at `content` pixels.
+    pub fn whole(content: (u32, u32)) -> Self {
+        Frame { crop: Crop::FULL, content }
+    }
+
+    fn size(&self) -> (f32, f32) {
+        (self.content.0.max(1) as f32, self.content.1.max(1) as f32)
+    }
+
+    /// Source-normalized point to a pixel on the drawn content.
+    fn to_pixels(self, p: (f32, f32)) -> (f32, f32) {
+        let (w, h) = self.size();
+        (
+            (p.0 - self.crop.x) / self.crop.w.max(f32::EPSILON) * w,
+            (p.1 - self.crop.y) / self.crop.h.max(f32::EPSILON) * h,
+        )
+    }
+
+    /// A pixel distance on the drawn content, back in source-normalized units.
+    fn to_normalized(self, dx: f32, dy: f32) -> (f32, f32) {
+        let (w, h) = self.size();
+        (dx / w * self.crop.w, dy / h * self.crop.h)
+    }
+}
+
+fn point(point: (f32, f32), frame: Frame) -> (f32, f32) {
+    frame.to_pixels(point)
+}
+
+fn annotation(item: &Item, frame: Frame) -> crate::annotate::Annotation {
     let shape = match &item.shape {
         Shape::Arrow { from, to } => crate::annotate::Shape::Arrow {
-            from: point(*from, wf, hf),
-            to: point(*to, wf, hf),
+            from: point(*from, frame),
+            to: point(*to, frame),
         },
         Shape::Line { from, to } => crate::annotate::Shape::Line {
-            from: point(*from, wf, hf),
-            to: point(*to, wf, hf),
+            from: point(*from, frame),
+            to: point(*to, frame),
         },
         Shape::Freehand { points } => crate::annotate::Shape::Freehand {
-            points: points.iter().map(|point_| point(*point_, wf, hf)).collect(),
+            points: points.iter().map(|point_| point(*point_, frame)).collect(),
         },
         Shape::Rect { a, b } => crate::annotate::Shape::Rect {
-            a: point(*a, wf, hf),
-            b: point(*b, wf, hf),
+            a: point(*a, frame),
+            b: point(*b, frame),
         },
         Shape::Ellipse { a, b } => crate::annotate::Shape::Ellipse {
-            a: point(*a, wf, hf),
-            b: point(*b, wf, hf),
+            a: point(*a, frame),
+            b: point(*b, frame),
         },
         Shape::Highlight { a, b } => crate::annotate::Shape::Highlight {
-            a: point(*a, wf, hf),
-            b: point(*b, wf, hf),
+            a: point(*a, frame),
+            b: point(*b, frame),
         },
         Shape::Counter { pos, n } => crate::annotate::Shape::Counter {
-            pos: point(*pos, wf, hf),
+            pos: point(*pos, frame),
             n: *n,
         },
         Shape::Blur { a, b } => crate::annotate::Shape::Blur {
-            a: point(*a, wf, hf),
-            b: point(*b, wf, hf),
+            a: point(*a, frame),
+            b: point(*b, frame),
         },
         Shape::Text { pos, text } => crate::annotate::Shape::Text {
-            pos: point(*pos, wf, hf),
+            pos: point(*pos, frame),
             text: text.clone(),
         },
     };
@@ -103,12 +165,12 @@ pub fn render_at(
     items: &[Item],
     time: i64,
     skip: Option<usize>,
-    content_size: (u32, u32),
+    frame: Frame,
     offset: (f32, f32),
 ) {
     for (index, item) in items.iter().enumerate() {
         if Some(index) != skip && item.active_at(time) {
-            render_one_at(image, item, content_size, offset);
+            render_one_at(image, item, frame, offset);
         }
     }
 }
@@ -121,20 +183,14 @@ pub fn render_preview_at(
     items: &[Item],
     time: i64,
     skip: Option<usize>,
-    preview_content_size: (u32, u32),
+    preview: Frame,
     source_content_size: (u32, u32),
     offset: (f32, f32),
 ) {
-    let effective_metric = preview_metric_scale(preview_content_size, source_content_size);
+    let effective_metric = preview_metric_scale(preview.content, source_content_size);
     for (index, item) in items.iter().enumerate() {
         if Some(index) != skip && item.active_at(time) {
-            render_one_with_metric(
-                image,
-                item,
-                preview_content_size,
-                offset,
-                effective_metric,
-            );
+            render_one_with_metric(image, item, preview, offset, effective_metric);
         }
     }
 }
@@ -157,26 +213,21 @@ fn metric_scale(content_size: (u32, u32)) -> f32 {
     (content_size.0.min(content_size.1) as f32 / 720.0).clamp(0.45, 4.0)
 }
 
-pub fn render_one_at(
-    image: &mut RgbaImage,
-    item: &Item,
-    content_size: (u32, u32),
-    offset: (f32, f32),
-) {
-    render_one_with_metric(image, item, content_size, offset, metric_scale(content_size));
+pub fn render_one_at(image: &mut RgbaImage, item: &Item, frame: Frame, offset: (f32, f32)) {
+    render_one_with_metric(image, item, frame, offset, metric_scale(frame.content));
 }
 
 fn render_one_with_metric(
     image: &mut RgbaImage,
     item: &Item,
-    content_size: (u32, u32),
+    frame: Frame,
     offset: (f32, f32),
     metric_scale: f32,
 ) {
     if let Shape::Text { pos, text } = &item.shape {
         crate::annotate::render_caption(
             image,
-            point(*pos, content_size.0 as f32, content_size.1 as f32),
+            point(*pos, frame),
             text,
             crate::annotate::CaptionOptions {
                 color_index: item.color,
@@ -191,7 +242,7 @@ fn render_one_with_metric(
     }
     crate::annotate::render_with_metric(
         image,
-        &[annotation(item, content_size.0, content_size.1)],
+        &[annotation(item, frame)],
         1.0,
         metric_scale,
         offset,
@@ -199,7 +250,14 @@ fn render_one_with_metric(
     );
 }
 
-pub fn bounds(item: &Item, content_size: (u32, u32)) -> (f32, f32, f32, f32) {
+/// Bounds in source-normalized coordinates.
+///
+/// Pixel-sized shapes — the step badge's radius, a caption's text metrics —
+/// are measured against the drawn content and converted back through the crop,
+/// so a tighter crop makes them cover proportionally more of the recording,
+/// which is exactly what is on screen.
+pub fn bounds(item: &Item, frame: Frame) -> (f32, f32, f32, f32) {
+    let content_size = frame.content;
     match &item.shape {
         Shape::Arrow { from, to } | Shape::Line { from, to } => (
             from.0.min(to.0),
@@ -221,8 +279,7 @@ pub fn bounds(item: &Item, content_size: (u32, u32)) -> (f32, f32, f32, f32) {
         }
         Shape::Counter { pos, .. } => {
             let radius = (14.0 * metric_scale(content_size) * item.size).max(9.0);
-            let rx = radius / content_size.0.max(1) as f32;
-            let ry = radius / content_size.1.max(1) as f32;
+            let (rx, ry) = frame.to_normalized(radius, radius);
             (
                 (pos.0 - rx).max(0.0),
                 (pos.1 - ry).max(0.0),
@@ -236,12 +293,7 @@ pub fn bounds(item: &Item, content_size: (u32, u32)) -> (f32, f32, f32, f32) {
                 item.size,
                 metric_scale(content_size),
             )
-            .map(|(width, height)| {
-                (
-                    width as f32 / content_size.0.max(1) as f32,
-                    height as f32 / content_size.1.max(1) as f32,
-                )
-            })
+            .map(|(width, height)| frame.to_normalized(width as f32, height as f32))
             .unwrap_or((0.04, 0.035 * item.size));
             (
                 pos.0.max(0.0),
@@ -265,12 +317,8 @@ fn distance_to_segment(point: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     ((point.0 - nearest.0).powi(2) + (point.1 - nearest.1).powi(2)).sqrt()
 }
 
-pub fn hit(
-    item: &Item,
-    point: (f32, f32),
-    tolerance: f32,
-    content_size: (u32, u32),
-) -> bool {
+pub fn hit(item: &Item, point: (f32, f32), tolerance: f32, frame: Frame) -> bool {
+    let content_size = frame.content;
     match &item.shape {
         Shape::Arrow { from, to } | Shape::Line { from, to } => {
             distance_to_segment(point, *from, *to) <= tolerance
@@ -279,14 +327,14 @@ pub fn hit(
             .windows(2)
             .any(|segment| distance_to_segment(point, segment[0], segment[1]) <= tolerance),
         Shape::Blur { .. } | Shape::Highlight { .. } | Shape::Text { .. } => {
-            let (x0, y0, x1, y1) = bounds(item, content_size);
+            let (x0, y0, x1, y1) = bounds(item, frame);
             point.0 >= x0 - tolerance
                 && point.0 <= x1 + tolerance
                 && point.1 >= y0 - tolerance
                 && point.1 <= y1 + tolerance
         }
         Shape::Rect { .. } => {
-            let (x0, y0, x1, y1) = bounds(item, content_size);
+            let (x0, y0, x1, y1) = bounds(item, frame);
             let inside = point.0 >= x0 - tolerance
                 && point.0 <= x1 + tolerance
                 && point.1 >= y0 - tolerance
@@ -308,17 +356,21 @@ pub fn hit(
             (value - 1.0).abs() * rx.min(ry) <= tolerance * 1.5
         }
         Shape::Counter { pos, .. } => {
+            // Measured in drawn pixels so the grab target stays circular on a
+            // wide recording, and through the crop so it keeps matching what
+            // is on screen once the frame narrows.
             let (width, height) = (content_size.0.max(1) as f32, content_size.1.max(1) as f32);
             let radius = (14.0 * metric_scale(content_size) * item.size).max(9.0);
-            let dx = (point.0 - pos.0) * width;
-            let dy = (point.1 - pos.1) * height;
+            let from_centre = frame.to_pixels(point);
+            let centre = frame.to_pixels(*pos);
+            let (dx, dy) = (from_centre.0 - centre.0, from_centre.1 - centre.1);
             dx.hypot(dy) <= radius + tolerance * width.min(height)
         }
     }
 }
 
-pub fn translate(item: &mut Item, dx: f32, dy: f32, content_size: (u32, u32)) {
-    let (x0, y0, x1, y1) = bounds(item, content_size);
+pub fn translate(item: &mut Item, dx: f32, dy: f32, frame: Frame) {
+    let (x0, y0, x1, y1) = bounds(item, frame);
     let dx = dx.clamp(-x0, 1.0 - x1);
     let dy = dy.clamp(-y0, 1.0 - y1);
     let move_point = |point: &mut (f32, f32)| {
@@ -365,13 +417,14 @@ pub fn hit_handle(
     item: &Item,
     point: (f32, f32),
     radius: f32,
-    content_size: (u32, u32),
+    frame: Frame,
 ) -> Option<ShapeHandle> {
-    let (width, height) = (content_size.0.max(1) as f32, content_size.1.max(1) as f32);
+    let (width, height) = (frame.content.0.max(1) as f32, frame.content.1.max(1) as f32);
     let radius_px = radius * width.min(height);
+    let at = frame.to_pixels(point);
     handles(item)?.into_iter().find_map(|(handle, candidate)| {
-        let dx = (point.0 - candidate.0) * width;
-        let dy = (point.1 - candidate.1) * height;
+        let candidate = frame.to_pixels(candidate);
+        let (dx, dy) = (at.0 - candidate.0, at.1 - candidate.1);
         (dx.hypot(dy) <= radius_px).then_some(handle)
     })
 }
@@ -399,7 +452,7 @@ pub fn set_handle(item: &mut Item, handle: ShapeHandle, point: (f32, f32)) {
 mod tests {
     use super::{
         bounds, handles, hit, hit_handle, metric_scale, preview_metric_scale, render_at,
-        set_handle, translate, CaptionStyle, Item, Shape, ShapeHandle,
+        set_handle, translate, CaptionStyle, Crop, Frame, Item, Shape, ShapeHandle,
     };
     use image::{Rgba, RgbaImage};
 
@@ -416,6 +469,86 @@ mod tests {
             caption_style: CaptionStyle::Shadow,
             caption_box_opacity: 0.68,
         }
+    }
+
+    #[test]
+    fn an_uncropped_frame_maps_exactly_as_a_bare_content_size_did() {
+        // The whole point of `Crop::FULL`: every existing path keeps its
+        // arithmetic to the pixel, so nothing moves until somebody crops.
+        let frame = Frame::whole((1920, 1080));
+        assert_eq!(frame.crop, Crop::FULL);
+        for p in [(0.0, 0.0), (0.25, 0.75), (1.0, 1.0), (0.5, 0.5)] {
+            let mapped = frame.to_pixels(p);
+            assert!((mapped.0 - p.0 * 1920.0).abs() < 0.001);
+            assert!((mapped.1 - p.1 * 1080.0).abs() < 0.001);
+        }
+        let (nx, ny) = frame.to_normalized(192.0, 108.0);
+        assert!((nx - 0.1).abs() < 0.0001 && (ny - 0.1).abs() < 0.0001);
+    }
+
+    #[test]
+    fn a_crop_reframes_source_coordinates_onto_the_drawn_content() {
+        // The middle quarter of the recording, drawn at its own pixel size.
+        let frame = Frame {
+            crop: Crop { x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
+            content: (960, 540),
+        };
+        assert_ne!(frame.crop, Crop::FULL);
+
+        // The crop's top-left is the content's origin, its centre the middle.
+        let origin = frame.to_pixels((0.25, 0.25));
+        assert!(origin.0.abs() < 0.001 && origin.1.abs() < 0.001);
+        let centre = frame.to_pixels((0.5, 0.5));
+        assert!((centre.0 - 480.0).abs() < 0.001 && (centre.1 - 270.0).abs() < 0.001);
+
+        // A point outside the crop maps outside the content rather than being
+        // clamped — annotations keep their place in the recording and the
+        // renderer clips whatever now falls off.
+        let above = frame.to_pixels((0.25, 0.0));
+        assert!(above.1 < 0.0, "a point above the crop should map above it");
+
+        // Pixel-sized things shrink into a proportionally larger share of the
+        // recording, which is what a tighter crop looks like on screen.
+        let (nx, ny) = frame.to_normalized(96.0, 54.0);
+        assert!((nx - 0.05).abs() < 0.0001 && (ny - 0.05).abs() < 0.0001);
+    }
+
+    #[test]
+    fn a_cropped_render_places_an_annotation_where_the_crop_puts_it() {
+        // An arrow across the middle of the recording. Cropped to the middle
+        // quarter it must still cross the middle of the drawn frame, not sit
+        // where the uncropped coordinates would have put it.
+        let item = Item {
+            shape: Shape::Rect { a: (0.45, 0.45), b: (0.55, 0.55) },
+            start: 0,
+            end: 20,
+            color: 0,
+            size: 1.0,
+            caption_style: CaptionStyle::Shadow,
+            caption_box_opacity: 0.68,
+        };
+        let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
+        render_at(
+            &mut image,
+            std::slice::from_ref(&item),
+            10,
+            None,
+            Frame { crop: Crop { x: 0.25, y: 0.25, w: 0.5, h: 0.5 }, content: (200, 200) },
+            (0.0, 0.0),
+        );
+
+        // 0.45..0.55 of the source is 0.4..0.6 of this crop — pixels 80..120.
+        let painted: Vec<(u32, u32)> = image
+            .enumerate_pixels()
+            .filter(|(_, _, pixel)| pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(!painted.is_empty(), "nothing was drawn");
+        let (min_x, max_x) = (
+            painted.iter().map(|(x, _)| *x).min().unwrap(),
+            painted.iter().map(|(x, _)| *x).max().unwrap(),
+        );
+        assert!(min_x >= 70 && max_x <= 130, "drawn at {min_x}..{max_x}, expected ~80..120");
     }
 
     #[test]
@@ -482,11 +615,11 @@ mod tests {
                 std::slice::from_ref(&item),
                 10,
                 None,
-                (320, 180),
+                Frame::whole((320, 180)),
                 (0.0, 0.0),
             );
             assert!(image.pixels().any(|pixel| pixel[0] > 0));
-            assert!(hit(&item, hit_point, 0.03, (320, 180)));
+            assert!(hit(&item, hit_point, 0.03, Frame::whole((320, 180))));
         }
     }
 
@@ -503,7 +636,7 @@ mod tests {
             caption_style: CaptionStyle::Shadow,
             caption_box_opacity: 0.68,
         };
-        translate(&mut item, 0.2, 0.3, (1920, 1080));
+        translate(&mut item, 0.2, 0.3, Frame::whole((1920, 1080)));
         let Shape::Freehand { points } = item.shape else {
             panic!("expected freehand path");
         };
@@ -519,10 +652,10 @@ mod tests {
     #[test]
     fn arrow_hit_testing_and_translation_use_normalized_space() {
         let mut item = arrow();
-        assert!(hit(&item, (0.3, 0.4), 0.01, (1920, 1080)));
-        assert!(!hit(&item, (0.8, 0.2), 0.01, (1920, 1080)));
-        translate(&mut item, 0.7, 0.7, (1920, 1080));
-        let (x0, y0, x1, y1) = bounds(&item, (1920, 1080));
+        assert!(hit(&item, (0.3, 0.4), 0.01, Frame::whole((1920, 1080))));
+        assert!(!hit(&item, (0.8, 0.2), 0.01, Frame::whole((1920, 1080))));
+        translate(&mut item, 0.7, 0.7, Frame::whole((1920, 1080)));
+        let (x0, y0, x1, y1) = bounds(&item, Frame::whole((1920, 1080)));
         for (actual, expected) in [x0, y0, x1, y1].into_iter().zip([0.6, 0.6, 1.0, 1.0]) {
             assert!((actual - expected).abs() < 0.00001);
         }
@@ -532,11 +665,11 @@ mod tests {
     fn arrow_endpoints_can_be_redirected_without_moving_the_other_end() {
         let mut item = arrow();
         assert_eq!(
-            hit_handle(&item, (0.102, 0.202), 0.025, (1920, 1080)),
+            hit_handle(&item, (0.102, 0.202), 0.025, Frame::whole((1920, 1080))),
             Some(ShapeHandle::First)
         );
         assert_eq!(
-            hit_handle(&item, (0.498, 0.598), 0.025, (1920, 1080)),
+            hit_handle(&item, (0.498, 0.598), 0.025, Frame::whole((1920, 1080))),
             Some(ShapeHandle::Second)
         );
         assert_eq!(handles(&item).unwrap()[1].1, (0.5, 0.6));
@@ -601,7 +734,7 @@ mod tests {
             caption_box_opacity: 0.68,
         };
         let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
-        render_at(&mut image, &[item], 10, None, (100, 100), (50.0, 50.0));
+        render_at(&mut image, &[item], 10, None, Frame::whole((100, 100)), (50.0, 50.0));
 
         assert!(image
             .enumerate_pixels()
@@ -634,7 +767,7 @@ mod tests {
             &[item],
             10,
             None,
-            (1000, 400),
+            Frame::whole((1000, 400)),
             (100.0, 100.0),
         );
 
@@ -670,12 +803,12 @@ mod tests {
             std::slice::from_ref(&item),
             10,
             None,
-            (400, 200),
+            Frame::whole((400, 200)),
             (0.0, 0.0),
         );
         let mut shadow_item = item;
         shadow_item.caption_style = CaptionStyle::Shadow;
-        render_at(&mut shadow, &[shadow_item], 10, None, (400, 200), (0.0, 0.0));
+        render_at(&mut shadow, &[shadow_item], 10, None, Frame::whole((400, 200)), (0.0, 0.0));
 
         // The box extends left of the text origin; shadow-only text does not.
         assert!(boxed.get_pixel(94, 52)[0] < shadow.get_pixel(94, 52)[0]);
@@ -696,7 +829,7 @@ mod tests {
             caption_style: CaptionStyle::Box,
             caption_box_opacity: 0.68,
         };
-        let (x0, y0, x1, y1) = bounds(&item, content_size);
+        let (x0, y0, x1, y1) = bounds(&item, Frame::whole(content_size));
         let (text_w, text_h) = crate::annotate::caption_text_size(
             "BATTLE",
             item.size,
@@ -729,11 +862,11 @@ mod tests {
             std::slice::from_ref(&item),
             10,
             None,
-            (400, 200),
+            Frame::whole((400, 200)),
             (0.0, 0.0),
         );
         item.caption_box_opacity = 0.90;
-        render_at(&mut solid, &[item], 10, None, (400, 200), (0.0, 0.0));
+        render_at(&mut solid, &[item], 10, None, Frame::whole((400, 200)), (0.0, 0.0));
 
         // This pixel sits on the plate padding, outside the caption glyphs.
         assert!(solid.get_pixel(95, 52)[0] < light.get_pixel(95, 52)[0]);
@@ -753,8 +886,8 @@ mod tests {
             caption_style: CaptionStyle::Box,
             caption_box_opacity: 0.68,
         };
-        translate(&mut item, 0.15, 0.1, (1920, 1080));
-        translate(&mut item, 0.1, 0.2, (1920, 1080));
+        translate(&mut item, 0.15, 0.1, Frame::whole((1920, 1080)));
+        translate(&mut item, 0.1, 0.2, Frame::whole((1920, 1080)));
         let Shape::Text { pos, .. } = item.shape else {
             panic!("caption changed shape");
         };
