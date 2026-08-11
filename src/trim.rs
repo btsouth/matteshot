@@ -92,6 +92,44 @@ fn content_size_for_encoder(
     (even(cw), even(ch))
 }
 
+/// A normalized crop as a source-pixel rect: `(x, y, width, height)`.
+///
+/// Clamped inside the frame and rounded to even dimensions, because H.264
+/// rejects odd ones — doing it here means a real crop is a straight copy
+/// rather than a copy plus a one-pixel resample.
+fn crop_rect(crop: crate::video_edit::Crop, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    // The whole recording is the whole recording, odd dimensions and all.
+    // Evening it here would shave a pixel off an odd source, report itself as a
+    // crop, and disagree with the preview — which keeps the frame untouched for
+    // `FULL`. The encoder evens its own input further down regardless.
+    if crop == crate::video_edit::Crop::FULL {
+        return (0, 0, w, h);
+    }
+    let even = |v: u32| (v.max(2)) & !1;
+    let span = |origin: f32, size: f32, limit: u32| {
+        let limit_f = limit as f32;
+        let origin = (origin * limit_f).round().clamp(0.0, limit_f) as u32;
+        let size = even(((size * limit_f).round().clamp(2.0, limit_f)) as u32);
+        (origin.min(limit.saturating_sub(size)), size)
+    };
+    let (x, width) = span(crop.x, crop.w, w);
+    let (y, height) = span(crop.y, crop.h, h);
+    (x, y, width, height)
+}
+
+/// Copy a sub-rect out of a tightly packed BGRA frame.
+fn crop_bgra(source: &[u8], source_w: u32, rect: (u32, u32, u32, u32), out: &mut [u8]) {
+    let (x, y, width, height) = rect;
+    let (src_stride, dst_stride) = (source_w as usize * 4, width as usize * 4);
+    out.par_chunks_mut(dst_stride)
+        .take(height as usize)
+        .enumerate()
+        .for_each(|(row, dst)| {
+            let at = (y as usize + row) * src_stride + x as usize * 4;
+            dst.copy_from_slice(&source[at..at + dst_stride]);
+        });
+}
+
 fn scrub_cache_plan(
     duration: i64,
     source_size: (u32, u32),
@@ -798,6 +836,7 @@ pub fn cut_with_edit_progress_cancel(
         matte,
         annotations,
         &[],
+        crate::video_edit::Crop::FULL,
         cancel,
         progress,
     )
@@ -812,6 +851,7 @@ pub fn cut_with_speed_edit_progress_cancel(
     matte: Option<(&crate::style::Style, &crate::compose::ComposeOpts)>,
     annotations: &[crate::video_edit::Item],
     speed_ranges: &[crate::video_speed::SpeedRange],
+    crop: crate::video_edit::Crop,
     cancel: &AtomicBool,
     mut progress: impl FnMut(u32),
 ) -> Result<()> {
@@ -840,12 +880,25 @@ pub fn cut_with_speed_edit_progress_cancel(
         Some((style, opts)) if !crate::compose::is_plain(style) => (Some(style), *opts),
         _ => (None, crate::compose::ComposeOpts::default()),
     };
+    // The crop decides what "content" means before anything else measures it:
+    // the encoder is sized from the kept region, not the recording.
+    let crop_rect = crop_rect(crop, w, h);
+    let cropped = crop_rect != (0, 0, w, h);
+    let (crop_w, crop_h) = (crop_rect.2, crop_rect.3);
+    if cropped {
+        eprintln!(
+            "export: cropping {w}x{h} to {crop_w}x{crop_h} at {},{}",
+            crop_rect.0, crop_rect.1
+        );
+    }
     // Content may have to shrink so the framed result stays encodable.
-    let (cw, ch) = content_size_for_encoder(w, h, &matte_opts, matte.is_some());
-    let downscaled = (cw, ch) != (w, h);
+    let (cw, ch) = content_size_for_encoder(crop_w, crop_h, &matte_opts, matte.is_some());
+    let downscaled = (cw, ch) != (crop_w, crop_h);
     if downscaled {
         crate::diagnostics::log("export content scaled down to stay encodable");
-        eprintln!("export: content {w}x{h} -> {cw}x{ch} so the framed result fits H.264");
+        eprintln!(
+            "export: content {crop_w}x{crop_h} -> {cw}x{ch} so the framed result fits H.264"
+        );
     }
     let matte_base = matte
         .map(|style| crate::compose::compose_base(cw as usize, ch as usize, style, &matte_opts));
@@ -880,6 +933,12 @@ pub fn cut_with_speed_edit_progress_cancel(
     let source_row = (w * 4) as usize;
     let content_row = (cw * 4) as usize;
     let mut raw = vec![0u8; source_row * h as usize];
+    // Only allocated when a crop actually removes something.
+    let mut cropped_frame = if cropped {
+        vec![0u8; crop_w as usize * 4 * crop_h as usize]
+    } else {
+        Vec::new()
+    };
     // Only allocated when the content actually has to shrink.
     let mut scaled_content = if downscaled {
         vec![0u8; content_row * ch as usize]
@@ -962,11 +1021,17 @@ pub fn cut_with_speed_edit_progress_cancel(
                 }
                 buf.Unlock()?;
 
-                // Everything downstream works in content coordinates, which
-                // are the source's unless the frame had to shrink to stay
-                // encodable.
+                // Everything downstream works in content coordinates: the
+                // kept region of the source, shrunk further only if the framed
+                // result would otherwise be too big to encode.
+                let kept: &[u8] = if cropped {
+                    crop_bgra(&raw, w, crop_rect, &mut cropped_frame);
+                    &cropped_frame
+                } else {
+                    &raw
+                };
                 let content: &[u8] = if downscaled {
-                    let rgba = bgra_to_rgba(&raw, w, h);
+                    let rgba = bgra_to_rgba(kept, crop_w, crop_h);
                     let small = image::imageops::resize(
                         &rgba,
                         cw,
@@ -981,7 +1046,7 @@ pub fn cut_with_speed_edit_progress_cancel(
                         });
                     &scaled_content
                 } else {
-                    &raw
+                    kept
                 };
 
                 let out = if let Some(composed) = composed_frame.as_mut() {
@@ -997,17 +1062,16 @@ pub fn cut_with_speed_edit_progress_cancel(
                     } else {
                         bgra_to_rgba_into(content, composed);
                     }
-                    // Whole recording: this path does not crop its frames yet,
-                    // so the content it composes is the full source. When a
-                    // crop reaches the export it has to arrive here too, or
-                    // annotations would be placed against a frame that no
-                    // longer matches what was cropped.
+                    // Annotations are normalized to the recording, so the
+                    // frame has to say which window of it these `cw` x `ch`
+                    // pixels are — otherwise a cropped export would place them
+                    // against a picture that no longer matches.
                     crate::video_edit::render_at(
                         composed,
                         annotations,
                         ts,
                         None,
-                        crate::video_edit::Frame::whole((cw, ch)),
+                        crate::video_edit::Frame { crop, content: (cw, ch) },
                         annotation_offset,
                     );
                     rgba_to_bgra_in_place(composed);
@@ -1087,8 +1151,9 @@ pub fn cut_with_speed_edit_progress_cancel(
 #[cfg(test)]
 mod tests {
     use super::{
-        bgra_to_rgba, cut_with_speed_edit_progress_cancel, fit_inside, open_reader, retime_pcm,
-        retime_video_sample, rgba_to_bgra, scrub_cache_plan, validate_video,
+        bgra_to_rgba, crop_rect, cut_with_speed_edit_progress_cancel, fit_inside, open_reader,
+        read_video_frame, retime_pcm, retime_video_sample, rgba_to_bgra, scrub_cache_plan,
+        validate_video,
     };
     use std::sync::atomic::AtomicBool;
 
@@ -1188,6 +1253,7 @@ mod tests {
             None,
             &[],
             &[],
+            crate::video_edit::Crop::FULL,
             &AtomicBool::new(false),
             |_| {},
         )
@@ -1198,6 +1264,119 @@ mod tests {
         std::fs::remove_file(output).unwrap();
         std::fs::remove_file(source).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn a_cropped_export_keeps_only_the_cropped_pixels() {
+        use windows::Win32::Media::MediaFoundation::{
+            MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MF_VERSION,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("matteshot-crop-export-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        let output = dir.join("output.mp4");
+        const FPS: u32 = 30;
+        const WIDTH: u32 = 320;
+        const HEIGHT: u32 = 240;
+        let interval = 10_000_000i64 / FPS as i64;
+
+        // Left half red, right half blue. Cropping to the right half must
+        // leave blue only — a crop that silently did nothing would keep both.
+        let mut frame = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+        for y in 0..HEIGHT as usize {
+            for x in 0..WIDTH as usize {
+                let at = (y * WIDTH as usize + x) * 4;
+                let bgra: [u8; 4] = if (x as u32) < WIDTH / 2 {
+                    [0, 0, 255, 255]
+                } else {
+                    [255, 0, 0, 255]
+                };
+                frame[at..at + 4].copy_from_slice(&bgra);
+            }
+        }
+
+        unsafe {
+            MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+            let (writer, stream, _) =
+                crate::record::make_sink(&source, WIDTH, HEIGHT, FPS, None).unwrap();
+            for index in 0..FPS {
+                let buffer = MFCreateMemoryBuffer(frame.len() as u32).unwrap();
+                let mut destination = std::ptr::null_mut();
+                buffer.Lock(&mut destination, None, None).unwrap();
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame.len());
+                buffer.Unlock().unwrap();
+                buffer.SetCurrentLength(frame.len() as u32).unwrap();
+                let sample = MFCreateSample().unwrap();
+                sample.AddBuffer(&buffer).unwrap();
+                sample.SetSampleTime(index as i64 * interval).unwrap();
+                sample.SetSampleDuration(interval).unwrap();
+                writer.WriteSample(stream, &sample).unwrap();
+            }
+            writer.Finalize().unwrap();
+        }
+
+        cut_with_speed_edit_progress_cancel(
+            &source,
+            &output,
+            0,
+            10_000_000,
+            None,
+            &[],
+            &[],
+            crate::video_edit::Crop { x: 0.5, y: 0.0, w: 0.5, h: 1.0 },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+
+        let (reader, out_w, out_h, stride, _) = open_reader(&output, false).unwrap();
+        assert_eq!((out_w, out_h), (WIDTH / 2, HEIGHT), "cropped frame size");
+        let (bgra, _) = read_video_frame(&reader, out_w, out_h, stride)
+            .unwrap()
+            .expect("cropped export has a frame");
+
+        // Every pixel should be the blue half. Sampled with a wide tolerance
+        // because H.264 is lossy; the point is that no red survived.
+        let centre = ((out_h / 2 * out_w + out_w / 2) * 4) as usize;
+        let (blue, red) = (bgra[centre] as i32, bgra[centre + 2] as i32);
+        assert!(
+            blue > 128 && red < 96,
+            "centre of the cropped export is not the kept half: b={blue} r={red}"
+        );
+
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn a_normalized_crop_becomes_an_even_source_rect_inside_the_frame() {
+        // Even dimensions because H.264 rejects odd ones, and never hanging
+        // off an edge however the floats round.
+        assert_eq!(crop_rect(crate::video_edit::Crop::FULL, 1920, 1080), (0, 0, 1920, 1080));
+        // An odd source is left exactly alone. Evening it here would shave a
+        // pixel, report itself as a crop, and disagree with the preview, which
+        // keeps the frame untouched for FULL.
+        assert_eq!(crop_rect(crate::video_edit::Crop::FULL, 321, 241), (0, 0, 321, 241));
+        assert_eq!(
+            crop_rect(crate::video_edit::Crop { x: 0.5, y: 0.0, w: 0.5, h: 1.0 }, 320, 240),
+            (160, 0, 160, 240)
+        );
+        // An odd span rounds down to even and is nudged back inside.
+        let (x, y, w, h) =
+            crop_rect(crate::video_edit::Crop { x: 0.9, y: 0.9, w: 0.1, h: 0.1 }, 641, 481);
+        assert_eq!((w % 2, h % 2), (0, 0), "odd dimensions would be rejected");
+        assert!(x + w <= 641 && y + h <= 481, "crop {x},{y} {w}x{h} hangs off the frame");
+        // A degenerate crop still yields something encodable.
+        let (_, _, w, h) =
+            crop_rect(crate::video_edit::Crop { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, 320, 240);
+        assert!(w >= 2 && h >= 2);
     }
 
     #[test]

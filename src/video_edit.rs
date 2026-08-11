@@ -63,8 +63,66 @@ pub struct Crop {
     pub h: f32,
 }
 
+/// The smallest fraction of a recording worth keeping. Below this the preview
+/// has nothing to show and the encoder nothing to work with.
+const MIN_CROP: f32 = 0.02;
+
 impl Crop {
     pub const FULL: Crop = Crop { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
+
+    /// Corners in the order `resized` counts them: top-left, top-right,
+    /// bottom-right, bottom-left.
+    pub fn corners(self) -> [(f32, f32); 4] {
+        [
+            (self.x, self.y),
+            (self.x + self.w, self.y),
+            (self.x + self.w, self.y + self.h),
+            (self.x, self.y + self.h),
+        ]
+    }
+
+    pub fn contains(self, p: (f32, f32)) -> bool {
+        p.0 >= self.x && p.0 <= self.x + self.w && p.1 >= self.y && p.1 <= self.y + self.h
+    }
+
+    /// Build a crop from two dragged corners. Clamped inside the recording and
+    /// widened to `MIN_CROP` rather than rejected — a slightly-too-small drag
+    /// should give a small crop, not nothing.
+    pub fn from_points(a: (f32, f32), b: (f32, f32)) -> Crop {
+        let span = |p: f32, q: f32| {
+            let (low, high) = (p.min(q).clamp(0.0, 1.0), p.max(q).clamp(0.0, 1.0));
+            let size = (high - low).max(MIN_CROP);
+            ((low).min(1.0 - size), size)
+        };
+        let (x, w) = span(a.0, b.0);
+        let (y, h) = span(a.1, b.1);
+        Crop { x, y, w, h }
+    }
+
+    /// Slide the crop without letting it leave the recording. The size never
+    /// changes, so dragging into an edge stops rather than shrinking.
+    pub fn moved(self, dx: f32, dy: f32) -> Crop {
+        Crop {
+            x: (self.x + dx).clamp(0.0, 1.0 - self.w),
+            y: (self.y + dy).clamp(0.0, 1.0 - self.h),
+            ..self
+        }
+    }
+
+    /// Drag one corner to `point`, keeping the opposite one pinned. Returns the
+    /// new crop and which corner is now held: dragging past the opposite corner
+    /// flips it to the one it crossed to, without which the next move would pin
+    /// the wrong point and the rectangle would stick.
+    pub fn resized(self, corner: u8, point: (f32, f32)) -> (Crop, u8) {
+        let opposite = self.corners()[((corner as usize) + 2) % 4];
+        let held = match (point.0 > opposite.0, point.1 > opposite.1) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+        };
+        (Crop::from_points(opposite, point), held)
+    }
 }
 
 /// How a drawn image relates to the recording: which window of the source it
@@ -82,11 +140,6 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The whole recording at `content` pixels.
-    pub fn whole(content: (u32, u32)) -> Self {
-        Frame { crop: Crop::FULL, content }
-    }
-
     fn size(&self) -> (f32, f32) {
         (self.content.0.max(1) as f32, self.content.1.max(1) as f32)
     }
@@ -456,6 +509,12 @@ mod tests {
     };
     use image::{Rgba, RgbaImage};
 
+    /// The whole recording at `content` pixels — what every caller passed
+    /// before cropping existed, and the baseline these tests compare against.
+    fn whole(content: (u32, u32)) -> Frame {
+        Frame { crop: Crop::FULL, content }
+    }
+
     fn arrow() -> Item {
         Item {
             shape: Shape::Arrow {
@@ -472,10 +531,60 @@ mod tests {
     }
 
     #[test]
+    fn a_swept_crop_normalizes_and_stays_inside_the_recording() {
+        // Dragged up and to the left, and past the edges.
+        assert_eq!(
+            Crop::from_points((0.9, 0.7), (-0.5, -0.3)),
+            Crop { x: 0.0, y: 0.0, w: 0.9, h: 0.7 }
+        );
+        let corner = Crop::from_points((0.6, 0.4), (9.0, 9.0));
+        assert!((corner.x - 0.6).abs() < 1e-6 && (corner.w - 0.4).abs() < 1e-6);
+        assert!((corner.y - 0.4).abs() < 1e-6 && (corner.h - 0.6).abs() < 1e-6);
+
+        // A flick gives a small crop, nudged back inside rather than hanging
+        // off the far edge.
+        let flick = Crop::from_points((1.0, 1.0), (1.0, 1.0));
+        assert!(flick.w >= super::MIN_CROP && flick.h >= super::MIN_CROP);
+        assert!(flick.x + flick.w <= 1.0 + 1e-6 && flick.y + flick.h <= 1.0 + 1e-6);
+    }
+
+    #[test]
+    fn dragging_a_crop_into_an_edge_stops_it_instead_of_resizing_it() {
+        let crop = Crop { x: 0.1, y: 0.1, w: 0.4, h: 0.3 };
+        let moved = crop.moved(0.05, -0.04);
+        assert!((moved.x - 0.15).abs() < 1e-6 && (moved.y - 0.06).abs() < 1e-6);
+        assert_eq!((moved.w, moved.h), (crop.w, crop.h));
+
+        let pinned = crop.moved(9.0, 9.0);
+        assert!((pinned.x - 0.6).abs() < 1e-6 && (pinned.y - 0.7).abs() < 1e-6);
+        assert_eq!((pinned.w, pinned.h), (crop.w, crop.h));
+        let pinned = crop.moved(-9.0, -9.0);
+        assert!(pinned.x.abs() < 1e-6 && pinned.y.abs() < 1e-6);
+    }
+
+    #[test]
+    fn resizing_a_crop_pins_the_opposite_corner_and_survives_crossing_it() {
+        let crop = Crop { x: 0.1, y: 0.1, w: 0.4, h: 0.3 };
+        // Corner 0 is the top-left; (0.5, 0.4) stays put while it is dragged.
+        let (resized, held) = crop.resized(0, (0.2, 0.25));
+        assert!((resized.x - 0.2).abs() < 1e-6 && (resized.y - 0.25).abs() < 1e-6);
+        assert!((resized.w - 0.3).abs() < 1e-6 && (resized.h - 0.15).abs() < 1e-6);
+        assert_eq!(held, 0);
+
+        // Dragged past the pinned corner it becomes the bottom-right one, so
+        // the next move still pins (0.5, 0.4).
+        let (crossed, held) = crop.resized(0, (0.7, 0.6));
+        assert_eq!(held, 2);
+        assert!((crossed.x - 0.5).abs() < 1e-6 && (crossed.y - 0.4).abs() < 1e-6);
+        let (again, _) = crossed.resized(held, (0.8, 0.7));
+        assert!((again.x - 0.5).abs() < 1e-6 && (again.w - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
     fn an_uncropped_frame_maps_exactly_as_a_bare_content_size_did() {
         // The whole point of `Crop::FULL`: every existing path keeps its
         // arithmetic to the pixel, so nothing moves until somebody crops.
-        let frame = Frame::whole((1920, 1080));
+        let frame = whole((1920, 1080));
         assert_eq!(frame.crop, Crop::FULL);
         for p in [(0.0, 0.0), (0.25, 0.75), (1.0, 1.0), (0.5, 0.5)] {
             let mapped = frame.to_pixels(p);
@@ -615,11 +724,11 @@ mod tests {
                 std::slice::from_ref(&item),
                 10,
                 None,
-                Frame::whole((320, 180)),
+                whole((320, 180)),
                 (0.0, 0.0),
             );
             assert!(image.pixels().any(|pixel| pixel[0] > 0));
-            assert!(hit(&item, hit_point, 0.03, Frame::whole((320, 180))));
+            assert!(hit(&item, hit_point, 0.03, whole((320, 180))));
         }
     }
 
@@ -636,7 +745,7 @@ mod tests {
             caption_style: CaptionStyle::Shadow,
             caption_box_opacity: 0.68,
         };
-        translate(&mut item, 0.2, 0.3, Frame::whole((1920, 1080)));
+        translate(&mut item, 0.2, 0.3, whole((1920, 1080)));
         let Shape::Freehand { points } = item.shape else {
             panic!("expected freehand path");
         };
@@ -652,10 +761,10 @@ mod tests {
     #[test]
     fn arrow_hit_testing_and_translation_use_normalized_space() {
         let mut item = arrow();
-        assert!(hit(&item, (0.3, 0.4), 0.01, Frame::whole((1920, 1080))));
-        assert!(!hit(&item, (0.8, 0.2), 0.01, Frame::whole((1920, 1080))));
-        translate(&mut item, 0.7, 0.7, Frame::whole((1920, 1080)));
-        let (x0, y0, x1, y1) = bounds(&item, Frame::whole((1920, 1080)));
+        assert!(hit(&item, (0.3, 0.4), 0.01, whole((1920, 1080))));
+        assert!(!hit(&item, (0.8, 0.2), 0.01, whole((1920, 1080))));
+        translate(&mut item, 0.7, 0.7, whole((1920, 1080)));
+        let (x0, y0, x1, y1) = bounds(&item, whole((1920, 1080)));
         for (actual, expected) in [x0, y0, x1, y1].into_iter().zip([0.6, 0.6, 1.0, 1.0]) {
             assert!((actual - expected).abs() < 0.00001);
         }
@@ -665,11 +774,11 @@ mod tests {
     fn arrow_endpoints_can_be_redirected_without_moving_the_other_end() {
         let mut item = arrow();
         assert_eq!(
-            hit_handle(&item, (0.102, 0.202), 0.025, Frame::whole((1920, 1080))),
+            hit_handle(&item, (0.102, 0.202), 0.025, whole((1920, 1080))),
             Some(ShapeHandle::First)
         );
         assert_eq!(
-            hit_handle(&item, (0.498, 0.598), 0.025, Frame::whole((1920, 1080))),
+            hit_handle(&item, (0.498, 0.598), 0.025, whole((1920, 1080))),
             Some(ShapeHandle::Second)
         );
         assert_eq!(handles(&item).unwrap()[1].1, (0.5, 0.6));
@@ -734,7 +843,7 @@ mod tests {
             caption_box_opacity: 0.68,
         };
         let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
-        render_at(&mut image, &[item], 10, None, Frame::whole((100, 100)), (50.0, 50.0));
+        render_at(&mut image, &[item], 10, None, whole((100, 100)), (50.0, 50.0));
 
         assert!(image
             .enumerate_pixels()
@@ -767,7 +876,7 @@ mod tests {
             &[item],
             10,
             None,
-            Frame::whole((1000, 400)),
+            whole((1000, 400)),
             (100.0, 100.0),
         );
 
@@ -803,12 +912,12 @@ mod tests {
             std::slice::from_ref(&item),
             10,
             None,
-            Frame::whole((400, 200)),
+            whole((400, 200)),
             (0.0, 0.0),
         );
         let mut shadow_item = item;
         shadow_item.caption_style = CaptionStyle::Shadow;
-        render_at(&mut shadow, &[shadow_item], 10, None, Frame::whole((400, 200)), (0.0, 0.0));
+        render_at(&mut shadow, &[shadow_item], 10, None, whole((400, 200)), (0.0, 0.0));
 
         // The box extends left of the text origin; shadow-only text does not.
         assert!(boxed.get_pixel(94, 52)[0] < shadow.get_pixel(94, 52)[0]);
@@ -829,7 +938,7 @@ mod tests {
             caption_style: CaptionStyle::Box,
             caption_box_opacity: 0.68,
         };
-        let (x0, y0, x1, y1) = bounds(&item, Frame::whole(content_size));
+        let (x0, y0, x1, y1) = bounds(&item, whole(content_size));
         let (text_w, text_h) = crate::annotate::caption_text_size(
             "BATTLE",
             item.size,
@@ -862,11 +971,11 @@ mod tests {
             std::slice::from_ref(&item),
             10,
             None,
-            Frame::whole((400, 200)),
+            whole((400, 200)),
             (0.0, 0.0),
         );
         item.caption_box_opacity = 0.90;
-        render_at(&mut solid, &[item], 10, None, Frame::whole((400, 200)), (0.0, 0.0));
+        render_at(&mut solid, &[item], 10, None, whole((400, 200)), (0.0, 0.0));
 
         // This pixel sits on the plate padding, outside the caption glyphs.
         assert!(solid.get_pixel(95, 52)[0] < light.get_pixel(95, 52)[0]);
@@ -886,8 +995,8 @@ mod tests {
             caption_style: CaptionStyle::Box,
             caption_box_opacity: 0.68,
         };
-        translate(&mut item, 0.15, 0.1, Frame::whole((1920, 1080)));
-        translate(&mut item, 0.1, 0.2, Frame::whole((1920, 1080)));
+        translate(&mut item, 0.15, 0.1, whole((1920, 1080)));
+        translate(&mut item, 0.1, 0.2, whole((1920, 1080)));
         let Shape::Text { pos, .. } = item.shape else {
             panic!("caption changed shape");
         };
