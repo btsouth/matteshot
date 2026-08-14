@@ -113,6 +113,21 @@ try {
         throw "Unexpected installed binary signer."
     }
 
+    # Inno generates unins000.exe at install time from the payload the compiler
+    # signed (SignedUninstaller). An unsigned one here means SmartScreen scares
+    # customers at uninstall despite a trusted install.
+    Write-Step "Verifying uninstaller signature"
+    if (-not (Test-Path $uninstaller)) {
+        throw "Uninstaller was not found after install."
+    }
+    $uninstallerSignature = Get-AuthenticodeSignature $uninstaller
+    if ($uninstallerSignature.Status -ne "Valid") {
+        throw "Uninstaller signature is $($uninstallerSignature.Status)."
+    }
+    if ($uninstallerSignature.SignerCertificate.Subject -notmatch "CN=Brandon South") {
+        throw "Unexpected uninstaller signer."
+    }
+
     Write-Step "Checking untouched trial state"
     $initialStatus = Invoke-Matteshot @("--license-status") "license-before"
     if ($initialStatus -notmatch "14-day trial ready") {

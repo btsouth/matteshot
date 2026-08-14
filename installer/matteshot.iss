@@ -15,6 +15,16 @@
 #endif
 
 [Setup]
+; CI passes /DSign plus an /Ssigntool= command wired to scripts\sign-file.ps1.
+; Signing has to happen inside the compiler for the uninstaller's sake:
+; unins000.exe is generated here, so a post-build signing pass can only ever
+; reach the outer setup executable, and 0.18.0 shipped customers an unsigned
+; uninstaller that way. SignTool also signs the setup itself, which replaces
+; the old separate post-ISCC signing step. Local unsigned builds omit /DSign.
+#ifdef Sign
+SignTool=signtool
+SignedUninstaller=yes
+#endif
 AppId={{8B1F3C52-9D14-4A6E-B7E0-52A32C1D9F41}
 AppName=Matteshot
 AppVersion={#AppVersion}

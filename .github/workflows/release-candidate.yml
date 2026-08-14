@@ -1,10 +1,13 @@
 name: Release candidate
 
+# Dispatch-only. This workflow signs with the production Trusted Signing
+# identity, so pull requests must never schedule it: a PR trigger meant any
+# same-repository branch could run its own build.rs on the persistent signing
+# runner with the release environment and OIDC attached, and walk away with a
+# production-signed artifact before review. Candidates are cut manually from
+# commits already merged to main; the ancestry gate below enforces that.
 on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: read
@@ -15,7 +18,6 @@ jobs:
   # doesn't is kept off billed minutes.
   build:
     name: Build and sign private candidate
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, windows, matteshot]
     environment: release
     timeout-minutes: 30
@@ -26,13 +28,29 @@ jobs:
       version: ${{ steps.package.outputs.version }}
       installer-name: ${{ steps.installer.outputs.name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history so the ancestry gate below can walk back to main.
+          fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # workflow_dispatch runs whatever ref it was pointed at, and an admin can
+      # point it at any branch. Only commits that already survived review and
+      # merged to protected main may reach the signing identity.
+      - name: Require a commit reachable from main
+        shell: pwsh
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Commit $env:GITHUB_SHA is not reachable from origin/main. Candidates are signed only from merged commits."
+            exit 1
+          }
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Read package version
         id: package
@@ -66,14 +84,14 @@ jobs:
           }
 
       - name: Sign in to Azure with GitHub OIDC
-        uses: azure/login@v3
+        uses: Azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign the app binary with Trusted Signing
-        uses: Azure/artifact-signing-action@v2
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
         with:
           endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
@@ -83,16 +101,27 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Build installer
+      # ISCC signs the setup executable and the generated uninstaller through
+      # scripts\sign-file.ps1. The uninstaller can only be signed here: it
+      # exists solely inside the compiler, and shipping it unsigned meant
+      # SmartScreen warnings at uninstall despite a trusted install.
+      - name: Build and sign installer
         id: installer
         shell: pwsh
+        env:
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
         run: |
           # Pinned to match release.yml: the ISCC path below is version
           # specific, and a candidate built on a different compiler than the
           # real release is not much of a rehearsal.
           choco install innosetup --version=6.7.1 -y --no-progress
           $version = '${{ steps.package.outputs.version }}'
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\matteshot.iss
+          $signScript = (Resolve-Path 'scripts\sign-file.ps1').Path
+          $signCommand = "pwsh -NoProfile -ExecutionPolicy Bypass -File `"$signScript`" `$f"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=$version /DSign "/Ssigntool=$signCommand" installer\matteshot.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $path = "installer\Output\MatteshotSetup-$version.exe"
           if (-not (Test-Path $path)) {
@@ -105,29 +134,26 @@ jobs:
           # version string and silently going stale if the naming changes.
           "name=$(Split-Path -Leaf $path)" >> $env:GITHUB_OUTPUT
 
-      - name: Sign installer with Trusted Signing
-        uses: Azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files: ${{ steps.installer.outputs.path }}
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
       - name: Verify signatures and checksum
         shell: pwsh
         run: |
-          $app = Get-AuthenticodeSignature '${{ github.workspace }}\target\release\matteshot.exe'
-          $installer = Get-AuthenticodeSignature '${{ steps.installer.outputs.path }}'
-          if ($app.Status -ne 'Valid') {
-            Write-Error "App signature is $($app.Status)."
-            exit 1
-          }
-          if ($installer.Status -ne 'Valid') {
-            Write-Error "Installer signature is $($installer.Status)."
-            exit 1
+          # Assert the exact signer, not just generic validity: the installed
+          # app's own updater gate (src/installer.rs) accepts only this
+          # identity, so a merely-Valid signature from a drifted profile would
+          # pass Windows and still brick auto-update for every client.
+          foreach ($file in @(
+            '${{ github.workspace }}\target\release\matteshot.exe',
+            '${{ steps.installer.outputs.path }}'
+          )) {
+            $sig = Get-AuthenticodeSignature $file
+            if ($sig.Status -ne 'Valid') {
+              Write-Error "Signature on $file is $($sig.Status)."
+              exit 1
+            }
+            if ($sig.SignerCertificate.Subject -notmatch 'CN=Brandon South') {
+              Write-Error "Unexpected signer on ${file}: $($sig.SignerCertificate.Subject)"
+              exit 1
+            }
           }
           $hash = (Get-FileHash -Algorithm SHA256 '${{ steps.installer.outputs.path }}').Hash.ToLowerInvariant()
           # Written next to the installer (workspace-relative), not RUNNER_TEMP,
@@ -139,7 +165,7 @@ jobs:
       # Handed to the probe job below, which needs a real GitHub-hosted desktop
       # session the self-hosted runner cannot provide.
       - name: Upload unverified candidate for probing
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: candidate-unverified-${{ steps.package.outputs.version }}
           path: |
@@ -160,10 +186,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Download unverified candidate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: candidate-unverified-${{ needs.build.outputs.version }}
 
@@ -175,15 +201,16 @@ jobs:
         shell: pwsh
         run: |
           $installerPath = "installer\Output\${{ needs.build.outputs.installer-name }}"
-          $app = Get-AuthenticodeSignature 'target\release\matteshot.exe'
-          $installer = Get-AuthenticodeSignature $installerPath
-          if ($app.Status -ne 'Valid') {
-            Write-Error "App signature is $($app.Status) after transfer."
-            exit 1
-          }
-          if ($installer.Status -ne 'Valid') {
-            Write-Error "Installer signature is $($installer.Status) after transfer."
-            exit 1
+          foreach ($file in @('target\release\matteshot.exe', $installerPath)) {
+            $sig = Get-AuthenticodeSignature $file
+            if ($sig.Status -ne 'Valid') {
+              Write-Error "Signature on $file is $($sig.Status) after transfer."
+              exit 1
+            }
+            if ($sig.SignerCertificate.Subject -notmatch 'CN=Brandon South') {
+              Write-Error "Unexpected signer on ${file}: $($sig.SignerCertificate.Subject)"
+              exit 1
+            }
           }
           $expected = ((Get-Content -Raw 'installer\Output\MatteshotSetup.exe.sha256') -split '\s+')[0].ToLowerInvariant()
           $actual = (Get-FileHash -Algorithm SHA256 $installerPath).Hash.ToLowerInvariant()
@@ -219,7 +246,7 @@ jobs:
             -SignedFile '${{ github.workspace }}\installer\Output\${{ needs.build.outputs.installer-name }}'
 
       - name: Upload private signed candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Matteshot-${{ needs.build.outputs.version }}-signed-candidate
           path: |
