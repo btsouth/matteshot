@@ -35,7 +35,7 @@ jobs:
     # the single runner with ci.yml and will queue behind builds.
     runs-on: [self-hosted, windows, matteshot, grok]
     continue-on-error: true
-    timeout-minutes: 20
+    timeout-minutes: 35
     # Only the owner's own same-repository branches may schedule the persistent
     # local runner. pull_request_target keeps this workflow definition on the
     # trusted base branch while CodeRev treats the pinned PR head as evidence.
