@@ -375,7 +375,27 @@ fn needs_token_protection(state: &State) -> bool {
 
 fn load_state() -> Result<State> {
     let path = state_path().context("Windows has no application data directory")?;
-    let state = load_state_from(&path)?;
+    load_state_at(&path)
+}
+
+/// The downgrade escape hatch beside `license.json`. Builds that predate the
+/// protected token cannot parse the migrated file and report the license
+/// unavailable; renaming this sidecar back over `license.json` restores them.
+/// It holds the pre-migration plaintext, so it is deleted the moment the
+/// server rotates the token (next refresh) — from then on its contents are
+/// dead credentials and a downgraded build needs a fresh activation anyway.
+fn pre_dpapi_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("json.pre-dpapi")
+}
+
+fn remove_pre_dpapi_backup() {
+    if let Some(path) = state_path() {
+        let _ = std::fs::remove_file(pre_dpapi_backup_path(&path));
+    }
+}
+
+fn load_state_at(path: &std::path::Path) -> Result<State> {
+    let state = load_state_from(path)?;
     if !needs_token_protection(&state) {
         return Ok(state);
     }
@@ -385,21 +405,28 @@ fn load_state() -> Result<State> {
     // read above. (The named mutex is recursive per thread, so callers that
     // already hold it are fine.) save_state is atomic, and everything past
     // the lock is best-effort: on any failure the plaintext keeps working and
-    // the next load retries. The token that sat exposed on disk is then
-    // retired by the next scheduled refresh, which rotates tokens
-    // server-side.
+    // the next load retries.
     let Ok(_guard) = crate::state_lock::lock(LICENSE_MUTEX) else {
         return Ok(state);
     };
-    let mut state = load_state_from(&path)?;
+    let mut state = load_state_from(path)?;
     if needs_token_protection(&state) {
+        // The sidecar first: a migrated file with no backup strands anyone
+        // who rolls back to a build that cannot parse the new shape. Backup
+        // failure is not fatal, but it is worth a breadcrumb.
+        let backup = pre_dpapi_backup_path(path);
+        if let Err(error) = std::fs::copy(path, &backup) {
+            crate::diagnostics::log(&format!(
+                "pre-migration license backup failed (migrating anyway): {error}"
+            ));
+        }
         let migrated = state.license.take().map(StoredLicense::into_protected);
         let protected = migrated
             .as_ref()
             .is_some_and(|stored| stored.refresh_token.is_none());
         state.license = migrated;
         if protected {
-            match save_state(&state) {
+            match save_state_at(path, &state) {
                 Ok(()) => crate::diagnostics::log("license refresh token now DPAPI-protected"),
                 Err(error) => crate::diagnostics::log(&format!(
                     "license token protection migration not saved yet: {error:#}"
@@ -444,11 +471,15 @@ fn load_state_for_activation() -> Result<State> {
 
 fn save_state(state: &State) -> Result<()> {
     let path = state_path().context("Windows has no application data directory")?;
+    save_state_at(&path, state)
+}
+
+fn save_state_at(path: &std::path::Path, state: &State) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("create Matteshot data directory")?;
     }
     let body = serde_json::to_vec_pretty(state).context("serialize license state")?;
-    crate::state_lock::atomic_write(&path, &body).context("replace license state")
+    crate::state_lock::atomic_write(path, &body).context("replace license state")
 }
 
 static LAST_VALID_STATUS: OnceLock<Mutex<Option<Status>>> = OnceLock::new();
@@ -823,6 +854,9 @@ pub fn refresh_once() -> Result<Status> {
             state.license = None;
             save_state(&state)?;
         }
+        // The server just rejected this activation, so the sidecar's copy of
+        // its token is equally dead.
+        remove_pre_dpapi_backup();
         bail!(
             "{}",
             response_error(&response, "This activation is no longer valid.")
@@ -850,6 +884,10 @@ pub fn refresh_once() -> Result<Status> {
     }
     state.license = Some(replacement);
     save_state(&state)?;
+    // The refresh rotated the token server-side, so the pre-migration
+    // sidecar now holds a dead credential: no downgrade can use it, and
+    // keeping plaintext around past its usefulness was never the deal.
+    remove_pre_dpapi_backup();
     Ok(Status::Licensed {
         customer_email: certificate.customer_email,
         updates_until: certificate.updates_until,
@@ -978,6 +1016,8 @@ pub fn deactivate() -> Result<()> {
         state.license = None;
         save_state(&state)?;
     }
+    // Deactivation released the seat; the sidecar's token died with it.
+    remove_pre_dpapi_backup();
     Ok(())
 }
 
@@ -1350,6 +1390,36 @@ mod tests {
         let state = State { license: Some(migrated), ..Default::default() };
         assert!(same_activation(&state, &stored_legacy("tok-legacy")));
         assert!(!same_activation(&state, &stored_legacy("tok-other")));
+    }
+
+    #[test]
+    fn migration_leaves_a_downgrade_sidecar_beside_the_protected_state() {
+        let path = temporary_state_path("pre-dpapi-sidecar");
+        let _ = std::fs::remove_file(&path);
+        let legacy = serde_json::to_vec_pretty(&State {
+            license: Some(stored_legacy("tok-sidecar")),
+            ..Default::default()
+        })
+        .unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+
+        let state = load_state_at(&path).unwrap();
+        assert_eq!(
+            state.license.as_ref().and_then(StoredLicense::token).as_deref(),
+            Some("tok-sidecar")
+        );
+        // The migrated file no longer carries the plaintext...
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("tok-sidecar"));
+        // ...and the sidecar holds the exact pre-migration bytes, so a build
+        // that cannot parse the new shape can be restored by renaming it
+        // back. Without this, an 0.18.0 next to a newer build reported
+        // "License state temporarily unavailable" with no way home.
+        let sidecar = pre_dpapi_backup_path(&path);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), legacy);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     #[test]
