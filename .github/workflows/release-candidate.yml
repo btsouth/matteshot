@@ -30,8 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # Full history so the ancestry gate below can walk back to main.
+          # Full history so the ancestry gate below can walk back to main —
+          # this same fetch creates origin/main, so the gate needs no later
+          # credentialed fetch and the token is not left on the runner.
           fetch-depth: 0
+          persist-credentials: false
 
       # workflow_dispatch runs whatever ref it was pointed at, and an admin can
       # point it at any branch. Only commits that already survived review and
@@ -39,7 +42,8 @@ jobs:
       - name: Require a commit reachable from main
         shell: pwsh
         run: |
-          git fetch --no-tags origin main
+          # origin/main comes from the checkout above. If it is somehow
+          # absent, merge-base errors and this gate fails closed.
           git merge-base --is-ancestor $env:GITHUB_SHA origin/main
           if ($LASTEXITCODE -ne 0) {
             Write-Error "Commit $env:GITHUB_SHA is not reachable from origin/main. Candidates are signed only from merged commits."
@@ -76,7 +80,9 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-            choco install azure-cli -y --no-progress
+            # Pinned like every other dependency this credentialed job runs;
+            # check-workflow-pins.ps1 rejects an unpinned choco install.
+            choco install azure-cli --version=2.89.1 -y --no-progress
           }
           $azDir = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin"
           if (Test-Path $azDir) {
@@ -119,7 +125,14 @@ jobs:
           choco install innosetup --version=6.7.1 -y --no-progress
           $version = '${{ steps.package.outputs.version }}'
           $signScript = (Resolve-Path 'scripts\sign-file.ps1').Path
-          $signCommand = "pwsh -NoProfile -ExecutionPolicy Bypass -File `"$signScript`" `$f"
+          if ($signScript -match '\s') {
+            Write-Error "sign-file.ps1 resolved to a path with whitespace, which the Inno sign command cannot carry unquoted: $signScript"
+            exit 1
+          }
+          # Inno substitutes `$f` with the quoted target path itself; the
+          # guard above keeps the script path quote-free, so the command has
+          # no embedded-quote layers to survive native argument passing.
+          $signCommand = "pwsh -NoProfile -ExecutionPolicy Bypass -File $signScript `$f"
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
             /DAppVersion=$version /DSign "/Ssigntool=$signCommand" installer\matteshot.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -189,6 +202,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Download unverified candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

@@ -38,14 +38,32 @@ if (-not $installed) {
 }
 Import-Module -Name TrustedSigning -RequiredVersion $trustedSigningVersion
 
-Invoke-TrustedSigning `
-    -Endpoint $env:ARTIFACT_SIGNING_ENDPOINT `
-    -CodeSigningAccountName $env:ARTIFACT_SIGNING_ACCOUNT_NAME `
-    -CertificateProfileName $env:ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME `
-    -Files $Path `
-    -FileDigest SHA256 `
-    -TimestampRfc3161 'http://timestamp.acs.microsoft.com' `
-    -TimestampDigest SHA256
+# Invoke-TrustedSigning 0.5.8 has no single-file parameter — it signs a
+# folder's contents (FilesFolder + FilesFolderFilter). This script is handed
+# exactly one file at a time (the setup exe, or the uninstaller's temp file,
+# which is not even named *.exe), so stage a lone copy as .exe in a scratch
+# folder, sign that, and copy the signed bytes back: Authenticode lives inside
+# the file, so the copy carries the signature with it.
+$resolved = (Resolve-Path -LiteralPath $Path).Path
+$scratchRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+$scratch = New-Item -ItemType Directory `
+    -Path (Join-Path $scratchRoot ("sign-" + [guid]::NewGuid().ToString('N')))
+try {
+    $staged = Join-Path $scratch.FullName 'staged.exe'
+    Copy-Item -LiteralPath $resolved -Destination $staged
+    Invoke-TrustedSigning `
+        -Endpoint $env:ARTIFACT_SIGNING_ENDPOINT `
+        -CodeSigningAccountName $env:ARTIFACT_SIGNING_ACCOUNT_NAME `
+        -CertificateProfileName $env:ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME `
+        -FilesFolder $scratch.FullName `
+        -FilesFolderFilter 'exe' `
+        -FileDigest SHA256 `
+        -TimestampRfc3161 'http://timestamp.acs.microsoft.com' `
+        -TimestampDigest SHA256
+    Copy-Item -LiteralPath $staged -Destination $resolved -Force
+} finally {
+    Remove-Item -Recurse -Force $scratch
+}
 
 $signature = Get-AuthenticodeSignature -FilePath $Path
 if ($signature.Status -ne 'Valid') {

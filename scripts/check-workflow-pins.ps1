@@ -18,6 +18,12 @@ foreach ($workflow in $workflows) {
         $line = $lines[$i]
         $location = "$($workflow.Name):$($i + 1)"
 
+        # Full-line comments (YAML's, or PowerShell's inside run: blocks)
+        # execute nothing; without this the rules flag their own docs.
+        if ($line -match '^\s*#') {
+            continue
+        }
+
         if ($line -match '^\s*(?:-\s+)?uses:\s*(\S+)') {
             $ref = $Matches[1].Trim("'`"")
             # Local composite actions carry no ref to pin.
@@ -35,6 +41,12 @@ foreach ($workflow in $workflows) {
                 $failures += "${location}: npx package '$package' must pin an exact x.y.z version."
             }
         }
+
+        # Chocolatey packages are as mutable as npm tags, and these installs
+        # run on the signing runner before credentials come into scope.
+        if ($line -match '\bchoco(?:latey)?\s+install\b' -and $line -notmatch '--version[=\s]') {
+            $failures += "${location}: choco install must pin --version."
+        }
     }
 }
 
@@ -49,15 +61,15 @@ foreach ($script in $scripts) {
         if ($lines[$i] -match '^\s*#') {
             continue
         }
-        if ($lines[$i] -match '\bInstall-Module\b') {
+        if ($lines[$i] -match '\bInstall-(?:Module|PSResource)\b') {
             # The call may wrap across backtick continuations; look at the
             # whole statement before deciding the version is missing.
             $statement = $lines[$i]
             for ($j = $i; $j -lt $lines.Count - 1 -and $lines[$j].TrimEnd().EndsWith('`'); $j++) {
                 $statement += ' ' + $lines[$j + 1]
             }
-            if ($statement -notmatch '-RequiredVersion\b') {
-                $failures += "$($script.Name):$($i + 1): Install-Module must pin -RequiredVersion."
+            if ($statement -notmatch '-(?:RequiredVersion|Version)\b') {
+                $failures += "$($script.Name):$($i + 1): module install must pin an exact version."
             }
         }
     }
