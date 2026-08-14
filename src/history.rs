@@ -77,20 +77,47 @@ fn history_path() -> Option<PathBuf> {
 
 const HISTORY_MUTEX: &str = "Local\\Matteshot.History.State";
 
-fn load_unlocked() -> Log {
-    history_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+fn quarantine_path(path: &Path) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("json.corrupt-{unique}"))
 }
 
-fn save_unlocked(log: &Log) {
-    let Some(path) = history_path() else { return };
+/// Read the index ahead of a rewrite. `Ok` is a log that is safe to mutate
+/// and save back: the real contents, a fresh log for a file that has never
+/// existed, or a fresh log after corrupt bytes were quarantined aside. `Err`
+/// is a transient read failure — the bytes on disk may be perfectly good, so
+/// the caller must not write anything over them. Collapsing that case into
+/// "empty" is how one locked read plus one save used to erase the entire
+/// history.
+fn load_for_mutation(path: &Path) -> Result<Log> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Log::default()),
+        Err(error) => return Err(error).context("read history index"),
+    };
+    match serde_json::from_str(&body) {
+        Ok(log) => Ok(log),
+        Err(error) => {
+            // Corrupt is permanent, unlike a sharing violation: keep the
+            // bytes for inspection, then deliberately start fresh rather
+            // than failing every future save.
+            let backup = quarantine_path(path);
+            std::fs::rename(path, &backup).context("quarantine corrupt history index")?;
+            crate::diagnostics::log(&format!("corrupt history index quarantined: {error}"));
+            Ok(Log::default())
+        }
+    }
+}
+
+fn save_unlocked_at(path: &Path, log: &Log) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_vec_pretty(log) {
-        let _ = crate::state_lock::atomic_write(&path, &json);
+        let _ = crate::state_lock::atomic_write(path, &json);
     }
 }
 
@@ -144,24 +171,47 @@ fn normalize_source(source: Option<&str>) -> Option<String> {
 /// Record a successful save. Never fatal: history is a convenience index, not
 /// something a capture should fail over, so every error is swallowed here.
 pub fn record(path: &Path, width: u32, height: u32, style: &str, source: Option<&str>) {
-    let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
-    let mut log = load_unlocked();
-    log.entries.push(Entry {
+    let entry = Entry {
         path: path.to_path_buf(),
         saved_at: Local::now().timestamp(),
         width,
         height,
         style: style.to_string(),
         source: normalize_source(source),
-    });
+    };
+    let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
+    let Some(index) = history_path() else { return };
+    append_at(&index, entry);
+}
+
+fn append_at(index: &Path, entry: Entry) {
+    let mut log = match load_for_mutation(index) {
+        Ok(log) => log,
+        Err(error) => {
+            // Transient: the capture PNG is saved either way; skipping this
+            // one index entry is recoverable, overwriting the whole history
+            // with it never was.
+            crate::diagnostics::log(&format!(
+                "capture not indexed, history unreadable this save: {error:#}"
+            ));
+            return;
+        }
+    };
+    log.entries.push(entry);
     log.entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
-    save_unlocked(&log);
+    save_unlocked_at(index, &log);
 }
 
 /// Every entry whose file still exists, most recent first.
 pub fn list() -> Vec<Entry> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
-    let mut entries = trim_entries(load_unlocked().entries, MAX_ENTRIES, |p| p.is_file());
+    let Some(path) = history_path() else {
+        return Vec::new();
+    };
+    // A transient read failure shows an empty window this open — list never
+    // writes, so the index itself is untouched and comes back next time.
+    let log = load_for_mutation(&path).unwrap_or_default();
+    let mut entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
     entries.reverse();
     entries
 }
@@ -179,9 +229,13 @@ pub fn remove(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("delete capture"),
     }
-    let mut log = load_unlocked();
+    let index = history_path().context("Windows has no application data directory")?;
+    // Unlike record, a transient read failure surfaces here: the file is
+    // already gone, and silently keeping its stale entry would leave a
+    // Delete that "worked" still showing the capture.
+    let mut log = load_for_mutation(&index)?;
     log.entries.retain(|e| e.path != path);
-    save_unlocked(&log);
+    save_unlocked_at(&index, &log);
     Ok(())
 }
 
@@ -290,6 +344,72 @@ mod persistence_tests {
         // needs its own case rather than relying on the same check as \t/\n.
         let normalized = normalize_source(Some("Left\u{2028}Right\u{2029}End")).unwrap();
         assert_eq!(normalized, "Left Right End");
+    }
+
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("matteshot-history-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry_at(path: &Path) -> Entry {
+        Entry {
+            path: path.to_path_buf(),
+            saved_at: 1,
+            width: 10,
+            height: 10,
+            style: "plain".into(),
+            source: None,
+        }
+    }
+
+    /// A capture file the exists-filter in `trim_entries` will keep.
+    fn capture(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"png").unwrap();
+        path
+    }
+
+    #[test]
+    fn a_missing_index_starts_fresh_and_appends_keep_prior_entries() {
+        let dir = temp_dir("append");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&capture(&dir, "a.png")));
+        append_at(&index, entry_at(&capture(&dir, "b.png")));
+        let log = load_for_mutation(&index).unwrap();
+        assert_eq!(log.entries.len(), 2, "the second append lost the first entry");
+    }
+
+    #[test]
+    fn corrupt_bytes_are_quarantined_before_the_recovery_write() {
+        let dir = temp_dir("corrupt");
+        let index = dir.join("history.json");
+        std::fs::write(&index, b"{ not json").unwrap();
+        append_at(&index, entry_at(&capture(&dir, "a.png")));
+        // The deliberate fresh index holds the new capture...
+        assert_eq!(load_for_mutation(&index).unwrap().entries.len(), 1);
+        // ...and the original bytes were set aside, not destroyed.
+        let quarantined = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("history.json.corrupt-"))
+            .expect("the corrupt index was quarantined");
+        assert_eq!(std::fs::read(quarantined.path()).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn an_unreadable_index_is_never_overwritten() {
+        let dir = temp_dir("unreadable");
+        // A directory at the index path fails reads with something other
+        // than NotFound — the same shape as a sharing/permission error, the
+        // exact case that used to collapse into "empty history" and then be
+        // saved over.
+        let index = dir.join("history.json");
+        std::fs::create_dir_all(&index).unwrap();
+        append_at(&index, entry_at(&capture(&dir, "a.png")));
+        assert!(index.is_dir(), "the unreadable index was replaced by a write");
     }
 }
 

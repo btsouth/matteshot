@@ -703,6 +703,56 @@ fn partial_gif_path(destination: &std::path::Path, id: u64) -> std::path::PathBu
     parent.join(format!("{stem}.partial-{}-{id}.gif", std::process::id()))
 }
 
+/// Keep waiting on a capture worker the UI has already given up on, and
+/// publish its recording if finalization eventually succeeds. The GIF track
+/// is deliberately dropped on this path: the MP4 is the user's data.
+///
+/// Bounded at 15 minutes. Past that — or on any worker/validation failure —
+/// the partial is left in place: startup cleanup now validates video partials
+/// and recovers playable ones, so leaving the file is preservation, not
+/// litter.
+fn supervise_late_finalize(
+    worker: std::thread::JoinHandle<Option<GifFrames>>,
+    progress: Arc<Progress>,
+    partial: std::path::PathBuf,
+    destination: std::path::PathBuf,
+) {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+        while !worker.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                crate::diagnostics::log(
+                    "late recording finalize never completed; partial left for startup recovery",
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if worker.join().is_err() {
+            crate::diagnostics::log("late recording worker panicked");
+            return;
+        }
+        if let Some(error) = progress.error.lock().unwrap().clone() {
+            crate::diagnostics::log(&format!("late recording capture failed: {error}"));
+            return;
+        }
+        if let Err(error) = crate::trim::validate_video(&partial) {
+            crate::diagnostics::log(&format!("late recording failed validation: {error:#}"));
+            return;
+        }
+        match publish_recording_with(&partial, &destination, |from, to| std::fs::rename(from, to))
+        {
+            Ok(()) => crate::diagnostics::log(&format!(
+                "late recording finalized and published to {}",
+                destination.display()
+            )),
+            Err(error) => {
+                crate::diagnostics::log(&format!("late recording publish failed: {error:#}"))
+            }
+        }
+    });
+}
+
 fn publish_recording_with(
     partial: &std::path::Path,
     destination: &std::path::Path,
@@ -823,9 +873,15 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     let worker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !worker.is_finished() {
         if std::time::Instant::now() >= worker_deadline {
-            crate::diagnostics::log("recording finalize timeout");
+            // A slow Media Foundation Finalize is late, not lost: minutes of
+            // encoding can still land after the UI gives up waiting. Keep
+            // supervising off-thread and publish if it completes — returning
+            // here used to orphan the file, and startup then deleted a
+            // recording that had actually finished.
+            crate::diagnostics::log("recording finalize timeout; supervising in the background");
+            supervise_late_finalize(worker, progress.clone(), partial_mp4.clone(), mp4.clone());
             bail!(
-                "The recorder did not finish within 60 seconds. The incomplete file was quarantined and will be removed after restart."
+                "This recording is taking unusually long to finish. Matteshot keeps finalizing it in the background; if that succeeds, the video appears in your videos folder."
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
