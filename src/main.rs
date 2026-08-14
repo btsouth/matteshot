@@ -1157,37 +1157,42 @@ fn preview_bench(long_edge: u32) -> Result<()> {
     Ok(())
 }
 
-/// Auto-stop for the headless recording probes: close the stop pill `secs`
-/// after it appears.
+/// Auto-stop for the headless recording probes: close this session's stop
+/// pill `secs` after the capture loop's encoding clock starts.
 ///
-/// The countdown must not start at spawn. `record::session` still has WGC and
-/// encoder startup ahead of it, which on a starved CI VM can take seconds —
-/// counted from spawn, a 3-second probe once shipped a 0.17s fixture and the
-/// strict probe suite failed on it. Counting from the pill's appearance also
-/// closes the opposite hole: a timer that fired before the pill existed posted
-/// its WM_CLOSE to nothing, and the session recorded until the job timed out.
+/// The countdown must not start at spawn, and the pill's appearance is not
+/// enough either: recui creates it before WGC and the encoder finish setting
+/// up on the worker. Counted from either of those, a 3-second probe on a
+/// starved CI VM once shipped a 0.17s fixture and the strict probe suite
+/// failed on it. `record::PROBE_CAPTURE_RUNNING` flips exactly when encoded
+/// time starts accumulating, so the requested seconds measure recording.
+///
+/// The pill is looked up at fire time, restricted to this process: caching a
+/// desktop-wide handle across the sleep could close the resident app's pill
+/// (leaving this session recording until the job timeout) or post to a
+/// recycled handle.
 fn schedule_recording_stop(secs: u64) {
     std::thread::spawn(move || {
-        // Bounded wait: if the pill never appears the session failed to start
-        // and its error already ended the probe; there is nothing to stop.
+        use std::sync::atomic::Ordering;
+        // Bounded wait: if capture never starts the session failed and its
+        // own error already ended the probe; there is nothing to stop.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        let pill = loop {
-            if let Some(h) = crate::window::find_by_class("matteshot_recui") {
-                break h;
-            }
+        while !record::PROBE_CAPTURE_RUNNING.load(Ordering::Acquire) {
             if std::time::Instant::now() >= deadline {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        };
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         std::thread::sleep(std::time::Duration::from_secs(secs));
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                pill,
-                windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
+        if let Some(pill) = crate::window::find_own_by_class("matteshot_recui") {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    pill,
+                    windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
         }
     });
 }

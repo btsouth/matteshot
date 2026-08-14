@@ -66,6 +66,12 @@ const GIF_MAX_FRAMES: usize = 240;
 const GIF_MAX_WIDTH: u32 = 480;
 static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Flipped by the capture loop the moment its encoding clock starts. Probe
+/// observability only: the headless recording probes anchor their auto-stop
+/// countdown here so the requested duration measures actual recording, not
+/// WGC/encoder startup. Never reset — probe processes run one session.
+pub static PROBE_CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn sanitize_fps(fps: u32) -> u32 {
     match fps {
         SMOOTH_FPS => SMOOTH_FPS,
@@ -409,6 +415,12 @@ fn capture_loop(
     let frame_interval = 10_000_000i64 / fps as i64;
     let gif_every = gif_every(fps);
     let recording_clock = std::time::Instant::now();
+    // Everything the encoded duration is measured against starts here — WGC
+    // item, frame pool, and sink setup are all behind us. The headless probes
+    // key their auto-stop countdown off this moment: anything earlier (process
+    // start, even the pill's creation) still overlaps startup, which on a
+    // starved CI VM once ate a 3-second budget down to a 0.17s fixture.
+    PROBE_CAPTURE_RUNNING.store(true, Ordering::Release);
     let mut staging: Option<ID3D11Texture2D> = None;
     let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
     let row_bytes = (out_w * 4) as usize;

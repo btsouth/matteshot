@@ -241,6 +241,8 @@ pub fn find_by_title(substr: &str) -> Option<HWND> {
 
 struct ClassFindState<'a> {
     class_name: &'a str,
+    /// Only accept windows owned by this process id. `None` accepts any owner.
+    process: Option<u32>,
     found: Option<HWND>,
 }
 
@@ -249,6 +251,16 @@ unsafe extern "system" fn enum_class_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let mut class = [0u16; 128];
     let len = GetClassNameW(hwnd, &mut class) as usize;
     if String::from_utf16_lossy(&class[..len]) == state.class_name {
+        if let Some(process) = state.process {
+            let mut owner = 0u32;
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                hwnd,
+                Some(&mut owner),
+            );
+            if owner != process {
+                return BOOL(1);
+            }
+        }
         state.found = Some(hwnd);
         return BOOL(0);
     }
@@ -260,6 +272,25 @@ unsafe extern "system" fn enum_class_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 pub fn find_by_class(class_name: &str) -> Option<HWND> {
     let mut state = ClassFindState {
         class_name,
+        process: None,
+        found: None,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_class_proc),
+            LPARAM(&mut state as *mut ClassFindState<'_> as isize),
+        );
+    }
+    state.found
+}
+
+/// `find_by_class` restricted to windows this process owns. EnumWindows sees
+/// the whole desktop, and a caller reacting to its *own* surface must not
+/// latch onto the resident app's identically classed window.
+pub fn find_own_by_class(class_name: &str) -> Option<HWND> {
+    let mut state = ClassFindState {
+        class_name,
+        process: Some(std::process::id()),
         found: None,
     };
     unsafe {
