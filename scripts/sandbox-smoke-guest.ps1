@@ -87,7 +87,9 @@ try {
     if ($installerSignature.Status -ne "Valid") {
         throw "Installer signature is $($installerSignature.Status)."
     }
-    if ($installerSignature.SignerCertificate.Subject -notmatch "CN=Brandon South") {
+    $installerSigner = $installerSignature.SignerCertificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($installerSigner -cne "Brandon South") {
         throw "Unexpected installer signer."
     }
 
@@ -109,7 +111,9 @@ try {
     if ($appSignature.Status -ne "Valid") {
         throw "Installed binary signature is $($appSignature.Status)."
     }
-    if ($appSignature.SignerCertificate.Subject -notmatch "CN=Brandon South") {
+    $appSigner = $appSignature.SignerCertificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($appSigner -cne "Brandon South") {
         throw "Unexpected installed binary signer."
     }
 
@@ -124,7 +128,9 @@ try {
     if ($uninstallerSignature.Status -ne "Valid") {
         throw "Uninstaller signature is $($uninstallerSignature.Status)."
     }
-    if ($uninstallerSignature.SignerCertificate.Subject -notmatch "CN=Brandon South") {
+    $uninstallerSigner = $uninstallerSignature.SignerCertificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($uninstallerSigner -cne "Brandon South") {
         throw "Unexpected uninstaller signer."
     }
 

@@ -27,9 +27,16 @@ foreach ($name in @(
     }
 }
 
-if (-not (Get-Module -ListAvailable -Name TrustedSigning)) {
-    Install-Module -Name TrustedSigning -Force -Scope CurrentUser -Repository PSGallery
+# Version-pinned like every other dependency this pipeline executes with
+# credentials in scope; check-workflow-pins.ps1 enforces the pin's presence.
+$trustedSigningVersion = '0.5.8'
+$installed = Get-Module -ListAvailable -Name TrustedSigning |
+    Where-Object { $_.Version -eq $trustedSigningVersion }
+if (-not $installed) {
+    Install-Module -Name TrustedSigning -RequiredVersion $trustedSigningVersion `
+        -Force -Scope CurrentUser -Repository PSGallery
 }
+Import-Module -Name TrustedSigning -RequiredVersion $trustedSigningVersion
 
 Invoke-TrustedSigning `
     -Endpoint $env:ARTIFACT_SIGNING_ENDPOINT `
@@ -45,8 +52,13 @@ if ($signature.Status -ne 'Valid') {
     Write-Error "Signature on $Path is $($signature.Status) after signing."
     exit 1
 }
-if ($signature.SignerCertificate.Subject -notmatch 'CN=Brandon South') {
-    Write-Error "Unexpected signer on $Path`: $($signature.SignerCertificate.Subject)"
+# Exact simple display name, the same value the installed app's updater gate
+# compares (CERT_NAME_SIMPLE_DISPLAY_TYPE in src/installer.rs). A substring
+# match would accept 'CN=Brandon South Evil'.
+$signer = $signature.SignerCertificate.GetNameInfo(
+    [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+if ($signer -cne 'Brandon South') {
+    Write-Error "Unexpected signer on $Path`: '$signer' ($($signature.SignerCertificate.Subject))"
     exit 1
 }
 Write-Host "Signed $Path as $($signature.SignerCertificate.Subject)."

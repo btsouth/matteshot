@@ -140,8 +140,10 @@ jobs:
               Write-Error "Signature on $file is $($sig.Status)."
               exit 1
             }
-            if ($sig.SignerCertificate.Subject -notmatch 'CN=Brandon South') {
-              Write-Error "Unexpected signer on ${file}: $($sig.SignerCertificate.Subject)"
+            $signer = $sig.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if ($signer -cne 'Brandon South') {
+              Write-Error "Unexpected signer on ${file}: '$signer' ($($sig.SignerCertificate.Subject))"
               exit 1
             }
           }
@@ -193,8 +195,10 @@ jobs:
               Write-Error "Signature on $file is $($sig.Status) after transfer."
               exit 1
             }
-            if ($sig.SignerCertificate.Subject -notmatch 'CN=Brandon South') {
-              Write-Error "Unexpected signer on ${file}: $($sig.SignerCertificate.Subject)"
+            $signer = $sig.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if ($signer -cne 'Brandon South') {
+              Write-Error "Unexpected signer on ${file}: '$signer' ($($sig.SignerCertificate.Subject))"
               exit 1
             }
           }
