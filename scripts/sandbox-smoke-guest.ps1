@@ -46,7 +46,21 @@ function Remove-TestActivation {
     }
 
     $licenseState = Get-Content -Raw $licenseStatePath | ConvertFrom-Json
-    if (-not $licenseState.license.refresh_token -or -not $licenseState.license.certificate) {
+    # Current builds store the refresh token as a DPAPI current-user blob;
+    # the plaintext field only exists in pre-migration state. The sandbox
+    # user is the one who activated, so it can unprotect its own blob.
+    $storedToken = $licenseState.license.refresh_token
+    if (-not $storedToken -and $licenseState.license.refresh_token_protected) {
+        Add-Type -AssemblyName System.Security
+        $protectedBytes = [Convert]::FromBase64String($licenseState.license.refresh_token_protected)
+        $tokenBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $protectedBytes,
+            $null,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        $storedToken = [Text.Encoding]::UTF8.GetString($tokenBytes)
+    }
+    if (-not $storedToken -or -not $licenseState.license.certificate) {
         return $false
     }
 
@@ -60,7 +74,7 @@ function Remove-TestActivation {
     )
     $certificate = $certificateJson | ConvertFrom-Json
     $deactivationBody = @{
-        refresh_token = $licenseState.license.refresh_token
+        refresh_token = $storedToken
         device_id = $certificate.device_id
     } | ConvertTo-Json
     $deactivation = Invoke-RestMethod `

@@ -1,13 +1,17 @@
-//! Anonymous usage telemetry, sent to PostHog.
+//! Pseudonymous usage telemetry, sent to PostHog.
 //!
 //! Consent first: `Config::telemetry` is `Option<bool>` and starts as `None`,
 //! meaning unanswered. Nothing is sent while that holds. The first-run screen
 //! asks, with the box ticked where opt-out is lawful and empty across the EU,
 //! EEA, UK and Switzerland, and Settings can change the answer later.
 //!
-//! Only event names, the anonymous `device_id()`, the app version, and the
-//! Windows build are ever transmitted. Screenshots, OCR text, file names, and
-//! paths are never part of an event.
+//! Only event names, a random installation-scoped telemetry id, the app
+//! version, and the Windows build are ever transmitted. The id is minted after
+//! consent and is deliberately unrelated to `MachineGuid` and the licensing
+//! device id: a stable machine-derived identifier would make usage history
+//! joinable to a named customer and survive reinstalls, which "anonymous"
+//! never was. A retained random id is pseudonymous, so that is the word.
+//! Screenshots, OCR text, file names, and paths are never part of an event.
 //!
 //! `matteshot_failure` additionally carries an `operation` and a `kind`, both
 //! drawn from fixed sets. Error messages are never sent: `failure_kind`
@@ -220,6 +224,56 @@ pub fn report_with(event: &str, properties: &[(&str, serde_json::Value)]) {
     });
 }
 
+/// The pseudonymous, installation-scoped PostHog identity.
+///
+/// Minted lazily on the first event after consent, stored in config, and
+/// cleared when telemetry is turned off — re-enabling starts an unlinkable
+/// fresh history. Never derived from `MachineGuid` or the licensing device id;
+/// those join usage to a customer and survive reinstalls. `None` means do not
+/// send at all.
+fn distinct_id() -> Option<String> {
+    let config = crate::config::Config::load();
+    if !config.telemetry_enabled() {
+        return None;
+    }
+    if let Some(id) = config.telemetry_id {
+        return Some(id);
+    }
+    let fresh = new_telemetry_id()?;
+    // Persisted under Config::update's lock, where consent is re-checked:
+    // Settings may have turned telemetry off since the load above, and an
+    // opt-out must neither send this event nor have an id written back for a
+    // later opt-in to rejoin histories with. If a concurrent event minted
+    // first, the id already on disk is the one every thread must use.
+    match crate::config::Config::update(|cfg| {
+        if cfg.telemetry_enabled() && cfg.telemetry_id.is_none() {
+            cfg.telemetry_id = Some(fresh.clone());
+        }
+    }) {
+        Ok(saved) if saved.telemetry_enabled() => saved.telemetry_id,
+        Ok(_) => None,
+        // Config unwritable (read-only profile, full disk): keep one stable
+        // per-process id rather than a fresh PostHog person per event.
+        Err(_) => Some(SESSION_TELEMETRY_ID.get_or_init(|| fresh).clone()),
+    }
+}
+
+/// Fallback identity for a process whose config cannot be written. Still
+/// random and installation-unlinked; it just also stays stable across the
+/// events of this run.
+static SESSION_TELEMETRY_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// A random UUID, hyphenated lowercase. `None` if the system cannot produce
+/// one, in which case nothing is sent.
+fn new_telemetry_id() -> Option<String> {
+    let guid = windows::core::GUID::new().ok()?;
+    let d4 = guid.data4;
+    Some(format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1, guid.data2, guid.data3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+    ))
+}
+
 fn send_event(event: &str, properties: &[(String, serde_json::Value)]) -> Result<()> {
     let mut props = serde_json::Map::new();
     props.insert("product".into(), serde_json::Value::String("matteshot".into()));
@@ -240,10 +294,15 @@ fn send_event(event: &str, properties: &[(String, serde_json::Value)]) -> Result
         props.insert(key.clone(), value.clone());
     }
 
+    // No id, no event: consent was withdrawn between the spawn and now, or
+    // the id could not be minted. Never fall back to a machine identifier.
+    let Some(distinct_id) = distinct_id() else {
+        return Ok(());
+    };
     let payload = CaptureEvent {
         api_key: POSTHOG_API_KEY,
         event,
-        distinct_id: crate::license::device_id(),
+        distinct_id,
         properties: props,
     };
     let body = serde_json::to_vec(&payload).context("serialize telemetry event")?;
@@ -370,6 +429,24 @@ fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
 mod tests {
     use super::*;
     use anyhow::{anyhow, Context};
+
+    #[test]
+    fn telemetry_ids_are_random_and_unrelated_to_the_licensing_id() {
+        let first = new_telemetry_id().expect("a UUID can be minted");
+        let second = new_telemetry_id().expect("a UUID can be minted");
+        // Random per mint: a repeat would mean it is derived from something
+        // stable, which is exactly what this id must never be.
+        assert_ne!(first, second);
+        for id in [&first, &second] {
+            assert_eq!(id.len(), 36);
+            assert_eq!(id.matches('-').count(), 4);
+            assert_eq!(id.to_ascii_lowercase(), *id);
+            // The joinability this replaces: the licensing device id is a
+            // stable machine-derived hash and must never be the PostHog
+            // identity again.
+            assert_ne!(*id, crate::license::device_id());
+        }
+    }
 
     /// The whole point of the classifier: an operator can never be told what a
     /// user's files are called. Every one of these errors carries something

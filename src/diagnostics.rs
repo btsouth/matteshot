@@ -98,6 +98,13 @@ fn recent_events() -> String {
 /// Contains no account name, machine name, license key, capture title, or
 /// save path. It is safe to paste into a support request after reviewing it.
 pub fn report() -> String {
+    // The coarse entitlement class, never the tray label: that one greets
+    // the licensed user by email, and this report promises to carry no
+    // account identity.
+    report_with_license(crate::license::status().diagnostics_label())
+}
+
+fn report_with_license(license_label: &str) -> String {
     let config = crate::config::Config::load();
     let save_location = if config.save_dir.is_some() {
         "custom"
@@ -127,7 +134,7 @@ pub fn report() -> String {
          Recent lifecycle events:\r\n{}",
         env!("CARGO_PKG_VERSION"),
         windows_version(),
-        crate::license::status().tray_label(),
+        license_label,
         crate::prtscn::preferred(),
         crate::prtscn::owns_key(),
         downs,
@@ -183,5 +190,27 @@ mod tests {
         assert!(report.contains("Matteshot diagnostics"));
         assert!(report.contains("Capture folder: "));
         assert!(report.contains("Video folder: "));
+    }
+
+    #[test]
+    fn licensed_report_carries_no_identity_markers() {
+        // The promise in report()'s doc comment, checked against the exact
+        // status that used to leak: a licensed user with a stored email.
+        let status = crate::license::Status::Licensed {
+            customer_email: Some("person@example.com".into()),
+            updates_until: None,
+        };
+        let report = report_with_license(status.diagnostics_label());
+        assert!(report.contains("License: Licensed\r\n"));
+        // The lifecycle tail replays whatever this machine logged; the
+        // license line lives in the header, so that is where identity
+        // must be absent.
+        let header = report
+            .split("Recent lifecycle events:")
+            .next()
+            .expect("report has a header");
+        assert!(!header.contains('@'), "an email address reached the report");
+        assert!(!header.contains("Licensed to"));
+        assert!(!header.contains("person"));
     }
 }

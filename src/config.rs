@@ -43,6 +43,12 @@ pub struct Config {
     /// Installs that already carry an explicit true or false keep it and are
     /// not asked again.
     pub telemetry: Option<bool>,
+    /// The pseudonymous PostHog identity: a random UUID minted on the first
+    /// event after consent. Deliberately not derived from `MachineGuid` or any
+    /// licensing identifier — usage history must not be joinable to a
+    /// customer, and it must not survive a reinstall. Cleared whenever
+    /// telemetry is turned off, so turning it back on starts a fresh history.
+    pub telemetry_id: Option<String>,
     /// Keep the tweak editor's tab open after Copy so the capture can keep
     /// being refined. Off restores the old close-after-copy behavior.
     pub keep_editor_open: bool,
@@ -81,6 +87,7 @@ impl Default for Config {
             video_dir: None,
             auto_update: true,
             telemetry: None,
+            telemetry_id: None,
             keep_editor_open: true,
             capture_hotkey: default_capture_hotkey(),
             capture_delay_secs: default_capture_delay(),

@@ -86,6 +86,19 @@ impl Status {
         Some(format!("Updates through {}", until.format("%-d %B %Y")))
     }
 
+    /// Entitlement class only, for the privacy-safe support report. The tray
+    /// label greets the licensed user by email; a diagnostics paste must never
+    /// carry that identity, so this deliberately collapses every variant to a
+    /// coarse word.
+    pub fn diagnostics_label(&self) -> &'static str {
+        match self {
+            Status::Licensed { .. } => "Licensed",
+            Status::TrialNotStarted | Status::Trial { .. } => "Trial",
+            Status::Unavailable => "Unavailable",
+            Status::Expired => "Expired",
+        }
+    }
+
     pub fn tray_label(&self) -> String {
         match self {
             Status::Licensed {
@@ -122,7 +135,125 @@ struct State {
 struct StoredLicense {
     certificate: String,
     signature: String,
-    refresh_token: String,
+    /// Legacy plaintext refresh token from installs that predate DPAPI
+    /// protection. Read for migration and never written by current builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    /// The refresh token as a DPAPI current-user blob, base64. Useless off
+    /// this machine and account: a profile backup, support bundle, or
+    /// infostealer copying `license.json` gets ciphertext, not a reusable
+    /// session credential. Signature checks stop forgery; this stops theft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token_protected: Option<String>,
+}
+
+impl StoredLicense {
+    fn new(certificate: String, signature: String, refresh_token: String) -> Self {
+        match dpapi_protect(refresh_token.as_bytes()) {
+            Ok(blob) => Self {
+                certificate,
+                signature,
+                refresh_token: None,
+                refresh_token_protected: Some(STANDARD.encode(blob)),
+            },
+            Err(error) => {
+                // DPAPI failing for the current user is close to theoretical.
+                // If it does, a working activation beats an unusable one: keep
+                // the legacy shape and let a later load retry the migration.
+                crate::diagnostics::log(&format!(
+                    "license token protection unavailable, storing legacy shape: {error:#}"
+                ));
+                Self {
+                    certificate,
+                    signature,
+                    refresh_token: Some(refresh_token),
+                    refresh_token_protected: None,
+                }
+            }
+        }
+    }
+
+    /// The usable refresh token, whichever shape holds it. `None` when the
+    /// protected blob cannot be decrypted here — copied from another machine
+    /// or user profile, or corrupt — which callers treat as "no session".
+    fn token(&self) -> Option<String> {
+        if let Some(blob) = &self.refresh_token_protected {
+            let decoded = STANDARD.decode(blob).ok()?;
+            let secret = dpapi_unprotect(&decoded).ok()?;
+            return String::from_utf8(secret).ok();
+        }
+        self.refresh_token.clone()
+    }
+
+    /// Drain a legacy plaintext token into the protected shape. Identity for
+    /// already-protected state; on DPAPI failure the legacy shape survives so
+    /// nothing is lost and the next load retries.
+    fn into_protected(self) -> Self {
+        match (&self.refresh_token, &self.refresh_token_protected) {
+            (Some(token), None) => {
+                let token = token.clone();
+                Self::new(self.certificate, self.signature, token)
+            }
+            _ => self,
+        }
+    }
+}
+
+/// Encrypt for the current Windows user (DPAPI), no UI ever.
+fn dpapi_protect(secret: &[u8]) -> Result<Vec<u8>> {
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: secret.len() as u32,
+        pbData: secret.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    unsafe {
+        CryptProtectData(
+            &input,
+            None,
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+        .context("protect secret with DPAPI")?;
+        let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(
+            output.pbData as *mut core::ffi::c_void,
+        ));
+        Ok(bytes)
+    }
+}
+
+fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>> {
+    use windows::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: blob.len() as u32,
+        pbData: blob.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    unsafe {
+        CryptUnprotectData(
+            &input,
+            None,
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+        .context("unprotect secret with DPAPI")?;
+        let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(
+            output.pbData as *mut core::ffi::c_void,
+        ));
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -235,9 +366,48 @@ fn load_state_from(path: &std::path::Path) -> Result<State> {
     serde_json::from_str(&body).context("parse license state")
 }
 
+fn needs_token_protection(state: &State) -> bool {
+    state
+        .license
+        .as_ref()
+        .is_some_and(|stored| stored.refresh_token.is_some())
+}
+
 fn load_state() -> Result<State> {
     let path = state_path().context("Windows has no application data directory")?;
-    load_state_from(&path)
+    let state = load_state_from(&path)?;
+    if !needs_token_protection(&state) {
+        return Ok(state);
+    }
+    // Drain the pre-DPAPI plaintext token into the protected shape. The write
+    // happens under LICENSE_MUTEX with the state re-read inside it, so a
+    // concurrent activation or refresh save cannot be clobbered with what was
+    // read above. (The named mutex is recursive per thread, so callers that
+    // already hold it are fine.) save_state is atomic, and everything past
+    // the lock is best-effort: on any failure the plaintext keeps working and
+    // the next load retries. The token that sat exposed on disk is then
+    // retired by the next scheduled refresh, which rotates tokens
+    // server-side.
+    let Ok(_guard) = crate::state_lock::lock(LICENSE_MUTEX) else {
+        return Ok(state);
+    };
+    let mut state = load_state_from(&path)?;
+    if needs_token_protection(&state) {
+        let migrated = state.license.take().map(StoredLicense::into_protected);
+        let protected = migrated
+            .as_ref()
+            .is_some_and(|stored| stored.refresh_token.is_none());
+        state.license = migrated;
+        if protected {
+            match save_state(&state) {
+                Ok(()) => crate::diagnostics::log("license refresh token now DPAPI-protected"),
+                Err(error) => crate::diagnostics::log(&format!(
+                    "license token protection migration not saved yet: {error:#}"
+                )),
+            }
+        }
+    }
+    Ok(state)
 }
 
 fn corrupt_state_backup_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -307,11 +477,17 @@ fn status_after_load_error(error: &anyhow::Error, cached: Option<Status>) -> Sta
 }
 
 fn same_activation(state: &State, expected: &StoredLicense) -> bool {
-    state
-        .license
-        .as_ref()
-        .map(|stored| stored.refresh_token.as_str())
-        == Some(expected.refresh_token.as_str())
+    // Compared through `token()` so a protected and a legacy shape holding
+    // the same credential still count as the same activation mid-migration.
+    // Two undecryptable tokens are never "the same": that would let damaged
+    // state replace or release an activation it cannot prove it owns.
+    match (
+        state.license.as_ref().and_then(StoredLicense::token),
+        expected.token(),
+    ) {
+        (Some(current), Some(expected)) => current == expected,
+        _ => false,
+    }
 }
 
 /// Once this PC has held a paid activation it cannot fall back into an unused
@@ -608,11 +784,11 @@ pub fn activate(license_key: &str) -> Result<Status> {
     if !response.activated {
         bail!("The license could not be activated.");
     }
-    let stored = StoredLicense {
-        certificate: response.certificate,
-        signature: response.signature,
-        refresh_token: response.refresh_token,
-    };
+    let stored = StoredLicense::new(
+        response.certificate,
+        response.signature,
+        response.refresh_token,
+    );
     let certificate = verify(&stored, &device).context("verify activation certificate")?;
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
     let mut state = load_state_for_activation()?;
@@ -634,7 +810,9 @@ pub fn refresh_once() -> Result<Status> {
             .context("Matteshot is not activated")?
     };
     let request = SessionRequest {
-        refresh_token: stored.refresh_token.clone(),
+        refresh_token: stored
+            .token()
+            .context("the stored session credential cannot be read on this machine")?,
         device_id: device_id(),
     };
     let (status_code, response) = post_json(LICENSE_PATH_REFRESH, &serde_json::to_vec(&request)?)?;
@@ -659,11 +837,11 @@ pub fn refresh_once() -> Result<Status> {
 
     let response: ActivationResponse =
         serde_json::from_slice(&response).context("read refresh response")?;
-    let replacement = StoredLicense {
-        certificate: response.certificate,
-        signature: response.signature,
-        refresh_token: response.refresh_token,
-    };
+    let replacement = StoredLicense::new(
+        response.certificate,
+        response.signature,
+        response.refresh_token,
+    );
     let certificate = verify(&replacement, &device_id())?;
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
     let mut state = load_state()?;
@@ -781,7 +959,9 @@ pub fn deactivate() -> Result<()> {
             .context("Matteshot is not activated")?
     };
     let request = SessionRequest {
-        refresh_token: stored.refresh_token.clone(),
+        refresh_token: stored
+            .token()
+            .context("the stored session credential cannot be read on this machine")?,
         device_id: device_id(),
     };
     let (status_code, response) =
@@ -1125,21 +1305,66 @@ mod tests {
         }
     }
 
-    fn stored(token: &str) -> StoredLicense {
+    /// The pre-DPAPI on-disk shape, as older installs still hold it.
+    fn stored_legacy(token: &str) -> StoredLicense {
         StoredLicense {
             certificate: "certificate".into(),
             signature: "signature".into(),
-            refresh_token: token.into(),
+            refresh_token: Some(token.into()),
+            refresh_token_protected: None,
         }
     }
 
     #[test]
     fn refresh_results_cannot_replace_a_newer_activation() {
-        let mut state = State { license: Some(stored("new")), ..Default::default() };
-        assert!(!same_activation(&state, &stored("old")));
-        assert!(same_activation(&state, &stored("new")));
+        let mut state = State { license: Some(stored_legacy("new")), ..Default::default() };
+        assert!(!same_activation(&state, &stored_legacy("old")));
+        assert!(same_activation(&state, &stored_legacy("new")));
         state.license = None;
-        assert!(!same_activation(&state, &stored("new")));
+        assert!(!same_activation(&state, &stored_legacy("new")));
+    }
+
+    #[test]
+    fn protected_state_never_serializes_the_plaintext_token() {
+        let stored = StoredLicense::new("certificate".into(), "signature".into(), "tok-secret-123".into());
+        // DPAPI is available for the CI user; a legacy fallback here would
+        // silently void the whole protection.
+        assert!(stored.refresh_token.is_none(), "token stored in legacy plaintext");
+        let json = serde_json::to_string(&State {
+            license: Some(stored.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!json.contains("tok-secret-123"), "plaintext token reached license.json");
+        // The credential still round-trips for this user on this machine.
+        assert_eq!(stored.token().as_deref(), Some("tok-secret-123"));
+    }
+
+    #[test]
+    fn legacy_plaintext_migrates_and_still_matches_its_activation() {
+        let migrated = stored_legacy("tok-legacy").into_protected();
+        assert!(migrated.refresh_token.is_none());
+        assert_eq!(migrated.token().as_deref(), Some("tok-legacy"));
+        // Mid-migration, the protected shape and the legacy shape holding the
+        // same credential are one activation.
+        let state = State { license: Some(migrated), ..Default::default() };
+        assert!(same_activation(&state, &stored_legacy("tok-legacy")));
+        assert!(!same_activation(&state, &stored_legacy("tok-other")));
+    }
+
+    #[test]
+    fn an_undecryptable_blob_is_no_session_rather_than_a_crash() {
+        let damaged = StoredLicense {
+            certificate: "certificate".into(),
+            signature: "signature".into(),
+            refresh_token: None,
+            refresh_token_protected: Some(STANDARD.encode(b"not a dpapi blob")),
+        };
+        assert_eq!(damaged.token(), None);
+        // Damaged state can never prove it owns an activation, so it must not
+        // be able to replace or release one.
+        let state = State { license: Some(damaged.clone()), ..Default::default() };
+        assert!(!same_activation(&state, &damaged));
     }
 
     #[test]

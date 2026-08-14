@@ -831,7 +831,15 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             // Toggling here answers the question too, so an install that
             // reaches Settings before the welcome screen is not asked twice.
             let enabled = !state.cfg.telemetry_enabled();
-            if update_config(hwnd, state, |cfg| cfg.telemetry = Some(enabled)) {
+            if update_config(hwnd, state, |cfg| {
+                cfg.telemetry = Some(enabled);
+                // Turning telemetry off also forgets the pseudonymous id, so
+                // a later opt-in starts a history that cannot be joined to
+                // the old one. A fresh id is minted on the next event.
+                if !enabled {
+                    cfg.telemetry_id = None;
+                }
+            }) {
                 crate::telemetry::set_enabled(enabled);
             }
         }
