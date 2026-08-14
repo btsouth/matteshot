@@ -44,6 +44,11 @@ $scripts = Get-ChildItem (Join-Path $root 'scripts') -Filter '*.ps1'
 foreach ($script in $scripts) {
     $lines = Get-Content $script.FullName
     for ($i = 0; $i -lt $lines.Count; $i++) {
+        # Comments don't install anything — without this the checker flags
+        # its own header (and any script that documents the rule).
+        if ($lines[$i] -match '^\s*#') {
+            continue
+        }
         if ($lines[$i] -match '\bInstall-Module\b') {
             # The call may wrap across backtick continuations; look at the
             # whole statement before deciding the version is missing.
