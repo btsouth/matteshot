@@ -217,9 +217,61 @@ struct TextSelect {
     focus: Option<usize>,
     /// Recognition is still running on the worker thread.
     pending: bool,
+    /// Which recognition run these words came from. Re-arming Select Text
+    /// issues a fresh generation, so a worker still chewing on the previous
+    /// bitmap cannot hand its words to the new request.
+    generation: u64,
     /// Replaces the hint line: progress, copy confirmation, or failure.
     message: Option<String>,
     dragging: bool,
+}
+
+/// What the OCR worker posts back: the recognition result plus enough identity
+/// to route it. The words belong to one bitmap of one document, so a delayed
+/// completion must never land on whichever tab happens to be active — that
+/// exposed text from a different screenshot and ran its redaction checks
+/// against the wrong coordinates.
+struct OcrCompletion {
+    /// `Document::id` of the capture that was recognized.
+    doc: u64,
+    /// `TextSelect::generation` of the request that started the worker.
+    generation: u64,
+    result: std::result::Result<Vec<crate::ocr::Word>, String>,
+}
+
+/// Hand a completion to the document and request it belongs to, or drop it.
+/// Only an exact match on both identifiers is accepted: the document may have
+/// been closed (id absent), the mode left (`text_select` gone), or Select Text
+/// re-armed (newer generation) while the worker ran. Returns whether anything
+/// changed and a repaint is due.
+fn deliver_ocr<'a>(
+    docs: impl IntoIterator<Item = (u64, &'a mut Option<TextSelect>)>,
+    completion: OcrCompletion,
+) -> bool {
+    for (id, text_select) in docs {
+        if id != completion.doc {
+            continue;
+        }
+        let Some(select) = text_select.as_mut() else {
+            return false;
+        };
+        if !select.pending || select.generation != completion.generation {
+            return false;
+        }
+        select.pending = false;
+        match completion.result {
+            Ok(words) if words.is_empty() => {
+                select.message = Some("no text found in this capture".into());
+            }
+            Ok(words) => select.words = words,
+            Err(error) => {
+                eprintln!("ocr failed: {error}");
+                select.message = Some("could not read text from this capture".into());
+            }
+        }
+        return true;
+    }
+    false
 }
 
 impl TextSelect {
@@ -255,6 +307,9 @@ struct WindowLayout {
 /// reference the window: the split is what lets several of these live in a
 /// single editor at once.
 struct Document {
+    /// Stable identity for routing async completions back to this capture.
+    /// Tab indices shift as tabs close; this never does.
+    id: u64,
     /// Tab label: the captured window's title, or the region's size.
     title: String,
     raw: RgbaImage,
@@ -1086,16 +1141,20 @@ fn nearest_word(words: &[crate::ocr::Word], p: (f32, f32)) -> Option<usize> {
 /// Words under a pixelate-redact box are not selectable. OCR reads the raw
 /// capture, so without this the redaction would be decorative: the hidden
 /// text would still highlight and still copy.
+///
+/// Any positive intersection counts, failing closed. Pixelating 40% of a
+/// password hides those characters visually, and a majority threshold would
+/// still copy the complete original word — the pixels say "redacted" while
+/// the clipboard says otherwise.
 fn redacted(anns: &[crate::annotate::Annotation], word: &crate::ocr::Word) -> bool {
     let (wx0, wy0, wx1, wy1) = word.rect;
-    let area = ((wx1 - wx0) * (wy1 - wy0)).max(1.0);
     anns.iter().any(|ann| {
         let crate::annotate::Shape::Blur { a, b } = &ann.shape else {
             return false;
         };
-        let overlap_x = (wx1.min(a.0.max(b.0)) - wx0.max(a.0.min(b.0))).max(0.0);
-        let overlap_y = (wy1.min(a.1.max(b.1)) - wy0.max(a.1.min(b.1))).max(0.0);
-        overlap_x * overlap_y > area * 0.5
+        let overlap_x = wx1.min(a.0.max(b.0)) - wx0.max(a.0.min(b.0));
+        let overlap_y = wy1.min(a.1.max(b.1)) - wy0.max(a.1.min(b.1));
+        overlap_x > 0.0 && overlap_y > 0.0
     })
 }
 
@@ -1167,11 +1226,18 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
     state.doc_mut().selected = None;
     state.doc_mut().hover_ann = None;
     state.doc_mut().moving = None;
+    // A fresh generation per request: a worker still running for an earlier
+    // arm of this mode — or for another tab — must not satisfy this one.
+    static NEXT_OCR_GENERATION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let generation = NEXT_OCR_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let doc_id = state.doc().id;
     state.doc_mut().text_select = Some(TextSelect {
         words: Vec::new(),
         anchor: None,
         focus: None,
         pending: true,
+        generation,
         message: None,
         dragging: false,
     });
@@ -1190,8 +1256,10 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
     std::thread::spawn(move || {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
         let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let payload = Box::into_raw(Box::new(
-            crate::ocr::recognize_words(&raw)
+        let payload = Box::into_raw(Box::new(OcrCompletion {
+            doc: doc_id,
+            generation,
+            result: crate::ocr::recognize_words(&raw)
                 .map(|mut words| {
                     for word in &mut words {
                         word.rect.0 += ox;
@@ -1202,7 +1270,7 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
                     words
                 })
                 .map_err(|error| format!("{error:#}")),
-        ));
+        }));
         if com.is_ok() {
             unsafe { CoUninitialize() };
         }
@@ -3760,31 +3828,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if lparam.0 == 0 {
                 return LRESULT(0);
             }
-            let payload = Box::from_raw(
-                lparam.0 as *mut std::result::Result<Vec<crate::ocr::Word>, String>,
-            );
+            let payload = Box::from_raw(lparam.0 as *mut OcrCompletion);
             if let Some(state) = state_of(hwnd) {
-                if let Some(select) = state.doc_mut().text_select.as_mut() {
-                    // A stale result from a mode the user already left has
-                    // nothing to attach to.
-                    if select.pending {
-                        select.pending = false;
-                        match *payload {
-                            Ok(words) if words.is_empty() => {
-                                select.message = Some("no text found in this capture".into());
-                            }
-                            // Already in raw-capture coordinates: the worker
-                            // applied the crop origin it was launched with,
-                            // which is the one that produced these boxes.
-                            Ok(words) => select.words = words,
-                            Err(error) => {
-                                eprintln!("ocr failed: {error}");
-                                select.message =
-                                    Some("could not read text from this capture".into());
-                            }
-                        }
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
+                // Routed by document id and request generation, not to whichever
+                // tab is active: start Select Text on A, switch to B and start
+                // it there, and A's slower result must land on A — not populate
+                // B with another screenshot's words. Words are already in
+                // raw-capture coordinates: the worker applied the crop origin
+                // it was launched with, which is the one that produced these
+                // boxes.
+                let docs = state
+                    .docs
+                    .iter_mut()
+                    .map(|doc| (doc.id, &mut doc.text_select));
+                if deliver_ocr(docs, *payload) {
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
             }
             LRESULT(0)
@@ -4273,7 +4331,9 @@ fn build_document(
     // that first frame cheap on a large capture.
     const PREVIEW_INITIAL: u32 = 1200;
     let (small, scale, small_fast, metric_fast) = preview_sources(&raw, PREVIEW_INITIAL);
+    static NEXT_DOC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     Document {
+        id: NEXT_DOC_ID.fetch_add(1, Ordering::Relaxed),
         title,
         raw,
         crop: None,
@@ -4579,9 +4639,9 @@ mod tests {
         apply_text_input, custom_size_axis, custom_size_bounds, custom_size_result,
         freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
         output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
-        corner_index, crop_contains, crop_drag_for, crop_from_points, move_crop,
+        corner_index, crop_contains, crop_drag_for, crop_from_points, deliver_ocr, move_crop,
         preview_sources, preview_target_edge, redacted, render_final, resize_crop, tab_for_digit,
-        tool_after_pick, Crop, CropDrag, History, HISTORY_LIMIT,
+        tool_after_pick, Crop, CropDrag, History, OcrCompletion, TextSelect, HISTORY_LIMIT,
         translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
         CROP_TOOL, MIN_CROP, TOOLS,
     };
@@ -5159,13 +5219,38 @@ mod tests {
         let anns = [blur((90.0, 90.0), (210.0, 130.0))];
         assert!(redacted(&anns, &covered));
 
-        // A box that only clips a corner is not redaction.
+        // Fail closed: even a corner clip means part of the word is hidden in
+        // the picture, so none of it may copy. The old majority threshold let
+        // a word whose minority was pixelated copy in full.
         let grazed = [blur((190.0, 110.0), (300.0, 200.0))];
-        assert!(!redacted(&grazed, &covered));
+        assert!(redacted(&grazed, &covered));
+
+        // A minority slice, exactly half, and a majority all redact alike.
+        let minority = [blur((100.0, 100.0), (140.0, 120.0))];
+        assert!(redacted(&minority, &covered));
+        let exact_half = [blur((100.0, 100.0), (150.0, 120.0))];
+        assert!(redacted(&exact_half, &covered));
+        let majority = [blur((100.0, 100.0), (190.0, 120.0))];
+        assert!(redacted(&majority, &covered));
 
         // Corners given in any order still describe the same box.
         let reversed = [blur((210.0, 130.0), (90.0, 90.0))];
         assert!(redacted(&reversed, &covered));
+
+        // Several boxes: any one of them touching the word is enough.
+        let several = [
+            blur((0.0, 0.0), (10.0, 10.0)),
+            blur((150.0, 105.0), (160.0, 115.0)),
+        ];
+        assert!(redacted(&several, &covered));
+
+        // A box that merely shares an edge hides no pixels of the word.
+        let adjacent = [blur((200.0, 100.0), (300.0, 120.0))];
+        assert!(!redacted(&adjacent, &covered));
+
+        // A neighbouring word clear of every box stays selectable.
+        let neighbour = word("visible", 0, (220.0, 100.0, 300.0, 120.0));
+        assert!(!redacted(&anns, &neighbour));
 
         // Other annotation kinds never hide text.
         let boxed = [Annotation {
@@ -5173,6 +5258,74 @@ mod tests {
             ..blur((0.0, 0.0), (0.0, 0.0))
         }];
         assert!(!redacted(&boxed, &covered));
+    }
+
+    fn pending_select(generation: u64) -> Option<TextSelect> {
+        Some(TextSelect {
+            words: Vec::new(),
+            anchor: None,
+            focus: None,
+            pending: true,
+            generation,
+            message: None,
+            dragging: false,
+        })
+    }
+
+    fn ocr_ok(doc: u64, generation: u64, text: &str) -> OcrCompletion {
+        OcrCompletion {
+            doc,
+            generation,
+            result: Ok(vec![word(text, 0, (0.0, 0.0, 10.0, 10.0))]),
+        }
+    }
+
+    #[test]
+    fn a_delayed_ocr_result_lands_on_its_own_tab_never_the_active_one() {
+        // Tab A started recognition, the user switched to tab B and started it
+        // there too. A's worker is slower and finishes second — each result
+        // must reach the tab whose bitmap it read.
+        let mut a = pending_select(1);
+        let mut b = pending_select(2);
+
+        assert!(deliver_ocr([(1, &mut a), (2, &mut b)], ocr_ok(2, 2, "b-word")));
+        let b_select = b.as_ref().unwrap();
+        assert!(!b_select.pending);
+        assert_eq!(b_select.words[0].text, "b-word");
+        // A is untouched: still waiting on its own worker.
+        assert!(a.as_ref().unwrap().pending);
+        assert!(a.as_ref().unwrap().words.is_empty());
+
+        assert!(deliver_ocr([(1, &mut a), (2, &mut b)], ocr_ok(1, 1, "a-word")));
+        assert_eq!(a.as_ref().unwrap().words[0].text, "a-word");
+        assert_eq!(b.as_ref().unwrap().words[0].text, "b-word");
+    }
+
+    #[test]
+    fn an_earlier_request_cannot_satisfy_a_later_one_on_the_same_tab() {
+        // Select Text was re-armed on the same tab, superseding request 1 with
+        // request 2. Request 1's stale words must be dropped — and must leave
+        // the tab pending so request 2's real result can still land.
+        let mut select = pending_select(2);
+        assert!(!deliver_ocr([(7, &mut select)], ocr_ok(7, 1, "stale")));
+        assert!(select.as_ref().unwrap().pending);
+        assert!(select.as_ref().unwrap().words.is_empty());
+
+        assert!(deliver_ocr([(7, &mut select)], ocr_ok(7, 2, "fresh")));
+        assert_eq!(select.as_ref().unwrap().words[0].text, "fresh");
+    }
+
+    #[test]
+    fn completions_for_closed_tabs_or_a_left_mode_are_discarded() {
+        // The tab was closed while the worker ran: its id is gone.
+        let mut other = pending_select(5);
+        assert!(!deliver_ocr([(9, &mut other)], ocr_ok(3, 1, "orphan")));
+        assert!(other.as_ref().unwrap().pending);
+
+        // The user left Select Text on a tab that still exists.
+        let mut left: Option<TextSelect> = None;
+        assert!(!deliver_ocr([(3, &mut left)], ocr_ok(3, 1, "late")));
+        assert!(left.is_none());
     }
 
     #[test]
