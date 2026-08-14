@@ -9,21 +9,261 @@ permissions:
   contents: read
 
 jobs:
-  release:
-    name: Build, sign and release
+  # Build and sign on the self-hosted runner, but do not publish yet: the
+  # strict probe suite needs a GitHub-hosted desktop session (the probe job
+  # below), and nothing may reach R2 until the exact artifact has passed the
+  # same signer-identity gate every installed client enforces.
+  build:
+    name: Build and sign
+    runs-on: [self-hosted, windows, matteshot]
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      version: ${{ steps.installer.outputs.version }}
+      installer-name: ${{ steps.installer.outputs.name }}
+      hash: ${{ steps.verify.outputs.hash }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history so the ancestry gate below can walk back to main —
+          # this same fetch creates origin/main, so the gate needs no later
+          # credentialed fetch and the token is not left on the runner.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A tag can be pushed onto any commit. Only commits that already merged
+      # to protected main may be built and signed as a release. The tag name
+      # travels through env, never spliced into script text: git allows quotes
+      # and $() in tag names, and an interpolated one would execute here.
+      - name: Require a tag on a commit reachable from main
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          # origin/main comes from the checkout above. If it is somehow
+          # absent, merge-base errors and this gate fails closed.
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Tag $env:TAG_NAME points at $env:GITHUB_SHA, which is not reachable from origin/main."
+            exit 1
+          }
+
+      - name: Validate release version
+        id: release
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: .\scripts\validate-release-version.ps1 -Tag $env:TAG_NAME
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify code
+        shell: pwsh
+        run: .\scripts\verify-code.ps1
+
+      # GitHub-hosted images ship the Azure CLI preinstalled; this self-hosted
+      # one does not. The runner service's own process PATH predates any
+      # install, so a fresh choco install is invisible to later steps unless
+      # its directory is added to GITHUB_PATH explicitly.
+      - name: Install Azure CLI
+        shell: pwsh
+        run: |
+          if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+            # Pinned like every other dependency this credentialed job runs;
+            # check-workflow-pins.ps1 rejects an unpinned choco install.
+            choco install azure-cli --version=2.89.1 -y --no-progress
+          }
+          $azDir = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin"
+          if (Test-Path $azDir) {
+            $azDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Sign in to Azure with GitHub OIDC
+        uses: Azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Sign the app exe first so the installer packages a signed binary.
+      - name: Sign the app binary with Trusted Signing
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ github.workspace }}\target\release\matteshot.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # ISCC signs the setup executable and the generated uninstaller through
+      # scripts\sign-file.ps1. The uninstaller can only be signed here: it
+      # exists solely inside the compiler, and shipping it unsigned meant
+      # SmartScreen warnings at uninstall despite a trusted install.
+      - name: Build and sign the installer
+        id: installer
+        shell: pwsh
+        env:
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          # Pinned: the ISCC path below is version-specific, and Inno Setup 7
+          # is already out upstream. An unpinned install breaks this step the
+          # day the Chocolatey package moves to it, after the app binary has
+          # been signed but before anything is published. 6.7.1 is the newest
+          # the Chocolatey feed carries.
+          choco install innosetup --version=6.7.1 -y --no-progress
+          $version = '${{ steps.release.outputs.version }}'
+          $signScript = (Resolve-Path 'scripts\sign-file.ps1').Path
+          if ($signScript -match '\s') {
+            Write-Error "sign-file.ps1 resolved to a path with whitespace, which the Inno sign command cannot carry unquoted: $signScript"
+            exit 1
+          }
+          # Inno substitutes `$f` with the quoted target path itself; the
+          # guard above keeps the script path quote-free, so the command has
+          # no embedded-quote layers to survive native argument passing.
+          $signCommand = "pwsh -NoProfile -ExecutionPolicy Bypass -File $signScript `$f"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=$version /DSign "/Ssigntool=$signCommand" installer\matteshot.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $path = "installer\Output\MatteshotSetup-$version.exe"
+          if (-not (Test-Path $path)) { Write-Error "installer not found at $path"; exit 1 }
+          "path=$((Resolve-Path $path).Path)" >> $env:GITHUB_OUTPUT
+          "name=$(Split-Path -Leaf $path)" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Verify signatures and checksum
+        id: verify
+        shell: pwsh
+        run: |
+          # Assert the exact signer, not just generic validity: the installed
+          # app's own updater gate (src/installer.rs) accepts only this
+          # identity, so a merely-Valid signature from a drifted profile would
+          # pass Windows and still brick auto-update for every client.
+          foreach ($file in @(
+            '${{ github.workspace }}\target\release\matteshot.exe',
+            '${{ steps.installer.outputs.path }}'
+          )) {
+            $sig = Get-AuthenticodeSignature $file
+            $sig | Format-List Status, StatusMessage, SignerCertificate
+            if ($sig.Status -ne 'Valid') {
+              Write-Error "Signature on $file is $($sig.Status)."
+              exit 1
+            }
+            $signer = $sig.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if ($signer -cne 'Brandon South') {
+              Write-Error "Unexpected signer on ${file}: '$signer' ($($sig.SignerCertificate.Subject))"
+              exit 1
+            }
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 '${{ steps.installer.outputs.path }}').Hash.ToLowerInvariant()
+          "hash=$hash" >> $env:GITHUB_OUTPUT
+          # Travels inside the artifact so the probe and publish jobs verify
+          # the exact bytes this job hashed, on their own machines.
+          "$hash  MatteshotSetup-${{ steps.installer.outputs.version }}.exe" |
+            Set-Content -Encoding ascii -NoNewline 'installer\Output\MatteshotSetup.exe.sha256'
+          Write-Host "SHA-256: $hash"
+
+      - name: Upload unverified release for probing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-unverified-${{ steps.installer.outputs.version }}
+          path: |
+            target\release\matteshot.exe
+            installer\Output\${{ steps.installer.outputs.name }}
+            installer\Output\MatteshotSetup.exe.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # The strict probe suite includes the updater's own --verify-signature-test
+  # gate (accept ours, reject tampered, reject foreign), run against the exact
+  # tagged artifact. It needs a GitHub-hosted desktop session: the self-hosted
+  # runner is a Session 0 service with no desktop for --record-test to encode
+  # from. Releases are rare enough that the couple of billed minutes is cheap
+  # against publishing an installer every installed client would reject.
+  probe:
+    name: Probe the tagged release
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download unverified release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-unverified-${{ needs.build.outputs.version }}
+
+      - name: Re-verify signature and hash after transfer
+        shell: pwsh
+        run: |
+          $installerPath = "installer\Output\${{ needs.build.outputs.installer-name }}"
+          foreach ($file in @('target\release\matteshot.exe', $installerPath)) {
+            $sig = Get-AuthenticodeSignature $file
+            if ($sig.Status -ne 'Valid') {
+              Write-Error "Signature on $file is $($sig.Status) after transfer."
+              exit 1
+            }
+            $signer = $sig.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if ($signer -cne 'Brandon South') {
+              Write-Error "Unexpected signer on ${file}: '$signer' ($($sig.SignerCertificate.Subject))"
+              exit 1
+            }
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 $installerPath).Hash.ToLowerInvariant()
+          if ($actual -ne '${{ needs.build.outputs.hash }}') {
+            Write-Error "Installer hash changed after transfer. Expected ${{ needs.build.outputs.hash }}, got $actual."
+            exit 1
+          }
+
+      - name: Record a video fixture
+        shell: pwsh
+        run: |
+          & '${{ github.workspace }}\target\release\matteshot.exe' --record-test 3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Probe the tagged release
+        shell: pwsh
+        # -Offline: the network probes check the *published* release, which
+        # this run has deliberately not published yet. -NoCapture because a
+        # GitHub-hosted runner has no visible window. -Strict so a probe that
+        # silently did not run fails the release instead of shipping.
+        run: |
+          .\scripts\run-probes.ps1 `
+            -Strict `
+            -Offline `
+            -NoCapture `
+            -Exe '${{ github.workspace }}\target\release\matteshot.exe' `
+            -SignedFile '${{ github.workspace }}\installer\Output\${{ needs.build.outputs.installer-name }}'
+
+  # Publishes only after the probe job passed, and only bytes whose SHA-256
+  # matches what the build job hashed and the probe job tested.
+  publish:
+    name: Publish
+    needs: [build, probe]
     runs-on: [self-hosted, windows, matteshot]
     environment: release
     timeout-minutes: 30
     permissions:
       contents: write
-      id-token: write
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Validate release version
-        id: release
-        shell: pwsh
-        run: .\scripts\validate-release-version.ps1 -Tag '${{ github.ref_name }}'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # gh release create authenticates through GH_TOKEN env, not git.
+          persist-credentials: false
 
       - name: Require release credentials
         shell: pwsh
@@ -49,102 +289,30 @@ jobs:
             exit 1
           }
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download probed release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          components: clippy
+          name: release-unverified-${{ needs.build.outputs.version }}
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Verify code
-        shell: pwsh
-        run: .\scripts\verify-code.ps1
-
-      # GitHub-hosted images ship the Azure CLI preinstalled; this self-hosted
-      # one does not. The runner service's own process PATH predates any
-      # install, so a fresh choco install is invisible to later steps unless
-      # its directory is added to GITHUB_PATH explicitly.
-      - name: Install Azure CLI
-        shell: pwsh
-        run: |
-          if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-            choco install azure-cli -y --no-progress
-          }
-          $azDir = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin"
-          if (Test-Path $azDir) {
-            $azDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          }
-
-      - name: Sign in to Azure with GitHub OIDC
-        uses: azure/login@v3
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-      # Sign the app exe first so the installer packages a signed binary.
-      - name: Sign the app binary with Trusted Signing
-        uses: Azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files: ${{ github.workspace }}\target\release\matteshot.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Build the installer
-        id: installer
-        shell: pwsh
-        run: |
-          # Pinned: the ISCC path below is version-specific, and Inno Setup 7
-          # is already out upstream. An unpinned install breaks this step the
-          # day the Chocolatey package moves to it, after the app binary has
-          # been signed but before anything is published. 6.7.1 is the newest
-          # the Chocolatey feed carries.
-          choco install innosetup --version=6.7.1 -y --no-progress
-          $version = '${{ steps.release.outputs.version }}'
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\matteshot.iss
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $path = "installer\Output\MatteshotSetup-$version.exe"
-          if (-not (Test-Path $path)) { Write-Error "installer not found at $path"; exit 1 }
-          # The signing action requires rooted paths.
-          "path=$((Resolve-Path $path).Path)" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Sign the installer with Trusted Signing
-        uses: Azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files: ${{ steps.installer.outputs.path }}
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Verify the signature
-        shell: pwsh
-        run: |
-          $sig = Get-AuthenticodeSignature '${{ steps.installer.outputs.path }}'
-          $sig | Format-List Status, StatusMessage, SignerCertificate
-          if ($sig.Status -ne 'Valid') { Write-Error "signature is $($sig.Status)"; exit 1 }
-
-      - name: Generate SHA-256 checksums
+      - name: Verify the probed bytes and stage checksums
         id: checksums
         shell: pwsh
         run: |
-          $version = '${{ steps.installer.outputs.version }}'
-          $path = '${{ steps.installer.outputs.path }}'
-          $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+          $version = '${{ needs.build.outputs.version }}'
+          $expected = '${{ needs.build.outputs.hash }}'
+          $path = (Resolve-Path "installer\Output\${{ needs.build.outputs.installer-name }}").Path
+          $actual = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            Write-Error "Installer hash changed between probing and publication. Expected $expected, got $actual."
+            exit 1
+          }
           $versioned = Join-Path $env:RUNNER_TEMP "MatteshotSetup-$version.exe.sha256"
           $stable = Join-Path $env:RUNNER_TEMP "MatteshotSetup.exe.sha256"
-          "$hash  MatteshotSetup-$version.exe" | Set-Content -Encoding ascii -NoNewline $versioned
-          "$hash  MatteshotSetup.exe" | Set-Content -Encoding ascii -NoNewline $stable
-          "hash=$hash" >> $env:GITHUB_OUTPUT
+          "$expected  MatteshotSetup-$version.exe" | Set-Content -Encoding ascii -NoNewline $versioned
+          "$expected  MatteshotSetup.exe" | Set-Content -Encoding ascii -NoNewline $stable
+          "path=$path" >> $env:GITHUB_OUTPUT
           "versioned=$versioned" >> $env:GITHUB_OUTPUT
           "stable=$stable" >> $env:GITHUB_OUTPUT
-          Write-Host "SHA-256: $hash"
 
       - name: Publish the installer to Cloudflare R2
         shell: pwsh
@@ -152,24 +320,24 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          $v = '${{ steps.installer.outputs.version }}'
-          $p = '${{ steps.installer.outputs.path }}'
+          $v = '${{ needs.build.outputs.version }}'
+          $p = '${{ steps.checksums.outputs.path }}'
           # Versioned objects never change, so they can be cached forever.
           # The stable names DO change every release, and an installer cached
           # at the edge alongside a fresh checksum is a hash mismatch that
           # breaks auto-update for everyone until the cache expires.
           $immutable = "public, max-age=31536000, immutable"
           $mutable = "public, max-age=60, must-revalidate"
-          npx --yes wrangler@4 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe" `
+          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe" `
             --file $p --content-type application/octet-stream --cache-control $immutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4 r2 object put "matteshot-downloads/MatteshotSetup.exe" `
+          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup.exe" `
             --file $p --content-type application/octet-stream --cache-control $mutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe.sha256" `
+          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe.sha256" `
             --file '${{ steps.checksums.outputs.versioned }}' --content-type text/plain --cache-control $immutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4 r2 object put "matteshot-downloads/MatteshotSetup.exe.sha256" `
+          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup.exe.sha256" `
             --file '${{ steps.checksums.outputs.stable }}' --content-type text/plain --cache-control $mutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -233,8 +401,8 @@ jobs:
       - name: Verify published installers
         shell: pwsh
         run: |
-          $v = '${{ steps.installer.outputs.version }}'
-          $expected = '${{ steps.checksums.outputs.hash }}'
+          $v = '${{ needs.build.outputs.version }}'
+          $expected = '${{ needs.build.outputs.hash }}'
           $versioned = Join-Path $env:RUNNER_TEMP "verify-MatteshotSetup-$v.exe"
           $stable = Join-Path $env:RUNNER_TEMP "verify-MatteshotSetup.exe"
           $nonce = [guid]::NewGuid().ToString("N")
@@ -290,11 +458,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = '${{ steps.installer.outputs.version }}'
-          $hash = '${{ steps.checksums.outputs.hash }}'
+          $version = '${{ needs.build.outputs.version }}'
+          $hash = '${{ needs.build.outputs.hash }}'
           $notes = "Signed Windows installer.`n`nSHA-256: $hash"
           gh release create "v$version" `
-            '${{ steps.installer.outputs.path }}' `
+            '${{ steps.checksums.outputs.path }}' `
             '${{ steps.checksums.outputs.versioned }}' `
             --title "Matteshot $version" `
             --notes $notes `

@@ -87,7 +87,9 @@ try {
     if ($installerSignature.Status -ne "Valid") {
         throw "Installer signature is $($installerSignature.Status)."
     }
-    if ($installerSignature.SignerCertificate.Subject -notmatch "CN=Brandon South") {
+    $installerSigner = $installerSignature.SignerCertificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($installerSigner -cne "Brandon South") {
         throw "Unexpected installer signer."
     }
 
@@ -109,8 +111,27 @@ try {
     if ($appSignature.Status -ne "Valid") {
         throw "Installed binary signature is $($appSignature.Status)."
     }
-    if ($appSignature.SignerCertificate.Subject -notmatch "CN=Brandon South") {
+    $appSigner = $appSignature.SignerCertificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($appSigner -cne "Brandon South") {
         throw "Unexpected installed binary signer."
+    }
+
+    # Inno generates unins000.exe at install time from the payload the compiler
+    # signed (SignedUninstaller). An unsigned one here means SmartScreen scares
+    # customers at uninstall despite a trusted install.
+    Write-Step "Verifying uninstaller signature"
+    if (-not (Test-Path $uninstaller)) {
+        throw "Uninstaller was not found after install."
+    }
+    $uninstallerSignature = Get-AuthenticodeSignature $uninstaller
+    if ($uninstallerSignature.Status -ne "Valid") {
+        throw "Uninstaller signature is $($uninstallerSignature.Status)."
+    }
+    $uninstallerSigner = $uninstallerSignature.SignerCertificate.GetNameInfo(
+        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($uninstallerSigner -cne "Brandon South") {
+        throw "Unexpected uninstaller signer."
     }
 
     Write-Step "Checking untouched trial state"
