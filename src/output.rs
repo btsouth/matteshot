@@ -80,10 +80,22 @@ fn partial_recording_owner(name: &str) -> Option<u32> {
     owner.parse().ok()
 }
 
+/// What to do with one stale partial. Deletion must be earned, not the
+/// default: only bytes proven undecodable may be removed.
+enum PartialDisposition {
+    /// Playable and moved to its recovery name.
+    Recovered(PathBuf),
+    /// Proven-undecodable bytes; safe to delete.
+    Delete,
+    /// Playable but not movable right now (name exhaustion, transient lock).
+    /// Leave it exactly where it is; a later cleanup retries.
+    Keep,
+}
+
 fn cleanup_stale_partials(
     dir: &Path,
     owner_of: fn(&str) -> Option<u32>,
-    recover: impl Fn(&Path) -> Option<PathBuf>,
+    disposition: impl Fn(&Path) -> PartialDisposition,
 ) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -109,16 +121,29 @@ fn cleanup_stale_partials(
         // A stale partial is not automatically garbage: a finalize that
         // outlived its process can leave a complete, playable recording
         // behind. Offer it back before anything is deleted.
-        if let Some(recovered) = recover(&path) {
-            crate::diagnostics::log(&format!(
-                "recovered a finished recording from a stale partial: {}",
-                recovered.display()
-            ));
-            handled += 1;
-            continue;
-        }
-        if std::fs::remove_file(&path).is_ok() {
-            handled += 1;
+        match disposition(&path) {
+            PartialDisposition::Recovered(recovered) => {
+                // File name only: lifecycle events replay verbatim inside
+                // the privacy-safe support report.
+                crate::diagnostics::log(&format!(
+                    "recovered a finished recording from a stale partial as {}",
+                    recovered
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+                handled += 1;
+            }
+            PartialDisposition::Delete => {
+                if std::fs::remove_file(&path).is_ok() {
+                    handled += 1;
+                }
+            }
+            PartialDisposition::Keep => {
+                crate::diagnostics::log(
+                    "a playable stale partial could not be recovered yet; keeping it",
+                );
+            }
         }
     }
     handled
@@ -141,13 +166,22 @@ fn recovered_video_path(partial: &Path) -> Option<PathBuf> {
         .find(|candidate| !candidate.exists())
 }
 
-fn recover_video_partial(path: &Path) -> Option<PathBuf> {
-    // Fail toward deletion only on proven-undecodable bytes; the validator
-    // decodes real frames, so a truncated mid-write partial never passes.
-    crate::trim::validate_video(path).ok()?;
-    let destination = recovered_video_path(path)?;
-    std::fs::rename(path, &destination).ok()?;
-    Some(destination)
+fn video_partial_disposition(path: &Path) -> PartialDisposition {
+    // Deletion only on proven-undecodable bytes; the validator decodes real
+    // frames, so a truncated mid-write partial never passes. Everything that
+    // fails *after* validation — recovery-name exhaustion, a transient
+    // rename/lock error — keeps the file: it is user data that merely could
+    // not be moved this time.
+    if crate::trim::validate_video(path).is_err() {
+        return PartialDisposition::Delete;
+    }
+    let Some(destination) = recovered_video_path(path) else {
+        return PartialDisposition::Keep;
+    };
+    match std::fs::rename(path, &destination) {
+        Ok(()) => PartialDisposition::Recovered(destination),
+        Err(_) => PartialDisposition::Keep,
+    }
 }
 
 /// Handle Matteshot's unmistakable incomplete-recording names: recover the
@@ -155,7 +189,7 @@ fn recover_video_partial(path: &Path) -> Option<PathBuf> {
 /// this process may belong to another open editor, so it is retained unless
 /// it is old enough to be from a reused process ID.
 pub fn cleanup_stale_video_partials(dir: &Path) -> usize {
-    cleanup_stale_partials(dir, partial_recording_owner, recover_video_partial)
+    cleanup_stale_partials(dir, partial_recording_owner, video_partial_disposition)
 }
 
 struct ClipboardGuard;
@@ -300,7 +334,7 @@ fn partial_png_owner(name: &str) -> Option<u32> {
 pub fn cleanup_stale_png_partials(dir: &Path) -> usize {
     // PNG partials are staged bytes mid-save with nothing to recover: the
     // finished capture either published or the save failed loudly.
-    cleanup_stale_partials(dir, partial_png_owner, |_| None)
+    cleanup_stale_partials(dir, partial_png_owner, |_| PartialDisposition::Delete)
 }
 
 fn publish_png_with(
@@ -604,13 +638,17 @@ mod tests {
         let playable = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
         std::fs::write(&playable, b"finished recording").unwrap();
 
-        // The real recover fn validates with Media Foundation; the plumbing
-        // under test is that a recoverable partial is moved, counted, and
-        // never deleted.
+        // The real disposition fn validates with Media Foundation; the
+        // plumbing under test is that a recoverable partial is moved,
+        // counted, and never deleted.
         let handled = cleanup_stale_partials(&dir, partial_recording_owner, |path| {
-            let destination = recovered_video_path(path)?;
-            std::fs::rename(path, &destination).ok()?;
-            Some(destination)
+            let Some(destination) = recovered_video_path(path) else {
+                return PartialDisposition::Keep;
+            };
+            match std::fs::rename(path, &destination) {
+                Ok(()) => PartialDisposition::Recovered(destination),
+                Err(_) => PartialDisposition::Keep,
+            }
         });
         assert_eq!(handled, 1);
         assert!(!playable.exists());
@@ -619,6 +657,33 @@ mod tests {
         assert_eq!(std::fs::read(&recovered).unwrap(), b"finished recording");
 
         std::fs::remove_file(recovered).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn a_playable_partial_that_cannot_move_is_kept_not_deleted() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-partial-keep-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let other_pid = std::process::id().wrapping_add(1).max(1);
+        let playable = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
+        std::fs::write(&playable, b"finished recording").unwrap();
+
+        // Validation passed but the move could not happen (transient lock,
+        // name exhaustion): the recording must survive in place.
+        let handled = cleanup_stale_partials(&dir, partial_recording_owner, |_| {
+            PartialDisposition::Keep
+        });
+        assert_eq!(handled, 0);
+        assert!(playable.exists(), "a kept partial was deleted");
+
+        std::fs::remove_file(playable).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 

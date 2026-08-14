@@ -740,15 +740,22 @@ fn supervise_late_finalize(
             crate::diagnostics::log(&format!("late recording failed validation: {error:#}"));
             return;
         }
+        // File name only: lifecycle events replay verbatim inside the
+        // privacy-safe support report, which promises to carry no paths.
         match publish_recording_with(&partial, &destination, |from, to| std::fs::rename(from, to))
         {
             Ok(()) => crate::diagnostics::log(&format!(
-                "late recording finalized and published to {}",
-                destination.display()
+                "late recording finalized and published as {}",
+                destination
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
             )),
-            Err(error) => {
-                crate::diagnostics::log(&format!("late recording publish failed: {error:#}"))
-            }
+            // The error text names the kept recovery file's full path; a
+            // fixed message keeps the lifecycle log path-free.
+            Err(_) => crate::diagnostics::log(
+                "late recording publish failed; the partial file is kept in the videos folder",
+            ),
         }
     });
 }

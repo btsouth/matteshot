@@ -208,9 +208,15 @@ pub fn list() -> Vec<Entry> {
     let Some(path) = history_path() else {
         return Vec::new();
     };
-    // A transient read failure shows an empty window this open — list never
-    // writes, so the index itself is untouched and comes back next time.
-    let log = load_for_mutation(&path).unwrap_or_default();
+    // Strictly read-only: any failure — transient or corrupt — shows an
+    // empty window this open and leaves the file exactly as it was. The
+    // quarantine-and-start-fresh recovery belongs to the mutating paths,
+    // which pair it with a replacement write; browsing must not move the
+    // index aside and leave nothing behind.
+    let log: Log = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .unwrap_or_default();
     let mut entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
     entries.reverse();
     entries
