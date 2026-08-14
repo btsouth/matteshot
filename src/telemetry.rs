@@ -240,19 +240,28 @@ fn distinct_id() -> Option<String> {
         return Some(id);
     }
     let fresh = new_telemetry_id()?;
-    // Persisted under Config::update's lock. If a concurrent event minted
+    // Persisted under Config::update's lock, where consent is re-checked:
+    // Settings may have turned telemetry off since the load above, and an
+    // opt-out must neither send this event nor have an id written back for a
+    // later opt-in to rejoin histories with. If a concurrent event minted
     // first, the id already on disk is the one every thread must use.
     match crate::config::Config::update(|cfg| {
-        if cfg.telemetry_id.is_none() {
+        if cfg.telemetry_enabled() && cfg.telemetry_id.is_none() {
             cfg.telemetry_id = Some(fresh.clone());
         }
     }) {
-        Ok(saved) => saved.telemetry_id,
-        // Config could not be written; the unsaved id is still random and
-        // never machine-derived, it just will not survive the process.
-        Err(_) => Some(fresh),
+        Ok(saved) if saved.telemetry_enabled() => saved.telemetry_id,
+        Ok(_) => None,
+        // Config unwritable (read-only profile, full disk): keep one stable
+        // per-process id rather than a fresh PostHog person per event.
+        Err(_) => Some(SESSION_TELEMETRY_ID.get_or_init(|| fresh).clone()),
     }
 }
+
+/// Fallback identity for a process whose config cannot be written. Still
+/// random and installation-unlinked; it just also stays stable across the
+/// events of this run.
+static SESSION_TELEMETRY_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// A random UUID, hyphenated lowercase. `None` if the system cannot produce
 /// one, in which case nothing is sent.

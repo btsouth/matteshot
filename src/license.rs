@@ -366,20 +366,33 @@ fn load_state_from(path: &std::path::Path) -> Result<State> {
     serde_json::from_str(&body).context("parse license state")
 }
 
-fn load_state() -> Result<State> {
-    let path = state_path().context("Windows has no application data directory")?;
-    let mut state = load_state_from(&path)?;
-    // Drain a pre-DPAPI plaintext token into the protected shape the first
-    // time it is seen. save_state writes atomically, so a crash leaves either
-    // the old file or the migrated one, never a torn mix. Best-effort beyond
-    // that: if the write fails the plaintext keeps working and the next load
-    // retries. The token that sat exposed on disk is then retired by the next
-    // scheduled refresh, which rotates tokens server-side.
-    if state
+fn needs_token_protection(state: &State) -> bool {
+    state
         .license
         .as_ref()
         .is_some_and(|stored| stored.refresh_token.is_some())
-    {
+}
+
+fn load_state() -> Result<State> {
+    let path = state_path().context("Windows has no application data directory")?;
+    let state = load_state_from(&path)?;
+    if !needs_token_protection(&state) {
+        return Ok(state);
+    }
+    // Drain the pre-DPAPI plaintext token into the protected shape. The write
+    // happens under LICENSE_MUTEX with the state re-read inside it, so a
+    // concurrent activation or refresh save cannot be clobbered with what was
+    // read above. (The named mutex is recursive per thread, so callers that
+    // already hold it are fine.) save_state is atomic, and everything past
+    // the lock is best-effort: on any failure the plaintext keeps working and
+    // the next load retries. The token that sat exposed on disk is then
+    // retired by the next scheduled refresh, which rotates tokens
+    // server-side.
+    let Ok(_guard) = crate::state_lock::lock(LICENSE_MUTEX) else {
+        return Ok(state);
+    };
+    let mut state = load_state_from(&path)?;
+    if needs_token_protection(&state) {
         let migrated = state.license.take().map(StoredLicense::into_protected);
         let protected = migrated
             .as_ref()
