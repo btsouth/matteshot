@@ -1157,6 +1157,46 @@ fn preview_bench(long_edge: u32) -> Result<()> {
     Ok(())
 }
 
+/// Auto-stop for the headless recording probes: close this session's stop
+/// pill `secs` after the capture loop's encoding clock starts.
+///
+/// The countdown must not start at spawn, and the pill's appearance is not
+/// enough either: recui creates it before WGC and the encoder finish setting
+/// up on the worker. Counted from either of those, a 3-second probe on a
+/// starved CI VM once shipped a 0.17s fixture and the strict probe suite
+/// failed on it. `record::PROBE_CAPTURE_RUNNING` flips exactly when encoded
+/// time starts accumulating, so the requested seconds measure recording.
+///
+/// The pill is looked up at fire time, restricted to this process: caching a
+/// desktop-wide handle across the sleep could close the resident app's pill
+/// (leaving this session recording until the job timeout) or post to a
+/// recycled handle.
+fn schedule_recording_stop(secs: u64) {
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        // Bounded wait: if capture never starts the session failed and its
+        // own error already ended the probe; there is nothing to stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !record::PROBE_CAPTURE_RUNNING.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        if let Some(pill) = crate::window::find_own_by_class("matteshot_recui") {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    pill,
+                    windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
     unsafe {
         // STA: the folder picker (IFileDialog) requires it; WGC's
@@ -1332,20 +1372,7 @@ fn main() -> Result<()> {
                 right: 640,
                 bottom: 480,
             };
-            // Auto-stop: close the pill from a timer thread.
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(secs));
-                if let Some(h) = crate::window::find_by_class("matteshot_recui") {
-                    unsafe {
-                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                            h,
-                            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                            windows::Win32::Foundation::WPARAM(0),
-                            windows::Win32::Foundation::LPARAM(0),
-                        );
-                    }
-                }
-            });
+            schedule_recording_stop(secs);
             record::session(record::Target::region(rect, mon), true)?;
             license::record_successful_capture();
             // Keep pumping briefly so the review window can be inspected.
@@ -1382,19 +1409,7 @@ fn main() -> Result<()> {
             let secs: u64 = args.get(2).and_then(|value| value.parse().ok()).unwrap_or(6);
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(secs));
-                if let Some(controls) = crate::window::find_by_class("matteshot_recui") {
-                    unsafe {
-                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                            controls,
-                            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                            windows::Win32::Foundation::WPARAM(0),
-                            windows::Win32::Foundation::LPARAM(0),
-                        );
-                    }
-                }
-            });
+            schedule_recording_stop(secs);
             record::session(record::Target::window(hwnd), false)?;
             license::record_successful_capture();
 
