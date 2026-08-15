@@ -806,6 +806,7 @@ fn run_app() -> Result<()> {
         if prtscn_ours { "= capture overlay" } else { "not held (see tray menu)" }
     );
     diagnostics::log("resident ready");
+    RESIDENT_READY.store(true, Ordering::Relaxed);
 
     // First run: show the core loop before the app disappears into the tray.
     // This is non-modal, so PrtScn and tray commands remain live.
@@ -2053,7 +2054,7 @@ fn main() -> Result<()> {
         None => {
             let result = run_app();
             if let Err(error) = &result {
-                report_resident_startup_failure(error);
+                report_resident_failure(error, RESIDENT_READY.load(Ordering::Relaxed));
             }
             result
         }
@@ -2067,20 +2068,32 @@ fn main() -> Result<()> {
     result
 }
 
+/// Flipped once the tray exists and the resident is usable. `run_app` can
+/// still fail after that (a `?` on the message-loop side of Activate,
+/// Deactivate, or the expired-license window), and that is a running app
+/// stopping, not a startup that never happened — the dialog, the diagnostic
+/// event, and the telemetry kind all say which.
+static RESIDENT_READY: AtomicBool = AtomicBool::new(false);
+
 /// The resident is a windows-subsystem process: nothing it prints is ever
 /// seen. When `run_app` fails, the app used to just not be there — no tray
 /// icon, no PrtScn, and nothing to say why. Show one dialog the user can act
 /// on, and leave one diagnostic event and one telemetry failure behind it.
 /// Every other mode (`--once`, probes, `--license`) is a console flow and
 /// keeps stderr.
-fn report_resident_startup_failure(error: &anyhow::Error) {
+fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
     let message = startup_failure_message(error);
+    let (event, operation, title) = if was_running {
+        ("resident stopped", "resident", "Matteshot stopped unexpectedly")
+    } else {
+        ("resident startup failed", "startup", "Matteshot could not start")
+    };
     diagnostics::log(&format!(
-        "resident startup failed: {}",
+        "{event}: {}",
         without_paths(&format!("{error:#}"))
     ));
-    telemetry::report_failure("startup", error);
-    let title = HSTRING::from("Matteshot could not start");
+    telemetry::report_failure(operation, error);
+    let title = HSTRING::from(title);
     let text = HSTRING::from(message.as_str());
     unsafe {
         MessageBoxW(
