@@ -13,15 +13,17 @@ use std::ptr;
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::HANDLE;
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
     WINHTTP_QUERY_STATUS_CODE,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::System::Threading::{
+    CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 /// The only certificate subject we will execute. Trusted Signing issues these
@@ -419,9 +421,38 @@ pub fn stage(url: &str, version: &str, progress: impl FnMut(u32)) -> Result<Path
     Ok(dest)
 }
 
+const INSTALLER_ARGS: &str = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL";
+
+/// Quoted path plus Inno flags. `CreateProcessW` requires a mutable buffer.
+fn launch_command_line(path: &Path) -> Vec<u16> {
+    format!("\"{}\" {INSTALLER_ARGS}", path.display())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Image and command line for `CreateProcessW`. No shell verb: a hijacked
+/// `HKCU\Software\Classes\exefile\shell\open\command` cannot interpose.
+struct LaunchPlan {
+    application_name: PathBuf,
+    command_line: Vec<u16>,
+    show_window: u16,
+}
+
+fn launch_plan(path: &Path) -> LaunchPlan {
+    LaunchPlan {
+        application_name: path.to_path_buf(),
+        command_line: launch_command_line(path),
+        show_window: SW_HIDE.0 as u16,
+    }
+}
+
 /// Run a staged installer with no window of any kind. Inno is a GUI process,
 /// so `/VERYSILENT` plus `SW_HIDE` means nothing ever paints; the per-user
 /// install directory means no elevation prompt either.
+///
+/// `CreateProcessW` runs the verified image directly (`lpApplicationName` is
+/// the staged path), so a hijacked `.exe` open association cannot interpose.
 ///
 /// The installer stops the resident through `--quit`, replaces the binary, and
 /// relaunches it, so this call is the last thing this process usefully does.
@@ -429,22 +460,33 @@ pub fn launch(path: &Path) -> Result<()> {
     if !path.is_file() {
         bail!("staged installer is missing");
     }
-    let file = HSTRING::from(path.as_os_str());
-    let params = HSTRING::from("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL");
-    // ShellExecuteW returns a pseudo-HINSTANCE; anything <= 32 is a failure
-    // code, not a handle.
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(file.as_ptr()),
-            PCWSTR(params.as_ptr()),
-            PCWSTR::null(),
-            SW_HIDE,
-        )
+    let plan = launch_plan(path);
+    let application = HSTRING::from(plan.application_name.as_os_str());
+    let mut command_line = plan.command_line;
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESHOWWINDOW,
+        wShowWindow: plan.show_window,
+        ..Default::default()
     };
-    if result.0 as usize <= 32 {
-        bail!("could not start the installer ({})", result.0 as usize);
+    let mut process = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            &application,
+            PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            None,
+            &startup,
+            &mut process,
+        )
+        .context("could not start the installer")?;
+        // This process is about to be replaced; do not wait.
+        let _ = CloseHandle(process.hThread);
+        let _ = CloseHandle(process.hProcess);
     }
     Ok(())
 }
@@ -501,5 +543,44 @@ mod tests {
             staged_path("../..").file_name().unwrap(),
             "MatteshotSetup-pending.exe"
         );
+    }
+
+    fn utf16_cstr(buf: &[u16]) -> String {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    }
+
+    #[test]
+    fn launch_command_line_quotes_paths_with_spaces_and_keeps_inno_flags() {
+        let path = Path::new(r"C:\Users\Tyler South\AppData\Local\Temp\MatteshotSetup-0.19.0.exe");
+        let line = utf16_cstr(&launch_command_line(path));
+        assert_eq!(
+            line,
+            r#""C:\Users\Tyler South\AppData\Local\Temp\MatteshotSetup-0.19.0.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL"#
+        );
+    }
+
+    #[test]
+    fn launch_plan_uses_createprocess_so_hkcu_exefile_open_cannot_interpose() {
+        // CreateProcessW(lpApplicationName = staged path) so a hijacked
+        // HKCU\Software\Classes\exefile\shell\open\command cannot interpose.
+        let path = Path::new(r"C:\Users\Tyler South\AppData\Local\Temp\MatteshotSetup-0.19.0.exe");
+        let plan = launch_plan(path);
+        assert_eq!(plan.application_name.as_path(), path);
+        assert_eq!(plan.show_window, SW_HIDE.0 as u16);
+        let line = utf16_cstr(&plan.command_line);
+        assert!(
+            !line.split_whitespace().any(|token| token == "open"),
+            "launch must not carry a shell verb: {line}"
+        );
+    }
+
+    #[test]
+    fn launch_errors_when_the_staged_installer_is_missing() {
+        let missing =
+            std::env::temp_dir().join("MatteshotSetup-missing-sbs-858-does-not-exist.exe");
+        let _ = std::fs::remove_file(&missing);
+        let error = launch(&missing).unwrap_err().to_string();
+        assert!(error.contains("staged installer is missing"), "{error}");
     }
 }
