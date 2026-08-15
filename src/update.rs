@@ -317,7 +317,13 @@ pub fn start(hwnd: HWND) {
             if let Ok(Some(update)) = check_once() {
                 if handled_version.as_deref() != Some(update.version.as_str()) {
                     handled_version = Some(update.version.clone());
-                    let automatic = crate::config::Config::load().auto_update;
+                    let loaded = crate::config::Config::try_load();
+                    if let Err(error) = &loaded {
+                        crate::diagnostics::log(&format!(
+                            "update will not auto-install: config could not be read: {error:#}"
+                        ));
+                    }
+                    let automatic = crate::config::auto_update_from_load(loaded);
                     post(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, update.clone());
                     if automatic {
                         if let Err(error) = apply(hwnd_value, &update) {
@@ -352,6 +358,24 @@ mod tests {
     }
 
     const SETUP: &str = "https://download.matteshot.app/MatteshotSetup.exe";
+
+    #[test]
+    fn automatic_install_requires_a_successful_opt_in_read() {
+        assert!(crate::config::auto_update_from_load::<()>(Ok(
+            crate::config::Config {
+                auto_update: true,
+                ..Default::default()
+            }
+        )));
+        assert!(!crate::config::auto_update_from_load::<()>(Ok(
+            crate::config::Config {
+                auto_update: false,
+                ..Default::default()
+            }
+        )));
+        assert!(!crate::config::auto_update_from_load::<&str>(Err("locked")));
+        assert!(!crate::config::auto_update_from_load::<&str>(Err("truncated")));
+    }
 
     /// A manifest listing several served builds, each with a release date.
     fn history() -> String {
