@@ -444,7 +444,7 @@ mod tests {
             // The joinability this replaces: the licensing device id is a
             // stable machine-derived hash and must never be the PostHog
             // identity again.
-            assert_ne!(*id, crate::license::device_id());
+            assert_ne!(Ok(id.clone()), crate::license::device_id());
         }
     }
 

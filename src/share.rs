@@ -182,7 +182,8 @@ struct ShareResponse {
 pub fn share_file(path: &Path) -> Result<String> {
     let (certificate, signature) = crate::license::signed_certificate()
         .context("Sharing needs an active Matteshot license.")?;
-    let device_id = crate::license::device_id();
+    let device_id = crate::license::device_id()
+        .context("Sharing needs a stable device identity.")?;
 
     let content_type = share_content_type(path)?;
     let filename = path

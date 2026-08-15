@@ -44,6 +44,9 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const REGISTRY_KEY: &str = r"Software\Southbound Software\Matteshot";
 const REGISTRY_TRIAL_START: &str = "TrialStartedAt";
 const REGISTRY_LAST_SEEN: &str = "TrialLastSeenAt";
+/// Sticky hashed device identity. Written the first time a real MachineGuid
+/// hash is obtained, so a later unreadable guid does not mint a new id.
+const REGISTRY_DEVICE_ID: &str = "DeviceId";
 const LICENSE_MUTEX: &str = "Local\\Matteshot.License.State";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +132,11 @@ struct State {
     /// recorded on license.matteshot.app; the signed start never changes.
     #[serde(default)]
     trial: Option<StoredTrial>,
+    /// Hashed device identity, written the first time a real MachineGuid hash
+    /// is obtained. Sticky: a later readable guid must not change it, or an
+    /// already-activated certificate would fail its device match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -723,9 +731,27 @@ pub fn status() -> Status {
             return status_after_load_error(&error, remembered_status());
         }
     };
-    let device = device_id();
+    // An unreadable MachineGuid is not a reason to drop an activation. Fail
+    // closed and leave the files alone; a later successful read (or the
+    // already-stored hash) can still match the certificate.
+    let device = match resolve_current_device_id(state.device_id.as_deref()) {
+        Ok(id) => id,
+        Err(error) => {
+            crate::diagnostics::log(&format!(
+                "device identity is unavailable; leaving license state untouched: {error:#}"
+            ));
+            return Status::Unavailable;
+        }
+    };
+    let newly_remembered = state.device_id.as_deref() != Some(device.as_str());
+    if newly_remembered {
+        state.device_id = Some(device.clone());
+    }
     if let Some(stored) = state.license.as_ref() {
         if let Ok(certificate) = verify(stored, &device) {
+            if newly_remembered {
+                let _ = save_state(&state);
+            }
             return remember_status(Status::Licensed {
                 customer_email: certificate.customer_email,
                 updates_until: certificate.updates_until,
@@ -801,7 +827,8 @@ pub fn signed_certificate() -> Option<(String, String)> {
         error
     }).ok()?;
     let stored = state.license.as_ref()?;
-    verify(stored, &device_id()).ok()?;
+    let device = resolve_current_device_id(state.device_id.as_deref()).ok()?;
+    verify(stored, &device).ok()?;
     Some((stored.certificate.clone(), stored.signature.clone()))
 }
 
@@ -813,6 +840,12 @@ pub fn record_successful_capture() {
     if matches!(status(), Status::Licensed { .. }) {
         return;
     }
+    let Ok(device) = device_id() else {
+        crate::diagnostics::log(
+            "capture state update skipped because this PC has no stable device identity",
+        );
+        return;
+    };
     let _guard = crate::state_lock::lock(LICENSE_MUTEX).ok();
     let Ok(mut state) = load_state() else {
         crate::diagnostics::log(
@@ -827,6 +860,7 @@ pub fn record_successful_capture() {
         earliest(state.trial_started_at, registry_time(REGISTRY_TRIAL_START)).unwrap_or(now);
     state.trial_started_at = Some(started);
     state.last_seen_at = Some(now.max(state.last_seen_at.unwrap_or(now)));
+    state.device_id = Some(device);
     set_registry_time(REGISTRY_TRIAL_START, started);
     set_registry_time(REGISTRY_LAST_SEEN, state.last_seen_at.unwrap_or(now));
     let _ = save_state(&state);
@@ -849,7 +883,7 @@ pub fn activate(license_key: &str) -> Result<Status> {
         bail!("Enter the license key from your purchase email.");
     }
 
-    let device = device_id();
+    let device = device_id()?;
     let request = ActivateRequest {
         license_key: license_key.to_owned(),
         device_id: device.clone(),
@@ -879,6 +913,7 @@ pub fn activate(license_key: &str) -> Result<Status> {
     let mut state = load_state_for_activation()?;
     close_trial_after_activation(&mut state, Utc::now().timestamp());
     state.license = Some(stored);
+    state.device_id = Some(device.clone());
     save_state(&state)?;
     crate::telemetry::report("matteshot_license_activated");
     Ok(Status::Licensed {
@@ -894,11 +929,12 @@ pub fn refresh_once() -> Result<Status> {
             .license
             .context("Matteshot is not activated")?
     };
+    let device = device_id()?;
     let request = SessionRequest {
         refresh_token: stored
             .token()
             .context("the stored session credential cannot be read on this machine")?,
-        device_id: device_id(),
+        device_id: device.clone(),
     };
     let (status_code, response) = post_json(LICENSE_PATH_REFRESH, &serde_json::to_vec(&request)?)?;
     if status_code == 403 {
@@ -933,13 +969,14 @@ pub fn refresh_once() -> Result<Status> {
         response.signature,
         response.refresh_token,
     );
-    let certificate = verify(&replacement, &device_id())?;
+    let certificate = verify(&replacement, &device)?;
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
     let mut state = load_state()?;
     if !same_activation(&state, &stored) {
         bail!("activation changed while it was being refreshed");
     }
     state.license = Some(replacement);
+    state.device_id = Some(device);
     save_state(&state)?;
     // The refresh rotated the token server-side, so the pre-migration
     // sidecar now holds a dead credential: no downgrade can use it, and
@@ -966,6 +1003,7 @@ fn store_trial_certificate(stored: StoredTrial, device: &str) -> Result<()> {
     let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
     let mut state = load_state()?;
     state.trial = Some(stored);
+    state.device_id = Some(device.to_owned());
     save_state(&state)
 }
 
@@ -976,7 +1014,7 @@ fn store_trial_certificate(stored: StoredTrial, device: &str) -> Result<()> {
 /// unknown but a capture has already happened, the local start is sent up and
 /// locked in. Machines that have never captured keep the trial unstarted.
 fn sync_trial_once() -> Result<()> {
-    let device = device_id();
+    let device = device_id()?;
     let request = TrialStatusRequest {
         device_id: device.clone(),
         app_version: env!("CARGO_PKG_VERSION"),
@@ -1057,7 +1095,7 @@ pub fn deactivate() -> Result<()> {
         refresh_token: stored
             .token()
             .context("the stored session credential cannot be read on this machine")?,
-        device_id: device_id(),
+        device_id: device_id()?,
     };
     let (status_code, response) =
         post_json(LICENSE_PATH_DEACTIVATE, &serde_json::to_vec(&request)?)?;
@@ -1152,21 +1190,117 @@ fn verify_trial(stored: &StoredTrial, expected_device: &str) -> Result<TrialCert
     Ok(certificate)
 }
 
-/// Stable anonymous device identity: SHA-256 of the machine GUID. The same id
-/// powers licensing and telemetry, so an install can be joined to a purchase
-/// without ever exposing a machine name or email.
-pub fn device_id() -> String {
-    let machine_guid = RegKey::predef(HKEY_LOCAL_MACHINE)
+/// Inputs the device-id resolver can see. Tests inject these so the
+/// MachineGuid / stored-id cases do not need a live registry.
+struct DeviceIdInputs<'a> {
+    machine_guid: Option<&'a str>,
+    stored_hashed_id: Option<&'a str>,
+}
+
+struct ResolvedDeviceId {
+    hashed_id: String,
+    /// Freshly minted from a live MachineGuid. The caller must persist this
+    /// so a later unreadable guid still resolves to the same identity.
+    persist: bool,
+}
+
+fn nonempty_device_id(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Hash a MachineGuid the way activation, trial, and Share have always done:
+/// SHA-256 of `matteshot-device-v1\0` plus the lowercase trimmed guid.
+fn hash_machine_guid(guid: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"matteshot-device-v1\0");
+    digest.update(guid.trim().to_ascii_lowercase().as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// Resolve a stable device identity without talking to the registry.
+///
+/// A previously stored hashed id is sticky even if MachineGuid is now
+/// readable and would hash differently — that is the already-activated
+/// machine. A missing guid with no stored id is an error: we never invent
+/// an identity from the computer name, because two PCs named DESKTOP-XXXX
+/// (or both falling through to "Windows PC") would share a trial seat.
+fn resolve_device_id(inputs: DeviceIdInputs<'_>) -> Result<ResolvedDeviceId> {
+    if let Some(stored) = nonempty_device_id(inputs.stored_hashed_id) {
+        return Ok(ResolvedDeviceId {
+            hashed_id: stored.to_owned(),
+            persist: false,
+        });
+    }
+    if let Some(guid) = nonempty_device_id(inputs.machine_guid) {
+        return Ok(ResolvedDeviceId {
+            hashed_id: hash_machine_guid(guid),
+            persist: true,
+        });
+    }
+    bail!("this PC's machine identifier is unreadable")
+}
+
+fn read_machine_guid() -> Option<String> {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(
             r"SOFTWARE\Microsoft\Cryptography",
             KEY_READ | KEY_WOW64_64KEY,
         )
         .and_then(|key| key.get_value::<String, _>("MachineGuid"))
-        .unwrap_or_else(|_| device_name());
-    let mut digest = Sha256::new();
-    digest.update(b"matteshot-device-v1\0");
-    digest.update(machine_guid.trim().to_ascii_lowercase().as_bytes());
-    format!("{:x}", digest.finalize())
+        .ok()
+        .map(|guid| guid.trim().to_owned())
+        .filter(|guid| !guid.is_empty())
+}
+
+fn registry_device_id() -> Option<String> {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(REGISTRY_KEY, KEY_READ)
+        .ok()
+        .and_then(|key| key.get_value::<String, _>(REGISTRY_DEVICE_ID).ok())
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
+
+fn persist_registry_device_id(id: &str) {
+    if id.trim().is_empty() {
+        return;
+    }
+    if let Ok((key, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(REGISTRY_KEY) {
+        let _ = key.set_value(REGISTRY_DEVICE_ID, &id);
+    }
+}
+
+fn resolve_current_device_id(state_device_id: Option<&str>) -> Result<String> {
+    let machine_guid = read_machine_guid();
+    let from_registry = registry_device_id();
+    let stored = nonempty_device_id(state_device_id)
+        .map(str::to_owned)
+        .or(from_registry.clone());
+    let resolved = resolve_device_id(DeviceIdInputs {
+        machine_guid: machine_guid.as_deref(),
+        stored_hashed_id: stored.as_deref(),
+    })?;
+    // Persist a freshly minted hash, and backfill HKCU when license state
+    // already holds the sticky id so a later wiped license.json still
+    // resolves.
+    if resolved.persist || from_registry.is_none() {
+        persist_registry_device_id(&resolved.hashed_id);
+    }
+    Ok(resolved.hashed_id)
+}
+
+/// Stable anonymous device identity: SHA-256 of this PC's MachineGuid.
+///
+/// The trial worker pins this, activation binds it, and Share sends it.
+/// It is never derived from the computer name. If MachineGuid cannot be
+/// read and no hashed id was stored on a previous successful read, this
+/// returns an error so callers can fail closed instead of minting a
+/// colliding or unstable identity.
+pub fn device_id() -> Result<String> {
+    let from_state = load_state().ok().and_then(|state| {
+        nonempty_device_id(state.device_id.as_deref()).map(str::to_owned)
+    });
+    resolve_current_device_id(from_state.as_deref())
 }
 
 fn device_name() -> String {
@@ -1747,5 +1881,125 @@ mod tests {
             signature: "not-a-signature".into(),
         };
         assert!(verify_trial(&stored, "device").is_err());
+    }
+
+    fn name_derived_hashes() -> [String; 3] {
+        [
+            hash_machine_guid("COMPUTERNAME"),
+            hash_machine_guid("Windows PC"),
+            hash_machine_guid(""),
+        ]
+    }
+
+    #[test]
+    fn missing_machine_guid_without_a_stored_id_is_an_error() {
+        let result = resolve_device_id(DeviceIdInputs {
+            machine_guid: None,
+            stored_hashed_id: None,
+        });
+        let error = result.expect_err("a missing guid must not mint an identity");
+        let message = error.to_string();
+        for colliding in name_derived_hashes() {
+            assert_ne!(
+                message, colliding,
+                "the error must not be the hash of a computer name"
+            );
+        }
+    }
+
+    #[test]
+    fn two_empty_name_machines_do_not_share_a_minted_id() {
+        // The old fallback hashed COMPUTERNAME or the literal "Windows PC".
+        // Two machines with no guid and no stored id must both fail — they
+        // must not collide on a minted identity, whether the name is empty
+        // or absent.
+        let absent_name = resolve_device_id(DeviceIdInputs {
+            machine_guid: None,
+            stored_hashed_id: None,
+        });
+        let empty_name = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some("   "),
+            stored_hashed_id: Some(""),
+        });
+        assert!(absent_name.is_err(), "absent name must not mint an id");
+        assert!(empty_name.is_err(), "empty name must not mint an id");
+        // Both failed, so they cannot collide on hash("Windows PC") or
+        // hash("") the way the COMPUTERNAME fallback did.
+        for colliding in name_derived_hashes() {
+            assert_ne!(
+                absent_name.as_ref().ok().map(|r| r.hashed_id.as_str()),
+                Some(colliding.as_str())
+            );
+            assert_ne!(
+                empty_name.as_ref().ok().map(|r| r.hashed_id.as_str()),
+                Some(colliding.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn missing_machine_guid_reuses_a_stored_hashed_id() {
+        let stored = hash_machine_guid("already-activated-guid");
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: None,
+            stored_hashed_id: Some(&stored),
+        })
+        .expect("an already-activated machine must keep working");
+        assert_eq!(resolved.hashed_id, stored);
+        assert!(!resolved.persist);
+    }
+
+    #[test]
+    fn a_readable_guid_is_hashed_and_marked_to_persist() {
+        let guid = "  8C4A3E12-91F0-4B2A-A6D1-0F3E8B7C2A19  ";
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(guid),
+            stored_hashed_id: None,
+        })
+        .expect("a readable MachineGuid must produce an identity");
+        assert_eq!(resolved.hashed_id, hash_machine_guid(guid));
+        assert!(resolved.persist);
+        for colliding in name_derived_hashes() {
+            assert_ne!(resolved.hashed_id, colliding);
+        }
+    }
+
+    #[test]
+    fn a_stored_id_wins_over_a_different_readable_guid() {
+        let stored = hash_machine_guid("original-activated-guid");
+        let later = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF";
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(later),
+            stored_hashed_id: Some(&stored),
+        })
+        .expect("a stored identity is sticky");
+        assert_eq!(resolved.hashed_id, stored);
+        assert_ne!(resolved.hashed_id, hash_machine_guid(later));
+        assert!(!resolved.persist);
+    }
+
+    #[test]
+    fn the_device_hash_is_stable_and_ignores_the_computer_name() {
+        let guid = "AaBbCcDd-1234-5678-90ab-Cdef01234567";
+        let first = hash_machine_guid(guid);
+        let second = hash_machine_guid("  AABBCCDD-1234-5678-90AB-CDEF01234567  ");
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            "f46b948015079a17c88a70f02a518d999a736bd1991b0b847f511ea83fa95e2a"
+        );
+        assert_eq!(first.len(), 64);
+        assert_eq!(first, first.to_ascii_lowercase());
+        assert_ne!(first, hash_machine_guid("DESKTOP-XXXX"));
+        assert_ne!(first, hash_machine_guid("Windows PC"));
+        assert_ne!(first, hash_machine_guid("COMPUTERNAME"));
+        // The resolver hashes only the guid. A computer name is not an
+        // input, so it cannot change the result.
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(guid),
+            stored_hashed_id: None,
+        })
+        .unwrap();
+        assert_eq!(resolved.hashed_id, first);
     }
 }
