@@ -375,8 +375,82 @@ fn needs_token_protection(state: &State) -> bool {
 
 fn load_state() -> Result<State> {
     let path = state_path().context("Windows has no application data directory")?;
-    let state = load_state_from(&path)?;
+    load_state_at(&path)
+}
+
+/// The downgrade escape hatch beside `license.json`. Builds that predate the
+/// protected token cannot parse the migrated file and report the license
+/// unavailable; renaming this sidecar back over `license.json` restores them.
+/// It holds the pre-migration plaintext, so it is deleted the moment the
+/// server rotates the token (next refresh) — from then on its contents are
+/// dead credentials and a downgraded build needs a fresh activation anyway.
+fn pre_dpapi_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("json.pre-dpapi")
+}
+
+fn remove_pre_dpapi_backup() {
+    if let Some(path) = state_path() {
+        let _ = remove_pre_dpapi_backup_at(&path);
+    }
+}
+
+/// Best-effort but never silent: the sidecar holds a plaintext token, so a
+/// delete that fails (a scanner or indexer holding the file open) leaves a
+/// breadcrumb, and `load_state_at` retries on every later load until the
+/// file is gone. `Ok(false)` is "already gone".
+fn remove_pre_dpapi_backup_at(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(pre_dpapi_backup_path(path)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            crate::diagnostics::log(&format!(
+                "pre-migration license backup could not be removed yet: {error}"
+            ));
+            Err(error)
+        }
+    }
+}
+
+/// The sidecar outlives its purpose the moment the token it holds stops
+/// being the live one — rotated by a refresh, released by deactivation,
+/// rejected by the server. Each of those paths deletes it, but a delete can
+/// fail (see `remove_pre_dpapi_backup_at`), so every load looks again: a
+/// sidecar whose token no longer matches the live state is retired here.
+/// A sidecar still holding the live token is the downgrade escape hatch and
+/// stays.
+fn retire_stale_pre_dpapi_backup(path: &std::path::Path, state: &State) {
+    // Absent is the steady state; unreadable this time just means next time.
+    let Ok(sidecar) = std::fs::read(pre_dpapi_backup_path(path)) else {
+        return;
+    };
+    let sidecar_token = serde_json::from_slice::<State>(&sidecar)
+        .ok()
+        .and_then(|backup| backup.license)
+        .and_then(|stored| stored.token());
+    let dead = match (state.license.as_ref(), sidecar_token) {
+        // Deactivated or rejected: nothing is live, so nothing to downgrade to.
+        (None, _) => true,
+        // The sidecar holds no usable token: junk, whatever the live state.
+        (Some(_), None) => true,
+        (Some(live), Some(sidecar)) => match live.token() {
+            // Rotated server-side; the sidecar's copy stops working with it.
+            Some(live) => live != sidecar,
+            // The live blob does not decrypt here (copied profile, damaged
+            // blob). That says nothing about the sidecar's token being dead
+            // — and it may be the only copy that still works — so do not
+            // guess; the next refresh or deactivation settles it.
+            None => false,
+        },
+    };
+    if dead {
+        let _ = remove_pre_dpapi_backup_at(path);
+    }
+}
+
+fn load_state_at(path: &std::path::Path) -> Result<State> {
+    let state = load_state_from(path)?;
     if !needs_token_protection(&state) {
+        retire_stale_pre_dpapi_backup(path, &state);
         return Ok(state);
     }
     // Drain the pre-DPAPI plaintext token into the protected shape. The write
@@ -385,21 +459,28 @@ fn load_state() -> Result<State> {
     // read above. (The named mutex is recursive per thread, so callers that
     // already hold it are fine.) save_state is atomic, and everything past
     // the lock is best-effort: on any failure the plaintext keeps working and
-    // the next load retries. The token that sat exposed on disk is then
-    // retired by the next scheduled refresh, which rotates tokens
-    // server-side.
+    // the next load retries.
     let Ok(_guard) = crate::state_lock::lock(LICENSE_MUTEX) else {
         return Ok(state);
     };
-    let mut state = load_state_from(&path)?;
+    let mut state = load_state_from(path)?;
     if needs_token_protection(&state) {
+        // The sidecar first: a migrated file with no backup strands anyone
+        // who rolls back to a build that cannot parse the new shape. Backup
+        // failure is not fatal, but it is worth a breadcrumb.
+        let backup = pre_dpapi_backup_path(path);
+        if let Err(error) = std::fs::copy(path, &backup) {
+            crate::diagnostics::log(&format!(
+                "pre-migration license backup failed (migrating anyway): {error}"
+            ));
+        }
         let migrated = state.license.take().map(StoredLicense::into_protected);
         let protected = migrated
             .as_ref()
             .is_some_and(|stored| stored.refresh_token.is_none());
         state.license = migrated;
         if protected {
-            match save_state(&state) {
+            match save_state_at(path, &state) {
                 Ok(()) => crate::diagnostics::log("license refresh token now DPAPI-protected"),
                 Err(error) => crate::diagnostics::log(&format!(
                     "license token protection migration not saved yet: {error:#}"
@@ -444,11 +525,15 @@ fn load_state_for_activation() -> Result<State> {
 
 fn save_state(state: &State) -> Result<()> {
     let path = state_path().context("Windows has no application data directory")?;
+    save_state_at(&path, state)
+}
+
+fn save_state_at(path: &std::path::Path, state: &State) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("create Matteshot data directory")?;
     }
     let body = serde_json::to_vec_pretty(state).context("serialize license state")?;
-    crate::state_lock::atomic_write(&path, &body).context("replace license state")
+    crate::state_lock::atomic_write(path, &body).context("replace license state")
 }
 
 static LAST_VALID_STATUS: OnceLock<Mutex<Option<Status>>> = OnceLock::new();
@@ -819,9 +904,15 @@ pub fn refresh_once() -> Result<Status> {
     if status_code == 403 {
         let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
         let mut state = load_state()?;
+        // Only when the rejected activation is still the live one: a request
+        // that lost a race with a newer activation says nothing about the
+        // sidecar that activation may have written since.
         if same_activation(&state, &stored) {
             state.license = None;
             save_state(&state)?;
+            // The server just rejected this activation, so the sidecar's
+            // copy of its token is equally dead.
+            remove_pre_dpapi_backup();
         }
         bail!(
             "{}",
@@ -850,6 +941,10 @@ pub fn refresh_once() -> Result<Status> {
     }
     state.license = Some(replacement);
     save_state(&state)?;
+    // The refresh rotated the token server-side, so the pre-migration
+    // sidecar now holds a dead credential: no downgrade can use it, and
+    // keeping plaintext around past its usefulness was never the deal.
+    remove_pre_dpapi_backup();
     Ok(Status::Licensed {
         customer_email: certificate.customer_email,
         updates_until: certificate.updates_until,
@@ -977,6 +1072,10 @@ pub fn deactivate() -> Result<()> {
     if same_activation(&state, &stored) {
         state.license = None;
         save_state(&state)?;
+        // Deactivation released the seat; the sidecar's token died with it.
+        // Guarded like the state itself: a stale request must not take a
+        // newer activation's downgrade hatch with it.
+        remove_pre_dpapi_backup();
     }
     Ok(())
 }
@@ -1350,6 +1449,146 @@ mod tests {
         let state = State { license: Some(migrated), ..Default::default() };
         assert!(same_activation(&state, &stored_legacy("tok-legacy")));
         assert!(!same_activation(&state, &stored_legacy("tok-other")));
+    }
+
+    #[test]
+    fn migration_leaves_a_downgrade_sidecar_beside_the_protected_state() {
+        let path = temporary_state_path("pre-dpapi-sidecar");
+        let _ = std::fs::remove_file(&path);
+        let legacy = serde_json::to_vec_pretty(&State {
+            license: Some(stored_legacy("tok-sidecar")),
+            ..Default::default()
+        })
+        .unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+
+        let state = load_state_at(&path).unwrap();
+        assert_eq!(
+            state.license.as_ref().and_then(StoredLicense::token).as_deref(),
+            Some("tok-sidecar")
+        );
+        // The migrated file no longer carries the plaintext...
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("tok-sidecar"));
+        // ...and the sidecar holds the exact pre-migration bytes, so a build
+        // that cannot parse the new shape can be restored by renaming it
+        // back. Without this, an 0.18.0 next to a newer build reported
+        // "License state temporarily unavailable" with no way home.
+        let sidecar = pre_dpapi_backup_path(&path);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), legacy);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn the_sidecar_is_retired_once_its_token_is_no_longer_the_live_one() {
+        let path = temporary_state_path("pre-dpapi-retire");
+        let _ = std::fs::remove_file(&path);
+        let sidecar = pre_dpapi_backup_path(&path);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&State {
+                license: Some(stored_legacy("tok-live")),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Migration leaves the sidecar, and later loads keep it while its
+        // token is still the live one: that is the whole point of it.
+        load_state_at(&path).unwrap();
+        assert!(sidecar.exists());
+        load_state_at(&path).unwrap();
+        assert!(sidecar.exists(), "a still-live sidecar was retired early");
+
+        // A refresh rotated the token server-side (or a delete failed at the
+        // time). The next load notices the sidecar is dead and removes it.
+        save_state_at(
+            &path,
+            &State {
+                license: Some(StoredLicense::new(
+                    "certificate".into(),
+                    "signature".into(),
+                    "tok-rotated".into(),
+                )),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        load_state_at(&path).unwrap();
+        assert!(!sidecar.exists(), "a dead sidecar survived the next load");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_undecryptable_live_token_says_nothing_so_the_sidecar_stays() {
+        let path = temporary_state_path("pre-dpapi-undecryptable");
+        let _ = std::fs::remove_file(&path);
+        let sidecar = pre_dpapi_backup_path(&path);
+        std::fs::write(
+            &sidecar,
+            serde_json::to_vec_pretty(&State {
+                license: Some(stored_legacy("tok-live")),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // The live blob cannot be decrypted here — a copied profile or a
+        // damaged blob. Whether the sidecar's token still works is unknown,
+        // and it may be the only copy that does, so it is not retired.
+        save_state_at(
+            &path,
+            &State {
+                license: Some(StoredLicense {
+                    certificate: "certificate".into(),
+                    signature: "signature".into(),
+                    refresh_token: None,
+                    refresh_token_protected: Some(STANDARD.encode(b"not a dpapi blob")),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        load_state_at(&path).unwrap();
+        assert!(sidecar.exists(), "the sidecar was retired on a guess");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_deleted_yet_is_reported_and_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = temporary_state_path("pre-dpapi-locked");
+        let _ = std::fs::remove_file(&path);
+        let sidecar = pre_dpapi_backup_path(&path);
+        std::fs::write(&sidecar, b"{}").unwrap();
+        // Deactivated: no live license at all, so the sidecar is dead weight.
+        save_state_at(&path, &State::default()).unwrap();
+
+        // Something else holds the file with no sharing at all — the shape
+        // of a scanner or indexer mid-read.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&sidecar)
+            .unwrap();
+        assert!(remove_pre_dpapi_backup_at(&path).is_err());
+        load_state_at(&path).unwrap();
+        assert!(sidecar.exists(), "the locked sidecar cannot have gone anywhere");
+        drop(lock);
+
+        // The next load after the lock clears finishes the job.
+        load_state_at(&path).unwrap();
+        assert!(!sidecar.exists(), "the retry never removed the sidecar");
+        assert!(matches!(remove_pre_dpapi_backup_at(&path), Ok(false)));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
