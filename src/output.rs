@@ -90,6 +90,10 @@ enum PartialDisposition {
     /// Playable but not movable right now (name exhaustion, transient lock).
     /// Leave it exactly where it is; a later cleanup retries.
     Keep,
+    /// The validator could not reach a verdict (a lock on the file, COM or
+    /// Media Foundation unavailable). Not proven bad, so not deletable;
+    /// a later cleanup retries.
+    Unverified,
 }
 
 fn cleanup_stale_partials(
@@ -144,6 +148,11 @@ fn cleanup_stale_partials(
                     "a playable stale partial could not be recovered yet; keeping it",
                 );
             }
+            PartialDisposition::Unverified => {
+                crate::diagnostics::log(
+                    "a stale partial could not be checked for playability yet; keeping it",
+                );
+            }
         }
     }
     handled
@@ -153,7 +162,9 @@ fn cleanup_stale_partials(
 /// recording name with a `-recovered` marker, dodging collisions.
 fn recovered_video_path(partial: &Path) -> Option<PathBuf> {
     let name = partial.file_name()?.to_str()?;
-    let stem = name.split(".partial-").next()?;
+    // The trailing marker only: the original recording name may itself
+    // contain ".partial-".
+    let stem = name.rsplit_once(".partial-")?.0;
     let parent = partial.parent()?;
     (0..100)
         .map(|n| {
@@ -168,12 +179,17 @@ fn recovered_video_path(partial: &Path) -> Option<PathBuf> {
 
 fn video_partial_disposition(path: &Path) -> PartialDisposition {
     // Deletion only on proven-undecodable bytes; the validator decodes real
-    // frames, so a truncated mid-write partial never passes. Everything that
-    // fails *after* validation — recovery-name exhaustion, a transient
-    // rename/lock error — keeps the file: it is user data that merely could
-    // not be moved this time.
-    if crate::trim::validate_video(path).is_err() {
-        return PartialDisposition::Delete;
+    // frames, so a truncated mid-write partial never passes. A check that
+    // could not run — the file locked by an indexer, COM or Media Foundation
+    // not up — proves nothing, so the file stays. Everything that fails
+    // *after* validation — recovery-name exhaustion, a transient rename/lock
+    // error — keeps the file too: it is user data that merely could not be
+    // moved this time.
+    if let Err(error) = crate::trim::validate_video(path) {
+        return match crate::trim::validation_fault(&error) {
+            crate::trim::ValidationFault::Undecodable => PartialDisposition::Delete,
+            crate::trim::ValidationFault::Unavailable => PartialDisposition::Unverified,
+        };
     }
     let Some(destination) = recovered_video_path(path) else {
         return PartialDisposition::Keep;
@@ -683,6 +699,14 @@ mod tests {
         assert_eq!(handled, 0);
         assert!(playable.exists(), "a kept partial was deleted");
 
+        // Validation could not run at all (the file locked, the decoder
+        // unavailable): not proven bad, so not deletable either.
+        let handled = cleanup_stale_partials(&dir, partial_recording_owner, |_| {
+            PartialDisposition::Unverified
+        });
+        assert_eq!(handled, 0);
+        assert!(playable.exists(), "an unverified partial was deleted");
+
         std::fs::remove_file(playable).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
@@ -708,8 +732,48 @@ mod tests {
             dir.join("clip-recovered-1.mp4")
         );
 
+        // Only the trailing marker is stripped: a recording whose own name
+        // contains ".partial-" keeps that name.
+        let odd = dir.join("clip.partial-backup.partial-42-1.mp4");
+        assert_eq!(
+            recovered_video_path(&odd).unwrap(),
+            dir.join("clip.partial-backup-recovered.mp4")
+        );
+
         std::fs::remove_file(partial).unwrap();
         std::fs::remove_file(taken).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_partial_disposition_deletes_only_proven_undecodable_bytes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-partial-disposition-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Too small to be a recording: the validator's own verdict, deletable.
+        let garbage = dir.join("clip.partial-42-1.mp4");
+        std::fs::write(&garbage, b"stale").unwrap();
+        assert!(matches!(
+            video_partial_disposition(&garbage),
+            PartialDisposition::Delete
+        ));
+
+        // Gone before the check ran (or unreadable): no verdict on the bytes,
+        // so nothing may be deleted on the strength of it.
+        let missing = dir.join("clip.partial-42-2.mp4");
+        assert!(matches!(
+            video_partial_disposition(&missing),
+            PartialDisposition::Unverified
+        ));
+
+        std::fs::remove_file(garbage).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 }

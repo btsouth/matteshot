@@ -93,12 +93,16 @@ fn quarantine_path(path: &Path) -> PathBuf {
 /// "empty" is how one locked read plus one save used to erase the entire
 /// history.
 fn load_for_mutation(path: &Path) -> Result<Log> {
-    let body = match std::fs::read_to_string(path) {
+    // Raw bytes, so a file that is not UTF-8 (a UTF-16 save from an editor,
+    // mixed bytes) is a parse failure — corrupt, and quarantined below —
+    // rather than an `InvalidData` read error that looks transient and would
+    // block every future save while the bad file stays.
+    let body = match std::fs::read(path) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Log::default()),
         Err(error) => return Err(error).context("read history index"),
     };
-    match serde_json::from_str(&body) {
+    match serde_json::from_slice(&body) {
         Ok(log) => Ok(log),
         Err(error) => {
             // Corrupt is permanent, unlike a sharing violation: keep the
@@ -112,13 +116,12 @@ fn load_for_mutation(path: &Path) -> Result<Log> {
     }
 }
 
-fn save_unlocked_at(path: &Path, log: &Log) {
+fn save_unlocked_at(path: &Path, log: &Log) -> Result<()> {
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir).context("create history directory")?;
     }
-    if let Ok(json) = serde_json::to_vec_pretty(log) {
-        let _ = crate::state_lock::atomic_write(path, &json);
-    }
+    let json = serde_json::to_vec_pretty(log).context("serialize history index")?;
+    crate::state_lock::atomic_write(path, &json).context("write history index")
 }
 
 /// Drop entries the predicate rejects, then keep only the most recent `cap`.
@@ -199,7 +202,9 @@ fn append_at(index: &Path, entry: Entry) {
     };
     log.entries.push(entry);
     log.entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
-    save_unlocked_at(index, &log);
+    if let Err(error) = save_unlocked_at(index, &log) {
+        crate::diagnostics::log(&format!("capture not indexed, history write failed: {error:#}"));
+    }
 }
 
 /// Every entry whose file still exists, most recent first.
@@ -213,9 +218,9 @@ pub fn list() -> Vec<Entry> {
     // quarantine-and-start-fresh recovery belongs to the mutating paths,
     // which pair it with a replacement write; browsing must not move the
     // index aside and leave nothing behind.
-    let log: Log = std::fs::read_to_string(&path)
+    let log: Log = std::fs::read(&path)
         .ok()
-        .and_then(|body| serde_json::from_str(&body).ok())
+        .and_then(|body| serde_json::from_slice(&body).ok())
         .unwrap_or_default();
     let mut entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
     entries.reverse();
@@ -241,8 +246,9 @@ pub fn remove(path: &Path) -> Result<()> {
     // Delete that "worked" still showing the capture.
     let mut log = load_for_mutation(&index)?;
     log.entries.retain(|e| e.path != path);
-    save_unlocked_at(&index, &log);
-    Ok(())
+    // Same reasoning: the file is gone, so a stale entry left by a failed
+    // write is a Delete that only looked like it worked.
+    save_unlocked_at(&index, &log)
 }
 
 fn format_when(saved_at: i64) -> String {
@@ -416,6 +422,46 @@ mod persistence_tests {
         std::fs::create_dir_all(&index).unwrap();
         append_at(&index, entry_at(&capture(&dir, "a.png")));
         assert!(index.is_dir(), "the unreadable index was replaced by a write");
+    }
+
+    #[test]
+    fn a_non_utf8_index_is_corrupt_not_transient_so_saves_resume() {
+        let dir = temp_dir("utf16");
+        let index = dir.join("history.json");
+        // Notepad's "Unicode" save: UTF-16 with a BOM. Not a lock, not a
+        // permission problem — the bytes will never parse, so treating them
+        // as transient would block every future save while they sat there.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "{\"entries\":[]}".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&index, &utf16).unwrap();
+        append_at(&index, entry_at(&capture(&dir, "a.png")));
+        append_at(&index, entry_at(&capture(&dir, "b.png")));
+        assert_eq!(
+            load_for_mutation(&index).unwrap().entries.len(),
+            2,
+            "saves never resumed after the undecodable index"
+        );
+        let quarantined = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("history.json.corrupt-"))
+            .expect("the undecodable index was quarantined");
+        assert_eq!(std::fs::read(quarantined.path()).unwrap(), utf16);
+    }
+
+    #[test]
+    fn a_failed_index_write_surfaces_instead_of_being_swallowed() {
+        let dir = temp_dir("write-failure");
+        let index = dir.join("history.json");
+        // A directory squatting on the atomic write's temporary path is the
+        // simplest way to make the replace fail; `remove` propagates this so
+        // a Delete whose index write failed does not report success while
+        // the stale entry stays.
+        std::fs::create_dir_all(dir.join("history.json.tmp")).unwrap();
+        assert!(save_unlocked_at(&index, &Log::default()).is_err());
+        assert!(!index.exists());
     }
 }
 
