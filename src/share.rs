@@ -61,6 +61,27 @@ fn share_content_type(path: &Path) -> Result<&'static str> {
     }
 }
 
+/// Keep only ASCII alphanumeric plus `._-`. Empty after filtering becomes
+/// `capture.png` / `capture.mp4` from the already-validated content type,
+/// or `capture` if the type is unknown.
+///
+/// A renamed capture can put quotes/CR/LF in the on-disk name; the
+/// disposition must stay one inert token.
+fn sanitize_share_filename(name: &str, content_type: &str) -> String {
+    let filtered: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '_' | '-'))
+        .collect();
+    if filtered.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return filtered;
+    }
+    match content_type {
+        "image/png" => "capture.png".to_string(),
+        "video/mp4" => "capture.mp4".to_string(),
+        _ => "capture".to_string(),
+    }
+}
+
 fn validate_upload_size(len: u64) -> Result<()> {
     if len > MAX_UPLOAD_BYTES {
         bail!("This file is too large to share.");
@@ -185,10 +206,10 @@ pub fn share_file(path: &Path) -> Result<String> {
     let device_id = crate::license::device_id();
 
     let content_type = share_content_type(path)?;
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("capture");
+    let filename = sanitize_share_filename(
+        path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        content_type,
+    );
     let file_len = std::fs::metadata(path)
         .context("read the file to share")?
         .len();
@@ -446,6 +467,106 @@ mod tests {
             "video/mp4",
         );
         assert!(parts.before_file.len() + parts.after_file.len() < 2048);
+    }
+
+    fn assert_inert_share_filename(name: &str) {
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+            "unsafe chars survived: {name:?}"
+        );
+        for needle in ['"', '\r', '\n', '/', '\\'] {
+            assert!(!name.contains(needle), "{needle:?} survived in {name:?}");
+        }
+    }
+
+    #[test]
+    fn app_generated_share_filenames_are_unchanged() {
+        assert_eq!(
+            sanitize_share_filename("matteshot-20260815-133700123-adaptive.png", "image/png"),
+            "matteshot-20260815-133700123-adaptive.png"
+        );
+        assert_eq!(
+            sanitize_share_filename("matteshot-20260815-133700123.mp4", "video/mp4"),
+            "matteshot-20260815-133700123.mp4"
+        );
+    }
+
+    #[test]
+    fn quotes_cr_lf_and_path_separators_never_survive_in_share_filename() {
+        for (name, content_type) in [
+            ("evil\".png", "image/png"),
+            (
+                "shot.png\"\r\nContent-Disposition: form-data; name=\"certificate\"",
+                "image/png",
+            ),
+            ("shot.png\r\n\r\n--BOUND\r\n", "image/png"),
+            ("..\\..\\Windows\\win.ini", "image/png"),
+            ("foo/bar.png", "image/png"),
+            ("foo\\bar.png", "image/png"),
+        ] {
+            let sanitized = sanitize_share_filename(name, content_type);
+            assert_inert_share_filename(&sanitized);
+            assert_ne!(sanitized, name, "hostile name used as-is: {name:?}");
+        }
+    }
+
+    #[test]
+    fn sanitized_hostile_filename_cannot_inject_multipart_fields() {
+        let hostile =
+            "shot.png\"\r\nContent-Disposition: form-data; name=\"certificate\"\r\n\r\nforged\r\n--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"pwned.png";
+        let filename = sanitize_share_filename(hostile, "image/png");
+        assert_inert_share_filename(&filename);
+        let parts = multipart_parts(
+            "BOUND",
+            "cert-value",
+            "sig-value",
+            "device-value",
+            &filename,
+            "image/png",
+        );
+        let before = String::from_utf8(parts.before_file).unwrap();
+        assert!(
+            !before.contains(hostile),
+            "raw hostile payload leaked into before_file"
+        );
+        assert!(!before.contains("shot.png\""));
+        assert!(!before.contains("name=\"certificate\"\r\n\r\nforged"));
+        assert_eq!(before.matches("name=\"certificate\"").count(), 1);
+        assert_eq!(before.matches("name=\"signature\"").count(), 1);
+        assert_eq!(before.matches("name=\"device_id\"").count(), 1);
+        assert_eq!(before.matches("name=\"file\"").count(), 1);
+        assert_eq!(before.matches("filename=").count(), 1);
+        assert!(before.contains(&format!("filename=\"{filename}\"")));
+        assert!(before.contains("name=\"certificate\"\r\n\r\ncert-value\r\n"));
+    }
+
+    #[test]
+    fn empty_or_unusable_share_filenames_fall_back_from_content_type() {
+        for empty in ["", "...", "---", "._-", "\"\r\n", "/", "\\", "   "] {
+            assert_eq!(
+                sanitize_share_filename(empty, "image/png"),
+                "capture.png",
+                "{empty:?}"
+            );
+            assert_eq!(
+                sanitize_share_filename(empty, "video/mp4"),
+                "capture.mp4",
+                "{empty:?}"
+            );
+            assert_eq!(
+                sanitize_share_filename(empty, "application/octet-stream"),
+                "capture",
+                "{empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn punctuation_only_share_filename_is_not_used_as_is() {
+        assert_eq!(sanitize_share_filename("...", "image/png"), "capture.png");
+        assert_eq!(sanitize_share_filename("---", "video/mp4"), "capture.mp4");
+        assert_ne!(sanitize_share_filename("...", "image/png"), "...");
     }
 
     #[test]
