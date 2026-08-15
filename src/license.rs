@@ -904,13 +904,16 @@ pub fn refresh_once() -> Result<Status> {
     if status_code == 403 {
         let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
         let mut state = load_state()?;
+        // Only when the rejected activation is still the live one: a request
+        // that lost a race with a newer activation says nothing about the
+        // sidecar that activation may have written since.
         if same_activation(&state, &stored) {
             state.license = None;
             save_state(&state)?;
+            // The server just rejected this activation, so the sidecar's
+            // copy of its token is equally dead.
+            remove_pre_dpapi_backup();
         }
-        // The server just rejected this activation, so the sidecar's copy of
-        // its token is equally dead.
-        remove_pre_dpapi_backup();
         bail!(
             "{}",
             response_error(&response, "This activation is no longer valid.")
@@ -1069,9 +1072,11 @@ pub fn deactivate() -> Result<()> {
     if same_activation(&state, &stored) {
         state.license = None;
         save_state(&state)?;
+        // Deactivation released the seat; the sidecar's token died with it.
+        // Guarded like the state itself: a stale request must not take a
+        // newer activation's downgrade hatch with it.
+        remove_pre_dpapi_backup();
     }
-    // Deactivation released the seat; the sidecar's token died with it.
-    remove_pre_dpapi_backup();
     Ok(())
 }
 
