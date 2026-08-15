@@ -68,11 +68,55 @@ fn validate_upload_size(len: u64) -> Result<()> {
     Ok(())
 }
 
+/// Anything past this is not a share response: the worker answers with a
+/// short JSON object, and an endpoint that keeps streaming is faulty or not
+/// the endpoint. Read no further; the buffer stays small either way.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+fn append_bounded(response: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+    if response.len() + chunk.len() > MAX_RESPONSE_BYTES {
+        bail!("the share response was unexpectedly large");
+    }
+    response.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// Every caller opens the returned link in a browser or puts it on the
+/// clipboard, so it must be exactly the shape the Share worker mints:
+/// `https://share.matteshot.app/s/<id>` — canonical host, default port, no
+/// userinfo, no query or fragment. A scheme check alone would let a faulty
+/// or hijacked endpoint hand back any HTTPS site as though it were ours.
 fn validate_share_url(url: &str) -> Result<()> {
-    if !url.starts_with("https://") {
+    if !share_link_is_canonical(url) {
         bail!("the share response returned an unexpected link");
     }
     Ok(())
+}
+
+fn share_link_is_canonical(url: &str) -> bool {
+    if url.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()) {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    // Userinfo and an explicit port are both things the worker never emits;
+    // "share.matteshot.app@evil.example" and "share.matteshot.app:8443" each
+    // read as ours to a naive prefix check.
+    if authority.contains('@') || authority.contains(':') {
+        return false;
+    }
+    if !authority.eq_ignore_ascii_case(SHARE_HOST) {
+        return false;
+    }
+    let Some(id) = path.strip_prefix("/s/") else {
+        return false;
+    };
+    (6..=64).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 /// Upload on a worker thread and post `WM_SHARE_COMPLETE` to `hwnd` with the
@@ -355,7 +399,7 @@ fn post_multipart(
             if read == 0 {
                 break;
             }
-            response.extend_from_slice(&chunk[..read as usize]);
+            append_bounded(&mut response, &chunk[..read as usize])?;
         }
         Ok((status, response))
     }
@@ -452,15 +496,56 @@ mod tests {
     }
 
     #[test]
-    fn share_preflight_accepts_only_https_links() {
-        assert!(validate_share_url("https://share.example/x").is_ok());
+    fn only_a_canonical_share_link_is_accepted() {
+        assert!(validate_share_url("https://share.matteshot.app/s/ABCDEFGHJKMN").is_ok());
+        // Host names are case-insensitive; the id is whatever the worker minted.
+        assert!(validate_share_url("https://SHARE.matteshot.app/s/abc123XYZ").is_ok());
         for url in [
             "",
-            "http://share.example/x",
+            // Wrong or missing scheme.
+            "http://share.matteshot.app/s/ABCDEFGHJKMN",
             "file:///capture.png",
             "javascript:alert(1)",
+            "share.matteshot.app/s/ABCDEFGHJKMN",
+            // Not our host, including lookalikes a prefix check would pass.
+            "https://share.example/s/ABCDEFGHJKMN",
+            "https://share.matteshot.app.evil.example/s/ABCDEFGHJKMN",
+            "https://evil.example/share.matteshot.app/s/ABCDEFGHJKMN",
+            "https://matteshot.app/s/ABCDEFGHJKMN",
+            // Userinfo and alternate ports.
+            "https://share.matteshot.app@evil.example/s/ABCDEFGHJKMN",
+            "https://user:pw@share.matteshot.app/s/ABCDEFGHJKMN",
+            "https://share.matteshot.app:8443/s/ABCDEFGHJKMN",
+            "https://share.matteshot.app:443/s/ABCDEFGHJKMN",
+            // Wrong path shape, query, fragment, traversal, odd characters.
+            "https://share.matteshot.app/",
+            "https://share.matteshot.app/s/",
+            "https://share.matteshot.app/v1/share",
+            "https://share.matteshot.app/s/ABCDEFGHJKMN/raw",
+            "https://share.matteshot.app/s/ABCDEFGHJKMN?x=1",
+            "https://share.matteshot.app/s/ABCDEFGHJKMN#f",
+            "https://share.matteshot.app/s/../s/ABCDEFGHJKMN",
+            "https://share.matteshot.app/s/ABC",
+            "https://share.matteshot.app/s/ABCDEF GHJKMN",
+            "https://share.matteshot.app/s/ABCDEFGHJKMN\r\nSet-Cookie:x",
+            "https://share.matteshot.app/s/ABCDEFGHJKMN%2F..",
         ] {
-            assert!(validate_share_url(url).is_err(), "accepted {url}");
+            assert!(validate_share_url(url).is_err(), "accepted {url:?}");
         }
+        let too_long = format!("https://share.matteshot.app/s/{}", "A".repeat(65));
+        assert!(validate_share_url(&too_long).is_err());
+    }
+
+    #[test]
+    fn the_response_body_is_capped_before_it_grows() {
+        let mut body = Vec::new();
+        let chunk = vec![b'x'; 4096];
+        for _ in 0..(MAX_RESPONSE_BYTES / chunk.len()) {
+            append_bounded(&mut body, &chunk).unwrap();
+        }
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+        // The first byte past the cap fails, and nothing more is retained.
+        assert!(append_bounded(&mut body, b"y").is_err());
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
     }
 }
