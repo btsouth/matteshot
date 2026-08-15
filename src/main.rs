@@ -53,7 +53,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IsWindow, MessageBoxW, PostMessageW, IDYES,
-    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, WM_CLOSE, WM_HOTKEY,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MSG,
+    WM_CLOSE, WM_HOTKEY,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -721,22 +722,15 @@ fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
 }
 
 fn run_app() -> Result<()> {
-    // A resident that is on its way out still owns the slot for a moment. An
-    // update restarts the app the instant the installer finishes, so give the
-    // previous process time to release before deciding a resident is really
-    // there; otherwise the relaunch hands off to a corpse and exits, leaving
-    // the user with no tray app and no PrtScn.
-    let mut guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
-    if guard.is_none() {
-        for _ in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
-            if guard.is_some() {
-                diagnostics::log("resident slot claimed after the previous process exited");
-                break;
-            }
+    let guard = match claim_resident_slot() {
+        Ok(guard) => guard,
+        Err(error) => {
+            // CreateMutexW itself failed — nothing is held yet, but this is
+            // exactly the silent exit the dialog exists for.
+            report_resident_failure(&error, false);
+            return Err(error);
         }
-    }
+    };
     let Some(_resident_guard) = guard else {
         // A shortcut or autostart race should never create a second tray app
         // that competes for PrtScn. Make an intentional second launch useful
@@ -750,6 +744,45 @@ fn run_app() -> Result<()> {
         diagnostics::log("duplicate launch routed to resident");
         return Ok(());
     };
+    let result = run_resident();
+    if let Err(error) = &result {
+        // Reported here, not in main: the resident mutex is still held, so
+        // nothing races into the slot while the dialog is up, and the tray
+        // (if it ever existed) has already destroyed its window on the way
+        // out of run_resident, so the dialog's message pump has no freed
+        // state to reach. Hand the capture hooks back first — "start
+        // Matteshot again" has to be able to take them.
+        disable_capture_hotkeys(true);
+        report_resident_failure(error, RESIDENT_READY.load(Ordering::Relaxed));
+    }
+    result
+}
+
+/// `Some` when this process now owns the single-resident slot, `None` when
+/// another resident holds it. A resident that is on its way out still owns
+/// the slot for a moment — an update restarts the app the instant the
+/// installer finishes — so give the previous process time to release before
+/// deciding a resident is really there; otherwise the relaunch hands off to a
+/// corpse and exits, leaving the user with no tray app and no PrtScn.
+fn claim_resident_slot() -> Result<Option<state_lock::ProcessMutex>> {
+    let mut guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
+    if guard.is_none() {
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
+            if guard.is_some() {
+                diagnostics::log("resident slot claimed after the previous process exited");
+                break;
+            }
+        }
+    }
+    Ok(guard)
+}
+
+/// Everything after the resident slot is ours: telemetry, hotkeys, the tray,
+/// and the message loop. Owns the `Tray` for its whole lifetime, so an error
+/// anywhere in here drops it — and its window — before `run_app` reports.
+fn run_resident() -> Result<()> {
     telemetry::init();
     telemetry::report("matteshot_launch");
     let config = Config::load();
@@ -805,6 +838,7 @@ fn run_app() -> Result<()> {
         if prtscn_ours { "= capture overlay" } else { "not held (see tray menu)" }
     );
     diagnostics::log("resident ready");
+    RESIDENT_READY.store(true, Ordering::Relaxed);
 
     // First run: show the core loop before the app disappears into the tray.
     // This is non-modal, so PrtScn and tray commands remain live.
@@ -2053,7 +2087,275 @@ fn main() -> Result<()> {
     };
 
     if let Err(e) = &result {
+        // The CLI probes run from a console, so this is where their errors
+        // belong. The resident has no console; its failure was shown above.
         eprintln!("error: {e:#}");
     }
     result
+}
+
+/// Flipped once the tray exists and the resident is usable. `run_app` can
+/// still fail after that (a `?` on the message-loop side of Activate,
+/// Deactivate, or the expired-license window), and that is a running app
+/// stopping, not a startup that never happened — the dialog, the diagnostic
+/// event, and the telemetry kind all say which.
+static RESIDENT_READY: AtomicBool = AtomicBool::new(false);
+
+/// The resident is a windows-subsystem process: nothing it prints is ever
+/// seen. When `run_app` fails, the app used to just not be there — no tray
+/// icon, no PrtScn, and nothing to say why. Show one dialog the user can act
+/// on, and leave one diagnostic event and one telemetry failure behind it.
+/// Every other mode (`--once`, probes, `--license`) is a console flow and
+/// keeps stderr.
+fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
+    let message = startup_failure_message(error);
+    let (event, operation, title) = resident_failure_wording(was_running);
+    diagnostics::log(&format!(
+        "{event}: {}",
+        without_paths(&format!("{error:#}"))
+    ));
+    telemetry::report_failure(operation, error);
+    let title = HSTRING::from(title);
+    let text = HSTRING::from(message.as_str());
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+/// (diagnostic event, telemetry operation, dialog title) for a resident that
+/// failed before it was usable versus one that was running and stopped.
+fn resident_failure_wording(was_running: bool) -> (&'static str, &'static str, &'static str) {
+    if was_running {
+        ("resident stopped", "resident", "Matteshot stopped unexpectedly")
+    } else {
+        ("resident startup failed", "startup", "Matteshot could not start")
+    }
+}
+
+/// What the dialog says: a plain reason and the one thing to try, chosen from
+/// the failure's own context. The technical detail follows, scrubbed of local
+/// paths — the dialog is on the user's own screen, but its text gets pasted
+/// into support mail as-is, so it carries no user names or folders.
+fn startup_failure_message(error: &anyhow::Error) -> String {
+    let detail = without_paths(&format!("{error:#}"));
+    let lower = detail.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    // Exact contexts, not loose words: "create resident mutex" is
+    // CreateMutexW itself failing (a second copy takes a different, silent
+    // path), and "create state mutex" is the license lock, which has nothing
+    // to do with a stuck copy.
+    let advice = if has(&["create resident mutex"]) {
+        "Windows refused Matteshot's start-up lock. Sign out and back in, then start Matteshot again."
+    } else if has(&["create tray window", "notify icon", "shell_notifyicon"]) {
+        "Windows did not let Matteshot create its tray icon. Restart Windows Explorer, or sign out and back in, then start Matteshot again."
+    } else if has(&["application data", "app data", "data directory", "create directory"]) {
+        "Matteshot could not use its application data folder. Check that your AppData folder is writable, then start Matteshot again."
+    } else if has(&["access is denied", "access denied", "permission"]) {
+        "Windows denied Matteshot something it needs. Start Matteshot again; if that fails, try once as administrator to see the cause."
+    } else {
+        "Start Matteshot again. If this keeps happening, copy this message into an email to support@matteshot.app."
+    };
+    format!("{advice}\n\nDetail: {detail}\n\nThe diagnostics log has more (Settings > Diagnostics, or %LOCALAPPDATA%\\Matteshot\\matteshot.log).")
+}
+
+/// Drop anything shaped like a local file system path — a drive-letter path,
+/// a UNC path — so a folder or user name never rides along in text that is
+/// pasted into support mail or replayed into the shared support report.
+/// Windows paths contain spaces ("C:\\Users\\John Doe\\…", "Program Files"),
+/// so a space ends the path only when none of the next few words carries
+/// another separator; over-scrubbing a word is fine, leaking a name is not.
+fn without_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let word_start = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let drive = word_start
+            && i + 2 < bytes.len()
+            && bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/');
+        let unc = word_start && bytes[i..].starts_with(b"\\\\");
+        if drive || unc {
+            out.push_str("<path>");
+            i += if drive { 3 } else { 2 };
+            loop {
+                match bytes.get(i) {
+                    None | Some(b'"' | b'\'' | b',' | b';' | b'\n' | b'\r') => break,
+                    // "x.txt: Access is denied" ends the path; the drive colon
+                    // inside an extended path ("\\\\?\\C:\\Users\\…") does not.
+                    Some(b':') if !separator_follows(bytes, i + 1) => break,
+                    Some(b' ') if !path_continues_after_space(&bytes[i + 1..]) => break,
+                    Some(_) => i += 1,
+                }
+            }
+            continue;
+        }
+        // Advance one whole char, not one byte, so multibyte text survives.
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// After a space inside a suspected path: does one of the next three words
+/// (before any hard delimiter) carry a separator? "John Doe\\AppData" and
+/// "Program Files (x86)\\Matteshot" continue; "shot.png was not found" stops.
+fn separator_follows(bytes: &[u8], at: usize) -> bool {
+    matches!(bytes.get(at), Some(b'\\' | b'/'))
+}
+
+fn path_continues_after_space(rest: &[u8]) -> bool {
+    let mut words = 0;
+    let mut in_word = false;
+    for &byte in rest {
+        match byte {
+            // A colon here is either punctuation or the drive of a *new*
+            // path ("… c.txt to D:\\…"); either way this one is over.
+            b'"' | b'\'' | b',' | b';' | b':' | b'\n' | b'\r' => return false,
+            b' ' => {
+                if in_word {
+                    words += 1;
+                    in_word = false;
+                    if words == 3 {
+                        return false;
+                    }
+                }
+            }
+            b'\\' | b'/' => return true,
+            _ => in_word = true,
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::{resident_failure_wording, startup_failure_message, without_paths};
+
+    fn injected(context: &'static str, root: &'static str) -> anyhow::Error {
+        anyhow::anyhow!(root).context(context)
+    }
+
+    #[test]
+    fn each_startup_failure_gets_its_own_actionable_advice() {
+        // The three initializations that can fail before the tray exists.
+        let mutex = injected("create resident mutex", "Access is denied. (0x80070005)");
+        let tray = injected("create tray window", "Not enough quota (0x800705AD)");
+        let app_data = injected(
+            "Windows has no application data directory",
+            "C:\\Users\\tyler\\AppData\\Roaming was not found",
+        );
+
+        let mutex_text = startup_failure_message(&mutex);
+        assert!(mutex_text.contains("start-up lock"), "{mutex_text}");
+        let tray_text = startup_failure_message(&tray);
+        assert!(tray_text.contains("tray icon"), "{tray_text}");
+        let app_data_text = startup_failure_message(&app_data);
+        assert!(app_data_text.contains("AppData folder"), "{app_data_text}");
+
+        // Every message names the way back in, and carries the detail.
+        for text in [&mutex_text, &tray_text, &app_data_text] {
+            assert!(text.contains("start Matteshot again"), "{text}");
+            assert!(text.contains("Detail: "), "{text}");
+        }
+        // The default still tells the user what to do.
+        let unknown = startup_failure_message(&anyhow::anyhow!("something odd"));
+        assert!(unknown.contains("support@matteshot.app"), "{unknown}");
+    }
+
+    #[test]
+    fn advice_matches_exact_contexts_not_loose_words() {
+        // The license lock is a mutex too, but a stuck copy has nothing to
+        // do with it: this is an access problem and says so.
+        let state_lock = injected("create state mutex", "Access is denied. (0x80070005)");
+        let text = startup_failure_message(&state_lock);
+        assert!(!text.contains("start-up lock"), "{text}");
+        assert!(!text.contains("Task Manager"), "{text}");
+        assert!(text.contains("denied"), "{text}");
+
+        // "config" alone is not the application data folder.
+        let config = anyhow::anyhow!("invalid config value for capture_hotkey");
+        let text = startup_failure_message(&config);
+        assert!(!text.contains("AppData folder"), "{text}");
+
+        // A module-handle failure is not a tray-icon failure.
+        let module = injected("resolve module handle", "The specified module could not be found.");
+        let text = startup_failure_message(&module);
+        assert!(!text.contains("tray icon"), "{text}");
+    }
+
+    #[test]
+    fn a_stopped_resident_and_a_failed_startup_are_worded_apart() {
+        let (event, operation, title) = resident_failure_wording(false);
+        assert_eq!(event, "resident startup failed");
+        assert_eq!(operation, "startup");
+        assert_eq!(title, "Matteshot could not start");
+        let (event, operation, title) = resident_failure_wording(true);
+        assert_eq!(event, "resident stopped");
+        assert_eq!(operation, "resident");
+        assert_eq!(title, "Matteshot stopped unexpectedly");
+    }
+
+    #[test]
+    fn a_startup_failure_message_carries_no_local_paths() {
+        let error = anyhow::anyhow!("open C:\\Users\\tyler\\AppData\\Local\\Matteshot\\state.json")
+            .context("read \\\\server\\share\\config.json")
+            .context("Windows has no application data directory");
+        let text = startup_failure_message(&error);
+        assert!(!text.contains("tyler"), "{text}");
+        assert!(!text.contains("C:\\Users"), "{text}");
+        assert!(!text.contains("\\\\server"), "{text}");
+        assert!(text.contains("<path>"), "{text}");
+    }
+
+    #[test]
+    fn path_scrubbing_leaves_ordinary_text_alone() {
+        assert_eq!(without_paths("create resident mutex: Access is denied."), "create resident mutex: Access is denied.");
+        assert_eq!(without_paths("ratio 3:4 stays"), "ratio 3:4 stays");
+        assert_eq!(without_paths("(0x80070005) at 12:30"), "(0x80070005) at 12:30");
+        assert_eq!(without_paths("saved to D:\\Captures\\shot.png, then failed"), "saved to <path>, then failed");
+        assert_eq!(without_paths("share \\\\nas\\media\\clip.mp4 locked"), "share <path> locked");
+        assert_eq!(without_paths("unicode ünïcode C:/x/y end"), "unicode ünïcode <path> end");
+    }
+
+    #[test]
+    fn path_scrubbing_swallows_spaces_inside_a_path() {
+        assert_eq!(
+            without_paths("open C:\\Users\\John Doe\\AppData\\Local\\x.json was not found"),
+            "open <path> was not found"
+        );
+        assert_eq!(
+            without_paths("C:\\Program Files (x86)\\Matteshot\\matteshot.exe failed to start"),
+            "<path> failed to start"
+        );
+        assert_eq!(
+            without_paths("read C:\\Users\\Jane Q Public\\a.txt: Access is denied."),
+            "read <path>: Access is denied."
+        );
+        assert_eq!(
+            without_paths("share \\\\nas\\my share\\clip.mp4 locked"),
+            "share <path> locked"
+        );
+        // Two paths in one sentence stay two paths.
+        assert_eq!(
+            without_paths("copy C:\\a b\\c.txt to D:\\d e\\f.txt, then retry"),
+            "copy <path> to <path>, then retry"
+        );
+        // Extended-length and device paths carry the drive colon inside.
+        assert_eq!(
+            without_paths("open \\\\?\\C:\\Users\\John Doe\\x.json failed"),
+            "open <path> failed"
+        );
+        assert_eq!(
+            without_paths("open \\\\.\\C:\\Users\\tyler\\x.json: Access is denied."),
+            "open <path>: Access is denied."
+        );
+    }
 }

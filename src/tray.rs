@@ -22,7 +22,7 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DestroyMenu, GetCursorPos, GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA,
     HICON, ICONINFO, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
@@ -536,7 +536,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 impl Tray {
     pub fn create() -> Result<Tray> {
         unsafe {
-            let hinstance = GetModuleHandleW(None)?;
+            let hinstance = GetModuleHandleW(None).context("resolve module handle")?;
             let class = WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
                 hInstance: hinstance.into(),
@@ -563,7 +563,8 @@ impl Tray {
                 None,
                 hinstance,
                 Some(&mut *state as *mut TrayState as *const _),
-            )?;
+            )
+            .context("create tray window")?;
 
             let icon = make_icon();
             let mut data = NOTIFYICONDATAW {
@@ -625,6 +626,21 @@ impl Tray {
 
     pub fn quit() {
         unsafe { PostQuitMessage(0) };
+    }
+}
+
+/// The window's `GWLP_USERDATA` points into `state`, and the 250ms timer and
+/// the notify icon keep sending it messages for as long as the window
+/// exists. Destroy the window here, synchronously, before the fields drop:
+/// otherwise a `Tray` dropped on an error path leaves a live window whose
+/// next `WM_TIMER` — pumped by, say, the failure dialog — dereferences freed
+/// state.
+impl Drop for Tray {
+    fn drop(&mut self) {
+        self.remove();
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
     }
 }
 
