@@ -536,7 +536,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 impl Tray {
     pub fn create() -> Result<Tray> {
         unsafe {
-            let hinstance = GetModuleHandleW(None)?;
+            let hinstance = GetModuleHandleW(None).context("create tray window")?;
             let class = WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
                 hInstance: hinstance.into(),
@@ -563,7 +563,8 @@ impl Tray {
                 None,
                 hinstance,
                 Some(&mut *state as *mut TrayState as *const _),
-            )?;
+            )
+            .context("create tray window")?;
 
             let icon = make_icon();
             let mut data = NOTIFYICONDATAW {

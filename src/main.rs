@@ -53,7 +53,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IsWindow, MessageBoxW, PostMessageW, IDYES,
-    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, WM_CLOSE, WM_HOTKEY,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MSG,
+    WM_CLOSE, WM_HOTKEY,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2049,11 +2050,153 @@ fn main() -> Result<()> {
         Some(other) => bail!(
             "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --video-speed-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
-        None => run_app(),
+        None => {
+            let result = run_app();
+            if let Err(error) = &result {
+                report_resident_startup_failure(error);
+            }
+            result
+        }
     };
 
     if let Err(e) = &result {
+        // The CLI probes run from a console, so this is where their errors
+        // belong. The resident has no console; its failure was shown above.
         eprintln!("error: {e:#}");
     }
     result
+}
+
+/// The resident is a windows-subsystem process: nothing it prints is ever
+/// seen. When `run_app` fails, the app used to just not be there — no tray
+/// icon, no PrtScn, and nothing to say why. Show one dialog the user can act
+/// on, and leave one diagnostic event and one telemetry failure behind it.
+/// Every other mode (`--once`, probes, `--license`) is a console flow and
+/// keeps stderr.
+fn report_resident_startup_failure(error: &anyhow::Error) {
+    let message = startup_failure_message(error);
+    diagnostics::log(&format!(
+        "resident startup failed: {}",
+        without_paths(&format!("{error:#}"))
+    ));
+    telemetry::report_failure("startup", error);
+    let title = HSTRING::from("Matteshot could not start");
+    let text = HSTRING::from(message.as_str());
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+/// What the dialog says: a plain reason and the one thing to try, chosen from
+/// the failure's own context. The technical detail follows, scrubbed of local
+/// paths — the dialog is on the user's own screen, but its text gets pasted
+/// into support mail as-is, so it carries no user names or folders.
+fn startup_failure_message(error: &anyhow::Error) -> String {
+    let detail = without_paths(&format!("{error:#}"));
+    let lower = detail.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    let advice = if has(&["mutex", "resident"]) {
+        "Another copy of Matteshot may be stuck. End matteshot.exe in Task Manager, or sign out and back in, then start Matteshot again."
+    } else if has(&["tray", "notify icon", "shell_notifyicon"]) {
+        "Windows did not let Matteshot create its tray icon. Restart Windows Explorer, or sign out and back in, then start Matteshot again."
+    } else if has(&["application data", "data directory", "config", "create directory", "app data"]) {
+        "Matteshot could not use its application data folder. Check that your AppData folder is writable, then start Matteshot again."
+    } else if has(&["access is denied", "access denied", "permission"]) {
+        "Windows denied Matteshot something it needs. Start Matteshot again; if that fails, try once as administrator to see the cause."
+    } else {
+        "Start Matteshot again. If this keeps happening, copy this message into an email to support@matteshot.app."
+    };
+    format!("{advice}\n\nDetail: {detail}\n\nThe diagnostics log has more (Settings > Diagnostics, or %LOCALAPPDATA%\\Matteshot\\matteshot.log).")
+}
+
+/// Drop anything shaped like a local file system path — a drive-letter path,
+/// a UNC path — so a folder or user name never rides along in text that is
+/// pasted into support mail or replayed into the shared support report.
+fn without_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let drive = i + 2 < bytes.len()
+            && bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric());
+        let unc = bytes[i..].starts_with(b"\\\\") && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric());
+        if drive || unc {
+            out.push_str("<path>");
+            while i < bytes.len() && !matches!(bytes[i], b' ' | b'"' | b'\'' | b')' | b',' | b';' | b'\n' | b'\r') {
+                i += 1;
+            }
+            continue;
+        }
+        // Advance one whole char, not one byte, so multibyte text survives.
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::{startup_failure_message, without_paths};
+
+    fn injected(context: &'static str, root: &'static str) -> anyhow::Error {
+        anyhow::anyhow!(root).context(context)
+    }
+
+    #[test]
+    fn each_startup_failure_gets_its_own_actionable_advice() {
+        // The three initializations that can fail before the tray exists.
+        let mutex = injected("create resident mutex", "Access is denied. (0x80070005)");
+        let tray = injected("create tray window", "Not enough quota (0x800705AD)");
+        let app_data = injected(
+            "Windows has no application data directory",
+            "C:\\Users\\tyler\\AppData\\Roaming was not found",
+        );
+
+        let mutex_text = startup_failure_message(&mutex);
+        assert!(mutex_text.contains("Task Manager"), "{mutex_text}");
+        let tray_text = startup_failure_message(&tray);
+        assert!(tray_text.contains("tray icon"), "{tray_text}");
+        let app_data_text = startup_failure_message(&app_data);
+        assert!(app_data_text.contains("AppData folder"), "{app_data_text}");
+
+        // Every message names the way back in, and carries the detail.
+        for text in [&mutex_text, &tray_text, &app_data_text] {
+            assert!(text.contains("start Matteshot again"), "{text}");
+            assert!(text.contains("Detail: "), "{text}");
+        }
+        // The default still tells the user what to do.
+        let unknown = startup_failure_message(&anyhow::anyhow!("something odd"));
+        assert!(unknown.contains("support@matteshot.app"), "{unknown}");
+    }
+
+    #[test]
+    fn a_startup_failure_message_carries_no_local_paths() {
+        let error = anyhow::anyhow!("open C:\\Users\\tyler\\AppData\\Local\\Matteshot\\state.json")
+            .context("read \\\\server\\share\\config.json")
+            .context("Windows has no application data directory");
+        let text = startup_failure_message(&error);
+        assert!(!text.contains("tyler"), "{text}");
+        assert!(!text.contains("C:\\Users"), "{text}");
+        assert!(!text.contains("\\\\server"), "{text}");
+        assert!(text.contains("<path>"), "{text}");
+    }
+
+    #[test]
+    fn path_scrubbing_leaves_ordinary_text_alone() {
+        assert_eq!(without_paths("create resident mutex: Access is denied."), "create resident mutex: Access is denied.");
+        assert_eq!(without_paths("ratio 3:4 stays"), "ratio 3:4 stays");
+        assert_eq!(without_paths("(0x80070005) at 12:30"), "(0x80070005) at 12:30");
+        assert_eq!(without_paths("saved to D:\\Captures\\shot.png, then failed"), "saved to <path>, then failed");
+        assert_eq!(without_paths("share \\\\nas\\media\\clip.mp4 locked"), "share <path> locked");
+        assert_eq!(without_paths("unicode ünïcode C:/x/y end"), "unicode ünïcode <path> end");
+    }
 }
