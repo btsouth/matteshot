@@ -227,28 +227,59 @@ pub fn list() -> Vec<Entry> {
     entries
 }
 
+/// True when `path` is inside `root` after both are canonicalized.
+/// A path that cannot be resolved, or a root that cannot be resolved, is not owned.
+fn path_is_under_root(path: &Path, root: &Path) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
+fn path_is_owned_capture(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
+    roots.iter().any(|root| path_is_under_root(path, root.as_ref()))
+}
+
+fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
+    if path_is_owned_capture(path, roots) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            // Already gone (deleted outside the app, or a repeat click racing
+            // its own first Delete): the index is just stale, so finish
+            // dropping the entry instead of reporting a failure the user has no
+            // way to act on.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("delete capture"),
+        }
+    } else {
+        // History is an index, not a file manager: a stale or hand-edited
+        // entry must not unlink a file outside the save/video folders.
+        crate::diagnostics::log(&format!(
+            "history delete skipped file outside save/video folders: {}",
+            path.display()
+        ));
+    }
+    // Unlike record, a transient read failure surfaces here: Delete already
+    // decided the entry should go, and silently keeping it would leave a
+    // click that "worked" still showing the capture.
+    let mut log = load_for_mutation(index)?;
+    log.entries.retain(|e| e.path != path);
+    // Same reasoning: a stale entry left by a failed write is a Delete that
+    // only looked like it worked.
+    save_unlocked_at(index, &log)
+}
+
 /// Delete the file and drop it from history. Unlike `record`, errors surface:
 /// a Delete click that silently failed would look like it had worked.
 pub fn remove(path: &Path) -> Result<()> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        // Already gone (deleted outside the app, or a repeat click racing
-        // its own first Delete): the index is just stale, so finish
-        // dropping the entry instead of reporting a failure the user has no
-        // way to act on.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("delete capture"),
-    }
+    let config = crate::config::Config::load();
+    let roots = [config.save_dir(), config.video_dir()];
     let index = history_path().context("Windows has no application data directory")?;
-    // Unlike record, a transient read failure surfaces here: the file is
-    // already gone, and silently keeping its stale entry would leave a
-    // Delete that "worked" still showing the capture.
-    let mut log = load_for_mutation(&index)?;
-    log.entries.retain(|e| e.path != path);
-    // Same reasoning: the file is gone, so a stale entry left by a failed
-    // write is a Delete that only looked like it worked.
-    save_unlocked_at(&index, &log)
+    remove_at(&index, path, &roots)
 }
 
 fn format_when(saved_at: i64) -> String {
@@ -462,6 +493,109 @@ mod persistence_tests {
         std::fs::create_dir_all(dir.join("history.json.tmp")).unwrap();
         assert!(save_unlocked_at(&index, &Log::default()).is_err());
         assert!(!index.exists());
+    }
+
+    #[test]
+    fn path_is_under_root_accepts_a_real_file_inside_and_rejects_lookalikes() {
+        let base = temp_dir("under-root");
+        let root = base.join("root");
+        let root_evil = base.join("root-evil");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root_evil).unwrap();
+        let inside = capture(&root, "shot.png");
+        let sibling = capture(&root_evil, "shot.png");
+        let via_dotdot = root.join("..").join("root-evil").join("shot.png");
+
+        assert!(path_is_under_root(&inside, &root));
+        assert!(!path_is_under_root(&sibling, &root), "root-evil must not match root");
+        assert!(!path_is_under_root(&via_dotdot, &root), "`..` that lands outside is not owned");
+        assert!(!path_is_under_root(&inside, &base.join("no-such-root")));
+        assert!(!path_is_under_root(&root.join("missing.png"), &root));
+    }
+
+    #[test]
+    fn a_capture_is_owned_if_it_lives_under_save_dir_or_video_dir() {
+        let base = temp_dir("owned");
+        let save = base.join("save");
+        let video = base.join("video");
+        let other = base.join("other");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&video).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let in_save = capture(&save, "a.png");
+        let in_video = capture(&video, "b.mp4");
+        let in_other = capture(&other, "c.png");
+        let roots = [save, video];
+
+        assert!(path_is_owned_capture(&in_save, &roots));
+        assert!(path_is_owned_capture(&in_video, &roots));
+        assert!(!path_is_owned_capture(&in_other, &roots));
+    }
+
+    #[test]
+    fn an_unowned_history_entry_is_dropped_without_deleting_the_file() {
+        let dir = temp_dir("remove-unowned");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let foreign = capture(&outside, "win.ini");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&foreign));
+
+        assert!(remove_at(&index, &foreign, &[save]).is_ok());
+        assert!(foreign.is_file(), "a file outside the save folder must stay on disk");
+        assert!(
+            load_for_mutation(&index).unwrap().entries.is_empty(),
+            "the stale index row is dropped even when the file is left alone"
+        );
+    }
+
+    #[test]
+    fn a_file_inside_the_save_folder_is_unlinked_and_dropped() {
+        let dir = temp_dir("remove-owned");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let shot = capture(&save, "a.png");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&shot));
+
+        assert!(remove_at(&index, &shot, &[save]).is_ok());
+        assert!(!shot.exists());
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_file_inside_the_video_folder_is_unlinked_even_when_outside_save_dir() {
+        let dir = temp_dir("remove-video");
+        let save = dir.join("save");
+        let video = dir.join("video");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&video).unwrap();
+        let rec = capture(&video, "clip.mp4");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&rec));
+
+        assert!(remove_at(&index, &rec, &[save, video]).is_ok());
+        assert!(!rec.exists(), "recordings under video_dir are an allowed root");
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_path_that_escapes_the_save_folder_with_dotdot_is_not_unlinked() {
+        let dir = temp_dir("remove-escape");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let foreign = capture(&outside, "secret.txt");
+        let escaped = save.join("..").join("outside").join("secret.txt");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&escaped));
+
+        assert!(remove_at(&index, &escaped, &[save]).is_ok());
+        assert!(foreign.is_file(), "a `..` escape must not unlink the foreign file");
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
     }
 }
 
