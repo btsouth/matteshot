@@ -703,6 +703,107 @@ fn partial_gif_path(destination: &std::path::Path, id: u64) -> std::path::PathBu
     parent.join(format!("{stem}.partial-{}-{id}.gif", std::process::id()))
 }
 
+/// Keep waiting on a capture worker the UI has already given up on, and
+/// publish its recording if finalization eventually succeeds. The GIF track
+/// is deliberately dropped on this path: the MP4 is the user's data.
+///
+/// Bounded at 15 minutes. Past that — or on any worker/validation failure —
+/// the partial is left in place: startup cleanup now validates video partials
+/// and recovers playable ones, so leaving the file is preservation, not
+/// litter.
+fn supervise_late_finalize(
+    worker: std::thread::JoinHandle<Option<GifFrames>>,
+    progress: Arc<Progress>,
+    partial: std::path::PathBuf,
+    destination: std::path::PathBuf,
+) {
+    std::thread::spawn(move || {
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+        // Validation opens a Media Foundation source reader, which wants COM
+        // up on the calling thread — every other worker that probes a video
+        // (export, filmstrip, scrub) initializes it the same way. Without
+        // this a finished recording could fail its check for a reason that
+        // has nothing to do with the file.
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        finish_late_recording(
+            worker,
+            &progress,
+            &partial,
+            &destination,
+            std::time::Duration::from_secs(15 * 60),
+        );
+        if com.is_ok() {
+            unsafe { CoUninitialize() };
+        }
+    });
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LateFinalize {
+    /// The recording finished, validated, and now sits at its destination.
+    Published,
+    /// The partial was left where it is, for startup recovery to pick up.
+    Kept,
+}
+
+/// The supervisor's body, split from its thread so a test can drive it with
+/// a mock worker. Every lifecycle line here is path-free: the events replay
+/// verbatim inside the privacy-safe support report.
+fn finish_late_recording(
+    worker: std::thread::JoinHandle<Option<GifFrames>>,
+    progress: &Progress,
+    partial: &std::path::Path,
+    destination: &std::path::Path,
+    patience: std::time::Duration,
+) -> LateFinalize {
+    let deadline = std::time::Instant::now() + patience;
+    while !worker.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            crate::diagnostics::log(
+                "late recording finalize never completed; partial left for startup recovery",
+            );
+            return LateFinalize::Kept;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500).min(patience / 4));
+    }
+    if worker.join().is_err() {
+        crate::diagnostics::log("late recording worker panicked");
+        return LateFinalize::Kept;
+    }
+    if progress.error.lock().unwrap().is_some() {
+        crate::diagnostics::log("late recording capture failed; partial left for startup recovery");
+        return LateFinalize::Kept;
+    }
+    // The validator's error names the file's full path in its context; the
+    // fixed line keeps the lifecycle log path-free.
+    if crate::trim::validate_video(partial).is_err() {
+        crate::diagnostics::log(
+            "late recording failed validation; partial left for startup recovery",
+        );
+        return LateFinalize::Kept;
+    }
+    match publish_recording_with(partial, destination, |from, to| std::fs::rename(from, to)) {
+        Ok(()) => {
+            crate::diagnostics::log(&format!(
+                "late recording finalized and published as {}",
+                destination
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+            LateFinalize::Published
+        }
+        // The error text names the kept recovery file's full path; a fixed
+        // message keeps the lifecycle log path-free.
+        Err(_) => {
+            crate::diagnostics::log(
+                "late recording publish failed; the partial file is kept in the videos folder",
+            );
+            LateFinalize::Kept
+        }
+    }
+}
+
 fn publish_recording_with(
     partial: &std::path::Path,
     destination: &std::path::Path,
@@ -823,9 +924,15 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     let worker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !worker.is_finished() {
         if std::time::Instant::now() >= worker_deadline {
-            crate::diagnostics::log("recording finalize timeout");
+            // A slow Media Foundation Finalize is late, not lost: minutes of
+            // encoding can still land after the UI gives up waiting. Keep
+            // supervising off-thread and publish if it completes — returning
+            // here used to orphan the file, and startup then deleted a
+            // recording that had actually finished.
+            crate::diagnostics::log("recording finalize timeout; supervising in the background");
+            supervise_late_finalize(worker, progress.clone(), partial_mp4.clone(), mp4.clone());
             bail!(
-                "The recorder did not finish within 60 seconds. The incomplete file was quarantined and will be removed after restart."
+                "This recording is taking unusually long to finish. Matteshot keeps finalizing it in the background; if that succeeds, the video appears in your videos folder."
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -941,6 +1048,124 @@ mod tests {
             "matteshot-record-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    fn progress() -> Progress {
+        Progress {
+            stop: AtomicBool::new(false),
+            frames: AtomicU32::new(0),
+            started: std::time::Instant::now(),
+            error: Mutex::new(None),
+        }
+    }
+
+    /// A real, playable MP4 at `path`: one second of flat frames through the
+    /// same sink the recorder uses.
+    fn write_playable_mp4(path: &std::path::Path) {
+        const FPS: u32 = 30;
+        const SIZE: u32 = 64;
+        let interval = 10_000_000i64 / FPS as i64;
+        unsafe {
+            MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+            let (writer, stream, _) = make_sink(path, SIZE, SIZE, FPS, None).unwrap();
+            let frame = vec![96u8; (SIZE * SIZE * 4) as usize];
+            for index in 0..FPS {
+                let buffer = MFCreateMemoryBuffer(frame.len() as u32).unwrap();
+                let mut destination = std::ptr::null_mut();
+                buffer.Lock(&mut destination, None, None).unwrap();
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), destination, frame.len());
+                buffer.Unlock().unwrap();
+                buffer.SetCurrentLength(frame.len() as u32).unwrap();
+                let sample = MFCreateSample().unwrap();
+                sample.AddBuffer(&buffer).unwrap();
+                sample.SetSampleTime(index as i64 * interval).unwrap();
+                sample.SetSampleDuration(interval).unwrap();
+                writer.WriteSample(stream, &sample).unwrap();
+            }
+            writer.Finalize().unwrap();
+        }
+    }
+
+    /// A capture worker that "finalizes" for `takes` before reporting done.
+    fn late_worker(takes: std::time::Duration) -> std::thread::JoinHandle<Option<GifFrames>> {
+        std::thread::spawn(move || {
+            std::thread::sleep(takes);
+            None
+        })
+    }
+
+    #[test]
+    fn a_recording_that_finishes_after_the_ui_gave_up_is_still_published() {
+        let dir = temp_dir("late-finalize-published");
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("capture.partial-1-1.mp4");
+        let destination = dir.join("capture.mp4");
+        write_playable_mp4(&partial);
+
+        // The UI's 60-second wait is long over; the worker lands later still.
+        let worker = late_worker(std::time::Duration::from_millis(300));
+        let outcome = finish_late_recording(
+            worker,
+            &progress(),
+            &partial,
+            &destination,
+            std::time::Duration::from_secs(30),
+        );
+
+        assert_eq!(outcome, LateFinalize::Published);
+        assert!(destination.exists(), "the late recording never reached its destination");
+        assert!(!partial.exists());
+        assert!(crate::trim::validate_video(&destination).is_ok());
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn a_late_recording_that_fails_validation_is_kept_not_deleted() {
+        let dir = temp_dir("late-finalize-invalid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("capture.partial-1-1.mp4");
+        let destination = dir.join("capture.mp4");
+        std::fs::write(&partial, b"not an mp4").unwrap();
+
+        let worker = late_worker(std::time::Duration::from_millis(50));
+        let outcome = finish_late_recording(
+            worker,
+            &progress(),
+            &partial,
+            &destination,
+            std::time::Duration::from_secs(30),
+        );
+
+        assert_eq!(outcome, LateFinalize::Kept);
+        assert!(partial.exists(), "an unvalidated late partial was deleted");
+        assert!(!destination.exists());
+        std::fs::remove_file(partial).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn a_worker_that_outlives_the_supervisor_leaves_the_partial_for_startup() {
+        let dir = temp_dir("late-finalize-timeout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("capture.partial-1-1.mp4");
+        let destination = dir.join("capture.mp4");
+        std::fs::write(&partial, b"still being written").unwrap();
+
+        let worker = late_worker(std::time::Duration::from_secs(2));
+        let outcome = finish_late_recording(
+            worker,
+            &progress(),
+            &partial,
+            &destination,
+            std::time::Duration::from_millis(100),
+        );
+
+        assert_eq!(outcome, LateFinalize::Kept);
+        assert!(partial.exists());
+        assert!(!destination.exists());
+        std::fs::remove_file(partial).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

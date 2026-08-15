@@ -604,6 +604,64 @@ pub fn validate_video(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a `validate_video` failure says about the file, for callers deciding
+/// whether the bytes may be deleted. The validator's own `Err` folds both
+/// kinds together, which is fine for "do not publish this" but not for
+/// "throw this away".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationFault {
+    /// The bytes themselves are not a playable video: too small, no
+    /// duration, no decodable frames, or Media Foundation rejected the
+    /// container or stream.
+    Undecodable,
+    /// The check could not reach a verdict this time — a sharing violation
+    /// or access error on the file, COM or the Media Foundation platform not
+    /// up on this thread, no decoder installed. The bytes may be perfectly
+    /// good; try again later.
+    Unavailable,
+}
+
+pub fn validation_fault(error: &anyhow::Error) -> ValidationFault {
+    let root = error.root_cause();
+    if root.downcast_ref::<std::io::Error>().is_some() {
+        return ValidationFault::Unavailable;
+    }
+    match root.downcast_ref::<windows::core::Error>() {
+        Some(error) => fault_of_hresult(error.code()),
+        // The validator's own bails carry no source: those are its explicit
+        // content checks.
+        None => ValidationFault::Undecodable,
+    }
+}
+
+fn fault_of_hresult(code: windows::core::HRESULT) -> ValidationFault {
+    use windows::Win32::Foundation::{CO_E_NOTINITIALIZED, RPC_E_CHANGED_MODE};
+    use windows::Win32::Media::MediaFoundation::{
+        MF_E_NOT_INITIALIZED, MF_E_PLATFORM_NOT_INITIALIZED, MF_E_SHUTDOWN,
+        MF_E_TOPO_CODEC_NOT_FOUND, MF_E_UNSUPPORTED_D3D_TYPE,
+    };
+    // HRESULT_FROM_WIN32: an OS-level failure (sharing violation, access
+    // denied, out of memory, path not found) reached through the reader,
+    // not a statement about the media.
+    const FACILITY_WIN32: u32 = 7;
+    if (code.0 as u32 >> 16) & 0x1FFF == FACILITY_WIN32 {
+        return ValidationFault::Unavailable;
+    }
+    if matches!(
+        code,
+        CO_E_NOTINITIALIZED
+            | RPC_E_CHANGED_MODE
+            | MF_E_PLATFORM_NOT_INITIALIZED
+            | MF_E_NOT_INITIALIZED
+            | MF_E_SHUTDOWN
+            | MF_E_TOPO_CODEC_NOT_FOUND
+            | MF_E_UNSUPPORTED_D3D_TYPE
+    ) {
+        return ValidationFault::Unavailable;
+    }
+    ValidationFault::Undecodable
+}
+
 /// Resolve real stream indices — assuming video is 0 silently corrupts the
 /// output (audio bytes encoded as frames).
 fn stream_indices(reader: &IMFSourceReader) -> (u32, Option<u32>) {
@@ -1431,6 +1489,47 @@ mod tests {
         assert_eq!(content_size_for_encoder(960, 522, &opts, true), (960, 522));
         // Unframed output is its own size, so only absurd sources shrink.
         assert_eq!(content_size_for_encoder(3840, 2160, &opts, false), (3840, 2160));
+    }
+
+    #[test]
+    fn validation_faults_split_bad_bytes_from_a_check_that_could_not_run() {
+        use super::{validation_fault, ValidationFault};
+        use windows::Win32::Foundation::{CO_E_NOTINITIALIZED, ERROR_SHARING_VIOLATION, E_FAIL};
+        use windows::Win32::Media::MediaFoundation::{
+            MF_E_INVALIDMEDIATYPE, MF_E_TOPO_CODEC_NOT_FOUND, MF_E_UNSUPPORTED_BYTESTREAM_TYPE,
+        };
+
+        let content = |message: &'static str| anyhow::anyhow!(message);
+        let mf = |code: windows::core::HRESULT| {
+            anyhow::Error::from(windows::core::Error::from(code)).context("decode finalized video")
+        };
+
+        // The validator's own verdicts on the bytes.
+        for error in [
+            content("video is unexpectedly small (5 bytes)"),
+            content("video has no playable duration"),
+            content("video has no decodable frames"),
+            mf(MF_E_UNSUPPORTED_BYTESTREAM_TYPE),
+            mf(MF_E_INVALIDMEDIATYPE),
+            mf(E_FAIL),
+        ] {
+            assert_eq!(validation_fault(&error), ValidationFault::Undecodable, "{error:#}");
+        }
+
+        // Nothing here says the file is bad; the check simply did not run.
+        let locked = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "sharing violation",
+        ))
+        .context("read video metadata");
+        for error in [
+            locked,
+            mf(windows::core::HRESULT::from_win32(ERROR_SHARING_VIOLATION.0)),
+            mf(CO_E_NOTINITIALIZED),
+            mf(MF_E_TOPO_CODEC_NOT_FOUND),
+        ] {
+            assert_eq!(validation_fault(&error), ValidationFault::Unavailable, "{error:#}");
+        }
     }
 
     #[test]
