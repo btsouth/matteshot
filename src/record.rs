@@ -3,7 +3,7 @@
 //! main thread shows a floating stop pill that excludes itself from the
 //! recording (WDA_EXCLUDEFROMCAPTURE).
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -703,6 +703,58 @@ fn partial_gif_path(destination: &std::path::Path, id: u64) -> std::path::PathBu
     parent.join(format!("{stem}.partial-{}-{id}.gif", std::process::id()))
 }
 
+/// Quit and auto-update only looked at windows (SBS-893). The late-finalize
+/// supervisor is a detached thread with no surface, so those paths tore the
+/// process down while Finalize was still writing. An `AtomicUsize`, not a
+/// bool: two overlapping recordings must not clobber each other.
+static LATE_FINALIZE_OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Supervisor bound, and the longest `--quit` / tray Quit will wait for it.
+pub const LATE_FINALIZE_BOUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Increments [`LATE_FINALIZE_OUTSTANDING`] for its lifetime, including panic.
+pub struct LateFinalizeGuard;
+
+impl LateFinalizeGuard {
+    pub fn acquire() -> Self {
+        LATE_FINALIZE_OUTSTANDING.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for LateFinalizeGuard {
+    fn drop(&mut self) {
+        LATE_FINALIZE_OUTSTANDING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub fn late_finalize_outstanding() -> bool {
+    LATE_FINALIZE_OUTSTANDING.load(Ordering::Acquire) > 0
+}
+
+/// True once every late-finalize guard has dropped. Does not cancel the work.
+pub fn wait_until_late_finalize_idle(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !late_finalize_outstanding() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
+    }
+}
+
+/// Serializes tests that take a [`LateFinalizeGuard`]. The counter is
+/// process-global; overlapping tests would see each other's work.
+#[cfg(test)]
+pub(crate) fn lock_late_finalize_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Keep waiting on a capture worker the UI has already given up on, and
 /// publish its recording if finalization eventually succeeds. The GIF track
 /// is deliberately dropped on this path: the MP4 is the user's data.
@@ -716,8 +768,10 @@ fn supervise_late_finalize(
     progress: Arc<Progress>,
     partial: std::path::PathBuf,
     destination: std::path::PathBuf,
+    guard: LateFinalizeGuard,
 ) {
     std::thread::spawn(move || {
+        let _guard = guard;
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
         // Validation opens a Media Foundation source reader, which wants COM
         // up on the calling thread — every other worker that probes a video
@@ -730,7 +784,7 @@ fn supervise_late_finalize(
             &progress,
             &partial,
             &destination,
-            std::time::Duration::from_secs(15 * 60),
+            LATE_FINALIZE_BOUND,
         );
         if com.is_ok() {
             unsafe { CoUninitialize() };
@@ -921,6 +975,11 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     // join the capture worker even if creating or running the controls fails.
     let ui_result = crate::recui::run(progress.clone(), target);
     progress.stop.store(true, Ordering::Relaxed);
+    // SBS-893: recui is gone and this 60s join has no window. Quit and
+    // auto-update only looked at surfaces, so the wait — and the supervisor
+    // it may hand off to — was invisible. The guard drops on the happy and
+    // error paths; the late path transfers it to the supervisor thread.
+    let late_guard = LateFinalizeGuard::acquire();
     let worker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !worker.is_finished() {
         if std::time::Instant::now() >= worker_deadline {
@@ -930,13 +989,22 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
             // here used to orphan the file, and startup then deleted a
             // recording that had actually finished.
             crate::diagnostics::log("recording finalize timeout; supervising in the background");
-            supervise_late_finalize(worker, progress.clone(), partial_mp4.clone(), mp4.clone());
+            supervise_late_finalize(
+                worker,
+                progress.clone(),
+                partial_mp4.clone(),
+                mp4.clone(),
+                late_guard,
+            );
             bail!(
                 "This recording is taking unusually long to finish. Matteshot keeps finalizing it in the background; if that succeeds, the video appears in your videos folder."
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+    // Keep the guard through validate/publish (and the error-path deletes).
+    // Dropping here used to make the few seconds after the 60s join look
+    // idle to auto-update. The late path already moved the guard.
     let worker_result = worker.join();
 
     if let Err(error) = ui_result {
@@ -975,6 +1043,9 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         let _ = std::fs::remove_file(&gif);
         return Err(error);
     }
+    // Recording is at its destination. Drop before recdone::show so tray
+    // Quit does not claim a finished file is still finalizing (SBS-893).
+    drop(late_guard);
 
     let mut gif_saved = None;
     let mut gif_failed = false;
@@ -1166,6 +1237,60 @@ mod tests {
         assert!(!destination.exists());
         std::fs::remove_file(partial).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Two overlapping recordings must not clobber a bool; dropping the last
+    /// guard is what returns quit/auto-update to idle (SBS-893).
+    #[test]
+    fn late_finalize_outstanding_is_true_while_a_guard_is_held() {
+        let _serial = lock_late_finalize_for_test();
+        assert!(!late_finalize_outstanding());
+        let first = LateFinalizeGuard::acquire();
+        assert!(late_finalize_outstanding());
+        let second = LateFinalizeGuard::acquire();
+        assert!(late_finalize_outstanding());
+        drop(first);
+        assert!(late_finalize_outstanding(), "dropping one of two guards went idle");
+        drop(second);
+        assert!(!late_finalize_outstanding());
+    }
+
+    /// A waiter must observe the drop from another thread. A same-thread
+    /// acquire-then-wait would deadlock on a broken implementation that
+    /// expected the caller to cancel (SBS-893).
+    #[test]
+    fn wait_until_late_finalize_idle_returns_true_after_the_guard_drops() {
+        let _serial = lock_late_finalize_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = LateFinalizeGuard::acquire();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        });
+        rx.recv().unwrap();
+        assert!(
+            wait_until_late_finalize_idle(std::time::Duration::from_secs(2)),
+            "wait did not become idle after the other thread dropped its guard"
+        );
+        assert!(!late_finalize_outstanding());
+    }
+
+    /// Waiting must not clear the counter or invent a cancel. Quit used to
+    /// treat "no window" as permission to tear the process down while
+    /// Finalize was still writing (SBS-893).
+    #[test]
+    fn wait_until_late_finalize_idle_times_out_while_work_remains() {
+        let _serial = lock_late_finalize_for_test();
+        let guard = LateFinalizeGuard::acquire();
+        assert!(!wait_until_late_finalize_idle(
+            std::time::Duration::from_millis(30)
+        ));
+        assert!(
+            late_finalize_outstanding(),
+            "the wait cancelled outstanding work instead of only observing it"
+        );
+        drop(guard);
+        assert!(!late_finalize_outstanding());
     }
 
     #[test]

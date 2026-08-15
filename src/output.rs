@@ -6,8 +6,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use image::{ImageFormat, RgbaImage};
-use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows::core::{w, HRESULT, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, GlobalFree, ERROR_INVALID_PARAMETER, HANDLE, HWND, STILL_ACTIVE,
+};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
@@ -101,6 +106,7 @@ enum PartialDisposition {
 fn cleanup_stale_partials(
     dir: &Path,
     owner_of: fn(&str) -> Option<u32>,
+    owner_may_be_running: impl Fn(u32) -> Option<bool>,
     disposition: impl Fn(&Path) -> PartialDisposition,
 ) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -123,6 +129,23 @@ fn cleanup_stale_partials(
             .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60));
         if owner == std::process::id() && !old {
             continue;
+        }
+        // SBS-893: another instance may still be inside Finalize. Live owner
+        // → skip (do not validate, do not delete). Unknown liveness → keep.
+        // Unknown is not dead. Only a proven-dead owner (or this process
+        // after the 24h PID-reuse window) may be classified. Asking about
+        // our own PID would always look live and strand a day-old leftover.
+        if owner != std::process::id() {
+            match owner_may_be_running(owner) {
+                Some(true) => continue,
+                None => {
+                    crate::diagnostics::log(
+                        "a stale partial's owner process could not be checked; keeping it",
+                    );
+                    continue;
+                }
+                Some(false) => {}
+            }
         }
         // A stale partial is not automatically garbage: a finalize that
         // outlived its process can leave a complete, playable recording
@@ -202,12 +225,40 @@ fn video_partial_disposition(path: &Path) -> PartialDisposition {
     }
 }
 
+/// Three states, not two (SBS-893). A query that cannot run is not "dead":
+/// startup must not delete a mid-Finalize file on ACCESS_DENIED or any
+/// OpenProcess failure that is not a clear "no such process".
+fn process_may_be_running(pid: u32) -> Option<bool> {
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) => {
+            return if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) {
+                Some(false)
+            } else {
+                None
+            };
+        }
+    };
+    let mut exit_code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    let _ = unsafe { CloseHandle(handle) };
+    match queried {
+        Ok(()) => Some(exit_code == STILL_ACTIVE.0 as u32),
+        Err(_) => None,
+    }
+}
+
 /// Handle Matteshot's unmistakable incomplete-recording names: recover the
 /// playable ones under a `-recovered` name, remove the rest. A partial from
 /// this process may belong to another open editor, so it is retained unless
 /// it is old enough to be from a reused process ID.
 pub fn cleanup_stale_video_partials(dir: &Path) -> usize {
-    cleanup_stale_partials(dir, partial_recording_owner, video_partial_disposition)
+    cleanup_stale_partials(
+        dir,
+        partial_recording_owner,
+        process_may_be_running,
+        video_partial_disposition,
+    )
 }
 
 struct ClipboardGuard;
@@ -352,7 +403,12 @@ fn partial_png_owner(name: &str) -> Option<u32> {
 pub fn cleanup_stale_png_partials(dir: &Path) -> usize {
     // PNG partials are staged bytes mid-save with nothing to recover: the
     // finished capture either published or the save failed loudly.
-    cleanup_stale_partials(dir, partial_png_owner, |_| PartialDisposition::Delete)
+    cleanup_stale_partials(
+        dir,
+        partial_png_owner,
+        |_| Some(false),
+        |_| PartialDisposition::Delete,
+    )
 }
 
 fn publish_png_with(
@@ -667,7 +723,19 @@ mod tests {
         std::fs::write(&live_gif, b"live gif").unwrap();
         std::fs::write(&normal, b"normal").unwrap();
 
-        assert_eq!(cleanup_stale_video_partials(&dir), 2);
+        // wrapping_add(1) is not guaranteed to be a dead PID (reuse). This
+        // test pins disposition plumbing — other-PID undecodable bytes are
+        // deleted, live/normal names are left — not process liveness.
+        // Inject "known dead" so the old assertion still holds (SBS-893).
+        assert_eq!(
+            cleanup_stale_partials(
+                &dir,
+                partial_recording_owner,
+                |_| Some(false),
+                video_partial_disposition,
+            ),
+            2
+        );
         assert!(!stale.exists());
         assert!(!stale_gif.exists());
         assert!(live.exists());
@@ -723,15 +791,20 @@ mod tests {
         // The real disposition fn validates with Media Foundation; the
         // plumbing under test is that a recoverable partial is moved,
         // counted, and never deleted.
-        let handled = cleanup_stale_partials(&dir, partial_recording_owner, |path| {
-            let Some(destination) = recovered_video_path(path) else {
-                return PartialDisposition::Keep;
-            };
-            match std::fs::rename(path, &destination) {
-                Ok(()) => PartialDisposition::Recovered(destination),
-                Err(_) => PartialDisposition::Keep,
-            }
-        });
+        let handled = cleanup_stale_partials(
+            &dir,
+            partial_recording_owner,
+            |_| Some(false),
+            |path| {
+                let Some(destination) = recovered_video_path(path) else {
+                    return PartialDisposition::Keep;
+                };
+                match std::fs::rename(path, &destination) {
+                    Ok(()) => PartialDisposition::Recovered(destination),
+                    Err(_) => PartialDisposition::Keep,
+                }
+            },
+        );
         assert_eq!(handled, 1);
         assert!(!playable.exists());
         let recovered = dir.join("clip-recovered.mp4");
@@ -759,17 +832,23 @@ mod tests {
 
         // Validation passed but the move could not happen (transient lock,
         // name exhaustion): the recording must survive in place.
-        let handled = cleanup_stale_partials(&dir, partial_recording_owner, |_| {
-            PartialDisposition::Keep
-        });
+        let handled = cleanup_stale_partials(
+            &dir,
+            partial_recording_owner,
+            |_| Some(false),
+            |_| PartialDisposition::Keep,
+        );
         assert_eq!(handled, 0);
         assert!(playable.exists(), "a kept partial was deleted");
 
         // Validation could not run at all (the file locked, the decoder
         // unavailable): not proven bad, so not deletable either.
-        let handled = cleanup_stale_partials(&dir, partial_recording_owner, |_| {
-            PartialDisposition::Unverified
-        });
+        let handled = cleanup_stale_partials(
+            &dir,
+            partial_recording_owner,
+            |_| Some(false),
+            |_| PartialDisposition::Unverified,
+        );
         assert_eq!(handled, 0);
         assert!(playable.exists(), "an unverified partial was deleted");
 
@@ -842,6 +921,7 @@ mod tests {
         std::fs::remove_file(garbage).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
+
 
     /// Pins SBS-764: an unqualified helper name is never the launch path.
     #[test]
@@ -935,5 +1015,93 @@ mod tests {
             production.contains("reveal_explorer_exe(windows_directory().as_deref())"),
             "reveal_in_explorer must resolve explorer from the Windows directory"
         );
+    }
+
+    fn leftover_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-partial-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A live owner may still be inside Media Foundation Finalize.
+    /// Deleting those bytes is the SBS-893 hole: the next start classified
+    /// a mid-write MP4 as Undecodable and removed it.
+    #[test]
+    fn cleanup_skips_a_partial_whose_owner_process_may_still_be_running() {
+        let dir = leftover_dir("live-owner");
+        let other_pid = std::process::id().wrapping_add(1).max(1);
+        let partial = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
+        std::fs::write(&partial, b"still being written").unwrap();
+
+        let handled = cleanup_stale_partials(
+            &dir,
+            partial_recording_owner,
+            |_| Some(true),
+            |_| PartialDisposition::Delete,
+        );
+        assert_eq!(handled, 0);
+        assert!(
+            partial.exists(),
+            "a partial whose owner may still be running was deleted"
+        );
+
+        std::fs::remove_file(partial).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Failed liveness query is not "the owner is dead". Prefer keep over
+    /// delete when in doubt (SBS-893).
+    #[test]
+    fn cleanup_keeps_an_undecodable_partial_when_owner_liveness_is_unknown() {
+        let dir = leftover_dir("unknown-owner");
+        let other_pid = std::process::id().wrapping_add(1).max(1);
+        let partial = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
+        std::fs::write(&partial, b"still being written").unwrap();
+
+        let handled = cleanup_stale_partials(
+            &dir,
+            partial_recording_owner,
+            |_| None,
+            |_| PartialDisposition::Delete,
+        );
+        assert_eq!(handled, 0);
+        assert!(
+            partial.exists(),
+            "an undecodable partial was deleted when owner liveness was unknown"
+        );
+
+        std::fs::remove_file(partial).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Proven-dead owner + proven-undecodable bytes are still garbage.
+    /// The live/unknown skips must not stop us deleting that case (SBS-893).
+    #[test]
+    fn cleanup_still_deletes_undecodable_bytes_when_the_owner_is_known_dead() {
+        let dir = leftover_dir("dead-owner");
+        let other_pid = std::process::id().wrapping_add(1).max(1);
+        let partial = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
+        std::fs::write(&partial, b"not an mp4").unwrap();
+
+        let handled = cleanup_stale_partials(
+            &dir,
+            partial_recording_owner,
+            |_| Some(false),
+            |_| PartialDisposition::Delete,
+        );
+        assert_eq!(handled, 1);
+        assert!(
+            !partial.exists(),
+            "proven-undecodable bytes from a dead owner were kept"
+        );
+
+        std::fs::remove_dir(dir).unwrap();
     }
 }

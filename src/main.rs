@@ -53,8 +53,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, IsWindow, MessageBoxW, PostMessageW, IDYES,
-    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MSG,
-    WM_CLOSE, WM_HOTKEY,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    MB_YESNO, MSG, WM_CLOSE, WM_HOTKEY,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,6 +73,14 @@ const PREVIEW_MAX: u32 = 480;
 /// exports get their normal cancellation/finalization path.
 fn request_graceful_shutdown() -> Result<()> {
     fn close_all(class_name: &str, label: &str) -> Result<()> {
+        close_all_within(class_name, label, std::time::Duration::from_secs(30))
+    }
+
+    fn close_all_within(
+        class_name: &str,
+        label: &str,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
         loop {
             let hwnd = match crate::window::find_by_class(class_name) {
                 Some(hwnd) => hwnd,
@@ -82,7 +90,7 @@ fn request_graceful_shutdown() -> Result<()> {
                 PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))
                     .with_context(|| format!("ask {label} to close"))?;
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + timeout;
             while unsafe { IsWindow(hwnd) }.as_bool() {
                 if std::time::Instant::now() >= deadline {
                     bail!("{label} is still busy; finish or cancel the current operation and try again");
@@ -104,7 +112,22 @@ fn request_graceful_shutdown() -> Result<()> {
     close_all("matteshot_activation", "activation")?;
     close_all("matteshot_welcome", "welcome")?;
     close_all("matteshot_pin", "a pinned capture")?;
-    close_all("matteshot_tray", "Matteshot")?;
+    // SBS-893: supervise_late_finalize has no window. Closing the tray next
+    // would exit the resident mid-Finalize; the next start would then delete
+    // the mid-write MP4. Wait the supervisor bound so Finalize can publish
+    // or park the partial as Kept. This process's counter is empty when
+    // `--quit` is a helper; the resident honors the same bound on tray
+    // WM_CLOSE, so the tray close itself is allowed that long plus the
+    // usual 30s unwind. A 30s tray wait here would return busy and the
+    // installer would taskkill.
+    if !record::wait_until_late_finalize_idle(record::LATE_FINALIZE_BOUND) {
+        bail!("the recorder is still busy; finish or cancel the current operation and try again");
+    }
+    close_all_within(
+        "matteshot_tray",
+        "Matteshot",
+        record::LATE_FINALIZE_BOUND + std::time::Duration::from_secs(30),
+    )?;
     Ok(())
 }
 
@@ -1000,6 +1023,19 @@ fn run_resident() -> Result<()> {
                     }
                     tray::Action::Quit => {
                         diagnostics::log("resident quit requested");
+                        if record::late_finalize_outstanding() {
+                            unsafe {
+                                MessageBoxW(
+                                    None,
+                                    w!("A recording is still finishing. Matteshot will quit when it is done."),
+                                    w!("Matteshot"),
+                                    MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+                                );
+                            }
+                            if !record::wait_until_late_finalize_idle(record::LATE_FINALIZE_BOUND) {
+                                bail!("the recorder is still busy; finish or cancel the current operation and try again");
+                            }
+                        }
                         tray.remove();
                         tray::Tray::quit();
                         Ok(())
