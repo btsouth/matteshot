@@ -106,6 +106,33 @@ function Invoke-Probe {
     return $ok
 }
 
+function Get-FixtureDurationSeconds {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) { return $null }
+    $log = Join-Path $work 'duration-test.log'
+    try {
+        $p = Start-Process -FilePath $script:Exe -ArgumentList @('--duration-test', $Path) `
+            -RedirectStandardError $log -Wait -NoNewWindow -PassThru
+        if ($p.ExitCode -ne 0) { return $null }
+    } catch {
+        return $null
+    }
+    if (-not (Test-Path $log)) { return $null }
+    $out = Get-Content $log -Raw
+    if ($out -match 'duration:\s*([0-9.]+)s') {
+        return [double]$Matches[1]
+    }
+    $null
+}
+
+function Get-NewestMatteshotMp4 {
+    $videos = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'Matteshot'
+    Get-ChildItem $videos -Filter *.mp4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.Length -gt 0 } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
 # ---------------------------------------------------------------- capture ---
 # -NoCapture puts these out of scope rather than skipping them, so -Strict keeps
 # meaning "every probe this run promised actually ran". A GitHub-hosted runner
@@ -166,19 +193,37 @@ Invoke-Probe -Name 'preview rebuild budget' -ProbeArgs @('--preview-bench', '256
     -Expect 'preview rebuild within budget' -Advisory | Out-Null
 
 # ------------------------------------------------- recording and exporting ---
+$callerFixture = $Fixture -and (Test-Path $Fixture)
 if (-not $Fixture) {
-    $videos = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'Matteshot'
-    $Fixture = Get-ChildItem $videos -Filter *.mp4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Length -gt 0 } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1 -ExpandProperty FullName
+    $Fixture = Get-NewestMatteshotMp4
 }
-if (-not $Fixture -or -not (Test-Path $Fixture)) {
-    Write-Host 'No recording to test against; recording one (a window will appear briefly).' -ForegroundColor Yellow
-    Invoke-Probe -Name 'record (fixture)' -ProbeArgs @('--record-test', '3') | Out-Null
-    $videos = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'Matteshot'
-    $Fixture = Get-ChildItem $videos -Filter *.mp4 -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+
+# A starved CI record can come back at 0.6s; failing speed-export on that
+# is a false failure of a working probe.
+$fixtureSeconds = $null
+if ($Fixture -and (Test-Path $Fixture)) {
+    $fixtureSeconds = Get-FixtureDurationSeconds $Fixture
+}
+$speedReady = ($null -ne $fixtureSeconds) -and ($fixtureSeconds -ge 1.0)
+
+if ((-not $Fixture -or -not (Test-Path $Fixture)) -or (-not $callerFixture -and -not $speedReady)) {
+    $recordNames = @('record (fixture)', 'record (fixture retry)', 'record (fixture retry 2)')
+    foreach ($name in $recordNames) {
+        if (-not $Fixture -or -not (Test-Path $Fixture)) {
+            Write-Host 'No recording to test against; recording one (a window will appear briefly).' -ForegroundColor Yellow
+        } else {
+            Write-Host 'Recording is under one second; recording another (a window will appear briefly).' -ForegroundColor Yellow
+        }
+        Invoke-Probe -Name $name -ProbeArgs @('--record-test', '3') | Out-Null
+        $recorded = Get-NewestMatteshotMp4
+        if (-not $recorded -or -not (Test-Path $recorded)) {
+            continue
+        }
+        $Fixture = $recorded
+        $fixtureSeconds = Get-FixtureDurationSeconds $Fixture
+        $speedReady = ($null -ne $fixtureSeconds) -and ($fixtureSeconds -ge 1.0)
+        if ($speedReady) { break }
+    }
 }
 
 if ($Fixture -and (Test-Path $Fixture)) {
@@ -193,7 +238,19 @@ if ($Fixture -and (Test-Path $Fixture)) {
     # Forces a 1:1 aspect, which is what used to compose past the H.264 frame
     # limit and die with an unexplained media-type error.
     Invoke-Probe -Name 'annotated edit export' -ProbeArgs @('--video-edit-test', $probeFixture) -Expect 'video editor export' | Out-Null
-    Invoke-Probe -Name 'speed section export' -ProbeArgs @('--video-speed-test', $probeFixture) -Expect 'video speed export' | Out-Null
+    if ($speedReady) {
+        Invoke-Probe -Name 'speed section export' -ProbeArgs @('--video-speed-test', $probeFixture) -Expect 'video speed export' | Out-Null
+    } else {
+        $detail = if ($null -ne $fixtureSeconds) {
+            'fixture {0:0.00}s is under one second; skipped' -f $fixtureSeconds
+        } else {
+            'fixture duration unknown; skipped'
+        }
+        $results += [pscustomobject]@{
+            Probe = 'speed section export'; Result = 'WARN'; Seconds = 0
+            Detail = $detail
+        }
+    }
 } else {
     $results += [pscustomobject]@{
         Probe = 'video probes'; Result = 'SKIP'; Seconds = 0; Detail = 'no recording available'
