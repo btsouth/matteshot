@@ -722,22 +722,15 @@ fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
 }
 
 fn run_app() -> Result<()> {
-    // A resident that is on its way out still owns the slot for a moment. An
-    // update restarts the app the instant the installer finishes, so give the
-    // previous process time to release before deciding a resident is really
-    // there; otherwise the relaunch hands off to a corpse and exits, leaving
-    // the user with no tray app and no PrtScn.
-    let mut guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
-    if guard.is_none() {
-        for _ in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
-            if guard.is_some() {
-                diagnostics::log("resident slot claimed after the previous process exited");
-                break;
-            }
+    let guard = match claim_resident_slot() {
+        Ok(guard) => guard,
+        Err(error) => {
+            // CreateMutexW itself failed — nothing is held yet, but this is
+            // exactly the silent exit the dialog exists for.
+            report_resident_failure(&error, false);
+            return Err(error);
         }
-    }
+    };
     let Some(_resident_guard) = guard else {
         // A shortcut or autostart race should never create a second tray app
         // that competes for PrtScn. Make an intentional second launch useful
@@ -763,6 +756,27 @@ fn run_app() -> Result<()> {
         report_resident_failure(error, RESIDENT_READY.load(Ordering::Relaxed));
     }
     result
+}
+
+/// `Some` when this process now owns the single-resident slot, `None` when
+/// another resident holds it. A resident that is on its way out still owns
+/// the slot for a moment — an update restarts the app the instant the
+/// installer finishes — so give the previous process time to release before
+/// deciding a resident is really there; otherwise the relaunch hands off to a
+/// corpse and exits, leaving the user with no tray app and no PrtScn.
+fn claim_resident_slot() -> Result<Option<state_lock::ProcessMutex>> {
+    let mut guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
+    if guard.is_none() {
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            guard = state_lock::try_process_mutex("Local\\Matteshot.Resident.Process")?;
+            if guard.is_some() {
+                diagnostics::log("resident slot claimed after the previous process exited");
+                break;
+            }
+        }
+    }
+    Ok(guard)
 }
 
 /// Everything after the resident slot is ours: telemetry, hotkeys, the tray,
