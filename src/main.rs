@@ -2178,9 +2178,10 @@ fn separator_follows(bytes: &[u8], at: usize) -> bool {
 fn path_continues_after_space(rest: &[u8]) -> bool {
     let mut words = 0;
     let mut in_word = false;
-    for (index, &byte) in rest.iter().enumerate() {
+    for &byte in rest {
         match byte {
-            b':' if separator_follows(rest, index + 1) => return true,
+            // A colon here is either punctuation or the drive of a *new*
+            // path ("… c.txt to D:\\…"); either way this one is over.
             b'"' | b'\'' | b',' | b';' | b':' | b'\n' | b'\r' => return false,
             b' ' => {
                 if in_word {
