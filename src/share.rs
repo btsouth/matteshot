@@ -18,8 +18,9 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WinHttpWriteData, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+    WinHttpSetTimeouts, WinHttpWriteData, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    WINHTTP_FLAG_SECURE, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
     WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -277,6 +278,14 @@ fn multipart_parts(
     }
 }
 
+fn winhttp_redirect_policy() -> u32 {
+    WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+}
+
+fn redirect_status_is_error(status: u32) -> bool {
+    (300..400).contains(&status)
+}
+
 unsafe fn write_request_bytes(request: *mut c_void, bytes: &[u8]) -> Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -316,6 +325,15 @@ fn post_multipart(
             ),
             "open share connection",
         )?;
+        // WinHTTP follows 307/308 by default and would resubmit the
+        // capture bytes to Location.
+        let policy = winhttp_redirect_policy().to_ne_bytes();
+        WinHttpSetOption(
+            Some(session.0 as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(policy.as_slice()),
+        )
+        .context("disable share redirects")?;
         // A large recording needs real headroom on the send side; the
         // response is a small JSON body, so receive stays close to what
         // license.rs's post_json budgets for one.
@@ -384,6 +402,9 @@ fn post_multipart(
             &mut index,
         )
         .context("read share response status")?;
+        if redirect_status_is_error(status) {
+            bail!("share service redirected the request");
+        }
 
         let mut response = Vec::new();
         loop {
@@ -547,5 +568,33 @@ mod tests {
         // The first byte past the cap fails, and nothing more is retained.
         assert!(append_bounded(&mut body, b"y").is_err());
         assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn winhttp_redirect_policy_is_never() {
+        assert_eq!(
+            winhttp_redirect_policy(),
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+        );
+        assert_eq!(winhttp_redirect_policy(), 0);
+    }
+
+    /// A 307 to a second host must not transmit the body — NEVER plus
+    /// treating 3xx as error is the probe.
+    #[test]
+    fn redirect_status_is_error_for_3xx_including_307_and_308() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(redirect_status_is_error(status), "HTTP {status}");
+        }
+        for status in [200, 403, 404, 500] {
+            assert!(!redirect_status_is_error(status), "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn a_307_is_an_error_and_not_a_successful_share() {
+        assert!(redirect_status_is_error(307));
+        // share_file only treats 200 as a share URL; a 307 cannot become one.
+        assert_ne!(307u32, 200);
     }
 }

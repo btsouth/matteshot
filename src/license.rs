@@ -20,9 +20,10 @@ use std::time::Duration;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+    WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::RegKey;
@@ -901,7 +902,7 @@ pub fn refresh_once() -> Result<Status> {
         device_id: device_id(),
     };
     let (status_code, response) = post_json(LICENSE_PATH_REFRESH, &serde_json::to_vec(&request)?)?;
-    if status_code == 403 {
+    if refresh_should_drop_activation(status_code) {
         let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
         let mut state = load_state()?;
         // Only when the rejected activation is still the live one: a request
@@ -1187,6 +1188,18 @@ fn response_error(body: &[u8], fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+fn winhttp_redirect_policy() -> u32 {
+    WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+}
+
+fn redirect_status_is_error(status: u32) -> bool {
+    (300..400).contains(&status)
+}
+
+fn refresh_should_drop_activation(status: u32) -> bool {
+    status == 403
+}
+
 fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
     unsafe {
         let agent = HSTRING::from(concat!("Matteshot/", env!("CARGO_PKG_VERSION")));
@@ -1200,6 +1213,15 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
             ),
             "open license connection",
         )?;
+        // WinHTTP follows 307/308 by default and would resubmit the
+        // refresh token to Location.
+        let policy = winhttp_redirect_policy().to_ne_bytes();
+        WinHttpSetOption(
+            Some(session.0 as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(policy.as_slice()),
+        )
+        .context("disable license redirects")?;
         WinHttpSetTimeouts(session.0, 5_000, 5_000, 8_000, 10_000)
             .context("set license connection timeouts")?;
         let host = HSTRING::from(LICENSE_HOST);
@@ -1247,6 +1269,9 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
             &mut index,
         )
         .context("read license response status")?;
+        if redirect_status_is_error(status) {
+            bail!("license service redirected the request");
+        }
 
         let mut response = Vec::new();
         loop {
@@ -1747,5 +1772,34 @@ mod tests {
             signature: "not-a-signature".into(),
         };
         assert!(verify_trial(&stored, "device").is_err());
+    }
+
+    #[test]
+    fn winhttp_redirect_policy_is_never() {
+        assert_eq!(
+            winhttp_redirect_policy(),
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+        );
+        assert_eq!(winhttp_redirect_policy(), 0);
+    }
+
+    /// A 307 to a second host must not transmit the body — NEVER plus
+    /// treating 3xx as error is the probe.
+    #[test]
+    fn redirect_status_is_error_for_3xx_including_307_and_308() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(redirect_status_is_error(status), "HTTP {status}");
+        }
+        for status in [200, 403, 404, 500] {
+            assert!(!redirect_status_is_error(status), "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn a_307_must_not_drop_an_activation() {
+        assert!(refresh_should_drop_activation(403));
+        assert!(!refresh_should_drop_activation(307));
+        assert!(!refresh_should_drop_activation(308));
+        assert!(!refresh_should_drop_activation(200));
     }
 }

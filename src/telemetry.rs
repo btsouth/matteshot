@@ -33,9 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+    WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 const POSTHOG_HOST: &str = "us.i.posthog.com";
@@ -343,6 +344,14 @@ impl Drop for InternetHandle {
     }
 }
 
+fn winhttp_redirect_policy() -> u32 {
+    WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+}
+
+fn redirect_status_is_error(status: u32) -> bool {
+    (300..400).contains(&status)
+}
+
 fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
     unsafe {
         let agent = HSTRING::from(concat!("Matteshot/", env!("CARGO_PKG_VERSION")));
@@ -356,6 +365,15 @@ fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
             ),
             "open telemetry connection",
         )?;
+        // WinHTTP follows 307/308 by default and would resubmit the
+        // request body to Location.
+        let policy = winhttp_redirect_policy().to_ne_bytes();
+        WinHttpSetOption(
+            Some(session.0 as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(policy.as_slice()),
+        )
+        .context("disable telemetry redirects")?;
         WinHttpSetTimeouts(session.0, 5_000, 5_000, 8_000, 10_000)
             .context("set telemetry connection timeouts")?;
         let host = HSTRING::from(POSTHOG_HOST);
@@ -401,6 +419,9 @@ fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
             &mut index,
         )
         .context("read telemetry response status")?;
+        if redirect_status_is_error(status) {
+            anyhow::bail!("telemetry service redirected the request");
+        }
 
         let mut response = Vec::new();
         loop {
@@ -584,5 +605,26 @@ mod tests {
             .context("save the finished matte")
             .unwrap_err();
         assert_eq!(failure_kind(&wrapped), "access_denied");
+    }
+
+    #[test]
+    fn winhttp_redirect_policy_is_never() {
+        assert_eq!(
+            winhttp_redirect_policy(),
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+        );
+        assert_eq!(winhttp_redirect_policy(), 0);
+    }
+
+    /// A 307 to a second host must not transmit the body — NEVER plus
+    /// treating 3xx as error is the probe.
+    #[test]
+    fn redirect_status_is_error_for_3xx_including_307_and_308() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(redirect_status_is_error(status), "HTTP {status}");
+        }
+        for status in [200, 403, 404, 500] {
+            assert!(!redirect_status_is_error(status), "HTTP {status}");
+        }
     }
 }
