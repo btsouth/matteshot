@@ -751,6 +751,24 @@ fn run_app() -> Result<()> {
         diagnostics::log("duplicate launch routed to resident");
         return Ok(());
     };
+    let result = run_resident();
+    if let Err(error) = &result {
+        // Reported here, not in main: the resident mutex is still held, so
+        // nothing races into the slot while the dialog is up, and the tray
+        // (if it ever existed) has already destroyed its window on the way
+        // out of run_resident, so the dialog's message pump has no freed
+        // state to reach. Hand the capture hooks back first — "start
+        // Matteshot again" has to be able to take them.
+        disable_capture_hotkeys(true);
+        report_resident_failure(error, RESIDENT_READY.load(Ordering::Relaxed));
+    }
+    result
+}
+
+/// Everything after the resident slot is ours: telemetry, hotkeys, the tray,
+/// and the message loop. Owns the `Tray` for its whole lifetime, so an error
+/// anywhere in here drops it — and its window — before `run_app` reports.
+fn run_resident() -> Result<()> {
     telemetry::init();
     telemetry::report("matteshot_launch");
     let config = Config::load();
@@ -2051,13 +2069,7 @@ fn main() -> Result<()> {
         Some(other) => bail!(
             "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --video-speed-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
-        None => {
-            let result = run_app();
-            if let Err(error) = &result {
-                report_resident_failure(error, RESIDENT_READY.load(Ordering::Relaxed));
-            }
-            result
-        }
+        None => run_app(),
     };
 
     if let Err(e) = &result {
@@ -2083,11 +2095,7 @@ static RESIDENT_READY: AtomicBool = AtomicBool::new(false);
 /// keeps stderr.
 fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
     let message = startup_failure_message(error);
-    let (event, operation, title) = if was_running {
-        ("resident stopped", "resident", "Matteshot stopped unexpectedly")
-    } else {
-        ("resident startup failed", "startup", "Matteshot could not start")
-    };
+    let (event, operation, title) = resident_failure_wording(was_running);
     diagnostics::log(&format!(
         "{event}: {}",
         without_paths(&format!("{error:#}"))
@@ -2105,6 +2113,16 @@ fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
     }
 }
 
+/// (diagnostic event, telemetry operation, dialog title) for a resident that
+/// failed before it was usable versus one that was running and stopped.
+fn resident_failure_wording(was_running: bool) -> (&'static str, &'static str, &'static str) {
+    if was_running {
+        ("resident stopped", "resident", "Matteshot stopped unexpectedly")
+    } else {
+        ("resident startup failed", "startup", "Matteshot could not start")
+    }
+}
+
 /// What the dialog says: a plain reason and the one thing to try, chosen from
 /// the failure's own context. The technical detail follows, scrubbed of local
 /// paths — the dialog is on the user's own screen, but its text gets pasted
@@ -2113,11 +2131,15 @@ fn startup_failure_message(error: &anyhow::Error) -> String {
     let detail = without_paths(&format!("{error:#}"));
     let lower = detail.to_ascii_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-    let advice = if has(&["mutex", "resident"]) {
-        "Another copy of Matteshot may be stuck. End matteshot.exe in Task Manager, or sign out and back in, then start Matteshot again."
-    } else if has(&["tray", "notify icon", "shell_notifyicon"]) {
+    // Exact contexts, not loose words: "create resident mutex" is
+    // CreateMutexW itself failing (a second copy takes a different, silent
+    // path), and "create state mutex" is the license lock, which has nothing
+    // to do with a stuck copy.
+    let advice = if has(&["create resident mutex"]) {
+        "Windows refused Matteshot's start-up lock. Sign out and back in, then start Matteshot again."
+    } else if has(&["create tray window", "notify icon", "shell_notifyicon"]) {
         "Windows did not let Matteshot create its tray icon. Restart Windows Explorer, or sign out and back in, then start Matteshot again."
-    } else if has(&["application data", "data directory", "config", "create directory", "app data"]) {
+    } else if has(&["application data", "app data", "data directory", "create directory"]) {
         "Matteshot could not use its application data folder. Check that your AppData folder is writable, then start Matteshot again."
     } else if has(&["access is denied", "access denied", "permission"]) {
         "Windows denied Matteshot something it needs. Start Matteshot again; if that fails, try once as administrator to see the cause."
@@ -2201,7 +2223,7 @@ fn path_continues_after_space(rest: &[u8]) -> bool {
 
 #[cfg(test)]
 mod startup_failure_tests {
-    use super::{startup_failure_message, without_paths};
+    use super::{resident_failure_wording, startup_failure_message, without_paths};
 
     fn injected(context: &'static str, root: &'static str) -> anyhow::Error {
         anyhow::anyhow!(root).context(context)
@@ -2218,7 +2240,7 @@ mod startup_failure_tests {
         );
 
         let mutex_text = startup_failure_message(&mutex);
-        assert!(mutex_text.contains("Task Manager"), "{mutex_text}");
+        assert!(mutex_text.contains("start-up lock"), "{mutex_text}");
         let tray_text = startup_failure_message(&tray);
         assert!(tray_text.contains("tray icon"), "{tray_text}");
         let app_data_text = startup_failure_message(&app_data);
@@ -2232,6 +2254,39 @@ mod startup_failure_tests {
         // The default still tells the user what to do.
         let unknown = startup_failure_message(&anyhow::anyhow!("something odd"));
         assert!(unknown.contains("support@matteshot.app"), "{unknown}");
+    }
+
+    #[test]
+    fn advice_matches_exact_contexts_not_loose_words() {
+        // The license lock is a mutex too, but a stuck copy has nothing to
+        // do with it: this is an access problem and says so.
+        let state_lock = injected("create state mutex", "Access is denied. (0x80070005)");
+        let text = startup_failure_message(&state_lock);
+        assert!(!text.contains("start-up lock"), "{text}");
+        assert!(!text.contains("Task Manager"), "{text}");
+        assert!(text.contains("denied"), "{text}");
+
+        // "config" alone is not the application data folder.
+        let config = anyhow::anyhow!("invalid config value for capture_hotkey");
+        let text = startup_failure_message(&config);
+        assert!(!text.contains("AppData folder"), "{text}");
+
+        // A module-handle failure is not a tray-icon failure.
+        let module = injected("resolve module handle", "The specified module could not be found.");
+        let text = startup_failure_message(&module);
+        assert!(!text.contains("tray icon"), "{text}");
+    }
+
+    #[test]
+    fn a_stopped_resident_and_a_failed_startup_are_worded_apart() {
+        let (event, operation, title) = resident_failure_wording(false);
+        assert_eq!(event, "resident startup failed");
+        assert_eq!(operation, "startup");
+        assert_eq!(title, "Matteshot could not start");
+        let (event, operation, title) = resident_failure_wording(true);
+        assert_eq!(event, "resident stopped");
+        assert_eq!(operation, "resident");
+        assert_eq!(title, "Matteshot stopped unexpectedly");
     }
 
     #[test]
