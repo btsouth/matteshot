@@ -45,7 +45,8 @@ const REGISTRY_KEY: &str = r"Software\Southbound Software\Matteshot";
 const REGISTRY_TRIAL_START: &str = "TrialStartedAt";
 const REGISTRY_LAST_SEEN: &str = "TrialLastSeenAt";
 /// Sticky hashed device identity. Written the first time a real MachineGuid
-/// hash is obtained, so a later unreadable guid does not mint a new id.
+/// hash is obtained, or when an existing signed certificate seeds the id,
+/// so a later readable guid does not mint a new one.
 const REGISTRY_DEVICE_ID: &str = "DeviceId";
 const LICENSE_MUTEX: &str = "Local\\Matteshot.License.State";
 
@@ -132,8 +133,10 @@ struct State {
     /// recorded on license.matteshot.app; the signed start never changes.
     #[serde(default)]
     trial: Option<StoredTrial>,
-    /// Hashed device identity, written the first time a real MachineGuid hash
-    /// is obtained. Sticky: a later readable guid must not change it, or an
+    /// Hashed device identity. Written the first time we obtain a stable id:
+    /// a real MachineGuid hash, or the device_id from a certificate whose
+    /// signature already checked out (an activation issued before this field
+    /// existed). Sticky: a later readable guid must not change it, or an
     /// already-activated certificate would fail its device match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_id: Option<String>,
@@ -731,10 +734,12 @@ pub fn status() -> Status {
             return status_after_load_error(&error, remembered_status());
         }
     };
-    // An unreadable MachineGuid is not a reason to drop an activation. Fail
-    // closed and leave the files alone; a later successful read (or the
-    // already-stored hash) can still match the certificate.
-    let device = match resolve_current_device_id(state.device_id.as_deref()) {
+    // Prefer a stored hash, then a signature-verified certificate, then a
+    // live MachineGuid. An already-activated machine must keep the id it
+    // was issued under — minting a new guid hash here would fail the
+    // device match and drop the activation. With nothing to resolve, leave
+    // the files alone.
+    let device = match resolve_current_device_id(&state) {
         Ok(id) => id,
         Err(error) => {
             crate::diagnostics::log(&format!(
@@ -827,7 +832,7 @@ pub fn signed_certificate() -> Option<(String, String)> {
         error
     }).ok()?;
     let stored = state.license.as_ref()?;
-    let device = resolve_current_device_id(state.device_id.as_deref()).ok()?;
+    let device = resolve_current_device_id(&state).ok()?;
     verify(stored, &device).ok()?;
     Some((stored.certificate.clone(), stored.signature.clone()))
 }
@@ -1118,7 +1123,10 @@ pub fn deactivate() -> Result<()> {
     Ok(())
 }
 
-fn verify(stored: &StoredLicense, expected_device: &str) -> Result<Certificate> {
+/// Signature, parse, and structural checks only. Device match is deliberately
+/// omitted: an upgrade with no stored hash recovers the id from the
+/// certificate rather than minting a new one and dropping the activation.
+fn decode_signed_license(stored: &StoredLicense) -> Result<Certificate> {
     let public_bytes = STANDARD
         .decode(PUBLIC_KEY_BASE64)
         .context("decode Matteshot license public key")?;
@@ -1141,9 +1149,6 @@ fn verify(stored: &StoredLicense, expected_device: &str) -> Result<Certificate> 
     if certificate.version != 1 || certificate.kind != "license" {
         bail!("unsupported license certificate");
     }
-    if certificate.device_id != expected_device {
-        bail!("license belongs to a different device");
-    }
     if certificate.license_id.is_empty() || certificate.instance_id.is_empty() {
         bail!("license certificate is incomplete");
     }
@@ -1157,7 +1162,15 @@ fn verify(stored: &StoredLicense, expected_device: &str) -> Result<Certificate> 
     Ok(certificate)
 }
 
-fn verify_trial(stored: &StoredTrial, expected_device: &str) -> Result<TrialCertificate> {
+fn verify(stored: &StoredLicense, expected_device: &str) -> Result<Certificate> {
+    let certificate = decode_signed_license(stored)?;
+    if certificate.device_id != expected_device {
+        bail!("license belongs to a different device");
+    }
+    Ok(certificate)
+}
+
+fn decode_signed_trial(stored: &StoredTrial) -> Result<TrialCertificate> {
     let public_bytes = STANDARD
         .decode(PUBLIC_KEY_BASE64)
         .context("decode Matteshot license public key")?;
@@ -1180,9 +1193,6 @@ fn verify_trial(stored: &StoredTrial, expected_device: &str) -> Result<TrialCert
     if certificate.version != 1 || certificate.kind != "trial" {
         bail!("unsupported trial certificate");
     }
-    if certificate.device_id != expected_device {
-        bail!("trial belongs to a different device");
-    }
     DateTime::parse_from_rfc3339(&certificate.started_at)
         .context("trial start date is invalid")?;
     DateTime::parse_from_rfc3339(&certificate.issued_at)
@@ -1190,17 +1200,30 @@ fn verify_trial(stored: &StoredTrial, expected_device: &str) -> Result<TrialCert
     Ok(certificate)
 }
 
+fn verify_trial(stored: &StoredTrial, expected_device: &str) -> Result<TrialCertificate> {
+    let certificate = decode_signed_trial(stored)?;
+    if certificate.device_id != expected_device {
+        bail!("trial belongs to a different device");
+    }
+    Ok(certificate)
+}
+
 /// Inputs the device-id resolver can see. Tests inject these so the
-/// MachineGuid / stored-id cases do not need a live registry.
+/// MachineGuid / stored-id / certificate-seed cases do not need a live
+/// registry or a signing key.
 struct DeviceIdInputs<'a> {
     machine_guid: Option<&'a str>,
     stored_hashed_id: Option<&'a str>,
+    /// Already signature-verified certificate device_id. Device match is
+    /// what we are recovering, so the caller must not pass an unsigned body.
+    certificate_device_id: Option<&'a str>,
 }
 
 struct ResolvedDeviceId {
     hashed_id: String,
-    /// Freshly minted from a live MachineGuid. The caller must persist this
-    /// so a later unreadable guid still resolves to the same identity.
+    /// Freshly obtained — minted from a live MachineGuid, or seeded from a
+    /// signed certificate that predates the stored-hash field. The caller
+    /// must persist this so a later readable guid does not replace it.
     persist: bool,
 }
 
@@ -1221,14 +1244,24 @@ fn hash_machine_guid(guid: &str) -> String {
 ///
 /// A previously stored hashed id is sticky even if MachineGuid is now
 /// readable and would hash differently — that is the already-activated
-/// machine. A missing guid with no stored id is an error: we never invent
-/// an identity from the computer name, because two PCs named DESKTOP-XXXX
-/// (or both falling through to "Windows PC") would share a trial seat.
+/// machine. With no stored id, a signature-verified certificate's
+/// device_id is preferred over a newly readable guid, so an upgrade does
+/// not drop an activation issued under the old COMPUTERNAME fallback. A
+/// missing guid with no stored id and no certificate is an error: we
+/// never invent an identity from the computer name, because two PCs
+/// named DESKTOP-XXXX (or both falling through to "Windows PC") would
+/// share a trial seat.
 fn resolve_device_id(inputs: DeviceIdInputs<'_>) -> Result<ResolvedDeviceId> {
     if let Some(stored) = nonempty_device_id(inputs.stored_hashed_id) {
         return Ok(ResolvedDeviceId {
             hashed_id: stored.to_owned(),
             persist: false,
+        });
+    }
+    if let Some(from_certificate) = nonempty_device_id(inputs.certificate_device_id) {
+        return Ok(ResolvedDeviceId {
+            hashed_id: from_certificate.to_owned(),
+            persist: true,
         });
     }
     if let Some(guid) = nonempty_device_id(inputs.machine_guid) {
@@ -1270,37 +1303,67 @@ fn persist_registry_device_id(id: &str) {
     }
 }
 
-fn resolve_current_device_id(state_device_id: Option<&str>) -> Result<String> {
+/// Device id from a certificate whose signature has already checked out.
+/// Device match is skipped: that is the identity we are recovering.
+/// An invalid signature must not seed an id.
+fn signed_device_id_from_state(state: &State) -> Option<String> {
+    if let Some(stored) = state.license.as_ref() {
+        if let Ok(certificate) = decode_signed_license(stored) {
+            if let Some(id) = nonempty_device_id(Some(certificate.device_id.as_str())) {
+                return Some(id.to_owned());
+            }
+        }
+    }
+    if let Some(stored) = state.trial.as_ref() {
+        if let Ok(certificate) = decode_signed_trial(stored) {
+            if let Some(id) = nonempty_device_id(Some(certificate.device_id.as_str())) {
+                return Some(id.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_current_device_id(state: &State) -> Result<String> {
     let machine_guid = read_machine_guid();
     let from_registry = registry_device_id();
-    let stored = nonempty_device_id(state_device_id)
+    let stored = nonempty_device_id(state.device_id.as_deref())
         .map(str::to_owned)
         .or(from_registry.clone());
+    // Do not ask the certificate when a sticky id is already stored: a
+    // later-readable MachineGuid must not replace it, and neither must a
+    // different certificate copied onto the machine.
+    let from_certificate = if stored.is_none() {
+        signed_device_id_from_state(state)
+    } else {
+        None
+    };
     let resolved = resolve_device_id(DeviceIdInputs {
         machine_guid: machine_guid.as_deref(),
         stored_hashed_id: stored.as_deref(),
+        certificate_device_id: from_certificate.as_deref(),
     })?;
-    // Persist a freshly minted hash, and backfill HKCU when license state
-    // already holds the sticky id so a later wiped license.json still
-    // resolves.
+    // Persist a freshly obtained hash (minted or certificate-seeded), and
+    // backfill HKCU when license state already holds the sticky id so a
+    // later wiped license.json still resolves.
     if resolved.persist || from_registry.is_none() {
         persist_registry_device_id(&resolved.hashed_id);
     }
     Ok(resolved.hashed_id)
 }
 
-/// Stable anonymous device identity: SHA-256 of this PC's MachineGuid.
+/// Stable anonymous device identity: SHA-256 of this PC's MachineGuid,
+/// or the hashed id already stored / seeded from a signed certificate.
 ///
 /// The trial worker pins this, activation binds it, and Share sends it.
 /// It is never derived from the computer name. If MachineGuid cannot be
-/// read and no hashed id was stored on a previous successful read, this
-/// returns an error so callers can fail closed instead of minting a
-/// colliding or unstable identity.
+/// read and no hashed id was stored (or seeded from an existing
+/// certificate) on a previous successful read, this returns an error so
+/// callers can fail closed instead of minting a colliding or unstable
+/// identity.
 pub fn device_id() -> Result<String> {
-    let from_state = load_state().ok().and_then(|state| {
-        nonempty_device_id(state.device_id.as_deref()).map(str::to_owned)
-    });
-    resolve_current_device_id(from_state.as_deref())
+    let state = load_state().unwrap_or_default();
+    resolve_current_device_id(&state)
 }
 
 fn device_name() -> String {
@@ -1896,6 +1959,7 @@ mod tests {
         let result = resolve_device_id(DeviceIdInputs {
             machine_guid: None,
             stored_hashed_id: None,
+            certificate_device_id: None,
         });
         let error = result.expect_err("a missing guid must not mint an identity");
         let message = error.to_string();
@@ -1916,10 +1980,12 @@ mod tests {
         let absent_name = resolve_device_id(DeviceIdInputs {
             machine_guid: None,
             stored_hashed_id: None,
+            certificate_device_id: None,
         });
         let empty_name = resolve_device_id(DeviceIdInputs {
             machine_guid: Some("   "),
             stored_hashed_id: Some(""),
+            certificate_device_id: Some("   "),
         });
         assert!(absent_name.is_err(), "absent name must not mint an id");
         assert!(empty_name.is_err(), "empty name must not mint an id");
@@ -1943,6 +2009,7 @@ mod tests {
         let resolved = resolve_device_id(DeviceIdInputs {
             machine_guid: None,
             stored_hashed_id: Some(&stored),
+            certificate_device_id: None,
         })
         .expect("an already-activated machine must keep working");
         assert_eq!(resolved.hashed_id, stored);
@@ -1955,6 +2022,7 @@ mod tests {
         let resolved = resolve_device_id(DeviceIdInputs {
             machine_guid: Some(guid),
             stored_hashed_id: None,
+            certificate_device_id: None,
         })
         .expect("a readable MachineGuid must produce an identity");
         assert_eq!(resolved.hashed_id, hash_machine_guid(guid));
@@ -1971,6 +2039,7 @@ mod tests {
         let resolved = resolve_device_id(DeviceIdInputs {
             machine_guid: Some(later),
             stored_hashed_id: Some(&stored),
+            certificate_device_id: None,
         })
         .expect("a stored identity is sticky");
         assert_eq!(resolved.hashed_id, stored);
@@ -1998,8 +2067,46 @@ mod tests {
         let resolved = resolve_device_id(DeviceIdInputs {
             machine_guid: Some(guid),
             stored_hashed_id: None,
+            certificate_device_id: None,
         })
         .unwrap();
         assert_eq!(resolved.hashed_id, first);
+    }
+
+    #[test]
+    fn a_certificate_device_id_is_preferred_over_a_newly_readable_guid() {
+        // Upgrade path: an activation issued under the old COMPUTERNAME
+        // fallback has no stored hash yet. The guid is now readable and
+        // would hash differently; the certificate's device_id is the
+        // machine we already activated and must be kept.
+        let from_certificate = hash_machine_guid("COMPUTERNAME");
+        let later = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF";
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(later),
+            stored_hashed_id: None,
+            certificate_device_id: Some(&from_certificate),
+        })
+        .expect("a signed certificate seeds the sticky identity");
+        assert_eq!(resolved.hashed_id, from_certificate);
+        assert_ne!(resolved.hashed_id, hash_machine_guid(later));
+        assert!(resolved.persist);
+    }
+
+    #[test]
+    fn an_invalid_certificate_does_not_seed_a_device_id() {
+        let state = State {
+            license: Some(StoredLicense {
+                certificate: "not-a-certificate".into(),
+                signature: "not-a-signature".into(),
+                refresh_token: None,
+                refresh_token_protected: None,
+            }),
+            trial: Some(StoredTrial {
+                certificate: "not-a-certificate".into(),
+                signature: "not-a-signature".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(signed_device_id_from_state(&state), None);
     }
 }
