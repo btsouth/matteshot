@@ -227,6 +227,55 @@ pub fn list() -> Vec<Entry> {
     entries
 }
 
+/// True when `path` is inside `root` after both are canonicalized.
+/// A path that cannot be resolved, or a root that cannot be resolved, is not owned.
+fn path_is_under_root(path: &Path, root: &Path) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
+fn path_is_owned_capture(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
+    roots.iter().any(|root| path_is_under_root(path, root.as_ref()))
+}
+
+enum HistoryPathDisposition {
+    Owned,
+    UnownedDropped,
+}
+
+fn take_owned_history_path_at(
+    index: &Path,
+    path: &Path,
+    roots: &[PathBuf],
+) -> Result<HistoryPathDisposition> {
+    if path_is_owned_capture(path, roots) {
+        return Ok(HistoryPathDisposition::Owned);
+    }
+    // History is an index; a stale or hand-edited entry must not be
+    // uploaded, copied, opened, or handed to Explorer.
+    crate::diagnostics::log(&format!(
+        "history path outside save/video folders: {}",
+        path.display()
+    ));
+    let mut log = load_for_mutation(index)?;
+    log.entries.retain(|e| e.path != path);
+    save_unlocked_at(index, &log)?;
+    Ok(HistoryPathDisposition::UnownedDropped)
+}
+
+fn take_owned_history_path(path: &Path) -> Result<HistoryPathDisposition> {
+    let config = crate::config::Config::load();
+    let roots = [config.save_dir(), config.video_dir()];
+    let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
+    let index = history_path().context("Windows has no application data directory")?;
+    take_owned_history_path_at(&index, path, &roots)
+}
+
 /// Delete the file and drop it from history. Unlike `record`, errors surface:
 /// a Delete click that silently failed would look like it had worked.
 pub fn remove(path: &Path) -> Result<()> {
@@ -462,6 +511,152 @@ mod persistence_tests {
         std::fs::create_dir_all(dir.join("history.json.tmp")).unwrap();
         assert!(save_unlocked_at(&index, &Log::default()).is_err());
         assert!(!index.exists());
+    }
+
+    /// A prefix lookalike (`root-evil`) or a `..` escape must not count as inside `root`.
+    #[test]
+    fn path_is_under_root_accepts_a_real_file_inside_and_rejects_lookalikes() {
+        let base = temp_dir("under-root");
+        let root = base.join("root");
+        let root_evil = base.join("root-evil");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root_evil).unwrap();
+        let inside = capture(&root, "shot.png");
+        let sibling = capture(&root_evil, "shot.png");
+        let via_dotdot = root.join("..").join("root-evil").join("shot.png");
+
+        assert!(path_is_under_root(&inside, &root));
+        assert!(!path_is_under_root(&sibling, &root), "root-evil must not match root");
+        assert!(!path_is_under_root(&via_dotdot, &root), "`..` that lands outside is not owned");
+        assert!(!path_is_under_root(&inside, &base.join("no-such-root")));
+        assert!(!path_is_under_root(&root.join("missing.png"), &root));
+    }
+
+    /// Ownership is the current save_dir or video_dir, not "any existing file".
+    #[test]
+    fn a_capture_is_owned_if_it_lives_under_save_dir_or_video_dir() {
+        let base = temp_dir("owned");
+        let save = base.join("save");
+        let video = base.join("video");
+        let other = base.join("other");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&video).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let in_save = capture(&save, "a.png");
+        let in_video = capture(&video, "b.mp4");
+        let in_other = capture(&other, "c.png");
+        let roots = [save, video];
+
+        assert!(path_is_owned_capture(&in_save, &roots));
+        assert!(path_is_owned_capture(&in_video, &roots));
+        assert!(!path_is_owned_capture(&in_other, &roots));
+    }
+
+    /// Share/copy/open/reveal must drop a stale outside row without touching the file.
+    #[test]
+    fn an_unowned_history_path_is_dropped_and_the_file_is_left_alone() {
+        let dir = temp_dir("take-unowned");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let foreign = capture(&outside, "win.ini");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&foreign));
+
+        let disposition = take_owned_history_path_at(&index, &foreign, &[save]).unwrap();
+        assert!(
+            matches!(disposition, HistoryPathDisposition::UnownedDropped),
+            "an outside path must not surface as an IO error after being left alone"
+        );
+        assert!(foreign.is_file(), "a file outside the save folder must stay on disk");
+        assert!(
+            load_for_mutation(&index).unwrap().entries.is_empty(),
+            "the stale index row is dropped even when the file is left alone"
+        );
+    }
+
+    /// An owned capture stays on disk and in the index so the action can proceed.
+    #[test]
+    fn an_owned_save_dir_path_is_left_in_the_index() {
+        let dir = temp_dir("take-owned-save");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let shot = capture(&save, "a.png");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&shot));
+
+        let disposition = take_owned_history_path_at(&index, &shot, &[save]).unwrap();
+        assert!(matches!(disposition, HistoryPathDisposition::Owned));
+        assert!(shot.is_file(), "an owned capture must not be unlinked");
+        assert_eq!(
+            load_for_mutation(&index).unwrap().entries.len(),
+            1,
+            "an owned path must stay in the index"
+        );
+    }
+
+    /// Recordings live under video_dir; that folder is an allowed root, not a second-class one.
+    #[test]
+    fn a_file_inside_video_dir_is_owned_even_when_outside_save_dir() {
+        let dir = temp_dir("take-owned-video");
+        let save = dir.join("save");
+        let video = dir.join("video");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&video).unwrap();
+        let rec = capture(&video, "clip.mp4");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&rec));
+
+        let disposition = take_owned_history_path_at(&index, &rec, &[save, video]).unwrap();
+        assert!(matches!(disposition, HistoryPathDisposition::Owned));
+        assert!(rec.is_file());
+        assert_eq!(load_for_mutation(&index).unwrap().entries.len(), 1);
+    }
+
+    /// A `..` path that resolves outside the save folder must not be treated as owned.
+    #[test]
+    fn a_path_that_escapes_the_save_folder_with_dotdot_is_unowned() {
+        let dir = temp_dir("take-escape");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let foreign = capture(&outside, "secret.txt");
+        let escaped = save.join("..").join("outside").join("secret.txt");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&escaped));
+
+        let disposition = take_owned_history_path_at(&index, &escaped, &[save]).unwrap();
+        assert!(matches!(disposition, HistoryPathDisposition::UnownedDropped));
+        assert!(foreign.is_file(), "a `..` escape must not unlink the foreign file");
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    /// A failed index write after rejecting an unowned path is not "already handled".
+    #[test]
+    fn a_failed_index_write_on_an_unowned_path_surfaces() {
+        let dir = temp_dir("take-write-failure");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let foreign = capture(&outside, "win.ini");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&foreign));
+        // Same tmp-dir-as-file trick as `a_failed_index_write_surfaces_instead_of_being_swallowed`.
+        std::fs::create_dir_all(dir.join("history.json.tmp")).unwrap();
+
+        assert!(
+            take_owned_history_path_at(&index, &foreign, &[save]).is_err(),
+            "a failed drop must not be reported as UnownedDropped"
+        );
+        assert!(foreign.is_file());
+        assert_eq!(
+            load_for_mutation(&index).unwrap().entries.len(),
+            1,
+            "a failed write must leave the index row so the failure is visible"
+        );
     }
 }
 
@@ -867,7 +1062,39 @@ unsafe fn paint(hdc: HDC, state: &State) {
 // work today. Every touch of `State` here happens either before or after the
 // blocking call, never spanning it, via a fresh `state_of(hwnd)` each time.
 
+/// Returns true only when the path is an owned capture. An outside path is
+/// dropped from the index and the grid; a failed check leaves the action
+/// unperformed.
+unsafe fn require_owned_history_path(hwnd: HWND, path: &Path) -> bool {
+    match take_owned_history_path(path) {
+        Ok(HistoryPathDisposition::Owned) => true,
+        Ok(HistoryPathDisposition::UnownedDropped) => {
+            drop_history_thumb(hwnd, path);
+            let message = HSTRING::from("This file is not in the Matteshot save folder.");
+            let _ = MessageBoxW(hwnd, PCWSTR(message.as_ptr()), w!("Matteshot"), MB_OK | MB_ICONWARNING);
+            false
+        }
+        Err(error) => {
+            warn(hwnd, "This action could not be completed.", &error);
+            false
+        }
+    }
+}
+
+unsafe fn drop_history_thumb(hwnd: HWND, path: &Path) {
+    let Some(state) = state_of(hwnd) else { return };
+    if let Some(i) = state.thumbs.iter().position(|t| t.entry.path == path) {
+        state.thumbs.remove(i);
+    }
+    state.hover = -1;
+    relayout(state);
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
 unsafe fn copy_entry(hwnd: HWND, entry: &Entry) {
+    if !require_owned_history_path(hwnd, &entry.path) {
+        return;
+    }
     let image = match image::open(&entry.path) {
         Ok(img) => img.to_rgba8(),
         Err(error) => return warn(hwnd, "This capture could not be opened.", &error),
@@ -882,6 +1109,9 @@ unsafe fn copy_entry(hwnd: HWND, entry: &Entry) {
 }
 
 unsafe fn open_in_editor(hwnd: HWND, monitor: HMONITOR, entry: &Entry) {
+    if !require_owned_history_path(hwnd, &entry.path) {
+        return;
+    }
     let img = match image::open(&entry.path) {
         Ok(img) => img,
         Err(error) => return warn(hwnd, "This capture could not be opened.", &error),
@@ -902,11 +1132,17 @@ unsafe fn open_in_editor(hwnd: HWND, monitor: HMONITOR, entry: &Entry) {
     }
 }
 
-unsafe fn reveal_entry(entry: &Entry) {
+unsafe fn reveal_entry(hwnd: HWND, entry: &Entry) {
+    if !require_owned_history_path(hwnd, &entry.path) {
+        return;
+    }
     crate::output::reveal_in_explorer(&entry.path);
 }
 
 unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
+    if !require_owned_history_path(hwnd, &entry.path) {
+        return;
+    }
     if let Some(state) = state_of(hwnd) {
         state.status = Some(("Sharing\u{2026}".to_string(), std::time::Instant::now()));
         let _ = InvalidateRect(hwnd, None, false);
@@ -971,7 +1207,7 @@ unsafe fn context_menu(hwnd: HWND, entry: Entry) {
     match cmd.0 {
         1 => copy_entry(hwnd, &entry),
         2 => open_in_editor(hwnd, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &entry),
-        3 => reveal_entry(&entry),
+        3 => reveal_entry(hwnd, &entry),
         4 => share_entry(hwnd, &entry),
         5 => delete_entry(hwnd, &entry),
         _ => {}
