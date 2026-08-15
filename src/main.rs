@@ -2130,21 +2130,30 @@ fn startup_failure_message(error: &anyhow::Error) -> String {
 /// Drop anything shaped like a local file system path — a drive-letter path,
 /// a UNC path — so a folder or user name never rides along in text that is
 /// pasted into support mail or replayed into the shared support report.
+/// Windows paths contain spaces ("C:\\Users\\John Doe\\…", "Program Files"),
+/// so a space ends the path only when none of the next few words carries
+/// another separator; over-scrubbing a word is fine, leaking a name is not.
 fn without_paths(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let drive = i + 2 < bytes.len()
+        let word_start = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let drive = word_start
+            && i + 2 < bytes.len()
             && bytes[i].is_ascii_alphabetic()
             && bytes[i + 1] == b':'
-            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/')
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric());
-        let unc = bytes[i..].starts_with(b"\\\\") && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric());
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/');
+        let unc = word_start && bytes[i..].starts_with(b"\\\\");
         if drive || unc {
             out.push_str("<path>");
-            while i < bytes.len() && !matches!(bytes[i], b' ' | b'"' | b'\'' | b')' | b',' | b';' | b'\n' | b'\r') {
-                i += 1;
+            i += if drive { 3 } else { 2 };
+            loop {
+                match bytes.get(i) {
+                    None | Some(b'"' | b'\'' | b',' | b';' | b':' | b'\n' | b'\r') => break,
+                    Some(b' ') if !path_continues_after_space(&bytes[i + 1..]) => break,
+                    Some(_) => i += 1,
+                }
             }
             continue;
         }
@@ -2154,6 +2163,31 @@ fn without_paths(text: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// After a space inside a suspected path: does one of the next three words
+/// (before any hard delimiter) carry a separator? "John Doe\\AppData" and
+/// "Program Files (x86)\\Matteshot" continue; "shot.png was not found" stops.
+fn path_continues_after_space(rest: &[u8]) -> bool {
+    let mut words = 0;
+    let mut in_word = false;
+    for &byte in rest {
+        match byte {
+            b'"' | b'\'' | b',' | b';' | b':' | b'\n' | b'\r' => return false,
+            b' ' => {
+                if in_word {
+                    words += 1;
+                    in_word = false;
+                    if words == 3 {
+                        return false;
+                    }
+                }
+            }
+            b'\\' | b'/' => return true,
+            _ => in_word = true,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -2211,5 +2245,30 @@ mod startup_failure_tests {
         assert_eq!(without_paths("saved to D:\\Captures\\shot.png, then failed"), "saved to <path>, then failed");
         assert_eq!(without_paths("share \\\\nas\\media\\clip.mp4 locked"), "share <path> locked");
         assert_eq!(without_paths("unicode ünïcode C:/x/y end"), "unicode ünïcode <path> end");
+    }
+
+    #[test]
+    fn path_scrubbing_swallows_spaces_inside_a_path() {
+        assert_eq!(
+            without_paths("open C:\\Users\\John Doe\\AppData\\Local\\x.json was not found"),
+            "open <path> was not found"
+        );
+        assert_eq!(
+            without_paths("C:\\Program Files (x86)\\Matteshot\\matteshot.exe failed to start"),
+            "<path> failed to start"
+        );
+        assert_eq!(
+            without_paths("read C:\\Users\\Jane Q Public\\a.txt: Access is denied."),
+            "read <path>: Access is denied."
+        );
+        assert_eq!(
+            without_paths("share \\\\nas\\my share\\clip.mp4 locked"),
+            "share <path> locked"
+        );
+        // Two paths in one sentence stay two paths.
+        assert_eq!(
+            without_paths("copy C:\\a b\\c.txt to D:\\d e\\f.txt, then retry"),
+            "copy <path> to <path>, then retry"
+        );
     }
 }
