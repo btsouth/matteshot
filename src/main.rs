@@ -2150,7 +2150,10 @@ fn without_paths(text: &str) -> String {
             i += if drive { 3 } else { 2 };
             loop {
                 match bytes.get(i) {
-                    None | Some(b'"' | b'\'' | b',' | b';' | b':' | b'\n' | b'\r') => break,
+                    None | Some(b'"' | b'\'' | b',' | b';' | b'\n' | b'\r') => break,
+                    // "x.txt: Access is denied" ends the path; the drive colon
+                    // inside an extended path ("\\\\?\\C:\\Users\\…") does not.
+                    Some(b':') if !separator_follows(bytes, i + 1) => break,
                     Some(b' ') if !path_continues_after_space(&bytes[i + 1..]) => break,
                     Some(_) => i += 1,
                 }
@@ -2168,11 +2171,16 @@ fn without_paths(text: &str) -> String {
 /// After a space inside a suspected path: does one of the next three words
 /// (before any hard delimiter) carry a separator? "John Doe\\AppData" and
 /// "Program Files (x86)\\Matteshot" continue; "shot.png was not found" stops.
+fn separator_follows(bytes: &[u8], at: usize) -> bool {
+    matches!(bytes.get(at), Some(b'\\' | b'/'))
+}
+
 fn path_continues_after_space(rest: &[u8]) -> bool {
     let mut words = 0;
     let mut in_word = false;
-    for &byte in rest {
+    for (index, &byte) in rest.iter().enumerate() {
         match byte {
+            b':' if separator_follows(rest, index + 1) => return true,
             b'"' | b'\'' | b',' | b';' | b':' | b'\n' | b'\r' => return false,
             b' ' => {
                 if in_word {
@@ -2269,6 +2277,15 @@ mod startup_failure_tests {
         assert_eq!(
             without_paths("copy C:\\a b\\c.txt to D:\\d e\\f.txt, then retry"),
             "copy <path> to <path>, then retry"
+        );
+        // Extended-length and device paths carry the drive colon inside.
+        assert_eq!(
+            without_paths("open \\\\?\\C:\\Users\\John Doe\\x.json failed"),
+            "open <path> failed"
+        );
+        assert_eq!(
+            without_paths("open \\\\.\\C:\\Users\\tyler\\x.json: Access is denied."),
+            "open <path>: Access is denied."
         );
     }
 }
