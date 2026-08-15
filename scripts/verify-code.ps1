@@ -7,6 +7,13 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
+Write-Host 'Running sandbox smoke result tests'
+$pwsh = (Get-Process -Id $PID).Path
+& $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'test-sandbox-smoke-result.ps1')
+if ($LASTEXITCODE -ne 0) {
+    throw "Sandbox smoke result tests failed with exit code $LASTEXITCODE"
+}
+
 function Invoke-CargoStep {
     param(
         [string]$Name,

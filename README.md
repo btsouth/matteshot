@@ -127,7 +127,10 @@ Run the same static code gate used by CI, signed candidates, and releases:
 .\scripts\verify-code.ps1
 ```
 
-Release acceptance runs in Windows Sandbox with clipboard redirection disabled:
+Release acceptance runs in Windows Sandbox with clipboard redirection disabled.
+The host waits for the guest `result.json` and exits 0 only when `passed` is
+true. It exits non-zero on guest FAIL, timeout, or an unreadable/missing
+result. `-TimeoutSeconds` (default 1200) bounds the wait.
 
 ```powershell
 .\scripts\run-sandbox-smoke.ps1 `

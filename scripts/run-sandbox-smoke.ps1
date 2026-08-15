@@ -6,10 +6,17 @@ param(
     [string]$LicenseKeyPath,
 
     [Parameter(Mandatory = $true)]
-    [string]$WorkDirectory
+    [string]$WorkDirectory,
+
+    # How long the host waits for the guest result.json (SBS-901).
+    # Default 20 minutes covers install + capture + license + uninstall.
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$TimeoutSeconds = 1200
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "sandbox-smoke-result.ps1")
 
 $sandbox = (Get-Command "WindowsSandbox.exe" -ErrorAction Stop).Source
 $installer = (Resolve-Path $InstallerPath).Path
@@ -54,5 +61,25 @@ $configPath = Join-Path $work "matteshot-smoke.wsb"
 $configuration | Set-Content -Encoding UTF8 $configPath
 
 Write-Host "Starting isolated Matteshot acceptance test."
-Start-Process -FilePath $sandbox -ArgumentList "`"$configPath`"" | Out-Null
-Write-Host "Results will be written to $results"
+try {
+    $sandboxProcess = Start-Process `
+        -FilePath $sandbox `
+        -ArgumentList "`"$configPath`"" `
+        -PassThru
+} catch {
+    Write-Host "FAIL: Windows Sandbox could not be started: $($_.Exception.Message)"
+    exit 1
+}
+if (-not $sandboxProcess) {
+    Write-Host "FAIL: Windows Sandbox could not be started."
+    exit 1
+}
+
+Write-Host "Waiting up to $TimeoutSeconds seconds for guest result.json under $results"
+$outcome = Wait-SandboxSmokeResult `
+    -ResultsDirectory $results `
+    -TimeoutSeconds $TimeoutSeconds `
+    -SandboxProcess $sandboxProcess `
+    -StopLeftoverSandbox
+Write-Host $outcome.Message
+exit $outcome.ExitCode

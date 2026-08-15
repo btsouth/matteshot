@@ -284,11 +284,16 @@ finally {
             -ErrorAction SilentlyContinue
     }
 
-    @{
+    # SBS-901: the host polls this file. Write temp + rename so a reader
+    # never sees truncated JSON as a completed Fail.
+    $resultBody = @{
         passed = $passed
         completed_at = (Get-Date).ToUniversalTime().ToString("o")
         error = $failure
-    } | ConvertTo-Json | Set-Content -Encoding UTF8 $result
+    } | ConvertTo-Json
+    $resultTemp = Join-Path $results "result.json.tmp"
+    Set-Content -Encoding UTF8 -Path $resultTemp -Value $resultBody
+    Move-Item -LiteralPath $resultTemp -Destination $result -Force
 
     Start-Sleep -Seconds 2
     Stop-Computer -Force
