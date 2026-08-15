@@ -423,16 +423,26 @@ fn retire_stale_pre_dpapi_backup(path: &std::path::Path, state: &State) {
     let Ok(sidecar) = std::fs::read(pre_dpapi_backup_path(path)) else {
         return;
     };
-    let live = state.license.as_ref().and_then(StoredLicense::token);
     let sidecar_token = serde_json::from_slice::<State>(&sidecar)
         .ok()
         .and_then(|backup| backup.license)
         .and_then(|stored| stored.token());
-    let still_live = match (sidecar_token, live) {
-        (Some(sidecar), Some(live)) => sidecar == live,
-        _ => false,
+    let dead = match (state.license.as_ref(), sidecar_token) {
+        // Deactivated or rejected: nothing is live, so nothing to downgrade to.
+        (None, _) => true,
+        // The sidecar holds no usable token: junk, whatever the live state.
+        (Some(_), None) => true,
+        (Some(live), Some(sidecar)) => match live.token() {
+            // Rotated server-side; the sidecar's copy stops working with it.
+            Some(live) => live != sidecar,
+            // The live blob does not decrypt here (copied profile, damaged
+            // blob). That says nothing about the sidecar's token being dead
+            // — and it may be the only copy that still works — so do not
+            // guess; the next refresh or deactivation settles it.
+            None => false,
+        },
     };
-    if !still_live {
+    if dead {
         let _ = remove_pre_dpapi_backup_at(path);
     }
 }
@@ -1506,6 +1516,43 @@ mod tests {
         assert!(!sidecar.exists(), "a dead sidecar survived the next load");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_undecryptable_live_token_says_nothing_so_the_sidecar_stays() {
+        let path = temporary_state_path("pre-dpapi-undecryptable");
+        let _ = std::fs::remove_file(&path);
+        let sidecar = pre_dpapi_backup_path(&path);
+        std::fs::write(
+            &sidecar,
+            serde_json::to_vec_pretty(&State {
+                license: Some(stored_legacy("tok-live")),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // The live blob cannot be decrypted here — a copied profile or a
+        // damaged blob. Whether the sidecar's token still works is unknown,
+        // and it may be the only copy that does, so it is not retired.
+        save_state_at(
+            &path,
+            &State {
+                license: Some(StoredLicense {
+                    certificate: "certificate".into(),
+                    signature: "signature".into(),
+                    refresh_token: None,
+                    refresh_token_protected: Some(STANDARD.encode(b"not a dpapi blob")),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        load_state_at(&path).unwrap();
+        assert!(sidecar.exists(), "the sidecar was retired on a guess");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     #[test]
