@@ -1231,6 +1231,19 @@ fn schedule_recording_stop(secs: u64) {
     });
 }
 
+/// `--video-speed-test` compresses the middle half. A source under one
+/// second is not a broken exporter — it is a fixture the harness should
+/// have replaced. 10_000_000 is one second in Media Foundation's 100ns units.
+fn meets_speed_export_min_duration(duration_100ns: i64) -> bool {
+    duration_100ns >= 10_000_000
+}
+
+/// Integer 100ns ticks so the probe harness cannot round 0.9995s into 1.00s
+/// and then send a sub-second clip into `--video-speed-test`.
+fn duration_test_report(duration_100ns: i64) -> String {
+    format!("duration_100ns: {duration_100ns}")
+}
+
 fn main() -> Result<()> {
     unsafe {
         // STA: the folder picker (IFileDialog) requires it; WGC's
@@ -1602,6 +1615,13 @@ fn main() -> Result<()> {
             eprintln!("video editor export (1:1, 14% padding) -> {}", dst.display());
             Ok(())
         }
+        Some("--duration-test") => {
+            let src =
+                std::path::PathBuf::from(args.get(1).context("--duration-test <mp4>")?);
+            let source = trim::probe_opening(&src, 320, 180)?;
+            eprintln!("{}", duration_test_report(source.duration_100ns));
+            Ok(())
+        }
         // Speed-section export probe. Compresses the middle half to 4x and
         // verifies the produced file reports the correspondingly shorter
         // playable duration.
@@ -1610,7 +1630,10 @@ fn main() -> Result<()> {
                 std::path::PathBuf::from(args.get(1).context("--video-speed-test <mp4>")?);
             let source = trim::probe_opening(&src, 320, 180)?;
             let duration = source.duration_100ns;
-            anyhow::ensure!(duration >= 10_000_000, "video must be at least one second");
+            anyhow::ensure!(
+                meets_speed_export_min_duration(duration),
+                "video must be at least one second"
+            );
             let speed = video_speed::SpeedRange::new(duration / 4, duration * 3 / 4, 4);
             let map = video_speed::TimeMap::new(0, duration, &[speed])
                 .map_err(anyhow::Error::msg)?;
@@ -2081,7 +2104,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --video-speed-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --video-speed-test <mp4> | --duration-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
         ),
         None => run_app(),
     };
@@ -2357,5 +2380,44 @@ mod startup_failure_tests {
             without_paths("open \\\\.\\C:\\Users\\tyler\\x.json: Access is denied."),
             "open <path>: Access is denied."
         );
+    }
+}
+
+#[cfg(test)]
+mod speed_export_min_duration_tests {
+    use super::{duration_test_report, meets_speed_export_min_duration};
+
+    #[test]
+    fn duration_test_prints_integer_ticks_not_rounded_seconds() {
+        // `{:.2}s` would print 0.9995s as 1.00s; the harness used that to
+        // decide speed-export was ready while Rust still required 10_000_000.
+        assert_eq!(duration_test_report(9_995_000), "duration_100ns: 9995000");
+        assert!(!meets_speed_export_min_duration(9_995_000));
+    }
+
+    #[test]
+    fn ci_short_fixture_is_below_the_floor() {
+        assert!(!meets_speed_export_min_duration(6_000_000));
+    }
+
+    #[test]
+    fn exactly_one_second_meets_the_floor() {
+        assert!(meets_speed_export_min_duration(10_000_000));
+    }
+
+    #[test]
+    fn just_under_one_second_is_below_the_floor() {
+        assert!(!meets_speed_export_min_duration(9_999_999));
+    }
+
+    #[test]
+    fn good_ci_clip_meets_the_floor() {
+        assert!(meets_speed_export_min_duration(29_000_000));
+    }
+
+    #[test]
+    fn zero_and_negative_are_below_the_floor() {
+        assert!(!meets_speed_export_min_duration(0));
+        assert!(!meets_speed_export_min_duration(-1));
     }
 }
