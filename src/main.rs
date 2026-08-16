@@ -986,7 +986,10 @@ fn run_resident() -> Result<()> {
                         // proved is ours; the download page is the fallback
                         // when staging never happened or failed.
                         match tray.update_version().map(|v| installer::staged_path(&v)) {
-                            Some(staged) if staged.is_file() => {
+                            Some(staged) if installer::is_ready_to_launch(&staged) => {
+                                // Re-check before the balloon. A file that is
+                                // merely still in %TEMP% is not ours (SBS-911).
+                                installer::verify_still_ours(&staged)?;
                                 tray.notify(
                                     "Matteshot is updating",
                                     "Installing now. Matteshot will restart on its own.",

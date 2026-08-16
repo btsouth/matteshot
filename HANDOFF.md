@@ -158,8 +158,11 @@ Note: releases are still created as GitHub drafts (`--draft` in release.yml); pu
 
 **The app updates itself.** `installer.rs` downloads the signed installer,
 requires the published SHA-256 to match and Authenticode to be valid with the
-subject `Brandon South`, then runs it `/VERYSILENT` under `SW_HIDE`. Verified
-end to end: 0.11.0 updated itself to 0.11.1 unattended with no window shown.
+subject `Brandon South`, writes that hash beside the staged file, and runs
+those same two checks again immediately before `CreateProcessW` (the file
+sits in `%TEMP%` until apply's idle wait or a tray install click). Then it
+runs `/VERYSILENT` under `SW_HIDE`. Verified end to end: 0.11.0 updated
+itself to 0.11.1 unattended with no window shown.
 Test flags: `--update-test`, `--update-stage-test [url]`,
 `--verify-signature-test <exe>`, `--update-install-now [url]` (this one really
 installs).
