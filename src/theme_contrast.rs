@@ -136,17 +136,44 @@ fn gray_is_usable(gray: u32, window: u32, button_face: u32) -> bool {
         && contrast_ratio(gray, button_face) >= NORMAL_TEXT_MIN
 }
 
+/// The most background-like gray that still clears 4.5:1 on both fill
+/// surfaces. Used for `muted`/`faint` when `COLOR_GRAYTEXT` itself fails.
+///
+/// Copying `COLOR_WINDOWTEXT` instead would be readable but would collapse
+/// state: on High Contrast White `COLOR_HIGHLIGHT` is also the window text,
+/// so `text`, `muted` and `accent` all become the same black. Settings then
+/// paints PrtScn Off and Active identically, and the overlay's hover and
+/// idle labels stop differing. Falls back to `window_text` only if no gray
+/// passes, which readable High Contrast schemes never hit.
+fn readable_secondary(window: u32, button_face: u32, window_text: u32) -> u32 {
+    let mut best: Option<(u32, f64)> = None;
+    for level in 0..=255u32 {
+        let gray = level | (level << 8) | (level << 16);
+        if !gray_is_usable(gray, window, button_face) {
+            continue;
+        }
+        // Closest to the background of the passing grays, so it stays a
+        // clearly secondary weight rather than a second primary.
+        let distance = contrast_ratio(gray, window);
+        match best {
+            Some((_, best_distance)) if best_distance <= distance => {}
+            _ => best = Some((gray, distance)),
+        }
+    }
+    best.map(|(gray, _)| gray).unwrap_or(window_text)
+}
+
 /// Map High Contrast system colors into the palette roles.
 ///
 /// `COLOR_GRAYTEXT` is used for `muted`/`faint` only when it already
-/// meets 4.5:1 on both window and button face. Otherwise those roles
-/// use `COLOR_WINDOWTEXT`. Unreadable SPI is handled by the caller
+/// meets 4.5:1 on both window and button face. Otherwise those roles get a
+/// synthesized readable gray. Unreadable SPI is handled by the caller
 /// (`None` is not "High Contrast on").
 pub fn from_system_colors(c: SystemColors) -> Palette {
     let secondary = if gray_is_usable(c.gray_text, c.window, c.button_face) {
         c.gray_text
     } else {
-        c.window_text
+        readable_secondary(c.window, c.button_face, c.window_text)
     };
     Palette {
         light: relative_luminance(c.window) > 0.5,
@@ -286,17 +313,25 @@ mod tests {
         }
     }
 
-    /// SBS-762: High Contrast White must not paint with failing GrayText.
+    /// SBS-762: High Contrast White must not paint with failing GrayText,
+    /// and must not collapse the secondary roles into the primary one.
     #[test]
-    fn high_contrast_white_uses_window_text_when_gray_fails() {
+    fn high_contrast_white_replaces_failing_gray_without_collapsing_roles() {
         let palette = from_system_colors(HC_WHITE);
         assert!(palette.light);
         assert_eq!(palette.bg, HC_WHITE.window);
         assert_eq!(palette.panel, HC_WHITE.window);
         assert_eq!(palette.chip, HC_WHITE.button_face);
         assert_eq!(palette.text, HC_WHITE.window_text);
-        assert_eq!(palette.faint, HC_WHITE.window_text);
-        assert_eq!(palette.muted, HC_WHITE.window_text);
+        assert_ne!(
+            palette.muted, palette.text,
+            "muted must stay a secondary weight, not a second primary"
+        );
+        assert_ne!(
+            palette.accent, palette.muted,
+            "Settings paints Active with accent and Off with muted"
+        );
+        assert_eq!(palette.faint, palette.muted);
         assert_eq!(palette.accent, HC_WHITE.highlight);
         assert_eq!(palette.accent_text, HC_WHITE.highlight_text);
         assert!(

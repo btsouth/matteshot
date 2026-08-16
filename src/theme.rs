@@ -61,10 +61,17 @@ fn theme_from_palette(palette: Palette) -> Theme {
     }
 }
 
-/// uxtheme `SetPreferredAppMode` values. `Default` hands the menu colors
-/// back to the system, which is what High Contrast needs.
+/// uxtheme `SetPreferredAppMode` values.
+///
+/// `Default` hands the menu colors back to the system, which is what High
+/// Contrast needs. `AllowDark` follows the system app mode. The two Force
+/// modes ignore it, which is what an explicit `MATTESHOT_THEME` means:
+/// `AllowDark` on a light session would still draw light menus while the
+/// windows were painted with the dark palette.
 const APP_MODE_DEFAULT: i32 = 0;
 const APP_MODE_ALLOW_DARK: i32 = 1;
+const APP_MODE_FORCE_DARK: i32 = 2;
+const APP_MODE_FORCE_LIGHT: i32 = 3;
 
 /// The mode the classic popup menus should be in right now.
 ///
@@ -73,8 +80,8 @@ const APP_MODE_ALLOW_DARK: i32 = 1;
 /// the system app mode. Split out so the precedence is testable off Windows.
 fn preferred_menu_mode(override_theme: Option<&str>, high_contrast: bool) -> i32 {
     match override_theme {
-        Some("light") => return APP_MODE_DEFAULT,
-        Some("dark") => return APP_MODE_ALLOW_DARK,
+        Some("light") => return APP_MODE_FORCE_LIGHT,
+        Some("dark") => return APP_MODE_FORCE_DARK,
         _ => {}
     }
     if high_contrast {
@@ -84,17 +91,34 @@ fn preferred_menu_mode(override_theme: Option<&str>, high_contrast: bool) -> i32
     }
 }
 
-/// uxtheme ordinal 135 = `SetPreferredAppMode` — undocumented but the
-/// de-facto standard every dark-mode Win32 app relies on. Resolved once:
-/// this runs before every popup menu, and a `LoadLibraryW` per menu would
-/// leak a module handle each time. `None` means uxtheme did not export it.
-fn set_preferred_app_mode_proc() -> Option<extern "system" fn(i32) -> i32> {
-    static PROC: OnceLock<Option<usize>> = OnceLock::new();
-    let addr = *PROC.get_or_init(|| unsafe {
-        let lib = LoadLibraryW(windows::core::w!("uxtheme.dll")).ok()?;
-        GetProcAddress(lib, PCSTR(135 as *const u8)).map(|f| f as usize)
-    });
-    addr.map(|a| unsafe { std::mem::transmute::<usize, extern "system" fn(i32) -> i32>(a) })
+/// uxtheme ordinals 135 (`SetPreferredAppMode`) and 136 (`FlushMenuThemes`)
+/// — undocumented but the de-facto standard every dark-mode Win32 app relies
+/// on. Resolved once: this runs before every popup menu, and a `LoadLibraryW`
+/// per menu would leak a module handle each time.
+struct MenuThemeProcs {
+    set_preferred_app_mode: extern "system" fn(i32) -> i32,
+    flush_menu_themes: Option<extern "system" fn()>,
+}
+
+fn menu_theme_procs() -> Option<&'static MenuThemeProcs> {
+    static PROCS: OnceLock<Option<MenuThemeProcs>> = OnceLock::new();
+    PROCS
+        .get_or_init(|| unsafe {
+            let lib = LoadLibraryW(windows::core::w!("uxtheme.dll")).ok()?;
+            let set = GetProcAddress(lib, PCSTR(135 as *const u8))?;
+            Some(MenuThemeProcs {
+                set_preferred_app_mode: std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    extern "system" fn(i32) -> i32,
+                >(set),
+                flush_menu_themes: GetProcAddress(lib, PCSTR(136 as *const u8)).map(|flush| {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, extern "system" fn()>(
+                        flush,
+                    )
+                }),
+            })
+        })
+        .as_ref()
 }
 
 /// Point classic Win32 popup menus (tray, pin, history) at the current mode.
@@ -111,8 +135,15 @@ pub fn enable_dark_menus() {
     if LAST.swap(mode, Ordering::Relaxed) == mode {
         return;
     }
-    if let Some(set_preferred_app_mode) = set_preferred_app_mode_proc() {
-        set_preferred_app_mode(mode);
+    if let Some(procs) = menu_theme_procs() {
+        (procs.set_preferred_app_mode)(mode);
+        // Ordinal 135 only moves a process flag; the live menu theme cache is
+        // what the next TrackPopupMenu reads. Without this flush the first
+        // menu after a toggle keeps the old colors, and LAST has already
+        // recorded the new mode, so later menus skip the call and stay stale.
+        if let Some(flush) = procs.flush_menu_themes {
+            flush();
+        }
     }
 }
 
@@ -211,10 +242,15 @@ mod tests {
     /// behind when it is switched on after startup.
     #[test]
     fn menu_mode_follows_override_then_high_contrast() {
+        // No override: follow the system, and hand High Contrast its colors.
         assert_eq!(preferred_menu_mode(None, false), APP_MODE_ALLOW_DARK);
         assert_eq!(preferred_menu_mode(None, true), APP_MODE_DEFAULT);
-        assert_eq!(preferred_menu_mode(Some("dark"), true), APP_MODE_ALLOW_DARK);
-        assert_eq!(preferred_menu_mode(Some("light"), false), APP_MODE_DEFAULT);
+        // An override must force, not allow: AllowDark on a light session
+        // still draws light menus under a DARK window palette.
+        assert_eq!(preferred_menu_mode(Some("dark"), true), APP_MODE_FORCE_DARK);
+        assert_eq!(preferred_menu_mode(Some("dark"), false), APP_MODE_FORCE_DARK);
+        assert_eq!(preferred_menu_mode(Some("light"), true), APP_MODE_FORCE_LIGHT);
+        assert_eq!(preferred_menu_mode(Some("light"), false), APP_MODE_FORCE_LIGHT);
         // An unknown override value is not a third mode.
         assert_eq!(preferred_menu_mode(Some("hc"), true), APP_MODE_DEFAULT);
         assert_eq!(preferred_menu_mode(Some("hc"), false), APP_MODE_ALLOW_DARK);
