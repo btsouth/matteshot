@@ -243,9 +243,36 @@ fn path_is_owned_capture(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
     roots.iter().any(|root| path_is_under_root(path, root.as_ref()))
 }
 
+fn stable_canonical(path: &Path) -> Option<PathBuf> {
+    let first = std::fs::canonicalize(path).ok()?;
+    let second = std::fs::canonicalize(path).ok()?;
+    (first == second).then_some(first)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn parent_is_under_any_root(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
+    path.parent().is_some_and(|parent| {
+        roots
+            .iter()
+            .any(|root| path_is_under_root(parent, root.as_ref()))
+    })
+}
+
 fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
-    if path_is_owned_capture(path, roots) {
-        match std::fs::remove_file(path) {
+    let unlink = match stable_canonical(path) {
+        Some(canonical) if path_is_owned_capture(&canonical, roots) => Some(canonical),
+        _ if is_symlink(path) && parent_is_under_any_root(path, roots) => {
+            Some(path.to_path_buf())
+        }
+        _ => None,
+    };
+    if let Some(target) = unlink {
+        match std::fs::remove_file(&target) {
             Ok(()) => {}
             // Already gone (deleted outside the app, or a repeat click racing
             // its own first Delete): the index is just stale, so finish
@@ -596,6 +623,64 @@ mod persistence_tests {
         assert!(remove_at(&index, &escaped, &[save]).is_ok());
         assert!(foreign.is_file(), "a `..` escape must not unlink the foreign file");
         assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_symlink_inside_the_save_folder_is_unlinked_without_touching_its_target() {
+        let dir = temp_dir("remove-symlink");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = capture(&outside, "secret.txt");
+        let link = save.join("link.png");
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            eprintln!("skipping: creating a file symlink requires privilege");
+            return;
+        }
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&link));
+
+        assert!(remove_at(&index, &link, &[save]).is_ok());
+        assert!(
+            !link.exists(),
+            "the symlink inside save_dir must be unlinked"
+        );
+        assert!(
+            target.is_file(),
+            "the outside target must not be deleted"
+        );
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_directory_swap_of_save_dir_does_not_delete_an_outside_file() {
+        let dir = temp_dir("remove-swap");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let shot = capture(&save, "a.png");
+        let foreign = capture(&outside, "secret.txt");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&shot));
+
+        let real_save = dir.join("save.real");
+        std::fs::rename(&save, &real_save).unwrap();
+        if std::os::windows::fs::symlink_dir(&outside, &save).is_err() {
+            let _ = std::fs::rename(&real_save, &save);
+            eprintln!("skipping: creating a directory symlink requires privilege");
+            return;
+        }
+
+        let swapped = save.join("a.png");
+        assert!(remove_at(&index, &swapped, std::slice::from_ref(&real_save)).is_ok());
+        assert!(
+            foreign.is_file(),
+            "a swapped save_dir must not unlink an outside file"
+        );
+        let _ = std::fs::remove_dir(&save);
+        let _ = std::fs::rename(&real_save, &save);
     }
 }
 
