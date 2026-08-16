@@ -40,6 +40,7 @@ unsafe fn context_menu(hwnd: HWND) {
         AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, TrackPopupMenu,
         MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD,
     };
+    crate::theme::enable_dark_menus();
     let Ok(menu) = CreatePopupMenu() else { return };
     let _ = AppendMenuW(menu, MF_STRING, 1, w!("Copy image"));
     let _ = AppendMenuW(menu, MF_STRING, 2, w!("Close"));

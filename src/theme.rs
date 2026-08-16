@@ -3,9 +3,9 @@
 //! Every custom-drawn surface reads from here so the app looks intentional
 //! in both modes. `MATTESHOT_THEME=light|dark` overrides for testing.
 
-mod theme_contrast;
-
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
 
 use windows::core::PCSTR;
 use windows::Win32::Foundation::{COLORREF, HWND};
@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
-use theme_contrast::{Palette, SystemColors};
+use crate::theme_contrast::{self, Palette, SystemColors};
 
 #[derive(Clone, Copy)]
 pub struct Theme {
@@ -61,21 +61,58 @@ fn theme_from_palette(palette: Palette) -> Theme {
     }
 }
 
-/// Opt classic Win32 popup menus (tray, pin context menu) into dark mode.
-/// uxtheme ordinal 135 = SetPreferredAppMode(AllowDark) — undocumented but
-/// the de-facto standard every dark-mode Win32 app relies on. Best-effort.
-/// High Contrast owns the menu colors; do not force AllowDark over it.
+/// uxtheme `SetPreferredAppMode` values. `Default` hands the menu colors
+/// back to the system, which is what High Contrast needs.
+const APP_MODE_DEFAULT: i32 = 0;
+const APP_MODE_ALLOW_DARK: i32 = 1;
+
+/// The mode the classic popup menus should be in right now.
+///
+/// Same precedence as `theme_contrast::resolve`: `MATTESHOT_THEME` wins,
+/// then High Contrast owns the colors, then AllowDark lets the menus track
+/// the system app mode. Split out so the precedence is testable off Windows.
+fn preferred_menu_mode(override_theme: Option<&str>, high_contrast: bool) -> i32 {
+    match override_theme {
+        Some("light") => return APP_MODE_DEFAULT,
+        Some("dark") => return APP_MODE_ALLOW_DARK,
+        _ => {}
+    }
+    if high_contrast {
+        APP_MODE_DEFAULT
+    } else {
+        APP_MODE_ALLOW_DARK
+    }
+}
+
+/// uxtheme ordinal 135 = `SetPreferredAppMode` — undocumented but the
+/// de-facto standard every dark-mode Win32 app relies on. Resolved once:
+/// this runs before every popup menu, and a `LoadLibraryW` per menu would
+/// leak a module handle each time. `None` means uxtheme did not export it.
+fn set_preferred_app_mode_proc() -> Option<extern "system" fn(i32) -> i32> {
+    static PROC: OnceLock<Option<usize>> = OnceLock::new();
+    let addr = *PROC.get_or_init(|| unsafe {
+        let lib = LoadLibraryW(windows::core::w!("uxtheme.dll")).ok()?;
+        GetProcAddress(lib, PCSTR(135 as *const u8)).map(|f| f as usize)
+    });
+    addr.map(|a| unsafe { std::mem::transmute::<usize, extern "system" fn(i32) -> i32>(a) })
+}
+
+/// Point classic Win32 popup menus (tray, pin, history) at the current mode.
+///
+/// Called before each menu is built, not only at startup: High Contrast and
+/// the app mode can both be toggled while Matteshot is resident, and a stale
+/// AllowDark would keep dark menu colors over a live High Contrast theme.
+/// Best-effort; a missing export leaves the menus classic.
 pub fn enable_dark_menus() {
-    if high_contrast_on() {
+    let override_theme = std::env::var("MATTESHOT_THEME").ok();
+    let mode = preferred_menu_mode(override_theme.as_deref(), high_contrast_on());
+    // Skip the call when nothing moved so repeated menus are free.
+    static LAST: AtomicI32 = AtomicI32::new(i32::MIN);
+    if LAST.swap(mode, Ordering::Relaxed) == mode {
         return;
     }
-    unsafe {
-        if let Ok(lib) = LoadLibraryW(windows::core::w!("uxtheme.dll")) {
-            if let Some(f) = GetProcAddress(lib, PCSTR(135 as *const u8)) {
-                let set_preferred_app_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
-                set_preferred_app_mode(1); // AllowDark
-            }
-        }
+    if let Some(set_preferred_app_mode) = set_preferred_app_mode_proc() {
+        set_preferred_app_mode(mode);
     }
 }
 
@@ -163,4 +200,23 @@ pub fn current() -> Theme {
         read_high_contrast_colors(),
         apps_use_light_theme(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SBS-762: the menus follow the same precedence as the palette, and
+    /// High Contrast picks `Default` rather than leaving a stale AllowDark
+    /// behind when it is switched on after startup.
+    #[test]
+    fn menu_mode_follows_override_then_high_contrast() {
+        assert_eq!(preferred_menu_mode(None, false), APP_MODE_ALLOW_DARK);
+        assert_eq!(preferred_menu_mode(None, true), APP_MODE_DEFAULT);
+        assert_eq!(preferred_menu_mode(Some("dark"), true), APP_MODE_ALLOW_DARK);
+        assert_eq!(preferred_menu_mode(Some("light"), false), APP_MODE_DEFAULT);
+        // An unknown override value is not a third mode.
+        assert_eq!(preferred_menu_mode(Some("hc"), true), APP_MODE_DEFAULT);
+        assert_eq!(preferred_menu_mode(Some("hc"), false), APP_MODE_ALLOW_DARK);
+    }
 }

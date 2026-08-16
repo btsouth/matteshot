@@ -33,6 +33,7 @@ mod share;
 mod spike;
 mod style;
 mod theme;
+mod theme_contrast;
 mod tray;
 mod tweak;
 mod update;

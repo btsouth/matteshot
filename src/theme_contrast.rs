@@ -334,6 +334,24 @@ mod tests {
         assert!(accent >= NORMAL_TEXT_MIN, "HC black accent {accent:.2}:1");
     }
 
+    /// SBS-762: the capture overlay marks the selected mode and the armed
+    /// delay with an accent fill and `accent_text`. High Contrast maps chip
+    /// and panel to the same system color and can fold accent into
+    /// `window_text`, so the selected pair must still differ from the idle
+    /// pair on both fill and label.
+    #[test]
+    fn high_contrast_overlay_selection_differs_from_idle() {
+        for (name, colors) in [("white", HC_WHITE), ("black", HC_BLACK)] {
+            let p = from_system_colors(colors);
+            let selected = (p.accent, p.accent_text);
+            let idle = (p.panel, p.muted);
+            assert_ne!(selected, idle, "HC {name} selected overlay chip reads as idle");
+            assert_ne!(selected.0, idle.0, "HC {name} selected fill matches the panel");
+            let ratio = contrast_ratio(p.accent_text, p.accent);
+            assert!(ratio >= NORMAL_TEXT_MIN, "HC {name} accent_text on accent is {ratio:.2}:1");
+        }
+    }
+
     /// SBS-762: `MATTESHOT_THEME` still wins so tests can pin light/dark.
     #[test]
     fn env_override_wins_over_high_contrast() {
