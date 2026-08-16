@@ -390,6 +390,12 @@ function Invoke-CargoAuditRaw {
         return & $script:CargoAuditInvoker $Arguments
     }
 
+    # Windows PowerShell 5.1 wraps native stderr in ErrorRecords that obey
+    # $ErrorActionPreference, so 'Stop' turns cargo's first progress line on
+    # stderr into a terminating error. The catch below would then report
+    # MissingTool for a cargo that ran perfectly. Relax only around the call.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         $output = & cargo @Arguments 2>&1 | Out-String
         return [pscustomobject]@{
@@ -403,6 +409,8 @@ function Invoke-CargoAuditRaw {
             Output   = [string]$_
             Found    = $false
         }
+    } finally {
+        $ErrorActionPreference = $previous
     }
 }
 
@@ -427,7 +435,11 @@ function Resolve-CargoAuditTool {
 
     $pin = Get-CargoAuditPin
     $installArgs = @('install', 'cargo-audit', '--version', $pin, '--locked')
-    if ($probe.Found -and $version) {
+    # --force whenever a binary is already there, parseable version or not.
+    # An unparseable --version still means the file exists, and a plain
+    # `cargo install` would fail with "already exists" instead of healing to
+    # the pin, turning a recoverable state into InstallFailed.
+    if ($probe.Found) {
         $installArgs += '--force'
     }
 
@@ -491,11 +503,21 @@ function Invoke-RustsecAuditGate {
 
     # cargo-audit has no --locked flag. "Locked" here means Cargo.lock
     # (passed explicitly) plus a version-pinned cargo-audit binary.
-    $audit = Invoke-CargoAuditRaw -Arguments @(
-        'audit',
-        '--file', $lockPath,
-        '--deny', 'unsound'
-    )
+    #
+    # Run from $RepoRoot: cargo-audit finds .cargo/audit.toml relative to the
+    # working directory, so a caller in another directory would get none of
+    # the [output] deny, [target] or [yanked] policy this gate just validated
+    # and reconciled, and would Pass on a weaker audit than advertised.
+    Push-Location -LiteralPath $RepoRoot
+    try {
+        $audit = Invoke-CargoAuditRaw -Arguments @(
+            'audit',
+            '--file', $lockPath,
+            '--deny', 'unsound'
+        )
+    } finally {
+        Pop-Location
+    }
     if (-not $audit.Found) {
         return New-RustsecAuditOutcome -Kind Unknown -Reason MissingTool
     }

@@ -254,7 +254,12 @@ $dir = New-RustsecTestDir
 try {
     $exceptions = '{"exceptions":[{"id":"RUSTSEC-2024-0001","owner":"Tyler","justification":"x","expires":"2027-01-01"}]}'
     Write-RustsecFixture -Directory $dir -Exceptions $exceptions
-    $outcome = Invoke-RustsecAuditGate -RepoRoot $dir
+    # Fixed clock: expiry is checked before drift, so on the real clock this
+    # test would turn into ExpiredException on 2027-01-01 and block every
+    # build from then on.
+    $outcome = Invoke-RustsecAuditGate `
+        -RepoRoot $dir `
+        -NowUtc ([datetime]::Parse('2026-08-16T00:00:00Z'))
     Assert-Rustsec `
         -Name 'exception-without-ignore-is-rejected' `
         -Condition ($outcome.Kind -eq 'Fail' -and $outcome.Reason -eq 'IgnoreDrift' -and $outcome.ExitCode -ne 0) `
@@ -419,6 +424,17 @@ try {
 }
 
 # SBS-763: an unreadable audit.toml is Unknown, not an unhandled throw.
+# A clean invoker first: inheriting the fetch-error one above would produce
+# Unknown/AuditError anyway, so the assertion would hold even if the guard
+# were removed. With this invoker a readable audit.toml gives Pass, so only
+# the lock can produce AuditError.
+Use-FakeCargoAudit {
+    param($Arguments)
+    if ($Arguments -contains '--version') {
+        return [pscustomobject]@{ ExitCode = 0; Output = 'cargo-audit 0.22.2'; Found = $true }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Output = 'Success'; Found = $true }
+}
 $dir = New-RustsecTestDir
 $lock = $null
 try {

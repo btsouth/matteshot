@@ -2462,3 +2462,62 @@ mod speed_export_min_duration_tests {
         assert!(!meets_speed_export_min_duration(-1));
     }
 }
+
+#[cfg(test)]
+mod repo_hygiene_tests {
+    /// A rebase that leaves conflict markers in a file nothing compiles or
+    /// reads — README.md, a workflow, an .iss — still passes every other
+    /// test and every lint. One shipped to review that way. This is cheap
+    /// and catches it before CI goes green on a broken merge.
+    #[test]
+    fn no_tracked_text_file_has_merge_conflict_markers() {
+        // Built at runtime so this file cannot match its own needles.
+        let open = "<".repeat(7);
+        let close = ">".repeat(7);
+        let mut offenders = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    // Build output and git internals are not ours to police.
+                    if !matches!(name.as_str(), "target" | ".git" | "Output") {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                let text_file = matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("rs" | "md" | "ps1" | "toml" | "json" | "iss" | "yml" | "yaml")
+                );
+                if !text_file {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Only the marker plus whitespace: git always writes both of
+                // these, and neither is valid in any of these formats. The
+                // `=======` separator is skipped because a 7-character setext
+                // heading underline in Markdown is legitimate.
+                let conflicted = text.lines().any(|line| {
+                    [&open, &close].iter().any(|marker| {
+                        line.strip_prefix(marker.as_str())
+                            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                    })
+                });
+                if conflicted {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "unresolved merge conflict markers in: {offenders:?}"
+        );
+    }
+}
