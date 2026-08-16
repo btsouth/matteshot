@@ -194,6 +194,12 @@ impl Config {
         })
     }
 
+    /// Fail closed: a parse or I/O error is not "use Pictures\Matteshot".
+    pub fn try_load() -> anyhow::Result<Config> {
+        let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
+        load_unlocked()
+    }
+
     /// Atomically update only the fields owned by one action. This prevents a
     /// long-lived Settings window from overwriting a newer last-used matte.
     pub fn update(change: impl FnOnce(&mut Config)) -> anyhow::Result<Config> {
