@@ -1238,6 +1238,12 @@ fn meets_speed_export_min_duration(duration_100ns: i64) -> bool {
     duration_100ns >= 10_000_000
 }
 
+/// Integer 100ns ticks so the probe harness cannot round 0.9995s into 1.00s
+/// and then send a sub-second clip into `--video-speed-test`.
+fn duration_test_report(duration_100ns: i64) -> String {
+    format!("duration_100ns: {duration_100ns}")
+}
+
 fn main() -> Result<()> {
     unsafe {
         // STA: the folder picker (IFileDialog) requires it; WGC's
@@ -1613,7 +1619,7 @@ fn main() -> Result<()> {
             let src =
                 std::path::PathBuf::from(args.get(1).context("--duration-test <mp4>")?);
             let source = trim::probe_opening(&src, 320, 180)?;
-            eprintln!("duration: {:.2}s", source.duration_100ns as f64 / 1e7);
+            eprintln!("{}", duration_test_report(source.duration_100ns));
             Ok(())
         }
         // Speed-section export probe. Compresses the middle half to 4x and
@@ -2379,7 +2385,15 @@ mod startup_failure_tests {
 
 #[cfg(test)]
 mod speed_export_min_duration_tests {
-    use super::meets_speed_export_min_duration;
+    use super::{duration_test_report, meets_speed_export_min_duration};
+
+    #[test]
+    fn duration_test_prints_integer_ticks_not_rounded_seconds() {
+        // `{:.2}s` would print 0.9995s as 1.00s; the harness used that to
+        // decide speed-export was ready while Rust still required 10_000_000.
+        assert_eq!(duration_test_report(9_995_000), "duration_100ns: 9995000");
+        assert!(!meets_speed_export_min_duration(9_995_000));
+    }
 
     #[test]
     fn ci_short_fixture_is_below_the_floor() {
