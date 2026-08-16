@@ -609,4 +609,22 @@ mod tests {
         let error = launch(&missing).unwrap_err().to_string();
         assert!(error.contains("staged installer is missing"), "{error}");
     }
+    /// Pins SBS-764: the legacy nonzero `--quit` path must still exist, and
+    /// it must resolve taskkill through the native System32 directory.
+    #[test]
+    fn installer_legacy_quit_uses_native_system_taskkill() {
+        let source = include_str!("../installer/matteshot.iss");
+        assert!(
+            source.contains("if R <> 0 then"),
+            "legacy nonzero --quit fallback is missing"
+        );
+        assert!(
+            !source.contains("Exec('taskkill.exe'"),
+            "unqualified taskkill.exe is the SBS-764 failure mode"
+        );
+        assert!(
+            source.contains("ExecWithNativeSysDir('taskkill.exe'"),
+            "legacy close must use ExecWithNativeSysDir"
+        );
+    }
 }

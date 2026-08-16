@@ -1,6 +1,7 @@
 //! Delivering the result: clipboard, PNG on disk, optional editor handoff.
 
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::OsString;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -11,6 +12,7 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -425,18 +427,82 @@ pub fn text_to_clipboard(text: &str) -> Result<()> {
 }
 
 /// Reveal a file in Explorer, selected.
+///
+/// Explorer is launched from the Windows directory, never by unqualified
+/// name. A decoy `explorer.exe` in the process current directory must not
+/// run (SBS-764). If the Windows directory cannot be read, reveal is
+/// skipped rather than falling back to PATH search.
 pub fn reveal_in_explorer(path: &Path) {
+    let Some(exe) = reveal_explorer_exe(windows_directory().as_deref()) else {
+        return;
+    };
     let args = format!("/select,\"{}\"", path.display());
+    let exe = HSTRING::from(exe.as_os_str());
+    let args = HSTRING::from(args);
     unsafe {
         ShellExecuteW(
             None,
             w!("open"),
-            w!("explorer.exe"),
-            PCWSTR(HSTRING::from(args).as_ptr()),
+            PCWSTR(exe.as_ptr()),
+            PCWSTR(args.as_ptr()),
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
     }
+}
+
+/// Join a Windows-owned directory with a helper file name.
+///
+/// `file_name` must be a single name (`explorer.exe`). Callers pass a
+/// directory they already trust — `GetWindowsDirectoryW`, not cwd.
+fn trusted_helper_path(trusted_dir: &Path, file_name: &str) -> Option<PathBuf> {
+    if !is_plain_helper_name(file_name) {
+        return None;
+    }
+    Some(trusted_dir.join(file_name))
+}
+
+fn is_plain_helper_name(file_name: &str) -> bool {
+    if file_name.is_empty() || file_name == "." || file_name == ".." {
+        return false;
+    }
+    if file_name.bytes().any(|b| {
+        matches!(
+            b,
+            b'/' | b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|' | b'\0'
+        )
+    }) {
+        return false;
+    }
+    Path::new(file_name).file_name().and_then(|n| n.to_str()) == Some(file_name)
+}
+
+/// Absolute `explorer.exe` under the Windows directory, or `None` when
+/// that directory is unknown. `None` is not "search PATH".
+fn reveal_explorer_exe(windows_dir: Option<&Path>) -> Option<PathBuf> {
+    trusted_helper_path(windows_dir?, "explorer.exe")
+}
+
+fn windows_directory() -> Option<PathBuf> {
+    // MAX_PATH. If the real path is longer, the first call returns the
+    // required size and we retry. Empty/zero is unknown, not "search PATH".
+    let mut buf = vec![0u16; 260];
+    let mut n = unsafe { GetWindowsDirectoryW(Some(&mut buf)) };
+    if n == 0 {
+        return None;
+    }
+    if (n as usize) >= buf.len() {
+        buf.resize(n as usize, 0);
+        n = unsafe { GetWindowsDirectoryW(Some(&mut buf)) };
+        if n == 0 || (n as usize) >= buf.len() {
+            return None;
+        }
+    }
+    buf.truncate(n as usize);
+    if buf.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(&buf)))
 }
 
 /// Open the captures folder in Explorer.
@@ -775,5 +841,99 @@ mod tests {
 
         std::fs::remove_file(garbage).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Pins SBS-764: an unqualified helper name is never the launch path.
+    #[test]
+    fn trusted_helper_path_never_returns_an_unqualified_name() {
+        let trusted = Path::new("trusted-windows-dir");
+        let exe = trusted_helper_path(trusted, "explorer.exe").unwrap();
+        assert_eq!(exe, trusted.join("explorer.exe"));
+        assert_ne!(exe.as_os_str(), "explorer.exe");
+    }
+
+    /// Pins SBS-764: a decoy beside cwd is not selected when the trusted
+    /// directory is the Windows directory (or any other injected dir).
+    #[test]
+    fn trusted_helper_path_ignores_a_decoy_in_another_directory() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cwd = std::env::temp_dir().join(format!(
+            "matteshot-sbs-764-decoy-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let decoy = cwd.join("explorer.exe");
+        std::fs::write(&decoy, b"not explorer").unwrap();
+
+        let trusted = Path::new("trusted-windows-dir");
+        let exe = trusted_helper_path(trusted, "explorer.exe").unwrap();
+        assert_eq!(exe, trusted.join("explorer.exe"));
+        assert_ne!(exe, decoy);
+
+        std::fs::remove_file(decoy).unwrap();
+        std::fs::remove_dir(cwd).unwrap();
+    }
+
+    /// Pins SBS-764: helper names cannot steer the join with separators.
+    #[test]
+    fn trusted_helper_path_rejects_traversal_and_absolute_names() {
+        let trusted = Path::new("trusted-windows-dir");
+        for name in [
+            "",
+            ".",
+            "..",
+            "../explorer.exe",
+            r"..\explorer.exe",
+            r"C:\evil\explorer.exe",
+            "explorer.exe/../evil.exe",
+            r"explorer.exe\..\evil.exe",
+            "C:explorer.exe",
+        ] {
+            assert_eq!(
+                trusted_helper_path(trusted, name),
+                None,
+                "accepted {name:?}"
+            );
+        }
+    }
+
+    /// Pins SBS-764: failing to read the Windows directory is its own
+    /// state. It must not collapse into "launch explorer.exe by name".
+    #[test]
+    fn an_unreadable_windows_directory_does_not_fall_back_to_an_unqualified_helper() {
+        assert_eq!(reveal_explorer_exe(None), None);
+    }
+
+    /// Pins SBS-764: a known Windows directory always yields that
+    /// directory's explorer.exe, never an unqualified name.
+    #[test]
+    fn reveal_explorer_exe_is_under_the_supplied_windows_directory() {
+        let trusted = Path::new("other-windows-dir");
+        let exe = reveal_explorer_exe(Some(trusted)).unwrap();
+        assert_eq!(exe, trusted.join("explorer.exe"));
+    }
+
+    /// Pins SBS-764 at the source: the production launch must not go
+    /// back to an unqualified explorer helper.
+    #[test]
+    fn reveal_source_does_not_launch_unqualified_explorer() {
+        let source = include_str!("output.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        // Built in pieces so this test body cannot satisfy the needle.
+        let forbidden = ["w!(", "\"explorer.exe\")"].concat();
+        assert!(
+            !production.contains(&forbidden),
+            "reveal_in_explorer must not launch explorer.exe by unqualified name"
+        );
+        assert!(
+            production.contains("reveal_explorer_exe(windows_directory().as_deref())"),
+            "reveal_in_explorer must resolve explorer from the Windows directory"
+        );
     }
 }
