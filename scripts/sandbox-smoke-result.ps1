@@ -166,6 +166,25 @@ function Get-SandboxSmokeProcesses {
     Get-Process -Name (Get-SandboxSmokeProcessNames) -ErrorAction SilentlyContinue
 }
 
+function Get-SandboxSmokeProcessIds {
+    return @(Get-SandboxSmokeProcesses | ForEach-Object { $_.Id })
+}
+
+function Get-SandboxSmokeOwnProcesses {
+    param(
+        [int[]]$BaselineProcessIds
+    )
+
+    # Sandbox processes already up when the wait began belong to somebody
+    # else. Counting them would keep "session ended" false forever, so a
+    # guest that died without writing result.json would only be reported
+    # after the full timeout instead of after the 3s flush grace.
+    return @(
+        Get-SandboxSmokeProcesses |
+            Where-Object { $BaselineProcessIds -notcontains $_.Id }
+    )
+}
+
 function Clear-SandboxSmokePriorResult {
     param(
         [Parameter(Mandatory = $true)]
@@ -197,7 +216,9 @@ function Test-SandboxSmokeSessionEnded {
     param(
         [System.Diagnostics.Process]$SandboxProcess,
 
-        [switch]$SawSandbox
+        [switch]$SawSandbox,
+
+        [int[]]$BaselineProcessIds
     )
 
     if (-not $SawSandbox) {
@@ -217,7 +238,7 @@ function Test-SandboxSmokeSessionEnded {
         # Handle is unusable; fall through to the named-process check.
     }
 
-    $running = Get-SandboxSmokeProcesses
+    $running = Get-SandboxSmokeOwnProcesses -BaselineProcessIds $BaselineProcessIds
     return -not $running
 }
 
@@ -240,6 +261,9 @@ function Wait-SandboxSmokeResult {
     $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
     $graceDeadline = $null
     $sawSandbox = $false
+    # Snapshot before the guest can appear, so anything already running is
+    # somebody else's session for the rest of this wait.
+    $baselineIds = Get-SandboxSmokeProcessIds
 
     while ($true) {
         $snapshot = Read-SandboxSmokeResult -ResultsDirectory $ResultsDirectory
@@ -247,7 +271,7 @@ function Wait-SandboxSmokeResult {
             return $snapshot
         }
 
-        if (Get-SandboxSmokeProcesses) {
+        if (Get-SandboxSmokeOwnProcesses -BaselineProcessIds $baselineIds) {
             $sawSandbox = $true
         }
 
@@ -270,7 +294,10 @@ function Wait-SandboxSmokeResult {
                 -TimedOut
         }
 
-        if (Test-SandboxSmokeSessionEnded -SandboxProcess $SandboxProcess -SawSandbox:$sawSandbox) {
+        if (Test-SandboxSmokeSessionEnded `
+                -SandboxProcess $SandboxProcess `
+                -SawSandbox:$sawSandbox `
+                -BaselineProcessIds $baselineIds) {
             if ($null -eq $graceDeadline) {
                 $flushSeconds = 3
                 $graceDeadline = $now.AddSeconds($flushSeconds)

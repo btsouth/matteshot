@@ -210,6 +210,49 @@ try {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# SBS-901: an unrelated sandbox session on the host must not push a guest that
+# died without a result out to the full timeout.
+$dir = New-SandboxSmokeTestDir
+$exited = $null
+$script:originalGetProcesses = ${function:Get-SandboxSmokeProcesses}
+try {
+    $exited = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -PassThru -WindowStyle Hidden
+    $null = $exited.WaitForExit(5000)
+    # Id 424242 is always present (somebody else's session), so it is in the
+    # baseline the first poll takes. Ours appears after that and then goes
+    # away, which is a guest that exited without writing result.json.
+    $script:sandboxPolls = 0
+    function Get-SandboxSmokeProcesses {
+        $script:sandboxPolls++
+        $unrelated = [pscustomobject]@{ Id = 424242 }
+        if ($script:sandboxPolls -ge 2 -and $script:sandboxPolls -le 4) {
+            return @($unrelated, [pscustomobject]@{ Id = 424243 })
+        }
+        return @($unrelated)
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $outcome = Wait-SandboxSmokeResult `
+        -ResultsDirectory $dir `
+        -TimeoutSeconds 30 `
+        -PollIntervalMilliseconds 50 `
+        -SandboxProcess $exited
+    $sw.Stop()
+    Assert-SandboxSmoke `
+        -Name 'unrelated-session-does-not-delay-sandbox-exited' `
+        -Condition (
+            $outcome.Kind -eq 'Unknown' -and
+            $outcome.Reason -eq 'SandboxExited' -and
+            $outcome.ExitCode -eq 2 -and
+            -not $outcome.TimedOut -and
+            $sw.Elapsed.TotalSeconds -lt 15
+        ) `
+        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason) ExitCode=$($outcome.ExitCode) TimedOut=$($outcome.TimedOut) Seconds=$([math]::Round($sw.Elapsed.TotalSeconds, 1))"
+} finally {
+    Set-Item -Path function:Get-SandboxSmokeProcesses -Value $script:originalGetProcesses
+    if ($exited) { $exited.Dispose() }
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($script:failures -gt 0) {
     Write-Host "$script:failures sandbox smoke result test(s) failed; $script:passes passed."
     exit 1
