@@ -74,7 +74,7 @@ Any failure removes the download and leaves the running app untouched; the tray 
 
 ## Settings (tray menu)
 
-Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows, PrtScn capture toggle, GIF toggle, automatic updates toggle, keep the editor open after Copy, recording audio Off/System/Mic, plus **Copy diagnostics** (a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path) and **Deactivate this PC** for licensed installs. First run shows a tray balloon.
+Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows (a denied or missing Startup folder shows an error and leaves the checkbox matching the shortcut on disk), PrtScn capture toggle, GIF toggle, automatic updates toggle, keep the editor open after Copy, recording audio Off/System/Mic, plus **Copy diagnostics** (a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path) and **Deactivate this PC** for licensed installs. First run shows a tray balloon.
 
 Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. The tray menu is slim by design: capture (and the active-window variant), open captures/videos folders, license, and Settings — the rare actions live in the Settings window.
 
