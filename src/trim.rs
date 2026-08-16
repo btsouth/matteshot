@@ -786,9 +786,10 @@ pub fn cut_with_edit_progress(
     )
 }
 
-/// Convert one decoded PCM sample onto the shortened output timeline. Normal
-/// pieces retain their bytes; sped pieces become shorter silence so speech is
-/// never turned into unintelligible chipmunk audio.
+/// Convert one decoded PCM sample onto the output timeline. Frames outside
+/// the TimeMap interval are dropped; normal pieces retain their bytes; sped
+/// pieces become shorter silence so speech is never turned into unintelligible
+/// chipmunk audio.
 fn retime_pcm(
     bytes: &[u8],
     timestamp: i64,
@@ -836,6 +837,25 @@ fn retime_pcm(
     let output_frames = output.len() / block;
     let output_duration = output_frames as i64 * TICKS_PER_SECOND / format.rate as i64;
     Some((output, time_map.output_time(first), output_duration.max(1)))
+}
+
+/// Video still gates on the sample timestamp. Audio must not: a packet that
+/// starts before `start` can still contain in-range frames (SBS-751).
+fn sample_is_before_trim_start(is_video: bool, timestamp: i64, start: i64) -> bool {
+    is_video && timestamp < start
+}
+
+/// Clip one decoded PCM packet to the selected source interval and rebase
+/// it onto the output timeline. Ordinary trims and speed-section trims share
+/// this so a packet that straddles `[start, end)` is sliced instead of
+/// dropped or passed through whole (SBS-751).
+fn export_pcm(
+    bytes: &[u8],
+    timestamp: i64,
+    format: &crate::audio::Format,
+    time_map: &crate::video_speed::TimeMap,
+) -> Option<(Vec<u8>, i64, i64)> {
+    retime_pcm(bytes, timestamp, format, time_map)
 }
 
 fn retime_video_sample(
@@ -1022,21 +1042,26 @@ pub fn cut_with_speed_edit_progress_cancel(
                 continue;
             }
             let Some(sample) = sample else { continue };
-            if ts >= end {
-                if stream == video_idx {
-                    break;
-                }
-                continue;
-            }
-            if ts < start {
-                continue;
-            }
-            let rel = ts - start;
-
             let is_video = stream == video_idx;
             if !is_video && Some(stream) != audio_idx {
                 continue;
             }
+            // Video still gates on the sample timestamp. Audio must not:
+            // a packet that starts before `start` can still contain in-range
+            // frames, and dropping it was the ordinary-trim start-boundary
+            // bug (SBS-751). A packet whose timestamp is already at/after
+            // `end` has no in-range frames.
+            if ts >= end {
+                if is_video {
+                    break;
+                }
+                continue;
+            }
+            if sample_is_before_trim_start(is_video, ts, start) {
+                continue;
+            }
+            let rel = ts - start;
+
             if is_video {
                 let source_duration = sample.GetSampleDuration().unwrap_or(frame_interval);
                 let (output_time, output_duration, output_slot) =
@@ -1147,18 +1172,15 @@ pub fn cut_with_speed_edit_progress_cancel(
                 let source_bytes =
                     std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec();
                 buf.Unlock()?;
-                let retimed = if time_map.is_empty() {
-                    Some((
-                        source_bytes,
-                        rel,
-                        sample.GetSampleDuration().unwrap_or(100_000),
-                    ))
-                } else {
-                    let audio_fmt =
-                        audio_fmt.as_ref().context("audio stream has no PCM format")?;
-                    retime_pcm(&source_bytes, ts, audio_fmt, &time_map)
+                // Unknown format is not "write the packet unclipped": the sink
+                // is only created when format is known, but keep the states
+                // distinct if that ever changes (SBS-751).
+                let Some(audio_fmt) = audio_fmt.as_ref() else {
+                    continue;
                 };
-                let Some((bytes, output_time, output_duration)) = retimed else {
+                let Some((bytes, output_time, output_duration)) =
+                    export_pcm(&source_bytes, ts, audio_fmt, &time_map)
+                else {
                     continue;
                 };
 
@@ -1190,11 +1212,169 @@ pub fn cut_with_speed_edit_progress_cancel(
 #[cfg(test)]
 mod tests {
     use super::{
-        bgra_to_rgba, crop_rect, cut_with_speed_edit_progress_cancel, fit_inside, open_reader,
-        read_video_frame, retime_pcm, retime_video_sample, rgba_to_bgra, scrub_cache_plan,
-        validate_video,
+        bgra_to_rgba, crop_rect, cut_with_speed_edit_progress_cancel, export_pcm, fit_inside,
+        sample_is_before_trim_start,
+        open_reader, read_video_frame, retime_pcm, retime_video_sample, rgba_to_bgra,
+        scrub_cache_plan, validate_video,
     };
     use std::sync::atomic::AtomicBool;
+
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+
+    fn mono_pcm(first: i16, last: i16) -> Vec<u8> {
+        (first..=last).flat_map(i16::to_le_bytes).collect()
+    }
+
+    fn ordinary_map(start: i64, end: i64) -> crate::video_speed::TimeMap {
+        crate::video_speed::TimeMap::new(start, end, &[]).unwrap()
+    }
+
+    /// A packet that starts before the trim used to be dropped whole because
+    /// the export loop compared the sample timestamp to `start` (SBS-751).
+    #[test]
+    fn ordinary_trim_clips_a_pcm_packet_that_crosses_the_start() {
+        let format = crate::audio::Format { rate: 100, channels: 1 };
+        // 30 frames at 100 Hz from 0.1s -> 0.4s. Trim is [0.2s, 0.5s).
+        let source = mono_pcm(1, 30);
+        let map = ordinary_map(2_000_000, 5_000_000);
+        let (output, timestamp, duration) =
+            export_pcm(&source, 1_000_000, &format, &map).unwrap();
+        assert_eq!(timestamp, 0, "in-range audio must start at output time zero");
+        assert_eq!(duration, 2_000_000);
+        assert_eq!(output, source[10 * 2..], "only frames at/after 0.2s");
+    }
+
+    /// A packet that starts inside the trim and extends past `end` used to be
+    /// written whole when there were no speed sections (SBS-751).
+    #[test]
+    fn ordinary_trim_clips_a_pcm_packet_that_crosses_the_end() {
+        let format = crate::audio::Format { rate: 100, channels: 1 };
+        // 30 frames at 100 Hz from 0.1s -> 0.4s. Trim is [0, 0.2s).
+        let source = mono_pcm(1, 30);
+        let map = ordinary_map(0, 2_000_000);
+        let (output, timestamp, duration) =
+            export_pcm(&source, 1_000_000, &format, &map).unwrap();
+        assert_eq!(timestamp, 1_000_000);
+        assert_eq!(duration, 1_000_000);
+        assert_eq!(output, source[..10 * 2], "must stop at the chosen duration");
+    }
+
+    /// Wholly-outside packets are not an empty write; they are absent.
+    #[test]
+    fn ordinary_trim_drops_pcm_wholly_outside_the_interval() {
+        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let source = mono_pcm(1, 10);
+        assert!(
+            export_pcm(&source, 0, &format, &ordinary_map(2_000_000, 5_000_000)).is_none(),
+            "packet ending at 0.1s is before a 0.2s start"
+        );
+        assert!(
+            export_pcm(&source, 2_000_000, &format, &ordinary_map(0, 2_000_000)).is_none(),
+            "packet starting at end is outside [start, end)"
+        );
+    }
+
+    #[test]
+    fn ordinary_trim_keeps_a_pcm_packet_wholly_inside_the_interval() {
+        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let source = mono_pcm(1, 10);
+        let (output, timestamp, duration) =
+            export_pcm(&source, 1_000_000, &format, &ordinary_map(0, 5_000_000)).unwrap();
+        assert_eq!(timestamp, 1_000_000);
+        assert_eq!(duration, 1_000_000);
+        assert_eq!(output, source);
+    }
+
+    /// Speed-section retiming already sliced PCM. Ordinary trims must use the
+    /// same [start, end) cut so the two paths cannot drift (SBS-751).
+    #[test]
+    fn ordinary_and_speed_trims_share_start_boundary_semantics() {
+        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let source = mono_pcm(1, 30);
+        let ordinary = ordinary_map(2_000_000, 5_000_000);
+        // Speed range sits after this packet so it must not change the clip.
+        let sped = crate::video_speed::TimeMap::new(
+            2_000_000,
+            5_000_000,
+            &[crate::video_speed::SpeedRange::new(4_500_000, 5_000_000, 4)],
+        )
+        .unwrap();
+        assert_eq!(
+            export_pcm(&source, 1_000_000, &format, &ordinary),
+            export_pcm(&source, 1_000_000, &format, &sped)
+        );
+    }
+
+    #[test]
+    fn ordinary_trim_clips_stereo_on_frame_boundaries() {
+        let format = crate::audio::Format { rate: 100, channels: 2 };
+        let mut source = Vec::new();
+        for frame in 1i16..=20 {
+            source.extend_from_slice(&frame.to_le_bytes());
+            source.extend_from_slice(&(-frame).to_le_bytes());
+        }
+        let (output, timestamp, duration) =
+            export_pcm(&source, 0, &format, &ordinary_map(0, 1_000_000)).unwrap();
+        assert_eq!(timestamp, 0);
+        assert_eq!(duration, 1_000_000);
+        assert_eq!(output.len() % 4, 0, "must not split a stereo frame");
+        assert_eq!(output, source[..10 * 4]);
+    }
+
+    #[test]
+    fn export_pcm_treats_an_unusable_rate_as_unknown_not_silence() {
+        let format = crate::audio::Format { rate: 0, channels: 1 };
+        let source = mono_pcm(1, 10);
+        assert!(
+            export_pcm(&source, 0, &format, &ordinary_map(0, TICKS_PER_SECOND)).is_none(),
+            "rate 0 cannot be clipped; do not invent silence"
+        );
+    }
+
+    /// Ordinary trims used to bypass clipping when the TimeMap had no speed
+    /// sections. That branch must stay gone (SBS-751).
+    #[test]
+    fn ordinary_trim_does_not_bypass_pcm_clipping_when_the_time_map_is_empty() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/trim.rs"));
+        // Built at runtime so this test source does not itself contain the
+        // production needle.
+        let bypass = format!("if time_map.{}()", "is_empty");
+        assert!(
+            !src.contains(&bypass),
+            "empty TimeMap must not skip PCM clipping"
+        );
+        // Unique to the old ordinary-trim pass-through. Split so this test
+        // source does not itself contain the needle.
+        let old_duration = format!("unwrap_or({}_{})", "100", "000");
+        assert!(
+            !src.contains(&old_duration),
+            "ordinary trims must not write the decoder's whole-sample duration"
+        );
+        // The export loop's own call site, not any of the call sites in this
+        // test module, so removing the production call fails this. Split for
+        // the same reason as the needles above.
+        let production_call = format!("export_pcm(&source_{}, ts,", "bytes");
+        assert!(
+            src.contains(&production_call),
+            "the export loop must hand its audio packet to export_pcm"
+        );
+    }
+
+    #[test]
+    fn audio_that_starts_before_the_trim_is_not_skipped() {
+        // A packet at 0.05s with 0.1s of PCM still overlaps a trim that
+        // starts at 0.1s. Video of the same timestamp is still dropped.
+        assert!(
+            !sample_is_before_trim_start(false, 500_000, 1_000_000),
+            "audio that straddles the start must reach export_pcm"
+        );
+        assert!(
+            sample_is_before_trim_start(true, 500_000, 1_000_000),
+            "video before the start stays gated on timestamp"
+        );
+        assert!(!sample_is_before_trim_start(false, 1_000_000, 1_000_000));
+        assert!(!sample_is_before_trim_start(true, 1_000_000, 1_000_000));
+    }
 
     #[test]
     fn sped_audio_becomes_shorter_silence_while_surrounding_pcm_is_preserved() {
