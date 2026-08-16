@@ -4187,6 +4187,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let compose_opts = state_compose_opts(state);
                             let crop = state.crop;
                             let hwnd_raw = hwnd.0 as isize;
+                            let mailbox_generation = EXPORT_COMPLETIONS.generation_of(hwnd_raw);
                             let activity = Arc::new(Mutex::new(std::time::Instant::now()));
                             let finished = Arc::new(AtomicBool::new(false));
                             {
@@ -4270,7 +4271,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 };
                                 unsafe {
                                     let target = HWND(hwnd_raw as *mut _);
-                                    EXPORT_COMPLETIONS.post_with(hwnd_raw, done, |token| {
+                                    EXPORT_COMPLETIONS.post_with_at(hwnd_raw, mailbox_generation, done, |token| {
                                         crate::window::has_class(target, "matteshot_recdone")
                                             && PostMessageW(
                                                 target,
@@ -4909,6 +4910,7 @@ pub fn show(
                 {
                     let source = (*state).mp4.clone();
                     let target = hwnd.0 as isize;
+                    let mailbox_generation = SCRUB_COMPLETIONS.generation_of(target);
                     std::thread::spawn(move || {
                         let com = CoInitializeEx(None, COINIT_MULTITHREADED);
                         let result = crate::trim::scrub_worker(
@@ -4919,8 +4921,9 @@ pub fn show(
                             |generation, bytes, fw, fh| {
                                 let hwnd = HWND(target as *mut _);
                                 let mut posted = false;
-                                SCRUB_COMPLETIONS.post_with(
+                                SCRUB_COMPLETIONS.post_with_at(
                                     target,
+                                    mailbox_generation,
                                     (generation, bytes, fw, fh),
                                     |token| {
                                         posted = crate::window::has_class(hwnd, "matteshot_recdone")
@@ -4950,6 +4953,7 @@ pub fn show(
                 // the scrub cache behind it.
                 let source = (*state).mp4.clone();
                 let target = hwnd.0 as isize;
+                let mailbox_generation = PROBE_COMPLETIONS.generation_of(target);
                 std::thread::spawn(move || {
                     let com = CoInitializeEx(None, COINIT_MULTITHREADED);
                     let started = std::time::Instant::now();
@@ -4965,7 +4969,7 @@ pub fn show(
                         return;
                     };
                     let hwnd = HWND(target as *mut _);
-                    PROBE_COMPLETIONS.post_with(target, probed, |token| {
+                    PROBE_COMPLETIONS.post_with_at(target, mailbox_generation, probed, |token| {
                         crate::window::has_class(hwnd, "matteshot_recdone")
                             && PostMessageW(
                                 hwnd,

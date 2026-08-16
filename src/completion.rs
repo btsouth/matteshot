@@ -55,15 +55,23 @@ impl<T> CompletionMailbox<T> {
     fn mint_token(&self) -> CompletionToken {
         // Mix the counter so tokens are not 0/1 (the forged LPARAMs in the
         // SBS-743 acceptance check) and do not look like heap pointers.
+        // Mask to isize::MAX so LPARAM(token as isize) round-trips on both
+        // 32-bit and 64-bit Windows (the high bit would sign-extend).
+        const LPARAM_TOKEN_MASK: u64 = isize::MAX as u64;
         loop {
-            let token = splitmix64(self.next.fetch_add(1, Ordering::Relaxed));
+            let token = splitmix64(self.next.fetch_add(1, Ordering::Relaxed)) & LPARAM_TOKEN_MASK;
             if token > 1 {
                 return token;
             }
         }
     }
 
+    pub fn generation_of(&self, hwnd: isize) -> u64 {
+        self.lock().generation(hwnd)
+    }
+
     /// Store `payload` for `hwnd` at the window's current generation.
+    #[cfg(test)]
     pub fn insert(&self, hwnd: isize, payload: T) -> CompletionToken {
         let token = self.mint_token();
         let mut inner = self.lock();
@@ -77,13 +85,40 @@ impl<T> CompletionMailbox<T> {
         token
     }
 
+    /// Store `payload` only when `generation` is still this window's generation.
+    /// A worker snapshots before spawn; unbind in between refuses the insert.
+    pub fn insert_at(&self, hwnd: isize, generation: u64, payload: T) -> Option<CompletionToken> {
+        let token = self.mint_token();
+        let mut inner = self.lock();
+        if inner.generation(hwnd) != generation {
+            return None;
+        }
+        inner.pending.push(Slot {
+            token,
+            hwnd,
+            generation,
+            payload,
+        });
+        Some(token)
+    }
+
     /// Insert, then run `post(token)`. If posting fails, drop the token so
     /// the payload cannot leak for a window that will never receive it.
+    #[cfg(test)]
     pub fn post_with<F>(&self, hwnd: isize, payload: T, post: F)
     where
         F: FnOnce(CompletionToken) -> bool,
     {
-        let token = self.insert(hwnd, payload);
+        self.post_with_at(hwnd, self.generation_of(hwnd), payload, post);
+    }
+
+    pub fn post_with_at<F>(&self, hwnd: isize, generation: u64, payload: T, post: F)
+    where
+        F: FnOnce(CompletionToken) -> bool,
+    {
+        let Some(token) = self.insert_at(hwnd, generation, payload) else {
+            return;
+        };
         if !post(token) {
             self.discard_token(token);
         }
@@ -233,5 +268,27 @@ mod tests {
         assert_eq!(mailbox.pending_len(), 0);
         mailbox.post_with(0x100, "kept", |_| true);
         assert_eq!(mailbox.pending_len(), 1);
+    }
+
+    #[test]
+    fn insert_at_a_stale_generation_does_not_store_or_deliver() {
+        let mailbox = CompletionMailbox::new();
+        let hwnd = 0x100;
+        let generation = mailbox.generation_of(hwnd);
+        mailbox.unbind(hwnd);
+        assert!(mailbox.insert_at(hwnd, generation, "stale").is_none());
+        assert_eq!(mailbox.pending_len(), 0);
+        assert!(mailbox.take(1, hwnd).is_none());
+    }
+
+    #[test]
+    fn minted_tokens_round_trip_through_isize_lparam() {
+        let mailbox = CompletionMailbox::<u32>::new();
+        for i in 0..64 {
+            let token = mailbox.insert(0x10, i);
+            let lp = token as isize;
+            assert_eq!(lp as u64, token, "token {:#x} truncated through isize", token);
+            assert!(token <= isize::MAX as u64);
+        }
     }
 }

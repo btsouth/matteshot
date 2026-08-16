@@ -426,12 +426,14 @@ unsafe fn begin_activation(hwnd: HWND, state: &mut UiState) {
     let _ = InvalidateRect(hwnd, None, false);
     let _ = UpdateWindow(hwnd);
     let hwnd_raw = hwnd.0 as isize;
+    let mailbox_generation = ACTIVATION_COMPLETIONS.generation_of(hwnd_raw);
     std::thread::spawn(move || {
         let result = crate::license::activate(&key)
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
-        ACTIVATION_COMPLETIONS.post_with(
+        ACTIVATION_COMPLETIONS.post_with_at(
             hwnd_raw,
+            mailbox_generation,
             ActivationDone { result },
             |token| unsafe {
                 PostMessageW(

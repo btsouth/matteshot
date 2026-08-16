@@ -163,10 +163,12 @@ fn share_link_is_canonical(url: &str) -> bool {
 pub fn share_in_background(hwnd: HWND, path: PathBuf) -> u64 {
     let request_id = SHARE_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let hwnd_value = hwnd.0 as isize;
+    let mailbox_generation = SHARE_COMPLETIONS.generation_of(hwnd_value);
     std::thread::spawn(move || {
         let outcome: ShareOutcome = share_file(&path).map_err(|error| format!("{error:#}"));
-        SHARE_COMPLETIONS.post_with(
+        SHARE_COMPLETIONS.post_with_at(
             hwnd_value,
+            mailbox_generation,
             ShareCompletion {
                 request_id,
                 outcome,

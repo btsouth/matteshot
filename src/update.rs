@@ -276,14 +276,14 @@ fn post_token(hwnd_value: isize, message: u32, token: u64) -> bool {
     }
 }
 
-fn post_available(hwnd_value: isize, payload: AvailableUpdate) {
-    AVAILABLE_UPDATES.post_with(hwnd_value, payload, |token| {
+fn post_available(hwnd_value: isize, generation: u64, payload: AvailableUpdate) {
+    AVAILABLE_UPDATES.post_with_at(hwnd_value, generation, payload, |token| {
         post_token(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, token)
     });
 }
 
-fn post_installing(hwnd_value: isize, payload: String) {
-    INSTALLING_VERSIONS.post_with(hwnd_value, payload, |token| {
+fn post_installing(hwnd_value: isize, generation: u64, payload: String) {
+    INSTALLING_VERSIONS.post_with_at(hwnd_value, generation, payload, |token| {
         post_token(hwnd_value, crate::tray::WM_UPDATE_INSTALLING, token)
     });
 }
@@ -304,7 +304,7 @@ pub fn discard_window(hwnd: isize) {
 /// Fetch and verify the installer, then install it the moment the user is not
 /// in the middle of something. Returns only if the update could not be applied;
 /// a successful install replaces this process.
-fn apply(hwnd_value: isize, update: &AvailableUpdate) -> Result<()> {
+fn apply(hwnd_value: isize, generation: u64, update: &AvailableUpdate) -> Result<()> {
     let staged = crate::installer::stage(&update.download_url, &update.version, |_| {})?;
     crate::diagnostics::log("update staged and verified");
 
@@ -322,7 +322,7 @@ fn apply(hwnd_value: isize, update: &AvailableUpdate) -> Result<()> {
         waited += IDLE_POLL;
     }
 
-    post_installing(hwnd_value, update.version.clone());
+    post_installing(hwnd_value, generation, update.version.clone());
     thread::sleep(BALLOON_GRACE);
     crate::diagnostics::log("update installing");
     crate::installer::launch(&staged)
@@ -348,6 +348,8 @@ fn auto_install_decision<E>(loaded: Result<crate::config::Config, E>) -> AutoIns
 /// Failures are deliberately silent and retried at the next interval.
 pub fn start(hwnd: HWND) {
     let hwnd_value = hwnd.0 as isize;
+    let available_generation = AVAILABLE_UPDATES.generation_of(hwnd_value);
+    let installing_generation = INSTALLING_VERSIONS.generation_of(hwnd_value);
     thread::spawn(move || {
         let mut handled_version: Option<String> = None;
         let mut notified_version: Option<String> = None;
@@ -362,7 +364,7 @@ pub fn start(hwnd: HWND) {
                     }
                     let decision = auto_install_decision(loaded);
                     if notified_version.as_deref() != Some(update.version.as_str()) {
-                        post_available(hwnd_value, update.clone());
+                        post_available(hwnd_value, available_generation, update.clone());
                         notified_version = Some(update.version.clone());
                     }
                     match decision {
@@ -372,7 +374,7 @@ pub fn start(hwnd: HWND) {
                         }
                         AutoInstallDecision::Apply => {
                             handled_version = Some(update.version.clone());
-                            if let Err(error) = apply(hwnd_value, &update) {
+                            if let Err(error) = apply(hwnd_value, installing_generation, &update) {
                                 // Staging failed or the installer would not start.
                                 // The tray still offers the manual download, so
                                 // this is a quiet degradation, not a dead end.

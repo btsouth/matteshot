@@ -1256,6 +1256,7 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
     let raw = state.doc().content().clone();
     let (ox, oy) = state.doc().content_origin();
     let target = hwnd.0 as isize;
+    let mailbox_generation = OCR_COMPLETIONS.generation_of(target);
     std::thread::spawn(move || {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
         let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -1279,7 +1280,7 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
         }
         unsafe {
             let hwnd = HWND(target as *mut _);
-            OCR_COMPLETIONS.post_with(target, completion, |token| {
+            OCR_COMPLETIONS.post_with_at(target, mailbox_generation, completion, |token| {
                 crate::window::has_class(hwnd, "matteshot_tweak")
                     && PostMessageW(hwnd, WM_OCR_READY, WPARAM(0), LPARAM(token as isize)).is_ok()
             });
