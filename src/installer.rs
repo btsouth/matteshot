@@ -609,6 +609,7 @@ mod tests {
         let error = launch(&missing).unwrap_err().to_string();
         assert!(error.contains("staged installer is missing"), "{error}");
     }
+
     /// Pins SBS-764: the legacy nonzero `--quit` path must still exist, and
     /// it must resolve taskkill through the native System32 directory.
     #[test]
@@ -623,8 +624,8 @@ mod tests {
             "unqualified taskkill.exe is the SBS-764 failure mode"
         );
         assert!(
-            source.contains("ExecWithNativeSysDir('taskkill.exe'"),
-            "legacy close must use ExecWithNativeSysDir"
+            source.contains("ExpandConstant('{sys}\\taskkill.exe')"),
+            "legacy close must Exec native {{sys}}\\taskkill.exe"
         );
     }
 }

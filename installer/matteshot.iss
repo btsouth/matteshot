@@ -115,7 +115,7 @@ begin
       // Native System32, never an unqualified name: a decoy taskkill.exe
       // beside the installer must not run (SBS-764). Routing through cmd
       // would flash a console during an otherwise invisible update.
-      ExecWithNativeSysDir('taskkill.exe', '/im matteshot.exe', '', SW_HIDE,
+      Exec(ExpandConstant('{sys}\taskkill.exe'), '/im matteshot.exe', '', SW_HIDE,
         ewWaitUntilTerminated, R);
   end;
   Result := '';
