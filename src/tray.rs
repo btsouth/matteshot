@@ -471,7 +471,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.update = Some(*update);
                 if changed {
                     let version = &state.update.as_ref().unwrap().version;
-                    let automatic = crate::config::Config::load().auto_update;
+                    let automatic =
+                        crate::config::auto_update_from_load(crate::config::Config::try_load());
                     notify(
                         hwnd,
                         "Matteshot update available",
