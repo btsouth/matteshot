@@ -409,6 +409,8 @@ struct State {
     sharing: bool,
     /// Guards against a completion posted to a destroyed/reused HWND.
     share_request_id: Option<u64>,
+    /// Cached at open: Share is a paid-license action (SBS-906).
+    can_share: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -3106,6 +3108,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
             hdc,
             if primary {
                 state.theme.accent_text
+            } else if *act == Act::Share && !state.can_share {
+                state.theme.faint
             } else if hot {
                 state.theme.text
             } else {
@@ -4059,6 +4063,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // edit export — the recorded file is what these three
                         // buttons agree the "real" artifact is.
                         Act::Share => {
+                            if let crate::share::ShareStart::Unavailable(reason) =
+                                crate::share::share_start(crate::license::can_share())
+                            {
+                                state.status = Some(reason.into());
+                                let _ = InvalidateRect(hwnd, None, false);
+                                return LRESULT(0);
+                            }
                             // A second click while one upload is already in
                             // flight would start a redundant upload and let
                             // whichever WM_SHARE_COMPLETE lands last silently
@@ -4861,6 +4872,7 @@ pub fn show(
         scrub_generation: 0,
         sharing: false,
         share_request_id: None,
+        can_share: crate::license::can_share(),
     });
     recompose_preview(&mut state);
     let state = Box::into_raw(state);

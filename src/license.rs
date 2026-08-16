@@ -74,6 +74,13 @@ impl Status {
         !matches!(self, Status::Expired | Status::Unavailable)
     }
 
+    /// Share uploads attach `signed_certificate()`, which exists only for a
+    /// verified paid license. Trial, expired, unstarted, and unreadable
+    /// state cannot share (SBS-906).
+    pub fn can_share(&self) -> bool {
+        matches!(self, Status::Licensed { .. })
+    }
+
     /// How long this license is entitled to new versions, in words.
     ///
     /// Worth stating plainly. The term is the part of a perpetual license
@@ -779,6 +786,13 @@ pub fn status() -> Status {
     set_registry_time(REGISTRY_LAST_SEEN, effective_now);
     let _ = save_state(&state);
     remember_status(trial_status_at(started, previous_seen, now))
+}
+
+/// Whether this device can actually share: a verifiable paid certificate
+/// is present. Same condition `share_file` uses; a trial certificate is
+/// not enough (SBS-906).
+pub fn can_share() -> bool {
+    signed_certificate().is_some()
 }
 
 /// The signed certificate + signature this device's license holds, for
@@ -1628,10 +1642,34 @@ mod tests {
             Status::Unavailable
         );
         assert!(!Status::Unavailable.can_capture());
+        assert!(!Status::Unavailable.can_share());
         assert_eq!(
             Status::Unavailable.tray_label(),
             "License state temporarily unavailable"
         );
+    }
+
+    /// SBS-906: Share is a paid-license action. The entitlement class must
+    /// not collapse trial or unreadable state into "can share".
+    #[test]
+    fn only_a_paid_license_status_can_share() {
+        assert!(Status::Licensed {
+            customer_email: None,
+            updates_until: None,
+        }
+        .can_share());
+        for status in [
+            Status::TrialNotStarted,
+            Status::Trial { days_left: 14 },
+            Status::Trial { days_left: 1 },
+            Status::Unavailable,
+            Status::Expired,
+        ] {
+            assert!(!status.can_share(), "for {status:?}");
+        }
+        // Trial can still capture; Share is the stricter paid-only gate.
+        assert!(Status::Trial { days_left: 14 }.can_capture());
+        assert!(!Status::Trial { days_left: 14 }.can_share());
     }
 
     #[test]

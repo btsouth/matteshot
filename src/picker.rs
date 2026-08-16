@@ -52,13 +52,14 @@ enum KeyAction {
     Hover(i32),
 }
 
-fn key_action(vk: u16, hover: i32, count: usize) -> Option<KeyAction> {
+fn key_action(vk: u16, hover: i32, count: usize, can_share: bool) -> Option<KeyAction> {
     let selected = (count > 0).then(|| (hover.max(0) as usize).min(count - 1));
     match vk {
         v if v == VK_ESCAPE.0 => Some(KeyAction::Cancel),
         v if v == VK_RETURN.0 => selected.map(KeyAction::Choose),
         0x54 => selected.map(KeyAction::Tweak), // T
-        0x53 => selected.map(KeyAction::Share), // S
+        // S is Share only when a paid license can actually upload (SBS-906).
+        0x53 if can_share => selected.map(KeyAction::Share),
         0x50 => Some(KeyAction::Pin),           // P
         0x43 => Some(KeyAction::CopyText),      // C
         v if v == VK_LEFT.0 && count > 0 => Some(KeyAction::Hover(
@@ -218,6 +219,18 @@ struct State {
     /// cancel-on-focus-loss behavior.
     suspended: bool,
     theme: crate::theme::Theme,
+    /// Cached at open: Share is a paid-license action (SBS-906).
+    can_share: bool,
+}
+
+/// Hint line under the strip. "S share" is omitted unless a paid license
+/// can actually share — offering it to a trial user is SBS-906.
+fn hint_text(can_share: bool) -> String {
+    if can_share {
+        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   S share   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc".into()
+    } else {
+        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc".into()
+    }
 }
 
 fn to_bgra(img: &RgbaImage) -> Vec<u8> {
@@ -339,9 +352,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // Hint line along the bottom.
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.faint);
-    let mut hint = wide(
-        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   S share   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
-    );
+    let mut hint = wide(&hint_text(state.can_share));
     let mut hint_rect = RECT {
         left: 0,
         top: state.height - HINT_H - 4,
@@ -450,7 +461,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_KEYDOWN => {
             if let Some(state) = state_of(hwnd) {
                 let vk = wparam.0 as u16;
-                match key_action(vk, state.hover, state.thumbs.len()) {
+                match key_action(vk, state.hover, state.thumbs.len(), state.can_share) {
                     Some(KeyAction::Cancel) => finish(hwnd, state, PickAction::Cancel),
                     Some(KeyAction::Choose(index)) => {
                         finish(hwnd, state, PickAction::Choose(index))
@@ -550,6 +561,7 @@ pub fn pick(
         height: total_h,
         suspended: false,
         theme: crate::theme::current(),
+        can_share: crate::license::can_share(),
     });
 
     unsafe {
@@ -604,36 +616,49 @@ pub fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::{key_action, layout, should_cancel_on_deactivate, KeyAction, THUMB_H};
+    use super::{hint_text, key_action, layout, should_cancel_on_deactivate, KeyAction, THUMB_H};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
     };
 
     #[test]
     fn picker_shortcuts_choose_the_visible_variant() {
-        assert_eq!(key_action(VK_RETURN.0, 3, 7), Some(KeyAction::Choose(3)));
-        assert_eq!(key_action(0x54, 3, 7), Some(KeyAction::Tweak(3)));
-        assert_eq!(key_action(0x53, 3, 7), Some(KeyAction::Share(3)));
-        assert_eq!(key_action(0x50, 3, 7), Some(KeyAction::Pin));
-        assert_eq!(key_action(0x43, 3, 7), Some(KeyAction::CopyText));
-        assert_eq!(key_action(VK_ESCAPE.0, 3, 7), Some(KeyAction::Cancel));
+        assert_eq!(key_action(VK_RETURN.0, 3, 7, true), Some(KeyAction::Choose(3)));
+        assert_eq!(key_action(0x54, 3, 7, true), Some(KeyAction::Tweak(3)));
+        assert_eq!(key_action(0x53, 3, 7, true), Some(KeyAction::Share(3)));
+        assert_eq!(key_action(0x50, 3, 7, true), Some(KeyAction::Pin));
+        assert_eq!(key_action(0x43, 3, 7, true), Some(KeyAction::CopyText));
+        assert_eq!(key_action(VK_ESCAPE.0, 3, 7, true), Some(KeyAction::Cancel));
+    }
+
+    /// SBS-906: trial (and any other unpaid state) must not be offered Share.
+    #[test]
+    fn picker_does_not_offer_share_without_a_paid_license() {
+        assert_eq!(key_action(0x53, 3, 7, false), None);
+        assert_eq!(key_action(0x54, 3, 7, false), Some(KeyAction::Tweak(3)));
+        let licensed = hint_text(true);
+        let trial = hint_text(false);
+        assert!(licensed.contains("S share"), "{licensed}");
+        assert!(!trial.contains("S share"), "{trial}");
+        assert!(trial.contains("T tweak"), "{trial}");
+        assert!(trial.contains("C copy text"), "{trial}");
     }
 
     #[test]
     fn picker_arrows_wrap_and_recover_an_unset_hover() {
-        assert_eq!(key_action(VK_LEFT.0, 0, 7), Some(KeyAction::Hover(6)));
-        assert_eq!(key_action(VK_RIGHT.0, 6, 7), Some(KeyAction::Hover(0)));
-        assert_eq!(key_action(VK_RIGHT.0, -1, 7), Some(KeyAction::Hover(0)));
-        assert_eq!(key_action(VK_LEFT.0, -1, 7), Some(KeyAction::Hover(6)));
+        assert_eq!(key_action(VK_LEFT.0, 0, 7, true), Some(KeyAction::Hover(6)));
+        assert_eq!(key_action(VK_RIGHT.0, 6, 7, true), Some(KeyAction::Hover(0)));
+        assert_eq!(key_action(VK_RIGHT.0, -1, 7, true), Some(KeyAction::Hover(0)));
+        assert_eq!(key_action(VK_LEFT.0, -1, 7, true), Some(KeyAction::Hover(6)));
     }
 
     #[test]
     fn numeric_shortcuts_cannot_select_a_missing_variant() {
-        assert_eq!(key_action(0x31, 0, 7), Some(KeyAction::Choose(0)));
-        assert_eq!(key_action(0x37, 0, 7), Some(KeyAction::Choose(6)));
-        assert_eq!(key_action(0x38, 0, 7), None);
-        assert_eq!(key_action(VK_RETURN.0, 0, 0), None);
-        assert_eq!(key_action(VK_RIGHT.0, 0, 0), None);
+        assert_eq!(key_action(0x31, 0, 7, true), Some(KeyAction::Choose(0)));
+        assert_eq!(key_action(0x37, 0, 7, true), Some(KeyAction::Choose(6)));
+        assert_eq!(key_action(0x38, 0, 7, true), None);
+        assert_eq!(key_action(VK_RETURN.0, 0, 0, true), None);
+        assert_eq!(key_action(VK_RIGHT.0, 0, 0, true), None);
     }
 
     /// Every cell inside the window, and the window inside the work area.

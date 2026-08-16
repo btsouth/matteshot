@@ -973,6 +973,32 @@ fn max_scroll(content_h: i32, viewport_h: i32) -> i32 {
 mod layout_tests {
     use super::*;
 
+    /// SBS-906: History must not offer Share to a trial (or any unpaid) user.
+    #[test]
+    fn history_omits_share_without_a_paid_license() {
+        let licensed: Vec<_> = history_menu_items(true)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        let trial: Vec<_> = history_menu_items(false)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert!(licensed.contains(&"Share link"));
+        assert!(!trial.contains(&"Share link"));
+        assert_eq!(
+            trial,
+            ["Copy", "Open in editor", "Show in folder", "Delete\u{2026}"]
+        );
+        assert_eq!(
+            history_menu_items(false)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+        );
+    }
+
     #[test]
     fn a_wide_viewport_fits_more_columns_than_a_narrow_one() {
         let (wide_cells, _) = grid_layout(12, 900, CELL_W, CELL_H, MARGIN, GAP);
@@ -1360,6 +1386,15 @@ unsafe fn reveal_entry(hwnd: HWND, entry: &Entry) {
 }
 
 unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
+    if let crate::share::ShareStart::Unavailable(reason) =
+        crate::share::share_start(crate::license::can_share())
+    {
+        if let Some(state) = state_of(hwnd) {
+            state.status = Some((reason.to_string(), std::time::Instant::now()));
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        return;
+    }
     if !require_owned_history_path(hwnd, &entry.path) {
         return;
     }
@@ -1409,17 +1444,31 @@ unsafe fn warn(hwnd: HWND, prefix: &str, error: &dyn std::fmt::Display) {
     let _ = MessageBoxW(hwnd, PCWSTR(message.as_ptr()), w!("Matteshot"), MB_OK | MB_ICONWARNING);
 }
 
+/// History context-menu rows. Share is omitted unless a paid license can
+/// actually upload (SBS-906). Command ids stay stable so Delete is always 5.
+fn history_menu_items(can_share: bool) -> Vec<(usize, &'static str)> {
+    let mut items = vec![
+        (1, "Copy"),
+        (2, "Open in editor"),
+        (3, "Show in folder"),
+    ];
+    if can_share {
+        items.push((4, "Share link"));
+    }
+    items.push((5, "Delete\u{2026}"));
+    items
+}
+
 /// No `State` reference is held across `TrackPopupMenu` below, for the same
 /// reason spelled out above the action functions: it pumps WM_TIMER for this
 /// window while blocked.
 unsafe fn context_menu(hwnd: HWND, entry: Entry) {
     crate::theme::enable_dark_menus();
     let Ok(menu) = CreatePopupMenu() else { return };
-    let _ = AppendMenuW(menu, MF_STRING, 1, w!("Copy"));
-    let _ = AppendMenuW(menu, MF_STRING, 2, w!("Open in editor"));
-    let _ = AppendMenuW(menu, MF_STRING, 3, w!("Show in folder"));
-    let _ = AppendMenuW(menu, MF_STRING, 4, w!("Share link"));
-    let _ = AppendMenuW(menu, MF_STRING, 5, w!("Delete\u{2026}"));
+    for (id, label) in history_menu_items(crate::license::can_share()) {
+        let text = HSTRING::from(label);
+        let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(text.as_ptr()));
+    }
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);

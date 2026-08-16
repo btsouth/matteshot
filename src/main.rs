@@ -374,6 +374,11 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             return tweak::open(raw, styles, i, monitor, capture_title);
         }
         PickAction::Share(i) => {
+            if let share::ShareStart::Unavailable(reason) =
+                share::share_start(license::can_share())
+            {
+                anyhow::bail!("{reason}");
+            }
             // Same reasoning as Tweak: an in-flight auto-copy of a
             // different variant must not land after this one uploads.
             if let Some(p) = cancel_auto() {
