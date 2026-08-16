@@ -7,7 +7,13 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
-$pwsh = (Get-Process -Id $PID).Path
+# Prefer pwsh 7 over "whatever launched this". audit-rust.ps1 parses JSON,
+# and Windows PowerShell 5.1 turns an empty JSON array into $null, so a run
+# started from powershell.exe would exercise a different parser than CI.
+$pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+if (-not $pwsh) {
+    $pwsh = (Get-Process -Id $PID).Path
+}
 
 Write-Host 'Running sandbox smoke result tests'
 & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'test-sandbox-smoke-result.ps1')

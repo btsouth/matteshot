@@ -19,7 +19,11 @@ if ($LASTEXITCODE -ne 0) {
     throw 'strict Clippy validation failed'
 }
 
-$pwsh = (Get-Process -Id $PID).Path
+# Same reason as verify-code.ps1: audit-rust.ps1 wants pwsh 7's JSON parser.
+$pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+if (-not $pwsh) {
+    $pwsh = (Get-Process -Id $PID).Path
+}
 & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'audit-rust.ps1')
 if ($LASTEXITCODE -ne 0) {
     throw 'RustSec audit failed'
