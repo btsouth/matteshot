@@ -72,7 +72,8 @@ fn sanitize_share_filename(name: &str, content_type: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '_' | '-'))
         .collect();
-    if filtered.chars().any(|c| c.is_ascii_alphanumeric()) {
+    let stem = filtered.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&filtered);
+    if stem.chars().any(|c| c.is_ascii_alphanumeric()) {
         return filtered;
     }
     match content_type {
@@ -221,7 +222,7 @@ pub fn share_file(path: &Path) -> Result<String> {
         &certificate,
         &signature,
         &device_id,
-        filename,
+        &filename,
         content_type,
     );
 
@@ -563,10 +564,17 @@ mod tests {
     }
 
     #[test]
-    fn punctuation_only_share_filename_is_not_used_as_is() {
-        assert_eq!(sanitize_share_filename("...", "image/png"), "capture.png");
-        assert_eq!(sanitize_share_filename("---", "video/mp4"), "capture.mp4");
-        assert_ne!(sanitize_share_filename("...", "image/png"), "...");
+    fn shareable_png_names_without_an_ascii_stem_use_the_capture_png_fallback() {
+        assert_eq!(
+            sanitize_share_filename("スクリーンショット.png", "image/png"),
+            "capture.png"
+        );
+        assert_eq!(sanitize_share_filename("---.png", "image/png"), "capture.png");
+        assert_eq!(sanitize_share_filename(".png", "image/png"), "capture.png");
+        assert_eq!(
+            sanitize_share_filename("matteshot.png", "image/png"),
+            "matteshot.png"
+        );
     }
 
     #[test]
