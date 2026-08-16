@@ -35,9 +35,13 @@ pub(crate) fn apply_autostart_toggle<E: std::fmt::Display>(
     set: impl FnOnce(bool) -> Result<(), E>,
     is_enabled: impl FnOnce() -> bool,
 ) -> AutostartToggle {
+    // `{:#}` and not `to_string`: production passes `tray::set_autostart`,
+    // whose errors are anyhow contexts. Plain Display prints the outermost
+    // context alone, so a real Access Denied would reach the dialog as the
+    // tautology "write the autostart shortcut" with the OS cause dropped.
     let set_error = match set(want_enabled) {
         Ok(()) => None,
-        Err(error) => Some(error.to_string()),
+        Err(error) => Some(format!("{error:#}")),
     };
     let enabled = is_enabled();
     if set_error.is_none() && enabled == want_enabled {
@@ -128,6 +132,31 @@ mod tests {
             "error must keep the writer reason: {error}"
         );
         assert_eq!(out.diagnostic, Some(REMOVE_FAILED));
+    }
+
+    /// The unit tests above pass a `&'static str`, which cannot catch a
+    /// dropped anyhow cause chain. Production passes `tray::set_autostart`,
+    /// which wraps the OS error in `.context("write the autostart
+    /// shortcut")`; that context alone tells the user nothing.
+    #[test]
+    fn the_writer_reason_keeps_the_anyhow_cause_chain() {
+        let out = apply_autostart_toggle(
+            true,
+            |_| {
+                Err(anyhow::anyhow!("Access is denied. (os error 5)")
+                    .context("write the autostart shortcut"))
+            },
+            || false,
+        );
+        let error = out.error.expect("create failure must surface an error");
+        assert!(
+            error.contains("Access is denied"),
+            "the OS cause was dropped from the dialog: {error}"
+        );
+        assert!(
+            error.contains("write the autostart shortcut"),
+            "the outer context is still worth showing: {error}"
+        );
     }
 
     /// Successful enable/disable must stay silent. The old path already
