@@ -41,6 +41,9 @@ struct ActivationDone {
     result: std::result::Result<(), String>,
 }
 
+static ACTIVATION_COMPLETIONS: crate::completion::CompletionMailbox<ActivationDone> =
+    crate::completion::CompletionMailbox::new();
+
 struct UiState {
     edit: HWND,
     activated: bool,
@@ -423,24 +426,25 @@ unsafe fn begin_activation(hwnd: HWND, state: &mut UiState) {
     let _ = InvalidateRect(hwnd, None, false);
     let _ = UpdateWindow(hwnd);
     let hwnd_raw = hwnd.0 as isize;
+    let mailbox_generation = ACTIVATION_COMPLETIONS.generation_of(hwnd_raw);
     std::thread::spawn(move || {
         let result = crate::license::activate(&key)
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
-        let done = Box::new(ActivationDone { result });
-        let done_ptr = Box::into_raw(done);
-        unsafe {
-            if PostMessageW(
-                HWND(hwnd_raw as *mut _),
-                WM_ACTIVATION_DONE,
-                WPARAM(0),
-                LPARAM(done_ptr as isize),
-            )
-            .is_err()
-            {
-                drop(Box::from_raw(done_ptr));
-            }
-        }
+        ACTIVATION_COMPLETIONS.post_with_at(
+            hwnd_raw,
+            mailbox_generation,
+            ActivationDone { result },
+            |token| unsafe {
+                PostMessageW(
+                    HWND(hwnd_raw as *mut _),
+                    WM_ACTIVATION_DONE,
+                    WPARAM(0),
+                    LPARAM(token as isize),
+                )
+                .is_ok()
+            },
+        );
     });
 }
 
@@ -506,10 +510,9 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_ACTIVATION_DONE => {
-            if lparam.0 == 0 {
+            let Some(done) = ACTIVATION_COMPLETIONS.take(lparam.0 as u64, hwnd.0 as isize) else {
                 return LRESULT(0);
-            }
-            let done = Box::from_raw(lparam.0 as *mut ActivationDone);
+            };
             if let Some(state) = state(hwnd) {
                 state.activating = false;
                 let _ = EnableWindow(state.edit, true);
@@ -613,7 +616,10 @@ unsafe extern "system" fn wndproc(
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
-        WM_DESTROY => LRESULT(0),
+        WM_DESTROY => {
+            ACTIVATION_COMPLETIONS.unbind(hwnd.0 as isize);
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }

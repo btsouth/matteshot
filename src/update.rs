@@ -259,27 +259,52 @@ pub fn check_once() -> Result<Option<AvailableUpdate>> {
     Ok(update)
 }
 
-fn post<T>(hwnd_value: isize, message: u32, payload: T) {
-    let raw = Box::into_raw(Box::new(payload));
-    let posted = unsafe {
+static AVAILABLE_UPDATES: crate::completion::CompletionMailbox<AvailableUpdate> =
+    crate::completion::CompletionMailbox::new();
+static INSTALLING_VERSIONS: crate::completion::CompletionMailbox<String> =
+    crate::completion::CompletionMailbox::new();
+
+fn post_token(hwnd_value: isize, message: u32, token: u64) -> bool {
+    unsafe {
         PostMessageW(
             HWND(hwnd_value as *mut c_void),
             message,
             WPARAM(0),
-            LPARAM(raw as isize),
+            LPARAM(token as isize),
         )
-    };
-    if posted.is_err() {
-        unsafe {
-            drop(Box::from_raw(raw));
-        }
+        .is_ok()
     }
+}
+
+fn post_available(hwnd_value: isize, generation: u64, payload: AvailableUpdate) {
+    AVAILABLE_UPDATES.post_with_at(hwnd_value, generation, payload, |token| {
+        post_token(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, token)
+    });
+}
+
+fn post_installing(hwnd_value: isize, generation: u64, payload: String) {
+    INSTALLING_VERSIONS.post_with_at(hwnd_value, generation, payload, |token| {
+        post_token(hwnd_value, crate::tray::WM_UPDATE_INSTALLING, token)
+    });
+}
+
+pub fn take_available(token: u64, hwnd: isize) -> Option<AvailableUpdate> {
+    AVAILABLE_UPDATES.take(token, hwnd)
+}
+
+pub fn take_installing(token: u64, hwnd: isize) -> Option<String> {
+    INSTALLING_VERSIONS.take(token, hwnd)
+}
+
+pub fn discard_window(hwnd: isize) {
+    AVAILABLE_UPDATES.unbind(hwnd);
+    INSTALLING_VERSIONS.unbind(hwnd);
 }
 
 /// Fetch and verify the installer, then install it the moment the user is not
 /// in the middle of something. Returns only if the update could not be applied;
 /// a successful install replaces this process.
-fn apply(hwnd_value: isize, update: &AvailableUpdate) -> Result<()> {
+fn apply(hwnd_value: isize, generation: u64, update: &AvailableUpdate) -> Result<()> {
     let staged = crate::installer::stage(&update.download_url, &update.version, |_| {})?;
     crate::diagnostics::log("update staged and verified");
 
@@ -297,11 +322,7 @@ fn apply(hwnd_value: isize, update: &AvailableUpdate) -> Result<()> {
         waited += IDLE_POLL;
     }
 
-    post(
-        hwnd_value,
-        crate::tray::WM_UPDATE_INSTALLING,
-        update.version.clone(),
-    );
+    post_installing(hwnd_value, generation, update.version.clone());
     thread::sleep(BALLOON_GRACE);
     crate::diagnostics::log("update installing");
     crate::installer::launch(&staged)
@@ -327,6 +348,8 @@ fn auto_install_decision<E>(loaded: Result<crate::config::Config, E>) -> AutoIns
 /// Failures are deliberately silent and retried at the next interval.
 pub fn start(hwnd: HWND) {
     let hwnd_value = hwnd.0 as isize;
+    let available_generation = AVAILABLE_UPDATES.generation_of(hwnd_value);
+    let installing_generation = INSTALLING_VERSIONS.generation_of(hwnd_value);
     thread::spawn(move || {
         let mut handled_version: Option<String> = None;
         let mut notified_version: Option<String> = None;
@@ -341,7 +364,7 @@ pub fn start(hwnd: HWND) {
                     }
                     let decision = auto_install_decision(loaded);
                     if notified_version.as_deref() != Some(update.version.as_str()) {
-                        post(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, update.clone());
+                        post_available(hwnd_value, available_generation, update.clone());
                         notified_version = Some(update.version.clone());
                     }
                     match decision {
@@ -351,7 +374,7 @@ pub fn start(hwnd: HWND) {
                         }
                         AutoInstallDecision::Apply => {
                             handled_version = Some(update.version.clone());
-                            if let Err(error) = apply(hwnd_value, &update) {
+                            if let Err(error) = apply(hwnd_value, installing_generation, &update) {
                                 // Staging failed or the installer would not start.
                                 // The tray still offers the manual download, so
                                 // this is a quiet degradation, not a dead end.
@@ -644,5 +667,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(update.version, "1.5.0");
+    }
+
+    /// Pins SBS-743: a forged update LPARAM must not consume a real payload.
+    #[test]
+    fn forged_update_lparams_do_not_take_a_real_completion() {
+        let hwnd = 0x7A11;
+        let token = AVAILABLE_UPDATES.insert(
+            hwnd,
+            AvailableUpdate {
+                version: "1.2.3".into(),
+                download_url: "https://download.matteshot.app/MatteshotSetup.exe".into(),
+            },
+        );
+        for forged in [0_u64, 1, 0x7fff_ffff, 0xDEAD_BEEF] {
+            assert_ne!(token, forged);
+            assert!(take_available(forged, hwnd).is_none());
+        }
+        let got = take_available(token, hwnd).expect("real token");
+        assert_eq!(got.version, "1.2.3");
+        assert!(take_available(token, hwnd).is_none());
     }
 }

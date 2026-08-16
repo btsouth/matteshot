@@ -127,6 +127,13 @@ struct ExportDone {
     result: std::result::Result<(), String>,
 }
 
+static EXPORT_COMPLETIONS: crate::completion::CompletionMailbox<ExportDone> =
+    crate::completion::CompletionMailbox::new();
+static PROBE_COMPLETIONS: crate::completion::CompletionMailbox<crate::trim::Probe> =
+    crate::completion::CompletionMailbox::new();
+static SCRUB_COMPLETIONS: crate::completion::CompletionMailbox<(u64, Vec<u8>, u32, u32)> =
+    crate::completion::CompletionMailbox::new();
+
 #[derive(Default)]
 struct PlaybackMailbox {
     frame: Option<(u64, crate::trim::PlaybackFrame)>,
@@ -3148,10 +3155,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_EXPORT_DONE => {
-            if lparam.0 == 0 {
+            let Some(done) = EXPORT_COMPLETIONS.take(lparam.0 as u64, hwnd.0 as isize) else {
                 return LRESULT(0);
-            }
-            let done = Box::from_raw(lparam.0 as *mut ExportDone);
+            };
             let mut close = false;
             if let Some(state) = state_of(hwnd) {
                 if state.export_id == Some(done.id) {
@@ -3193,10 +3199,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         crate::share::WM_SHARE_COMPLETE => {
-            if lparam.0 == 0 {
+            let Some(completion) = crate::share::take_completion(lparam.0 as u64, hwnd.0 as isize)
+            else {
                 return LRESULT(0);
-            }
-            let completion = *Box::from_raw(lparam.0 as *mut crate::share::ShareCompletion);
+            };
             let is_current = state_of(hwnd).is_some_and(|state| {
                 crate::share::accept_completion(&mut state.share_request_id, completion.request_id)
             });
@@ -3237,10 +3243,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_PROBE_READY => {
-            if lparam.0 == 0 {
+            let Some(probe) = PROBE_COMPLETIONS.take(lparam.0 as u64, hwnd.0 as isize) else {
                 return LRESULT(0);
-            }
-            let probe = Box::from_raw(lparam.0 as *mut crate::trim::Probe);
+            };
             if let Some(state) = state_of(hwnd) {
                 if !probe.thumbs.is_empty() {
                     state.raw_thumbs = probe.thumbs;
@@ -3271,10 +3276,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_SCRUB_FRAME => {
-            if lparam.0 == 0 {
+            let Some(frame) = SCRUB_COMPLETIONS.take(lparam.0 as u64, hwnd.0 as isize) else {
                 return LRESULT(0);
-            }
-            let frame = Box::from_raw(lparam.0 as *mut (u64, Vec<u8>, u32, u32));
+            };
             if let Some(state) = state_of(hwnd) {
                 // Playback owns the preview while it runs, and a frame for a
                 // position the user has already scrubbed past is stale.
@@ -4183,6 +4187,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let compose_opts = state_compose_opts(state);
                             let crop = state.crop;
                             let hwnd_raw = hwnd.0 as isize;
+                            let mailbox_generation = EXPORT_COMPLETIONS.generation_of(hwnd_raw);
                             let activity = Arc::new(Mutex::new(std::time::Instant::now()));
                             let finished = Arc::new(AtomicBool::new(false));
                             {
@@ -4259,25 +4264,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     unsafe { CoUninitialize() };
                                 }
                                 finished.store(true, Ordering::Relaxed);
-                                let done = Box::new(ExportDone {
+                                let done = ExportDone {
                                     id: export_id,
                                     path: dst,
                                     result,
-                                });
-                                let done_ptr = Box::into_raw(done);
+                                };
                                 unsafe {
                                     let target = HWND(hwnd_raw as *mut _);
-                                    if !crate::window::has_class(target, "matteshot_recdone")
-                                        || PostMessageW(
-                                            target,
-                                            WM_EXPORT_DONE,
-                                            WPARAM(0),
-                                            LPARAM(done_ptr as isize),
-                                        )
-                                        .is_err()
-                                    {
-                                        drop(Box::from_raw(done_ptr));
-                                    }
+                                    EXPORT_COMPLETIONS.post_with_at(hwnd_raw, mailbox_generation, done, |token| {
+                                        crate::window::has_class(target, "matteshot_recdone")
+                                            && PostMessageW(
+                                                target,
+                                                WM_EXPORT_DONE,
+                                                WPARAM(0),
+                                                LPARAM(token as isize),
+                                            )
+                                            .is_ok()
+                                    });
                                 }
                             });
                         }
@@ -4651,6 +4654,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            crate::share::discard_window(hwnd.0 as isize);
+            EXPORT_COMPLETIONS.unbind(hwnd.0 as isize);
+            PROBE_COMPLETIONS.unbind(hwnd.0 as isize);
+            SCRUB_COMPLETIONS.unbind(hwnd.0 as isize);
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
@@ -4903,6 +4910,7 @@ pub fn show(
                 {
                     let source = (*state).mp4.clone();
                     let target = hwnd.0 as isize;
+                    let mailbox_generation = SCRUB_COMPLETIONS.generation_of(target);
                     std::thread::spawn(move || {
                         let com = CoInitializeEx(None, COINIT_MULTITHREADED);
                         let result = crate::trim::scrub_worker(
@@ -4911,22 +4919,25 @@ pub fn show(
                             preview_h,
                             scrub_rx,
                             |generation, bytes, fw, fh| {
-                                let payload =
-                                    Box::into_raw(Box::new((generation, bytes, fw, fh)));
                                 let hwnd = HWND(target as *mut _);
-                                if !crate::window::has_class(hwnd, "matteshot_recdone")
-                                    || PostMessageW(
-                                        hwnd,
-                                        WM_SCRUB_FRAME,
-                                        WPARAM(0),
-                                        LPARAM(payload as isize),
-                                    )
-                                    .is_err()
-                                {
-                                    drop(Box::from_raw(payload));
-                                    return false;
-                                }
-                                true
+                                let mut posted = false;
+                                SCRUB_COMPLETIONS.post_with_at(
+                                    target,
+                                    mailbox_generation,
+                                    (generation, bytes, fw, fh),
+                                    |token| {
+                                        posted = crate::window::has_class(hwnd, "matteshot_recdone")
+                                            && PostMessageW(
+                                                hwnd,
+                                                WM_SCRUB_FRAME,
+                                                WPARAM(0),
+                                                LPARAM(token as isize),
+                                            )
+                                            .is_ok();
+                                        posted
+                                    },
+                                );
+                                posted
                             },
                         );
                         if result.is_err() {
@@ -4942,6 +4953,7 @@ pub fn show(
                 // the scrub cache behind it.
                 let source = (*state).mp4.clone();
                 let target = hwnd.0 as isize;
+                let mailbox_generation = PROBE_COMPLETIONS.generation_of(target);
                 std::thread::spawn(move || {
                     let com = CoInitializeEx(None, COINIT_MULTITHREADED);
                     let started = std::time::Instant::now();
@@ -4956,14 +4968,17 @@ pub fn show(
                         crate::diagnostics::log("editor filmstrip probe failed");
                         return;
                     };
-                    let payload = Box::into_raw(Box::new(probed));
                     let hwnd = HWND(target as *mut _);
-                    if !crate::window::has_class(hwnd, "matteshot_recdone")
-                        || PostMessageW(hwnd, WM_PROBE_READY, WPARAM(0), LPARAM(payload as isize))
-                            .is_err()
-                    {
-                        drop(Box::from_raw(payload));
-                    }
+                    PROBE_COMPLETIONS.post_with_at(target, mailbox_generation, probed, |token| {
+                        crate::window::has_class(hwnd, "matteshot_recdone")
+                            && PostMessageW(
+                                hwnd,
+                                WM_PROBE_READY,
+                                WPARAM(0),
+                                LPARAM(token as isize),
+                            )
+                            .is_ok()
+                    });
                 });
             }
             Err(_) => drop(Box::from_raw(state)),
