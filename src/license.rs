@@ -410,10 +410,11 @@ fn remove_pre_dpapi_backup_at(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 fn load_state_at(path: &std::path::Path) -> Result<State> {
-    // Leftover 0.19.0 sidecar is live plaintext. Delete before taking the
-    // mutex, and even if the lock fails — delete does not need it.
-    let _ = remove_pre_dpapi_backup_at(path);
     let state = load_state_from(path)?;
+    // Leftover 0.19.0 sidecar is live plaintext. Only delete after this
+    // license.json has actually loaded, so a parse or sharing-violation
+    // error cannot strand the user without the sidecar.
+    let _ = remove_pre_dpapi_backup_at(path);
     if !needs_token_protection(&state) {
         return Ok(state);
     }
@@ -1479,6 +1480,29 @@ mod tests {
         assert!(
             !sidecar.exists(),
             "a leftover sidecar whose token still matches the live one survived load"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn an_unreadable_license_json_does_not_delete_the_sidecar() {
+        let path = temporary_state_path("pre-dpapi-unreadable");
+        let sidecar = pre_dpapi_backup_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+        std::fs::write(&path, b"{ paid activation interrupted").unwrap();
+        std::fs::write(&sidecar, b"{\"license\":{}}").unwrap();
+
+        assert!(load_state_at(&path).is_err());
+        assert!(
+            sidecar.exists(),
+            "a failed license.json load must not delete the leftover sidecar"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{ paid activation interrupted"
         );
 
         let _ = std::fs::remove_file(&path);
