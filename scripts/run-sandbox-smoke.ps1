@@ -6,10 +6,22 @@ param(
     [string]$LicenseKeyPath,
 
     [Parameter(Mandatory = $true)]
-    [string]$WorkDirectory
+    [string]$WorkDirectory,
+
+    # How long the host waits for the guest result.json (SBS-901).
+    # Default 20 minutes covers install + capture + license + uninstall.
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$TimeoutSeconds = 1200
 )
 
 $ErrorActionPreference = "Stop"
+
+try {
+    . (Join-Path $PSScriptRoot "sandbox-smoke-result.ps1")
+} catch {
+    Write-Host "FAIL: sandbox smoke helper could not be loaded: $($_.Exception.Message)"
+    exit 1
+}
 
 $sandbox = (Get-Command "WindowsSandbox.exe" -ErrorAction Stop).Source
 $installer = (Resolve-Path $InstallerPath).Path
@@ -19,6 +31,7 @@ $payload = Join-Path $work "payload"
 $results = Join-Path $work "results"
 
 New-Item -ItemType Directory -Force $payload, $results | Out-Null
+Clear-SandboxSmokePriorResult -ResultsDirectory $results
 Copy-Item $installer (Join-Path $payload (Split-Path $installer -Leaf))
 Copy-Item $licenseKey (Join-Path $payload "license-key.txt")
 Copy-Item `
@@ -54,5 +67,25 @@ $configPath = Join-Path $work "matteshot-smoke.wsb"
 $configuration | Set-Content -Encoding UTF8 $configPath
 
 Write-Host "Starting isolated Matteshot acceptance test."
-Start-Process -FilePath $sandbox -ArgumentList "`"$configPath`"" | Out-Null
-Write-Host "Results will be written to $results"
+try {
+    $sandboxProcess = Start-Process `
+        -FilePath $sandbox `
+        -ArgumentList "`"$configPath`"" `
+        -PassThru
+} catch {
+    Write-Host "FAIL: Windows Sandbox could not be started: $($_.Exception.Message)"
+    exit 1
+}
+if (-not $sandboxProcess) {
+    Write-Host "FAIL: Windows Sandbox could not be started."
+    exit 1
+}
+
+Write-Host "Waiting up to $TimeoutSeconds seconds for guest result.json under $results"
+$outcome = Wait-SandboxSmokeResult `
+    -ResultsDirectory $results `
+    -TimeoutSeconds $TimeoutSeconds `
+    -SandboxProcess $sandboxProcess `
+    -StopLeftoverSandbox
+Write-Host $outcome.Message
+exit $outcome.ExitCode
