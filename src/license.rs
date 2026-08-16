@@ -23,7 +23,7 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
     WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
     WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::RegKey;
@@ -1196,6 +1196,34 @@ fn redirect_status_is_error(status: u32) -> bool {
     (300..400).contains(&status)
 }
 
+fn redirect_refusal(service: &str, status: u32, location: Option<&str>) -> String {
+    format!(
+        "{service} service redirected the request: status={status} location={}",
+        location.filter(|value| !value.is_empty()).unwrap_or("none")
+    )
+}
+
+fn query_location_header(request: *mut c_void) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    let mut index = 0u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_LOCATION,
+            PCWSTR::null(),
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut size,
+            &mut index,
+        )
+        .ok()?;
+    }
+    let chars = (size as usize) / 2;
+    let text = String::from_utf16_lossy(&buf[..chars.min(buf.len())]);
+    let text = text.trim_end_matches('\0').trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
 fn refresh_should_drop_activation(status: u32) -> bool {
     status == 403
 }
@@ -1270,7 +1298,8 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
         )
         .context("read license response status")?;
         if redirect_status_is_error(status) {
-            bail!("license service redirected the request");
+            let location = query_location_header(request.0);
+            bail!("{}", redirect_refusal("license", status, location.as_deref()));
         }
 
         let mut response = Vec::new();
@@ -1793,6 +1822,14 @@ mod tests {
         for status in [200, 403, 404, 500] {
             assert!(!redirect_status_is_error(status), "HTTP {status}");
         }
+    }
+
+    #[test]
+    fn redirect_refusal_includes_status_and_location() {
+        let error = redirect_refusal("license", 307, Some("https://evil.example/v1"));
+        assert!(error.contains("status=307"), "{error}");
+        assert!(error.contains("https://evil.example/v1"), "{error}");
+        assert!(redirect_refusal("license", 301, None).contains("location=none"));
     }
 
     #[test]

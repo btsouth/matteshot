@@ -36,7 +36,7 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
     WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
     WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 
 const POSTHOG_HOST: &str = "us.i.posthog.com";
@@ -352,6 +352,34 @@ fn redirect_status_is_error(status: u32) -> bool {
     (300..400).contains(&status)
 }
 
+fn redirect_refusal(service: &str, status: u32, location: Option<&str>) -> String {
+    format!(
+        "{service} service redirected the request: status={status} location={}",
+        location.filter(|value| !value.is_empty()).unwrap_or("none")
+    )
+}
+
+fn query_location_header(request: *mut c_void) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    let mut index = 0u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_LOCATION,
+            PCWSTR::null(),
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut size,
+            &mut index,
+        )
+        .ok()?;
+    }
+    let chars = (size as usize) / 2;
+    let text = String::from_utf16_lossy(&buf[..chars.min(buf.len())]);
+    let text = text.trim_end_matches('\0').trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
 fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
     unsafe {
         let agent = HSTRING::from(concat!("Matteshot/", env!("CARGO_PKG_VERSION")));
@@ -420,7 +448,8 @@ fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
         )
         .context("read telemetry response status")?;
         if redirect_status_is_error(status) {
-            anyhow::bail!("telemetry service redirected the request");
+            let location = query_location_header(request.0);
+            anyhow::bail!("{}", redirect_refusal("telemetry", status, location.as_deref()));
         }
 
         let mut response = Vec::new();
