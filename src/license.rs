@@ -1203,25 +1203,44 @@ fn redirect_refusal(service: &str, status: u32, location: Option<&str>) -> Strin
     )
 }
 
-fn query_location_header(request: *mut c_void) -> Option<String> {
-    let mut buf = [0u16; 1024];
-    let mut size = (buf.len() * 2) as u32;
-    let mut index = 0u32;
-    unsafe {
-        WinHttpQueryHeaders(
-            request,
-            WINHTTP_QUERY_LOCATION,
-            PCWSTR::null(),
-            Some(buf.as_mut_ptr() as *mut c_void),
-            &mut size,
-            &mut index,
-        )
-        .ok()?;
+fn next_location_header_chars(current: usize, required_bytes: u32) -> Option<usize> {
+    const MAX_CHARS: usize = 8192;
+    let needed = (required_bytes as usize).div_ceil(2);
+    if needed <= current || needed > MAX_CHARS {
+        None
+    } else {
+        Some(needed)
     }
-    let chars = (size as usize) / 2;
-    let text = String::from_utf16_lossy(&buf[..chars.min(buf.len())]);
-    let text = text.trim_end_matches('\0').trim();
-    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn query_location_header(request: *mut c_void) -> Option<String> {
+    let mut chars = 1024usize;
+    loop {
+        let mut buf = vec![0u16; chars];
+        let mut size = (buf.len() * 2) as u32;
+        let mut index = 0u32;
+        match unsafe {
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_LOCATION,
+                PCWSTR::null(),
+                Some(buf.as_mut_ptr() as *mut c_void),
+                &mut size,
+                &mut index,
+            )
+        } {
+            Ok(()) => {
+                let wide = (size as usize) / 2;
+                let text = String::from_utf16_lossy(&buf[..wide.min(buf.len())]);
+                let text = text.trim_end_matches('\0').trim();
+                return (!text.is_empty()).then(|| text.to_owned());
+            }
+            Err(_) => {
+                let next = next_location_header_chars(chars, size)?;
+                chars = next;
+            }
+        }
+    }
 }
 
 fn refresh_should_drop_activation(status: u32) -> bool {
@@ -1830,6 +1849,14 @@ mod tests {
         assert!(error.contains("status=307"), "{error}");
         assert!(error.contains("https://evil.example/v1"), "{error}");
         assert!(redirect_refusal("license", 301, None).contains("location=none"));
+    }
+
+    #[test]
+    fn an_insufficient_location_buffer_retries_up_to_the_cap() {
+        assert_eq!(next_location_header_chars(1024, 4000), Some(2000));
+        assert_eq!(next_location_header_chars(1024, 2048), None);
+        assert_eq!(next_location_header_chars(1024, 20_000), None);
+        assert_eq!(next_location_header_chars(8192, 20_000), None);
     }
 
     #[test]
