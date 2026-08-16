@@ -248,6 +248,14 @@ enum HistoryPathDisposition {
     UnownedRefused,
 }
 
+/// File name only: diagnostics::report() embeds this log and promises no save path.
+fn history_event_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unnamed".into())
+}
+
 fn take_owned_history_path_at(
     path: &Path,
     roots: &[PathBuf],
@@ -261,20 +269,82 @@ fn take_owned_history_path_at(
     // failure is not proof the file is foreign.
     crate::diagnostics::log(&format!(
         "history path outside save/video folders: {}",
-        path.display()
+        history_event_name(path)
     ));
     HistoryPathDisposition::UnownedRefused
 }
 
 fn take_owned_history_path(path: &Path) -> Result<HistoryPathDisposition> {
     let config = crate::config::Config::try_load().map_err(|error| {
-        crate::diagnostics::log(&format!(
-            "history ownership check skipped because config could not be loaded: {error:#}"
-        ));
+        crate::diagnostics::log("history ownership check skipped because config could not be loaded");
         error
     })?;
     let roots = [config.save_dir(), config.video_dir()];
     Ok(take_owned_history_path_at(path, &roots))
+}
+
+fn stable_canonical(path: &Path) -> Option<PathBuf> {
+    let first = std::fs::canonicalize(path).ok()?;
+    let second = std::fs::canonicalize(path).ok()?;
+    (first == second).then_some(first)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn parent_is_under_any_root(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
+    path.parent().is_some_and(|parent| {
+        roots
+            .iter()
+            .any(|root| path_is_under_root(parent, root.as_ref()))
+    })
+}
+
+fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
+    // Load first: a Delete that cannot update the index must not unlink the file.
+    let mut log = load_for_mutation(index)?;
+    let unlink = if is_symlink(path) && parent_is_under_any_root(path, roots) {
+        Some(path.to_path_buf())
+    } else {
+        match stable_canonical(path) {
+            Some(canonical) if path_is_owned_capture(&canonical, roots) => Some(canonical),
+            _ => None,
+        }
+    };
+    if let Some(target) = unlink {
+        if !is_symlink(path) && !path_still_matches_canonical(path, &target) {
+            crate::diagnostics::log(&format!(
+                "history delete skipped because the path changed: {}",
+                history_event_name(path)
+            ));
+        } else {
+            match std::fs::remove_file(&target) {
+                Ok(()) => {}
+                // Already gone (deleted outside the app, or a repeat click racing
+                // its own first Delete): the index is just stale, so finish
+                // dropping the entry instead of reporting a failure the user has no
+                // way to act on.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("delete capture"),
+            }
+        }
+    } else {
+        // History is an index, not a file manager: a stale or hand-edited
+        // entry must not unlink a file outside the save/video folders.
+        crate::diagnostics::log(&format!(
+            "history delete skipped file outside save/video folders: {}",
+            history_event_name(path)
+        ));
+    }
+    log.entries.retain(|e| e.path != path);
+    save_unlocked_at(index, &log)
+}
+
+fn path_still_matches_canonical(path: &Path, expected: &Path) -> bool {
+    std::fs::canonicalize(path).ok().as_deref() == Some(expected)
 }
 
 /// Delete the file and drop it from history. Unlike `record`, errors surface:
@@ -283,31 +353,8 @@ pub fn remove(path: &Path) -> Result<()> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
     let config = crate::config::Config::try_load().context("config could not be loaded")?;
     let roots = [config.save_dir(), config.video_dir()];
-    if path_is_owned_capture(path, &roots) {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            // Already gone (deleted outside the app, or a repeat click racing
-            // its own first Delete): the index is just stale, so finish
-            // dropping the entry instead of reporting a failure the user has no
-            // way to act on.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("delete capture"),
-        }
-    } else {
-        crate::diagnostics::log(&format!(
-            "history delete refused outside save/video folders: {}",
-            path.display()
-        ));
-    }
     let index = history_path().context("Windows has no application data directory")?;
-    // Unlike record, a transient read failure surfaces here: the file is
-    // already gone, and silently keeping its stale entry would leave a
-    // Delete that "worked" still showing the capture.
-    let mut log = load_for_mutation(&index)?;
-    log.entries.retain(|e| e.path != path);
-    // Same reasoning: the file is gone, so a stale entry left by a failed
-    // write is a Delete that only looked like it worked.
-    save_unlocked_at(&index, &log)
+    remove_at(&index, path, &roots)
 }
 
 fn format_when(saved_at: i64) -> String {
@@ -562,6 +609,17 @@ mod persistence_tests {
         assert!(!path_is_owned_capture(&in_other, &roots));
     }
 
+    #[test]
+    fn history_event_name_is_a_file_name_not_a_drive_or_unc_path() {
+        let drive = history_event_name(Path::new(r"C:\Users\alex\Pictures\Matteshot\shot.png"));
+        assert_eq!(drive, "shot.png");
+        assert!(!drive.contains(':'));
+        assert!(!drive.contains('\\'));
+        let unc = history_event_name(Path::new(r"\\nas\share\secret.txt"));
+        assert_eq!(unc, "secret.txt");
+        assert!(!unc.contains('\\'));
+    }
+
     /// Share/copy/open/reveal refuse an outside path without rewriting history:
     /// a previous save folder is still a real capture.
     #[test]
@@ -658,6 +716,179 @@ mod persistence_tests {
 
         let disposition = take_owned_history_path_at(&missing, &[save]);
         assert!(matches!(disposition, HistoryPathDisposition::UnownedRefused));
+    }
+
+    #[test]
+    fn an_unowned_history_entry_is_dropped_without_deleting_the_file() {
+        let dir = temp_dir("remove-unowned");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let foreign = capture(&outside, "win.ini");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&foreign));
+
+        assert!(remove_at(&index, &foreign, &[save]).is_ok());
+        assert!(foreign.is_file(), "a file outside the save folder must stay on disk");
+        assert!(
+            load_for_mutation(&index).unwrap().entries.is_empty(),
+            "the stale index row is dropped even when the file is left alone"
+        );
+    }
+
+    #[test]
+    fn a_file_inside_the_save_folder_is_unlinked_and_dropped() {
+        let dir = temp_dir("remove-owned");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let shot = capture(&save, "a.png");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&shot));
+
+        assert!(remove_at(&index, &shot, &[save]).is_ok());
+        assert!(!shot.exists());
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_file_inside_the_video_folder_is_unlinked_even_when_outside_save_dir() {
+        let dir = temp_dir("remove-video");
+        let save = dir.join("save");
+        let video = dir.join("video");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&video).unwrap();
+        let rec = capture(&video, "clip.mp4");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&rec));
+
+        assert!(remove_at(&index, &rec, &[save, video]).is_ok());
+        assert!(!rec.exists(), "recordings under video_dir are an allowed root");
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_path_that_escapes_the_save_folder_with_dotdot_is_not_unlinked() {
+        let dir = temp_dir("remove-escape");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let foreign = capture(&outside, "secret.txt");
+        let escaped = save.join("..").join("outside").join("secret.txt");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&escaped));
+
+        assert!(remove_at(&index, &escaped, &[save]).is_ok());
+        assert!(foreign.is_file(), "a `..` escape must not unlink the foreign file");
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_symlink_inside_the_save_folder_is_unlinked_without_touching_its_target() {
+        let dir = temp_dir("remove-symlink");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = capture(&outside, "secret.txt");
+        let link = save.join("link.png");
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            eprintln!("skipping: creating a file symlink requires privilege");
+            return;
+        }
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&link));
+
+        assert!(remove_at(&index, &link, &[save]).is_ok());
+        assert!(
+            !link.exists(),
+            "the symlink inside save_dir must be unlinked"
+        );
+        assert!(
+            target.is_file(),
+            "the outside target must not be deleted"
+        );
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_symlink_to_another_file_in_the_save_folder_does_not_delete_the_target() {
+        let dir = temp_dir("remove-symlink-inside");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let target = capture(&save, "real.png");
+        let link = save.join("link.png");
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            eprintln!("skipping: creating a file symlink requires privilege");
+            return;
+        }
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&link));
+
+        assert!(remove_at(&index, &link, &[save]).is_ok());
+        assert!(!link.exists(), "the symlink must be unlinked");
+        assert!(
+            target.is_file(),
+            "an in-folder symlink must not delete its target"
+        );
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_index_does_not_unlink_the_file() {
+        let dir = temp_dir("remove-unreadable-index");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let shot = capture(&save, "a.png");
+        let index = dir.join("history.json");
+        std::fs::create_dir_all(&index).unwrap();
+
+        assert!(remove_at(&index, &shot, &[save]).is_err());
+        assert!(shot.is_file(), "a failed index load must leave the capture");
+    }
+
+    #[test]
+    fn path_still_matches_canonical_is_false_after_the_file_moves() {
+        let dir = temp_dir("canonical-moved");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = capture(&dir, "a.png");
+        let canonical = std::fs::canonicalize(&original).unwrap();
+        assert!(path_still_matches_canonical(&original, &canonical));
+        let moved = dir.join("b.png");
+        std::fs::rename(&original, &moved).unwrap();
+        assert!(!path_still_matches_canonical(&original, &canonical));
+        assert!(moved.is_file());
+    }
+
+    #[test]
+    fn a_directory_swap_of_save_dir_does_not_delete_an_outside_file() {
+        let dir = temp_dir("remove-swap");
+        let save = dir.join("save");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let shot = capture(&save, "a.png");
+        let foreign = capture(&outside, "secret.txt");
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&shot));
+
+        let real_save = dir.join("save.real");
+        std::fs::rename(&save, &real_save).unwrap();
+        if std::os::windows::fs::symlink_dir(&outside, &save).is_err() {
+            let _ = std::fs::rename(&real_save, &save);
+            eprintln!("skipping: creating a directory symlink requires privilege");
+            return;
+        }
+
+        let swapped = save.join("a.png");
+        assert!(remove_at(&index, &swapped, std::slice::from_ref(&real_save)).is_ok());
+        assert!(
+            foreign.is_file(),
+            "a swapped save_dir must not unlink an outside file"
+        );
+        let _ = std::fs::remove_dir(&save);
+        let _ = std::fs::rename(&real_save, &save);
     }
 }
 
