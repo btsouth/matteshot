@@ -16,7 +16,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-. (Join-Path $PSScriptRoot "sandbox-smoke-result.ps1")
+try {
+    . (Join-Path $PSScriptRoot "sandbox-smoke-result.ps1")
+} catch {
+    Write-Host "FAIL: sandbox smoke helper could not be loaded: $($_.Exception.Message)"
+    exit 1
+}
 
 $sandbox = (Get-Command "WindowsSandbox.exe" -ErrorAction Stop).Source
 $installer = (Resolve-Path $InstallerPath).Path
@@ -26,6 +31,7 @@ $payload = Join-Path $work "payload"
 $results = Join-Path $work "results"
 
 New-Item -ItemType Directory -Force $payload, $results | Out-Null
+Clear-SandboxSmokePriorResult -ResultsDirectory $results
 Copy-Item $installer (Join-Path $payload (Split-Path $installer -Leaf))
 Copy-Item $licenseKey (Join-Path $payload "license-key.txt")
 Copy-Item `

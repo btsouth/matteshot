@@ -156,18 +156,53 @@ function Read-SandboxSmokeResult {
         -ErrorText $errorText
 }
 
+function Get-SandboxSmokeProcessNames {
+    # WindowsSandbox.exe is a short-lived launcher. On current Windows the
+    # processes that stay up are Server / RemoteSession; Client is older.
+    @('WindowsSandbox', 'WindowsSandboxClient', 'WindowsSandboxServer', 'WindowsSandboxRemoteSession', 'wsb')
+}
+
+function Get-SandboxSmokeProcesses {
+    Get-Process -Name (Get-SandboxSmokeProcessNames) -ErrorAction SilentlyContinue
+}
+
+function Clear-SandboxSmokePriorResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResultsDirectory
+    )
+
+    $path = Get-SandboxSmokeResultPath -ResultsDirectory $ResultsDirectory
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ($path + '.tmp') -Force -ErrorAction SilentlyContinue
+}
+
 function Stop-SandboxSmokeLeftovers {
-    # Best-effort. A failed kill is not a pass (SBS-901).
-    foreach ($name in @('WindowsSandbox', 'WindowsSandboxClient')) {
-        Get-Process -Name $name -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+    param(
+        [System.Diagnostics.Process]$SandboxProcess
+    )
+
+    # Only the sandbox this run started. Killing every WindowsSandbox* process
+    # would tear down an unrelated session on the same host.
+    if (-not $SandboxProcess) {
+        return
+    }
+    try {
+        $SandboxProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+    } catch {
     }
 }
 
 function Test-SandboxSmokeSessionEnded {
     param(
-        [System.Diagnostics.Process]$SandboxProcess
+        [System.Diagnostics.Process]$SandboxProcess,
+
+        [switch]$SawSandbox
     )
+
+    if (-not $SawSandbox) {
+        return $false
+    }
 
     if (-not $SandboxProcess) {
         return $false
@@ -182,11 +217,7 @@ function Test-SandboxSmokeSessionEnded {
         # Handle is unusable; fall through to the named-process check.
     }
 
-    # WindowsSandbox.exe can be a short-lived launcher. If a client process is
-    # still up, the guest may still write result.json.
-    $running = Get-Process `
-        -Name @('WindowsSandbox', 'WindowsSandboxClient') `
-        -ErrorAction SilentlyContinue
+    $running = Get-SandboxSmokeProcesses
     return -not $running
 }
 
@@ -208,11 +239,16 @@ function Wait-SandboxSmokeResult {
 
     $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
     $graceDeadline = $null
+    $sawSandbox = $false
 
     while ($true) {
         $snapshot = Read-SandboxSmokeResult -ResultsDirectory $ResultsDirectory
         if (Test-SandboxSmokeOutcomeTerminal -Outcome $snapshot) {
             return $snapshot
+        }
+
+        if (Get-SandboxSmokeProcesses) {
+            $sawSandbox = $true
         }
 
         $now = [datetime]::UtcNow
@@ -223,13 +259,7 @@ function Wait-SandboxSmokeResult {
             }
 
             if ($StopLeftoverSandbox) {
-                if ($SandboxProcess) {
-                    try {
-                        $SandboxProcess | Stop-Process -Force -ErrorAction SilentlyContinue
-                    } catch {
-                    }
-                }
-                Stop-SandboxSmokeLeftovers
+                Stop-SandboxSmokeLeftovers -SandboxProcess $SandboxProcess
             }
 
             return New-SandboxSmokeOutcome `
@@ -240,7 +270,7 @@ function Wait-SandboxSmokeResult {
                 -TimedOut
         }
 
-        if (Test-SandboxSmokeSessionEnded -SandboxProcess $SandboxProcess) {
+        if (Test-SandboxSmokeSessionEnded -SandboxProcess $SandboxProcess -SawSandbox:$sawSandbox) {
             if ($null -eq $graceDeadline) {
                 $flushSeconds = 3
                 $graceDeadline = $now.AddSeconds($flushSeconds)
@@ -255,7 +285,7 @@ function Wait-SandboxSmokeResult {
                 }
 
                 if ($StopLeftoverSandbox) {
-                    Stop-SandboxSmokeLeftovers
+                    Stop-SandboxSmokeLeftovers -SandboxProcess $SandboxProcess
                 }
 
                 return New-SandboxSmokeOutcome `

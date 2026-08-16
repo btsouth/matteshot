@@ -159,6 +159,52 @@ try {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# SBS-901: a leftover passed:true from a previous guest must not make this run pass.
+$dir = New-SandboxSmokeTestDir
+try {
+    Write-SandboxSmokeFixture -Directory $dir -Json (@'
+{"passed": true, "error": null, "completed_at": "2026-01-01T00:00:00Z"}
+'@)
+    Clear-SandboxSmokePriorResult -ResultsDirectory $dir
+    $outcome = Wait-SandboxSmokeResult `
+        -ResultsDirectory $dir `
+        -TimeoutSeconds 1 `
+        -PollIntervalMilliseconds 50
+    Assert-SandboxSmoke `
+        -Name 'prior-result-json-is-wiped' `
+        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.Reason -eq 'Missing') `
+        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason)"
+} finally {
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# SBS-901: launcher already gone and no sandbox process seen is not SandboxExited at 3s.
+$dir = New-SandboxSmokeTestDir
+$exited = $null
+try {
+    $exited = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -PassThru -WindowStyle Hidden
+    $null = $exited.WaitForExit(5000)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $outcome = Wait-SandboxSmokeResult `
+        -ResultsDirectory $dir `
+        -TimeoutSeconds 5 `
+        -PollIntervalMilliseconds 50 `
+        -SandboxProcess $exited
+    $sw.Stop()
+    Assert-SandboxSmoke `
+        -Name 'unseen-sandbox-waits-until-timeout' `
+        -Condition (
+            $outcome.Kind -eq 'Unknown' -and
+            $outcome.Reason -eq 'Missing' -and
+            $outcome.TimedOut -and
+            $sw.Elapsed.TotalSeconds -ge 4
+        ) `
+        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason) TimedOut=$($outcome.TimedOut) Seconds=$([math]::Round($sw.Elapsed.TotalSeconds, 1))"
+} finally {
+    if ($exited) { $exited.Dispose() }
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($script:failures -gt 0) {
     Write-Host "$script:failures sandbox smoke result test(s) failed; $script:passes passed."
     exit 1
