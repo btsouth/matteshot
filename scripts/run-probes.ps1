@@ -114,15 +114,15 @@ function Get-FixtureDurationTicks {
         $p = Start-Process -FilePath $script:Exe -ArgumentList @('--duration-test', $Path) `
             -RedirectStandardError $log -Wait -NoNewWindow -PassThru
         if ($p.ExitCode -ne 0) { return $null }
+        if (-not (Test-Path $log)) { return $null }
+        $out = Get-Content $log -Raw -ErrorAction Stop
+        if ($out -match 'duration_100ns:\s*(-?\d+)') {
+            return [int64]$Matches[1]
+        }
+        return $null
     } catch {
         return $null
     }
-    if (-not (Test-Path $log)) { return $null }
-    $out = Get-Content $log -Raw
-    if ($out -match 'duration_100ns:\s*(-?\d+)') {
-        return [int64]$Matches[1]
-    }
-    $null
 }
 
 function Invoke-RecordFixture {
