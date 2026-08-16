@@ -126,7 +126,7 @@ fn request_graceful_shutdown() -> Result<()> {
     close_all_within(
         "matteshot_tray",
         "Matteshot",
-        record::LATE_FINALIZE_BOUND + std::time::Duration::from_secs(30),
+        record::QUIT_TRAY_WAIT,
     )?;
     Ok(())
 }
@@ -1024,14 +1024,12 @@ fn run_resident() -> Result<()> {
                     tray::Action::Quit => {
                         diagnostics::log("resident quit requested");
                         if record::late_finalize_outstanding() {
-                            unsafe {
-                                MessageBoxW(
-                                    None,
-                                    w!("A recording is still finishing. Matteshot will quit when it is done."),
-                                    w!("Matteshot"),
-                                    MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
-                                );
-                            }
+                            MessageBoxW(
+                                None,
+                                w!("A recording is still finishing. Matteshot will quit when it is done."),
+                                w!("Matteshot"),
+                                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+                            );
                             if !record::wait_until_late_finalize_idle(record::LATE_FINALIZE_BOUND) {
                                 bail!("the recorder is still busy; finish or cancel the current operation and try again");
                             }

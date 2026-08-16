@@ -712,6 +712,11 @@ static LATE_FINALIZE_OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
 /// Supervisor bound, and the longest `--quit` / tray Quit will wait for it.
 pub const LATE_FINALIZE_BOUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// Helper `--quit` cannot see this process's counter. Tray `WM_CLOSE` may
+/// sit behind the 60s join, then wait [`LATE_FINALIZE_BOUND`]. 90s is that
+/// join plus unwind slack so the helper does not taskkill mid-Finalize.
+pub const QUIT_TRAY_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60 + 90);
+
 /// Increments [`LATE_FINALIZE_OUTSTANDING`] for its lifetime, including panic.
 pub struct LateFinalizeGuard;
 
@@ -733,6 +738,8 @@ pub fn late_finalize_outstanding() -> bool {
 }
 
 /// True once every late-finalize guard has dropped. Does not cancel the work.
+/// Pumps queued messages except `WM_CLOSE` so the tray thread stays responsive
+/// instead of sitting in an unpumped sleep (Not Responding / taskkill).
 pub fn wait_until_late_finalize_idle(timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -742,8 +749,28 @@ pub fn wait_until_late_finalize_idle(timeout: std::time::Duration) -> bool {
         if std::time::Instant::now() >= deadline {
             return false;
         }
+        pump_waiting_messages();
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
+    }
+}
+
+/// Drain the thread queue without dispatching `WM_CLOSE`. Nested close during
+/// a wait or the 60s join would re-enter this wait while this stack still
+/// holds the guard.
+fn pump_waiting_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_CLOSE,
+    };
+    let mut msg = MSG::default();
+    unsafe {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message == WM_CLOSE {
+                continue;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 }
 
@@ -1000,6 +1027,7 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
                 "This recording is taking unusually long to finish. Matteshot keeps finalizing it in the background; if that succeeds, the video appears in your videos folder."
             );
         }
+        pump_waiting_messages();
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     // Keep the guard through validate/publish (and the error-path deletes).
@@ -1291,6 +1319,14 @@ mod tests {
         );
         drop(guard);
         assert!(!late_finalize_outstanding());
+    }
+
+    #[test]
+    fn quit_tray_wait_covers_the_join_plus_late_finalize_bound() {
+        assert!(
+            QUIT_TRAY_WAIT >= LATE_FINALIZE_BOUND + std::time::Duration::from_secs(90),
+            "helper --quit must outlast the 60s join plus the resident wait"
+        );
     }
 
     #[test]
