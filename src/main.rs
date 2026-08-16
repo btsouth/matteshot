@@ -3,6 +3,7 @@
 mod annotate;
 mod capture;
 mod compose;
+mod completion;
 mod config;
 mod delay;
 mod diagnostics;

@@ -1548,10 +1548,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         crate::share::WM_SHARE_COMPLETE => {
-            if lparam.0 == 0 {
+            let Some(completion) = crate::share::take_completion(lparam.0 as u64, hwnd.0 as isize)
+            else {
                 return LRESULT(0);
-            }
-            let completion = *Box::from_raw(lparam.0 as *mut crate::share::ShareCompletion);
+            };
             let is_current = state_of(hwnd).is_some_and(|state| {
                 crate::share::accept_completion(&mut state.pending_share, completion.request_id)
             });
@@ -1586,6 +1586,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            crate::share::discard_window(hwnd.0 as isize);
             let _ = KillTimer(hwnd, STATUS_TIMER_ID);
             let _ = KillTimer(hwnd, CLICK_TIMER_ID);
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;

@@ -464,11 +464,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_UPDATE_AVAILABLE => {
-            let update = Box::from_raw(lparam.0 as *mut crate::update::AvailableUpdate);
+            let Some(update) = crate::update::take_available(lparam.0 as u64, hwnd.0 as isize)
+            else {
+                return LRESULT(0);
+            };
             let state = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState).as_mut();
             if let Some(state) = state {
                 let changed = state.update.as_ref().map(|u| &u.version) != Some(&update.version);
-                state.update = Some(*update);
+                state.update = Some(update);
                 if changed {
                     let version = &state.update.as_ref().unwrap().version;
                     let automatic =
@@ -487,7 +490,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_UPDATE_INSTALLING => {
-            let version = Box::from_raw(lparam.0 as *mut String);
+            let Some(version) = crate::update::take_installing(lparam.0 as u64, hwnd.0 as isize)
+            else {
+                return LRESULT(0);
+            };
             notify(
                 hwnd,
                 "Matteshot is updating",
@@ -534,6 +540,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = crate::record::wait_until_late_finalize_idle(
                 crate::record::LATE_FINALIZE_BOUND,
             );
+            // SBS-743: after the wait, not before. That wait pumps, so an
+            // update completion posted during it is still delivered; a
+            // discard first would bump the generation and drop it.
+            crate::update::discard_window(hwnd.0 as isize);
             PostQuitMessage(0);
             LRESULT(0)
         }

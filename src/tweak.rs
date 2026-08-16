@@ -239,6 +239,9 @@ struct OcrCompletion {
     result: std::result::Result<Vec<crate::ocr::Word>, String>,
 }
 
+static OCR_COMPLETIONS: crate::completion::CompletionMailbox<OcrCompletion> =
+    crate::completion::CompletionMailbox::new();
+
 /// Hand a completion to the document and request it belongs to, or drop it.
 /// Only an exact match on both identifiers is accepted: the document may have
 /// been closed (id absent), the mode left (`text_select` gone), or Select Text
@@ -1256,7 +1259,7 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
     std::thread::spawn(move || {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
         let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let payload = Box::into_raw(Box::new(OcrCompletion {
+        let completion = OcrCompletion {
             doc: doc_id,
             generation,
             result: crate::ocr::recognize_words(&raw)
@@ -1270,17 +1273,16 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
                     words
                 })
                 .map_err(|error| format!("{error:#}")),
-        }));
+        };
         if com.is_ok() {
             unsafe { CoUninitialize() };
         }
         unsafe {
             let hwnd = HWND(target as *mut _);
-            if !crate::window::has_class(hwnd, "matteshot_tweak")
-                || PostMessageW(hwnd, WM_OCR_READY, WPARAM(0), LPARAM(payload as isize)).is_err()
-            {
-                drop(Box::from_raw(payload));
-            }
+            OCR_COMPLETIONS.post_with(target, completion, |token| {
+                crate::window::has_class(hwnd, "matteshot_tweak")
+                    && PostMessageW(hwnd, WM_OCR_READY, WPARAM(0), LPARAM(token as isize)).is_ok()
+            });
         }
     });
 }
@@ -3780,10 +3782,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // PrtScn mid-tweak: nested overlay; the frozen image includes this
         // window, so it's snippable. Esc there returns here untouched.
         crate::share::WM_SHARE_COMPLETE => {
-            if lparam.0 == 0 {
+            let Some(completion) = crate::share::take_completion(lparam.0 as u64, hwnd.0 as isize)
+            else {
                 return LRESULT(0);
-            }
-            let completion = *Box::from_raw(lparam.0 as *mut crate::share::ShareCompletion);
+            };
             let is_current = state_of(hwnd).is_some_and(|state| {
                 crate::share::accept_completion(&mut state.pending_share, completion.request_id)
             });
@@ -3825,10 +3827,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_OCR_READY => {
-            if lparam.0 == 0 {
+            let Some(payload) = OCR_COMPLETIONS.take(lparam.0 as u64, hwnd.0 as isize) else {
                 return LRESULT(0);
-            }
-            let payload = Box::from_raw(lparam.0 as *mut OcrCompletion);
+            };
             if let Some(state) = state_of(hwnd) {
                 // Routed by document id and request generation, not to whichever
                 // tab is active: start Select Text on A, switch to B and start
@@ -3841,7 +3842,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .docs
                     .iter_mut()
                     .map(|doc| (doc.id, &mut doc.text_select));
-                if deliver_ocr(docs, *payload) {
+                if deliver_ocr(docs, payload) {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
@@ -3969,6 +3970,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // The editor lives on the resident's message loop now, so its
             // state and GDI objects are released here rather than after a
             // nested loop returns.
+            crate::share::discard_window(hwnd.0 as isize);
+            OCR_COMPLETIONS.unbind(hwnd.0 as isize);
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);

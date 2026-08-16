@@ -259,21 +259,46 @@ pub fn check_once() -> Result<Option<AvailableUpdate>> {
     Ok(update)
 }
 
-fn post<T>(hwnd_value: isize, message: u32, payload: T) {
-    let raw = Box::into_raw(Box::new(payload));
-    let posted = unsafe {
+static AVAILABLE_UPDATES: crate::completion::CompletionMailbox<AvailableUpdate> =
+    crate::completion::CompletionMailbox::new();
+static INSTALLING_VERSIONS: crate::completion::CompletionMailbox<String> =
+    crate::completion::CompletionMailbox::new();
+
+fn post_token(hwnd_value: isize, message: u32, token: u64) -> bool {
+    unsafe {
         PostMessageW(
             HWND(hwnd_value as *mut c_void),
             message,
             WPARAM(0),
-            LPARAM(raw as isize),
+            LPARAM(token as isize),
         )
-    };
-    if posted.is_err() {
-        unsafe {
-            drop(Box::from_raw(raw));
-        }
+        .is_ok()
     }
+}
+
+fn post_available(hwnd_value: isize, payload: AvailableUpdate) {
+    AVAILABLE_UPDATES.post_with(hwnd_value, payload, |token| {
+        post_token(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, token)
+    });
+}
+
+fn post_installing(hwnd_value: isize, payload: String) {
+    INSTALLING_VERSIONS.post_with(hwnd_value, payload, |token| {
+        post_token(hwnd_value, crate::tray::WM_UPDATE_INSTALLING, token)
+    });
+}
+
+pub fn take_available(token: u64, hwnd: isize) -> Option<AvailableUpdate> {
+    AVAILABLE_UPDATES.take(token, hwnd)
+}
+
+pub fn take_installing(token: u64, hwnd: isize) -> Option<String> {
+    INSTALLING_VERSIONS.take(token, hwnd)
+}
+
+pub fn discard_window(hwnd: isize) {
+    AVAILABLE_UPDATES.unbind(hwnd);
+    INSTALLING_VERSIONS.unbind(hwnd);
 }
 
 /// Fetch and verify the installer, then install it the moment the user is not
@@ -297,11 +322,7 @@ fn apply(hwnd_value: isize, update: &AvailableUpdate) -> Result<()> {
         waited += IDLE_POLL;
     }
 
-    post(
-        hwnd_value,
-        crate::tray::WM_UPDATE_INSTALLING,
-        update.version.clone(),
-    );
+    post_installing(hwnd_value, update.version.clone());
     thread::sleep(BALLOON_GRACE);
     crate::diagnostics::log("update installing");
     crate::installer::launch(&staged)
@@ -341,7 +362,7 @@ pub fn start(hwnd: HWND) {
                     }
                     let decision = auto_install_decision(loaded);
                     if notified_version.as_deref() != Some(update.version.as_str()) {
-                        post(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, update.clone());
+                        post_available(hwnd_value, update.clone());
                         notified_version = Some(update.version.clone());
                     }
                     match decision {
@@ -644,5 +665,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(update.version, "1.5.0");
+    }
+
+    /// Pins SBS-743: a forged update LPARAM must not consume a real payload.
+    #[test]
+    fn forged_update_lparams_do_not_take_a_real_completion() {
+        let hwnd = 0x7A11;
+        let token = AVAILABLE_UPDATES.insert(
+            hwnd,
+            AvailableUpdate {
+                version: "1.2.3".into(),
+                download_url: "https://download.matteshot.app/MatteshotSetup.exe".into(),
+            },
+        );
+        for forged in [0_u64, 1, 0x7fff_ffff, 0xDEAD_BEEF] {
+            assert_ne!(token, forged);
+            assert!(take_available(forged, hwnd).is_none());
+        }
+        let got = take_available(token, hwnd).expect("real token");
+        assert_eq!(got.version, "1.2.3");
+        assert!(take_available(token, hwnd).is_none());
     }
 }

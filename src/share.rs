@@ -32,9 +32,9 @@ const SHARE_PATH: &str = "/v1/share";
 const MAX_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
 
 /// Posted to whichever window started a share once `share_in_background`'s
-/// worker thread finishes. `lparam` is a boxed `ShareCompletion` —
-/// `Box::from_raw` it back exactly once in the receiving wndproc, even when
-/// its request ID is stale.
+/// worker thread finishes. `lparam` is an opaque token from
+/// `SHARE_COMPLETIONS` (SBS-743) — never a pointer. Take it with
+/// `take_completion`; a forged or stale token is ignored.
 pub const WM_SHARE_COMPLETE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10;
 
 pub type ShareOutcome = Result<String, String>;
@@ -44,6 +44,9 @@ pub struct ShareCompletion {
     pub outcome: ShareOutcome,
 }
 
+static SHARE_COMPLETIONS: crate::completion::CompletionMailbox<ShareCompletion> =
+    crate::completion::CompletionMailbox::new();
+
 static SHARE_REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn accept_completion(pending: &mut Option<u64>, request_id: u64) -> bool {
@@ -52,6 +55,16 @@ pub fn accept_completion(pending: &mut Option<u64>, request_id: u64) -> bool {
     }
     *pending = None;
     true
+}
+
+/// Redeem a `WM_SHARE_COMPLETE` token for this window. Forged `LPARAM`
+/// values (0, 1, mapped addresses) return `None` and do not dereference.
+pub fn take_completion(token: u64, hwnd: isize) -> Option<ShareCompletion> {
+    SHARE_COMPLETIONS.take(token, hwnd)
+}
+
+pub fn discard_window(hwnd: isize) {
+    SHARE_COMPLETIONS.unbind(hwnd);
 }
 
 fn share_content_type(path: &Path) -> Result<&'static str> {
@@ -152,23 +165,22 @@ pub fn share_in_background(hwnd: HWND, path: PathBuf) -> u64 {
     let hwnd_value = hwnd.0 as isize;
     std::thread::spawn(move || {
         let outcome: ShareOutcome = share_file(&path).map_err(|error| format!("{error:#}"));
-        let raw = Box::into_raw(Box::new(ShareCompletion {
-            request_id,
-            outcome,
-        }));
-        let posted = unsafe {
-            PostMessageW(
-                HWND(hwnd_value as *mut c_void),
-                WM_SHARE_COMPLETE,
-                WPARAM(0),
-                LPARAM(raw as isize),
-            )
-        };
-        if posted.is_err() {
-            unsafe {
-                drop(Box::from_raw(raw));
-            }
-        }
+        SHARE_COMPLETIONS.post_with(
+            hwnd_value,
+            ShareCompletion {
+                request_id,
+                outcome,
+            },
+            |token| unsafe {
+                PostMessageW(
+                    HWND(hwnd_value as *mut c_void),
+                    WM_SHARE_COMPLETE,
+                    WPARAM(0),
+                    LPARAM(token as isize),
+                )
+                .is_ok()
+            },
+        );
     });
     request_id
 }
@@ -774,5 +786,30 @@ mod tests {
         assert!(redirect_status_is_error(307));
         // share_file only treats 200 as a share URL; a 307 cannot become one.
         assert_ne!(307u32, 200);
+    }
+
+    /// Pins SBS-743: the Share wndproc helper must ignore a forged LPARAM
+    /// instead of `Box::from_raw`ing it, and must not consume a real result.
+    #[test]
+    fn forged_share_lparams_do_not_take_a_real_completion() {
+        let hwnd = 0x51A2E;
+        let token = SHARE_COMPLETIONS.insert(
+            hwnd,
+            ShareCompletion {
+                request_id: 9,
+                outcome: Ok("https://share.matteshot.app/s/ABCDEFGHJKMN".into()),
+            },
+        );
+        for forged in [0_u64, 1, 0x7fff_ffff, 0xDEAD_BEEF] {
+            assert_ne!(token, forged);
+            assert!(
+                take_completion(forged, hwnd).is_none(),
+                "forged share token {:#x} was accepted",
+                forged
+            );
+        }
+        let got = take_completion(token, hwnd).expect("real token");
+        assert_eq!(got.request_id, 9);
+        assert!(take_completion(token, hwnd).is_none());
     }
 }
