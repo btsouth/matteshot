@@ -307,37 +307,63 @@ fn apply(hwnd_value: isize, update: &AvailableUpdate) -> Result<()> {
     crate::installer::launch(&staged)
 }
 
+/// A failed disk read is not an opt-out: retry on the next 24-hour loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoInstallDecision {
+    Apply,
+    Decline,
+    RetryRead,
+}
+
+fn auto_install_decision<E>(loaded: Result<crate::config::Config, E>) -> AutoInstallDecision {
+    match loaded {
+        Err(_) => AutoInstallDecision::RetryRead,
+        Ok(config) if config.auto_update => AutoInstallDecision::Apply,
+        Ok(_) => AutoInstallDecision::Decline,
+    }
+}
+
 /// Check immediately, then once every 24 hours while Matteshot stays open.
 /// Failures are deliberately silent and retried at the next interval.
 pub fn start(hwnd: HWND) {
     let hwnd_value = hwnd.0 as isize;
     thread::spawn(move || {
         let mut handled_version: Option<String> = None;
+        let mut notified_version: Option<String> = None;
         loop {
             if let Ok(Some(update)) = check_once() {
                 if handled_version.as_deref() != Some(update.version.as_str()) {
-                    handled_version = Some(update.version.clone());
                     let loaded = crate::config::Config::try_load();
                     if let Err(error) = &loaded {
                         crate::diagnostics::log(&format!(
                             "update will not auto-install: config could not be read: {error:#}"
                         ));
                     }
-                    let automatic = crate::config::auto_update_from_load(loaded);
-                    post(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, update.clone());
-                    if automatic {
-                        if let Err(error) = apply(hwnd_value, &update) {
-                            // Staging failed or the installer would not start.
-                            // The tray still offers the manual download, so
-                            // this is a quiet degradation, not a dead end.
-                            //
-                            // Quiet for the user, but not for us: a silent
-                            // update failure strands people on an old build
-                            // with nothing to report, so it is the one failure
-                            // most worth counting.
-                            crate::diagnostics::log("update could not be applied");
-                            crate::telemetry::report_failure("update", &error);
-                            eprintln!("update failed: {error:#}");
+                    let decision = auto_install_decision(loaded);
+                    if notified_version.as_deref() != Some(update.version.as_str()) {
+                        post(hwnd_value, crate::tray::WM_UPDATE_AVAILABLE, update.clone());
+                        notified_version = Some(update.version.clone());
+                    }
+                    match decision {
+                        AutoInstallDecision::RetryRead => {}
+                        AutoInstallDecision::Decline => {
+                            handled_version = Some(update.version.clone());
+                        }
+                        AutoInstallDecision::Apply => {
+                            handled_version = Some(update.version.clone());
+                            if let Err(error) = apply(hwnd_value, &update) {
+                                // Staging failed or the installer would not start.
+                                // The tray still offers the manual download, so
+                                // this is a quiet degradation, not a dead end.
+                                //
+                                // Quiet for the user, but not for us: a silent
+                                // update failure strands people on an old build
+                                // with nothing to report, so it is the one failure
+                                // most worth counting.
+                                crate::diagnostics::log("update could not be applied");
+                                crate::telemetry::report_failure("update", &error);
+                                eprintln!("update failed: {error:#}");
+                            }
                         }
                     }
                 }
@@ -375,6 +401,39 @@ mod tests {
         )));
         assert!(!crate::config::auto_update_from_load::<&str>(Err("locked")));
         assert!(!crate::config::auto_update_from_load::<&str>(Err("truncated")));
+    }
+
+    #[test]
+    fn a_failed_config_read_retries_auto_install_for_the_same_version() {
+        assert_eq!(
+            auto_install_decision::<&str>(Err("locked")),
+            AutoInstallDecision::RetryRead
+        );
+        assert_eq!(
+            auto_install_decision::<&str>(Err("truncated")),
+            AutoInstallDecision::RetryRead
+        );
+        assert_eq!(
+            auto_install_decision::<()>(Ok(crate::config::Config {
+                auto_update: true,
+                ..Default::default()
+            })),
+            AutoInstallDecision::Apply
+        );
+        assert_eq!(
+            auto_install_decision::<()>(Ok(crate::config::Config {
+                auto_update: false,
+                ..Default::default()
+            })),
+            AutoInstallDecision::Decline
+        );
+        let after_error = auto_install_decision::<&str>(Err("sharing violation"));
+        let after_repair = auto_install_decision::<()>(Ok(crate::config::Config {
+            auto_update: true,
+            ..Default::default()
+        }));
+        assert_eq!(after_error, AutoInstallDecision::RetryRead);
+        assert_eq!(after_repair, AutoInstallDecision::Apply);
     }
 
     /// A manifest listing several served builds, each with a release date.

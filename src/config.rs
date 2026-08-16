@@ -166,12 +166,14 @@ fn read_unlocked() -> anyhow::Result<DiskConfig> {
 
 /// Factory defaults turn auto-update and PrtScn on. A present file we cannot
 /// read is not a fresh install, so those stay off until a later read succeeds.
+/// `onboarded` is true so first-run welcome does not rewrite the file.
 fn fail_closed() -> Config {
     Config {
         auto_update: false,
         capture_prtscn: false,
         telemetry: None,
         capture_hotkey: crate::hotkey::NONE.to_owned(),
+        onboarded: true,
         ..Config::default()
     }
 }
@@ -193,7 +195,10 @@ fn remember(config: &Config) {
 /// last-known-good. An unreadable present file must not look like defaults.
 fn resolve_load(last_good: &mut Option<Config>, from_disk: anyhow::Result<DiskConfig>) -> Config {
     match from_disk {
-        Ok(DiskConfig::Missing) => Config::default(),
+        Ok(DiskConfig::Missing) => {
+            *last_good = None;
+            Config::default()
+        }
         Ok(DiskConfig::Present(config)) => {
             *last_good = Some(config.clone());
             config
@@ -216,14 +221,19 @@ fn corrupt_backup_path(path: &Path) -> PathBuf {
     path.with_extension(format!("json.corrupt-{unique}"))
 }
 
-fn load_for_update_from(path: &Path) -> anyhow::Result<Config> {
+fn load_for_update_from(path: &Path, last_good: Option<&Config>) -> anyhow::Result<Config> {
     match load_from(path) {
         Ok(config) => Ok(config),
         Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            let Some(last) = last_good.cloned() else {
+                return Err(error);
+            };
             let backup = corrupt_backup_path(path);
             std::fs::rename(path, &backup)?;
-            crate::diagnostics::log("corrupt config was quarantined before resetting settings");
-            Ok(Config::default())
+            crate::diagnostics::log(
+                "corrupt config was quarantined; restoring last-known-good settings",
+            );
+            Ok(last)
         }
         Err(error) => Err(error),
     }
@@ -233,7 +243,8 @@ fn load_for_update_unlocked() -> anyhow::Result<Config> {
     let Some(path) = config_path() else {
         return Ok(Config::default());
     };
-    load_for_update_from(&path)
+    let last = last_good_slot().clone();
+    load_for_update_from(&path, last.as_ref())
 }
 
 fn save_unlocked(config: &Config) -> anyhow::Result<()> {
@@ -260,7 +271,10 @@ impl Config {
     pub fn try_load() -> anyhow::Result<Config> {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
         match read_unlocked() {
-            Ok(DiskConfig::Missing) => Ok(Config::default()),
+            Ok(DiskConfig::Missing) => {
+                *last_good_slot() = None;
+                Ok(Config::default())
+            }
             Ok(DiskConfig::Present(config)) => {
                 remember(&config);
                 Ok(config)
@@ -347,33 +361,20 @@ mod tests {
     }
 
     #[test]
-    fn updating_a_corrupt_config_quarantines_it_before_resetting() {
+    fn updating_a_corrupt_config_without_last_good_leaves_the_file_alone() {
         let path = temporary_path("recover");
         let corrupt = b"{ definitely not json";
         std::fs::write(&path, corrupt).unwrap();
+        assert!(
+            load_for_update_from(&path, None).is_err(),
+            "without last-known-good, a parse error must not write factory defaults"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        assert!(
+            corrupt_siblings(&path).is_empty(),
+            "a failed update must not quarantine the only copy"
+        );
 
-        let mut config = load_for_update_from(&path).expect("quarantine corrupt config");
-        config.capture_hotkey = "Ctrl+Shift+F9".into();
-        let json = serde_json::to_vec_pretty(&config).unwrap();
-        crate::state_lock::atomic_write(&path, &json).unwrap();
-
-        let recovered = load_from(&path).expect("read recovered config");
-        assert_eq!(recovered.capture_hotkey, "Ctrl+Shift+F9");
-        let backup = std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .filter_map(Result::ok)
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(&format!(
-                        "{}.corrupt-",
-                        path.file_name().unwrap().to_string_lossy()
-                    ))
-            })
-            .expect("corrupt backup");
-        assert_eq!(std::fs::read(backup.path()).unwrap(), corrupt);
-        let _ = std::fs::remove_file(backup.path());
         let _ = std::fs::remove_file(path);
     }
 
@@ -503,6 +504,10 @@ mod tests {
         assert!(!config.auto_update);
         assert!(!config.capture_prtscn);
         assert_eq!(config.capture_hotkey, crate::hotkey::NONE);
+        assert!(
+            config.onboarded,
+            "a present unreadable file is not first-run and must not open welcome"
+        );
         assert!(config.telemetry_unanswered());
         assert!(!config.telemetry_enabled());
         let _ = std::fs::remove_file(path);
@@ -518,6 +523,70 @@ mod tests {
         assert!(!config.capture_prtscn);
         assert_eq!(config.capture_hotkey, crate::hotkey::NONE);
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn fail_closed_is_not_a_first_run() {
+        let config = fail_closed();
+        assert!(config.onboarded);
+        assert!(!config.auto_update);
+        assert!(!config.capture_prtscn);
+        assert_eq!(config.capture_hotkey, crate::hotkey::NONE);
+    }
+
+    #[test]
+    fn missing_clears_stale_last_good_so_a_later_corrupt_read_fails_closed() {
+        let path = temporary_path("missing-then-corrupt");
+        write_fixture(&path, opted_out_fixture());
+        let mut last_good = None;
+        let first = load_session(&path, &mut last_good);
+        assert!(!first.auto_update);
+        assert!(last_good.is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let missing = load_session(&path, &mut last_good);
+        assert!(missing.auto_update, "absence is a fresh install");
+        assert!(
+            last_good.is_none(),
+            "a missing file must not keep a previous session's settings"
+        );
+
+        write_fixture(&path, "{");
+        let corrupt = load_session(&path, &mut last_good);
+        assert!(!corrupt.auto_update);
+        assert_eq!(corrupt.capture_hotkey, crate::hotkey::NONE);
+        assert!(corrupt.onboarded);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_after_a_good_read_restores_last_good_instead_of_factory_defaults() {
+        let path = temporary_path("update-from-last-good");
+        write_fixture(&path, opted_out_fixture());
+        let mut last_good = None;
+        let loaded = load_session(&path, &mut last_good);
+
+        write_fixture(&path, "{");
+        let mut config =
+            load_for_update_from(&path, last_good.as_ref()).expect("seed from last-known-good");
+        assert!(!config.auto_update);
+        assert_eq!(config.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(config.telemetry, Some(false));
+        config.last_style = 3;
+        let json = serde_json::to_vec_pretty(&config).unwrap();
+        crate::state_lock::atomic_write(&path, &json).unwrap();
+
+        let saved = load_from(&path).expect("updated last-known-good");
+        assert!(!saved.auto_update);
+        assert_eq!(saved.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(saved.telemetry, Some(false));
+        assert_eq!(saved.last_style, 3);
+        assert_eq!(loaded.capture_delay_secs, 7);
+        assert_eq!(saved.capture_delay_secs, 7);
+        for backup in corrupt_siblings(&path) {
+            let _ = std::fs::remove_file(backup);
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
