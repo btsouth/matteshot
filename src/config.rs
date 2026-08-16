@@ -228,8 +228,12 @@ fn load_for_update_from(path: &Path, last_good: Option<&Config>) -> anyhow::Resu
             let Some(last) = last_good.cloned() else {
                 return Err(error);
             };
+            // Copy, do not rename. The live path must stay present until the
+            // last-good rewrite is durable. A rename plus a failed save leaves
+            // the path missing; the next load/try_load then treats that as a
+            // fresh install and re-authorizes silent install (SBS-910).
             let backup = corrupt_backup_path(path);
-            std::fs::rename(path, &backup)?;
+            std::fs::copy(path, &backup)?;
             crate::diagnostics::log(
                 "corrupt config was quarantined; restoring last-known-good settings",
             );
@@ -591,6 +595,11 @@ mod tests {
         assert!(!config.auto_update);
         assert_eq!(config.capture_hotkey, "Ctrl+Shift+F9");
         assert_eq!(config.telemetry, Some(false));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{",
+            "quarantine must leave the live path in place until the rewrite is durable"
+        );
         config.last_style = 3;
         let json = serde_json::to_vec_pretty(&config).unwrap();
         crate::state_lock::atomic_write(&path, &json).unwrap();
@@ -684,5 +693,60 @@ mod tests {
             "a locked or unreadable path must not authorize a silent install"
         );
         let _ = std::fs::remove_dir_all(locked);
+    }
+
+    /// SBS-910: renaming the live file aside before the last-good rewrite is
+    /// durable turns a failed save into a missing file. The next load/try_load
+    /// then clears last-good and returns factory defaults, which re-authorizes
+    /// silent install — a bypass of SBS-856.
+    #[test]
+    fn a_failed_save_after_quarantine_must_not_look_like_a_fresh_install() {
+        let path = temporary_path("failed-save-after-quarantine");
+        write_fixture(&path, opted_out_fixture());
+        let mut last_good = None;
+        let loaded = load_session(&path, &mut last_good);
+        assert!(!loaded.auto_update);
+        assert!(last_good.is_some());
+
+        write_fixture(&path, "{");
+        let recovered =
+            load_for_update_from(&path, last_good.as_ref()).expect("seed from last-known-good");
+        assert!(!recovered.auto_update);
+        assert_eq!(recovered.capture_hotkey, "Ctrl+Shift+F9");
+
+        // Failed save: the rewrite never becomes durable. The live path must
+        // still be a present unreadable file. Missing is the fresh-install
+        // arm in both resolve_load and try_load.
+        assert!(
+            path.exists(),
+            "quarantine must not remove the live path before the rewrite is durable"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
+        assert!(
+            !corrupt_siblings(&path).is_empty(),
+            "the corrupt bytes should still be preserved aside"
+        );
+
+        let from_disk = read_from(&path);
+        assert!(
+            from_disk.is_err(),
+            "the live path must still be a present unreadable file, not Missing"
+        );
+        let after = resolve_load(&mut last_good, from_disk);
+        assert!(
+            last_good.is_some(),
+            "a failed rewrite must not clear last-known-good"
+        );
+        assert!(!after.auto_update);
+        assert_eq!(after.capture_hotkey, "Ctrl+Shift+F9");
+        assert!(
+            !auto_update_from_load(load_from(&path)),
+            "a failed rewrite must not authorize a silent install"
+        );
+
+        for backup in corrupt_siblings(&path) {
+            let _ = std::fs::remove_file(backup);
+        }
+        let _ = std::fs::remove_file(path);
     }
 }
