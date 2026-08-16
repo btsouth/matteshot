@@ -19,7 +19,7 @@ pub struct Config {
     /// Maximum pixel length of the finished screenshot's longest edge.
     /// Zero preserves the original output dimensions.
     pub output_max_edge: u32,
-    /// First-run notification shown.
+    /// First-run onboarding completed (welcome shown, or balloon fallback after welcome failed).
     pub onboarded: bool,
     /// Whether the resident should own PrtScn while capture is licensed.
     /// This is the user's preference, not the current Windows routing state.

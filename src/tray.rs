@@ -606,7 +606,8 @@ impl Tray {
         }
     }
 
-    /// One-shot balloon notification (first run).
+    /// Show a tray balloon. Used for shortcut conflicts, update progress,
+    /// and the first-run fallback when the welcome window fails to open.
     pub fn notify(&self, title: &str, text: &str) {
         unsafe {
             notify(self.hwnd, title, text);
