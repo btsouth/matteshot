@@ -1350,9 +1350,13 @@ mod tests {
             !src.contains(&old_duration),
             "ordinary trims must not write the decoder's whole-sample duration"
         );
+        // The export loop's own call site, not any of the call sites in this
+        // test module, so removing the production call fails this. Split for
+        // the same reason as the needles above.
+        let production_call = format!("export_pcm(&source_{}, ts,", "bytes");
         assert!(
-            src.contains("export_pcm("),
-            "audio export must go through export_pcm"
+            src.contains(&production_call),
+            "the export loop must hand its audio packet to export_pcm"
         );
     }
 
