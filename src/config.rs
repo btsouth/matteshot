@@ -268,6 +268,7 @@ impl Config {
 
     /// This read only. Used by the updater so a stale last-known-good cannot
     /// authorize a silent install after the file has become unreadable.
+    /// A parse or I/O error is not "use Pictures\Matteshot".
     pub fn try_load() -> anyhow::Result<Config> {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
         match read_unlocked() {
@@ -357,6 +358,24 @@ mod tests {
         std::fs::write(&path, b"{ definitely not json").unwrap();
         assert!(load_from(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{ definitely not json");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_load_from_corrupt_json_is_err_not_default_pictures_path() {
+        let path = temporary_path("try-load-corrupt");
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+        assert!(
+            read_from(&path).is_err(),
+            "try_load reads via read_from; corrupt json must not become Config::default()"
+        );
+        let default_save = Config::default().save_dir();
+        assert!(
+            default_save
+                .file_name()
+                .is_some_and(|name| name == "Matteshot"),
+            "the default path try_load must not invent is {default_save:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
