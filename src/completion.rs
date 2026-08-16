@@ -52,15 +52,21 @@ impl<T> CompletionMailbox<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn mint_token(&self) -> CompletionToken {
-        // Mix the counter so tokens are not 0/1 (the forged LPARAMs in the
-        // SBS-743 acceptance check) and do not look like heap pointers.
-        // Mask to isize::MAX so LPARAM(token as isize) round-trips on both
-        // 32-bit and 64-bit Windows (the high bit would sign-extend).
+    /// Mint under the caller's lock so a token can never duplicate a live one.
+    ///
+    /// Mix the counter so tokens are not 0/1 (the forged LPARAMs in the
+    /// SBS-743 acceptance check) and do not look like heap pointers. Mask to
+    /// `isize::MAX` so `LPARAM(token as isize)` round-trips without
+    /// sign-extending the high bit. That mask drops a bit, so the mix is no
+    /// longer injective: two counter values can produce the same token, and a
+    /// duplicate among live slots would let `take` hand one window another
+    /// window's payload and `discard_token` remove both. Checking `pending`
+    /// here is the cheap way to make that impossible rather than unlikely.
+    fn mint_unique(inner: &Inner<T>, next: &AtomicU64) -> CompletionToken {
         const LPARAM_TOKEN_MASK: u64 = isize::MAX as u64;
         loop {
-            let token = splitmix64(self.next.fetch_add(1, Ordering::Relaxed)) & LPARAM_TOKEN_MASK;
-            if token > 1 {
+            let token = splitmix64(next.fetch_add(1, Ordering::Relaxed)) & LPARAM_TOKEN_MASK;
+            if token > 1 && !inner.pending.iter().any(|slot| slot.token == token) {
                 return token;
             }
         }
@@ -73,8 +79,8 @@ impl<T> CompletionMailbox<T> {
     /// Store `payload` for `hwnd` at the window's current generation.
     #[cfg(test)]
     pub fn insert(&self, hwnd: isize, payload: T) -> CompletionToken {
-        let token = self.mint_token();
         let mut inner = self.lock();
+        let token = Self::mint_unique(&inner, &self.next);
         let generation = inner.generation(hwnd);
         inner.pending.push(Slot {
             token,
@@ -88,11 +94,11 @@ impl<T> CompletionMailbox<T> {
     /// Store `payload` only when `generation` is still this window's generation.
     /// A worker snapshots before spawn; unbind in between refuses the insert.
     pub fn insert_at(&self, hwnd: isize, generation: u64, payload: T) -> Option<CompletionToken> {
-        let token = self.mint_token();
         let mut inner = self.lock();
         if inner.generation(hwnd) != generation {
             return None;
         }
+        let token = Self::mint_unique(&inner, &self.next);
         inner.pending.push(Slot {
             token,
             hwnd,
@@ -279,6 +285,21 @@ mod tests {
         assert!(mailbox.insert_at(hwnd, generation, "stale").is_none());
         assert_eq!(mailbox.pending_len(), 0);
         assert!(mailbox.take(1, hwnd).is_none());
+    }
+
+    /// Pins SBS-743: no two live slots may share a token. `take` matches the
+    /// first slot with a token, so a duplicate would deliver one window's
+    /// payload to another, and `discard_token` would drop both.
+    #[test]
+    fn no_two_live_slots_share_a_token() {
+        let mailbox = CompletionMailbox::<u32>::new();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..512u32 {
+            // Spread over several windows: uniqueness is global, not per-hwnd.
+            let token = mailbox.insert(0x10 + (i % 4) as isize, i);
+            assert!(seen.insert(token), "token {token:#x} was issued twice");
+        }
+        assert_eq!(mailbox.pending_len(), 512);
     }
 
     #[test]
