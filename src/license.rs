@@ -1279,11 +1279,10 @@ fn resolve_device_id(inputs: DeviceIdInputs<'_>) -> Result<ResolvedDeviceId> {
 }
 
 fn is_legacy_name_hash(id: &str) -> bool {
-    let mut seeds = vec![
-        "COMPUTERNAME".to_owned(),
-        "Windows PC".to_owned(),
-        String::new(),
-    ];
+    // Old builds hashed device_name(): the live COMPUTERNAME, or "Windows PC".
+    // The literal "COMPUTERNAME" and "" were never hashed, so accepting them
+    // would let a foreign cert bind on every PC.
+    let mut seeds = vec!["Windows PC".to_owned()];
     if let Ok(name) = std::env::var("COMPUTERNAME") {
         let name = name.trim().to_owned();
         if !name.is_empty() {
@@ -1402,8 +1401,18 @@ fn resolve_current_device_id(state: &State) -> Result<String> {
 /// callers can fail closed instead of minting a colliding or unstable
 /// identity.
 pub fn device_id() -> Result<String> {
-    let state = load_state()?;
-    resolve_current_device_id(&state)
+    match load_state() {
+        Ok(state) => resolve_current_device_id(&state),
+        // Activation quarantines a corrupt license.json after the server
+        // verifies a replacement. That path needs this PC's guid hash even
+        // when the file cannot be read; stored/cert hints are optional.
+        Err(_) => resolve_device_id(DeviceIdInputs {
+            machine_guid: read_machine_guid().as_deref(),
+            stored_hashed_id: None,
+            certificate_device_id: None,
+        })
+        .map(|resolved| resolved.hashed_id),
+    }
 }
 
 fn device_name() -> String {
@@ -2089,14 +2098,14 @@ mod tests {
 
     #[test]
     fn a_legacy_name_hash_is_kept_when_guid_becomes_readable() {
-        let stored = hash_machine_guid("COMPUTERNAME");
+        let stored = hash_machine_guid("Windows PC");
         let later = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF";
         let resolved = resolve_device_id(DeviceIdInputs {
             machine_guid: Some(later),
             stored_hashed_id: Some(&stored),
             certificate_device_id: None,
         })
-        .expect("a COMPUTERNAME-era identity must keep working");
+        .expect("a Windows-PC-era identity must keep working");
         assert_eq!(resolved.hashed_id, stored);
         assert_ne!(resolved.hashed_id, hash_machine_guid(later));
         assert!(!resolved.persist);
@@ -2119,7 +2128,7 @@ mod tests {
     #[test]
     fn registry_device_id_does_not_suppress_certificate_seeding() {
         let registry = hash_machine_guid("8C4A3E12-91F0-4B2A-A6D1-0F3E8B7C2A19");
-        let certificate = hash_machine_guid("COMPUTERNAME");
+        let certificate = hash_machine_guid("Windows PC");
         let (stored, from_certificate) =
             stored_and_certificate_ids(None, Some(&registry), Some(&certificate));
         assert_eq!(stored, None);
@@ -2129,22 +2138,51 @@ mod tests {
             stored_hashed_id: stored,
             certificate_device_id: from_certificate,
         })
-        .expect("a COMPUTERNAME-issued cert must seed over a minted registry id");
+        .expect("a name-era cert must seed over a minted registry id");
         assert_eq!(resolved.hashed_id, certificate);
         assert!(resolved.persist);
     }
 
     #[test]
-    fn a_failed_state_load_does_not_mint_a_device_id() {
-        fn device_id_from_load(loaded: Result<State>) -> Result<String> {
-            resolve_current_device_id(&loaded?)
+    fn a_failed_state_load_still_hashes_a_readable_guid() {
+        let guid = "8C4A3E12-91F0-4B2A-A6D1-0F3E8B7C2A19";
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(guid),
+            stored_hashed_id: None,
+            certificate_device_id: None,
+        })
+        .expect("activation must proceed when MachineGuid is readable");
+        assert_eq!(resolved.hashed_id, hash_machine_guid(guid));
+        assert!(resolved.persist);
+    }
+
+    #[test]
+    fn a_failed_state_load_fails_closed_when_guid_is_unreadable() {
+        resolve_device_id(DeviceIdInputs {
+            machine_guid: None,
+            stored_hashed_id: None,
+            certificate_device_id: None,
+        })
+        .expect_err("no stored id and no guid must not mint a name hash");
+    }
+
+    #[test]
+    fn a_literal_computername_hash_is_not_legacy_on_a_named_pc() {
+        let live = "8C4A3E12-91F0-4B2A-A6D1-0F3E8B7C2A19";
+        let stored = hash_machine_guid("COMPUTERNAME");
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(live),
+            stored_hashed_id: Some(&stored),
+            certificate_device_id: None,
+        })
+        .expect("a readable guid still produces this PC's identity");
+        let env_name = std::env::var("COMPUTERNAME").unwrap_or_default();
+        if env_name.trim() == "COMPUTERNAME" {
+            assert_eq!(resolved.hashed_id, stored);
+        } else {
+            assert_eq!(resolved.hashed_id, hash_machine_guid(live));
+            assert_ne!(resolved.hashed_id, stored);
         }
-        let error = device_id_from_load(Err(anyhow::anyhow!("parse license state")))
-            .expect_err("a corrupt license.json must fail closed");
-        assert!(
-            error.to_string().contains("parse license state"),
-            "{error:#}"
-        );
     }
 
     #[test]
@@ -2179,7 +2217,7 @@ mod tests {
         // fallback has no stored hash yet. The guid is now readable and
         // would hash differently; the certificate's device_id is the
         // machine we already activated and must be kept.
-        let from_certificate = hash_machine_guid("COMPUTERNAME");
+        let from_certificate = hash_machine_guid("Windows PC");
         let later = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF";
         let resolved = resolve_device_id(DeviceIdInputs {
             machine_guid: Some(later),
