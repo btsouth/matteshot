@@ -445,6 +445,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "image",
+ "png",
  "rayon",
  "semver",
  "serde",

@@ -10,6 +10,7 @@ mod delay;
 mod diagnostics;
 mod dpi;
 mod history;
+mod thumb_decode;
 mod hotkey;
 mod icon;
 mod installer;

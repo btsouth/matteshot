@@ -1025,6 +1025,53 @@ mod layout_tests {
     }
 }
 
+#[cfg(test)]
+mod thumb_tests {
+    use super::*;
+    use image::{Rgba, RgbaImage};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-history-thumb-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn make_thumb_letterboxes_a_tall_scroll_into_the_cell() {
+        let dir = temp_dir("cell");
+        let path = dir.join("scroll.png");
+        let mut img = RgbaImage::new(80, 4000);
+        for pixel in img.pixels_mut() {
+            *pixel = Rgba([8, 16, 24, 255]);
+        }
+        img.save(&path).unwrap();
+        let thumb = make_thumb(
+            &Entry {
+                path,
+                saved_at: 1,
+                width: 80,
+                height: 4000,
+                style: "Deep".into(),
+                source: Some("Notepad".into()),
+            },
+            CELL_W,
+            CELL_IMG_H,
+        )
+        .expect("tall scroll should still produce a cell thumb");
+        assert!(thumb.img_w <= CELL_W, "thumb width {} exceeds cell", thumb.img_w);
+        assert!(thumb.img_h <= CELL_IMG_H, "thumb height {} exceeds cell", thumb.img_h);
+        assert_eq!(
+            thumb.bgra.len(),
+            (thumb.img_w * thumb.img_h * 4) as usize
+        );
+        assert_eq!(thumb.source_label, "Notepad");
+    }
+}
+
 struct Thumb {
     entry: Entry,
     bgra: Vec<u8>,
@@ -1049,8 +1096,16 @@ fn to_bgra(img: &RgbaImage) -> Vec<u8> {
 /// cell's image area. `None` when the file cannot be decoded (corrupt or
 /// swapped for something else since it was indexed) — the entry is simply
 /// left out of the grid rather than shown broken.
+///
+/// Decode is capped (SBS-913): a 40k-px scroll capture is downsampled while
+/// the decoder still only holds one scanline, then letterboxed into the cell.
+/// Copy / reopen-in-editor still load the file at native size; those are
+/// one image on demand, not every indexed PNG on window open.
 fn make_thumb(entry: &Entry, max_w: i32, max_h: i32) -> Option<Thumb> {
-    let img = image::open(&entry.path).ok()?.to_rgba8();
+    let cap = crate::thumb_decode::THUMB_DECODE_MAX
+        .max(max_w.max(1) as u32)
+        .max(max_h.max(1) as u32);
+    let img = crate::thumb_decode::decode_for_thumb(&entry.path, cap)?;
     let (w, h) = (img.width().max(1) as f32, img.height().max(1) as f32);
     let scale = (max_w as f32 / w).min(max_h as f32 / h);
     let (tw, th) = ((w * scale).round().max(1.0) as u32, (h * scale).round().max(1.0) as u32);
