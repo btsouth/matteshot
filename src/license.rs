@@ -20,9 +20,10 @@ use std::time::Duration;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+    WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::RegKey;
@@ -942,7 +943,7 @@ pub fn refresh_once() -> Result<Status> {
         device_id: device.clone(),
     };
     let (status_code, response) = post_json(LICENSE_PATH_REFRESH, &serde_json::to_vec(&request)?)?;
-    if status_code == 403 {
+    if refresh_should_drop_activation(status_code) {
         let _guard = crate::state_lock::lock(LICENSE_MUTEX)?;
         let mut state = load_state()?;
         // Only when the rejected activation is still the live one: a request
@@ -1433,6 +1434,65 @@ fn response_error(body: &[u8], fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+fn winhttp_redirect_policy() -> u32 {
+    WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+}
+
+fn redirect_status_is_error(status: u32) -> bool {
+    (300..400).contains(&status)
+}
+
+fn redirect_refusal(service: &str, status: u32, location: Option<&str>) -> String {
+    format!(
+        "{service} service redirected the request: status={status} location={}",
+        location.filter(|value| !value.is_empty()).unwrap_or("none")
+    )
+}
+
+fn next_location_header_chars(current: usize, required_bytes: u32) -> Option<usize> {
+    const MAX_CHARS: usize = 8192;
+    let needed = (required_bytes as usize).div_ceil(2);
+    if needed <= current || needed > MAX_CHARS {
+        None
+    } else {
+        Some(needed)
+    }
+}
+
+fn query_location_header(request: *mut c_void) -> Option<String> {
+    let mut chars = 1024usize;
+    loop {
+        let mut buf = vec![0u16; chars];
+        let mut size = (buf.len() * 2) as u32;
+        let mut index = 0u32;
+        match unsafe {
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_LOCATION,
+                PCWSTR::null(),
+                Some(buf.as_mut_ptr() as *mut c_void),
+                &mut size,
+                &mut index,
+            )
+        } {
+            Ok(()) => {
+                let wide = (size as usize) / 2;
+                let text = String::from_utf16_lossy(&buf[..wide.min(buf.len())]);
+                let text = text.trim_end_matches('\0').trim();
+                return (!text.is_empty()).then(|| text.to_owned());
+            }
+            Err(_) => {
+                let next = next_location_header_chars(chars, size)?;
+                chars = next;
+            }
+        }
+    }
+}
+
+fn refresh_should_drop_activation(status: u32) -> bool {
+    status == 403
+}
+
 fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
     unsafe {
         let agent = HSTRING::from(concat!("Matteshot/", env!("CARGO_PKG_VERSION")));
@@ -1446,6 +1506,15 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
             ),
             "open license connection",
         )?;
+        // WinHTTP follows 307/308 by default and would resubmit the
+        // refresh token to Location.
+        let policy = winhttp_redirect_policy().to_ne_bytes();
+        WinHttpSetOption(
+            Some(session.0 as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(policy.as_slice()),
+        )
+        .context("disable license redirects")?;
         WinHttpSetTimeouts(session.0, 5_000, 5_000, 8_000, 10_000)
             .context("set license connection timeouts")?;
         let host = HSTRING::from(LICENSE_HOST);
@@ -1493,6 +1562,10 @@ fn post_json(path: &str, body: &[u8]) -> Result<(u32, Vec<u8>)> {
             &mut index,
         )
         .context("read license response status")?;
+        if redirect_status_is_error(status) {
+            let location = query_location_header(request.0);
+            bail!("{}", redirect_refusal("license", status, location.as_deref()));
+        }
 
         let mut response = Vec::new();
         loop {
@@ -1993,6 +2066,51 @@ mod tests {
             signature: "not-a-signature".into(),
         };
         assert!(verify_trial(&stored, "device").is_err());
+    }
+
+    #[test]
+    fn winhttp_redirect_policy_is_never() {
+        assert_eq!(
+            winhttp_redirect_policy(),
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+        );
+        assert_eq!(winhttp_redirect_policy(), 0);
+    }
+
+    /// A 307 to a second host must not transmit the body — NEVER plus
+    /// treating 3xx as error is the probe.
+    #[test]
+    fn redirect_status_is_error_for_3xx_including_307_and_308() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(redirect_status_is_error(status), "HTTP {status}");
+        }
+        for status in [200, 403, 404, 500] {
+            assert!(!redirect_status_is_error(status), "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn redirect_refusal_includes_status_and_location() {
+        let error = redirect_refusal("license", 307, Some("https://evil.example/v1"));
+        assert!(error.contains("status=307"), "{error}");
+        assert!(error.contains("https://evil.example/v1"), "{error}");
+        assert!(redirect_refusal("license", 301, None).contains("location=none"));
+    }
+
+    #[test]
+    fn an_insufficient_location_buffer_retries_up_to_the_cap() {
+        assert_eq!(next_location_header_chars(1024, 4000), Some(2000));
+        assert_eq!(next_location_header_chars(1024, 2048), None);
+        assert_eq!(next_location_header_chars(1024, 20_000), None);
+        assert_eq!(next_location_header_chars(8192, 20_000), None);
+    }
+
+    #[test]
+    fn a_307_must_not_drop_an_activation() {
+        assert!(refresh_should_drop_activation(403));
+        assert!(!refresh_should_drop_activation(307));
+        assert!(!refresh_should_drop_activation(308));
+        assert!(!refresh_should_drop_activation(200));
     }
 
     fn name_derived_hashes() -> [String; 3] {

@@ -33,9 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+    WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 
 const POSTHOG_HOST: &str = "us.i.posthog.com";
@@ -343,6 +344,61 @@ impl Drop for InternetHandle {
     }
 }
 
+fn winhttp_redirect_policy() -> u32 {
+    WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+}
+
+fn redirect_status_is_error(status: u32) -> bool {
+    (300..400).contains(&status)
+}
+
+fn redirect_refusal(service: &str, status: u32, location: Option<&str>) -> String {
+    format!(
+        "{service} service redirected the request: status={status} location={}",
+        location.filter(|value| !value.is_empty()).unwrap_or("none")
+    )
+}
+
+fn next_location_header_chars(current: usize, required_bytes: u32) -> Option<usize> {
+    const MAX_CHARS: usize = 8192;
+    let needed = (required_bytes as usize).div_ceil(2);
+    if needed <= current || needed > MAX_CHARS {
+        None
+    } else {
+        Some(needed)
+    }
+}
+
+fn query_location_header(request: *mut c_void) -> Option<String> {
+    let mut chars = 1024usize;
+    loop {
+        let mut buf = vec![0u16; chars];
+        let mut size = (buf.len() * 2) as u32;
+        let mut index = 0u32;
+        match unsafe {
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_LOCATION,
+                PCWSTR::null(),
+                Some(buf.as_mut_ptr() as *mut c_void),
+                &mut size,
+                &mut index,
+            )
+        } {
+            Ok(()) => {
+                let wide = (size as usize) / 2;
+                let text = String::from_utf16_lossy(&buf[..wide.min(buf.len())]);
+                let text = text.trim_end_matches('\0').trim();
+                return (!text.is_empty()).then(|| text.to_owned());
+            }
+            Err(_) => {
+                let next = next_location_header_chars(chars, size)?;
+                chars = next;
+            }
+        }
+    }
+}
+
 fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
     unsafe {
         let agent = HSTRING::from(concat!("Matteshot/", env!("CARGO_PKG_VERSION")));
@@ -356,6 +412,15 @@ fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
             ),
             "open telemetry connection",
         )?;
+        // WinHTTP follows 307/308 by default and would resubmit the
+        // request body to Location.
+        let policy = winhttp_redirect_policy().to_ne_bytes();
+        WinHttpSetOption(
+            Some(session.0 as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(policy.as_slice()),
+        )
+        .context("disable telemetry redirects")?;
         WinHttpSetTimeouts(session.0, 5_000, 5_000, 8_000, 10_000)
             .context("set telemetry connection timeouts")?;
         let host = HSTRING::from(POSTHOG_HOST);
@@ -401,6 +466,10 @@ fn post_json(body: &[u8]) -> Result<(u32, Vec<u8>)> {
             &mut index,
         )
         .context("read telemetry response status")?;
+        if redirect_status_is_error(status) {
+            let location = query_location_header(request.0);
+            anyhow::bail!("{}", redirect_refusal("telemetry", status, location.as_deref()));
+        }
 
         let mut response = Vec::new();
         loop {
@@ -586,5 +655,26 @@ mod tests {
             .context("save the finished matte")
             .unwrap_err();
         assert_eq!(failure_kind(&wrapped), "access_denied");
+    }
+
+    #[test]
+    fn winhttp_redirect_policy_is_never() {
+        assert_eq!(
+            winhttp_redirect_policy(),
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+        );
+        assert_eq!(winhttp_redirect_policy(), 0);
+    }
+
+    /// A 307 to a second host must not transmit the body — NEVER plus
+    /// treating 3xx as error is the probe.
+    #[test]
+    fn redirect_status_is_error_for_3xx_including_307_and_308() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(redirect_status_is_error(status), "HTTP {status}");
+        }
+        for status in [200, 403, 404, 500] {
+            assert!(!redirect_status_is_error(status), "HTTP {status}");
+        }
     }
 }
