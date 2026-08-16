@@ -611,9 +611,10 @@ mod tests {
     }
 
     /// Pins SBS-764: the legacy nonzero `--quit` path must still exist, and
-    /// it must resolve taskkill through the native System32 directory.
+    /// it must resolve taskkill through the Windows system directory rather
+    /// than by bare name.
     #[test]
-    fn installer_legacy_quit_uses_native_system_taskkill() {
+    fn installer_legacy_quit_execs_taskkill_from_the_system_directory() {
         let source = include_str!("../installer/matteshot.iss");
         assert!(
             source.contains("if R <> 0 then"),
@@ -625,7 +626,7 @@ mod tests {
         );
         assert!(
             source.contains("ExpandConstant('{sys}\\taskkill.exe')"),
-            "legacy close must Exec native {{sys}}\\taskkill.exe"
+            "legacy close must Exec {{sys}}\\taskkill.exe"
         );
     }
 }
