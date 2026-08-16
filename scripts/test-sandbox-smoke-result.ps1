@@ -65,7 +65,7 @@ try {
         -PollIntervalMilliseconds 50
     Assert-SandboxSmoke `
         -Name 'missing-result-after-timeout' `
-        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -ne 0) `
+        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -eq 2) `
         -Detail "Kind=$($outcome.Kind) ExitCode=$($outcome.ExitCode)"
 } finally {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -83,7 +83,7 @@ try {
         -PollIntervalMilliseconds 50
     Assert-SandboxSmoke `
         -Name 'guest-passed-false' `
-        -Condition ($outcome.Kind -eq 'Fail' -and $outcome.ExitCode -ne 0) `
+        -Condition ($outcome.Kind -eq 'Fail' -and $outcome.ExitCode -eq 1) `
         -Detail "Kind=$($outcome.Kind) ExitCode=$($outcome.ExitCode)"
 } finally {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -117,7 +117,7 @@ try {
         -PollIntervalMilliseconds 50
     Assert-SandboxSmoke `
         -Name 'unparseable-result-after-timeout' `
-        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -ne 0) `
+        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -eq 2) `
         -Detail "Kind=$($outcome.Kind) ExitCode=$($outcome.ExitCode)"
 } finally {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -135,7 +135,7 @@ try {
         -PollIntervalMilliseconds 50
     Assert-SandboxSmoke `
         -Name 'json-missing-passed-property' `
-        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -ne 0) `
+        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -eq 2) `
         -Detail "Kind=$($outcome.Kind) ExitCode=$($outcome.ExitCode)"
 } finally {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -153,7 +153,7 @@ try {
         -PollIntervalMilliseconds 50
     Assert-SandboxSmoke `
         -Name 'passed-not-boolean' `
-        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -ne 0) `
+        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.ExitCode -eq 2) `
         -Detail "Kind=$($outcome.Kind) ExitCode=$($outcome.ExitCode)"
 } finally {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -172,8 +172,12 @@ try {
         -PollIntervalMilliseconds 50
     Assert-SandboxSmoke `
         -Name 'prior-result-json-is-wiped' `
-        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.Reason -eq 'Missing') `
-        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason)"
+        -Condition (
+            $outcome.Kind -eq 'Unknown' -and
+            $outcome.Reason -eq 'Missing' -and
+            $outcome.ExitCode -eq 2
+        ) `
+        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason) ExitCode=$($outcome.ExitCode)"
 } finally {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -196,10 +200,11 @@ try {
         -Condition (
             $outcome.Kind -eq 'Unknown' -and
             $outcome.Reason -eq 'Missing' -and
+            $outcome.ExitCode -eq 2 -and
             $outcome.TimedOut -and
             $sw.Elapsed.TotalSeconds -ge 4
         ) `
-        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason) TimedOut=$($outcome.TimedOut) Seconds=$([math]::Round($sw.Elapsed.TotalSeconds, 1))"
+        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason) ExitCode=$($outcome.ExitCode) TimedOut=$($outcome.TimedOut) Seconds=$([math]::Round($sw.Elapsed.TotalSeconds, 1))"
 } finally {
     if ($exited) { $exited.Dispose() }
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
