@@ -264,22 +264,32 @@ fn parent_is_under_any_root(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
 }
 
 fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
-    let unlink = match stable_canonical(path) {
-        Some(canonical) if path_is_owned_capture(&canonical, roots) => Some(canonical),
-        _ if is_symlink(path) && parent_is_under_any_root(path, roots) => {
-            Some(path.to_path_buf())
+    // Load first: a Delete that cannot update the index must not unlink the file.
+    let mut log = load_for_mutation(index)?;
+    let unlink = if is_symlink(path) && parent_is_under_any_root(path, roots) {
+        Some(path.to_path_buf())
+    } else {
+        match stable_canonical(path) {
+            Some(canonical) if path_is_owned_capture(&canonical, roots) => Some(canonical),
+            _ => None,
         }
-        _ => None,
     };
     if let Some(target) = unlink {
-        match std::fs::remove_file(&target) {
-            Ok(()) => {}
-            // Already gone (deleted outside the app, or a repeat click racing
-            // its own first Delete): the index is just stale, so finish
-            // dropping the entry instead of reporting a failure the user has no
-            // way to act on.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("delete capture"),
+        if !is_symlink(path) && !path_still_matches_canonical(path, &target) {
+            crate::diagnostics::log(&format!(
+                "history delete skipped because the path changed: {}",
+                path.display()
+            ));
+        } else {
+            match std::fs::remove_file(&target) {
+                Ok(()) => {}
+                // Already gone (deleted outside the app, or a repeat click racing
+                // its own first Delete): the index is just stale, so finish
+                // dropping the entry instead of reporting a failure the user has no
+                // way to act on.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("delete capture"),
+            }
         }
     } else {
         // History is an index, not a file manager: a stale or hand-edited
@@ -289,14 +299,12 @@ fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
             path.display()
         ));
     }
-    // Unlike record, a transient read failure surfaces here: Delete already
-    // decided the entry should go, and silently keeping it would leave a
-    // click that "worked" still showing the capture.
-    let mut log = load_for_mutation(index)?;
     log.entries.retain(|e| e.path != path);
-    // Same reasoning: a stale entry left by a failed write is a Delete that
-    // only looked like it worked.
     save_unlocked_at(index, &log)
+}
+
+fn path_still_matches_canonical(path: &Path, expected: &Path) -> bool {
+    std::fs::canonicalize(path).ok().as_deref() == Some(expected)
 }
 
 /// Delete the file and drop it from history. Unlike `record`, errors surface:
@@ -651,6 +659,55 @@ mod persistence_tests {
             "the outside target must not be deleted"
         );
         assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_symlink_to_another_file_in_the_save_folder_does_not_delete_the_target() {
+        let dir = temp_dir("remove-symlink-inside");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let target = capture(&save, "real.png");
+        let link = save.join("link.png");
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            eprintln!("skipping: creating a file symlink requires privilege");
+            return;
+        }
+        let index = dir.join("history.json");
+        append_at(&index, entry_at(&link));
+
+        assert!(remove_at(&index, &link, &[save]).is_ok());
+        assert!(!link.exists(), "the symlink must be unlinked");
+        assert!(
+            target.is_file(),
+            "an in-folder symlink must not delete its target"
+        );
+        assert!(load_for_mutation(&index).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_index_does_not_unlink_the_file() {
+        let dir = temp_dir("remove-unreadable-index");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let shot = capture(&save, "a.png");
+        let index = dir.join("history.json");
+        std::fs::create_dir_all(&index).unwrap();
+
+        assert!(remove_at(&index, &shot, &[save]).is_err());
+        assert!(shot.is_file(), "a failed index load must leave the capture");
+    }
+
+    #[test]
+    fn path_still_matches_canonical_is_false_after_the_file_moves() {
+        let dir = temp_dir("canonical-moved");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = capture(&dir, "a.png");
+        let canonical = std::fs::canonicalize(&original).unwrap();
+        assert!(path_still_matches_canonical(&original, &canonical));
+        let moved = dir.join("b.png");
+        std::fs::rename(&original, &moved).unwrap();
+        assert!(!path_still_matches_canonical(&original, &canonical));
+        assert!(moved.is_file());
     }
 
     #[test]
