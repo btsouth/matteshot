@@ -275,9 +275,8 @@ fn take_owned_history_path_at(
 }
 
 fn take_owned_history_path(path: &Path) -> Result<HistoryPathDisposition> {
-    let config = crate::config::Config::try_load().map_err(|error| {
+    let config = crate::config::Config::try_load().inspect_err(|_| {
         crate::diagnostics::log("history ownership check skipped because config could not be loaded");
-        error
     })?;
     let roots = [config.save_dir(), config.video_dir()];
     Ok(take_owned_history_path_at(path, &roots))
