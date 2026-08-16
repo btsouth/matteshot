@@ -1219,6 +1219,7 @@ struct DeviceIdInputs<'a> {
     certificate_device_id: Option<&'a str>,
 }
 
+#[derive(Debug)]
 struct ResolvedDeviceId {
     hashed_id: String,
     /// Freshly obtained — minted from a live MachineGuid, or seeded from a
@@ -1242,27 +1243,31 @@ fn hash_machine_guid(guid: &str) -> String {
 
 /// Resolve a stable device identity without talking to the registry.
 ///
-/// A previously stored hashed id is sticky even if MachineGuid is now
-/// readable and would hash differently — that is the already-activated
-/// machine. With no stored id, a signature-verified certificate's
-/// device_id is preferred over a newly readable guid, so an upgrade does
-/// not drop an activation issued under the old COMPUTERNAME fallback. A
-/// missing guid with no stored id and no certificate is an error: we
-/// never invent an identity from the computer name, because two PCs
-/// named DESKTOP-XXXX (or both falling through to "Windows PC") would
-/// share a trial seat.
+/// When MachineGuid is readable, a stored or certificate id is accepted
+/// only if it is this PC's guid hash or a legacy name-derived hash
+/// (COMPUTERNAME / "Windows PC"). Any other stored hash is a copy from
+/// another machine and must not keep a license valid. When the guid is
+/// unreadable, a previously stored hash is sticky so an already-activated
+/// machine keeps working. A missing guid with no stored id and no
+/// certificate is an error: we never invent an identity from the computer
+/// name, because two PCs named DESKTOP-XXXX (or both falling through to
+/// "Windows PC") would share a trial seat.
 fn resolve_device_id(inputs: DeviceIdInputs<'_>) -> Result<ResolvedDeviceId> {
     if let Some(stored) = nonempty_device_id(inputs.stored_hashed_id) {
-        return Ok(ResolvedDeviceId {
-            hashed_id: stored.to_owned(),
-            persist: false,
-        });
+        if id_belongs_on_this_pc(stored, inputs.machine_guid) {
+            return Ok(ResolvedDeviceId {
+                hashed_id: stored.to_owned(),
+                persist: false,
+            });
+        }
     }
     if let Some(from_certificate) = nonempty_device_id(inputs.certificate_device_id) {
-        return Ok(ResolvedDeviceId {
-            hashed_id: from_certificate.to_owned(),
-            persist: true,
-        });
+        if id_belongs_on_this_pc(from_certificate, inputs.machine_guid) {
+            return Ok(ResolvedDeviceId {
+                hashed_id: from_certificate.to_owned(),
+                persist: true,
+            });
+        }
     }
     if let Some(guid) = nonempty_device_id(inputs.machine_guid) {
         return Ok(ResolvedDeviceId {
@@ -1271,6 +1276,46 @@ fn resolve_device_id(inputs: DeviceIdInputs<'_>) -> Result<ResolvedDeviceId> {
         });
     }
     bail!("this PC's machine identifier is unreadable")
+}
+
+fn is_legacy_name_hash(id: &str) -> bool {
+    let mut seeds = vec![
+        "COMPUTERNAME".to_owned(),
+        "Windows PC".to_owned(),
+        String::new(),
+    ];
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        let name = name.trim().to_owned();
+        if !name.is_empty() {
+            seeds.push(name);
+        }
+    }
+    seeds.iter().any(|seed| hash_machine_guid(seed) == id)
+}
+
+fn id_belongs_on_this_pc(id: &str, machine_guid: Option<&str>) -> bool {
+    match nonempty_device_id(machine_guid) {
+        None => true,
+        Some(guid) if id == hash_machine_guid(guid) => true,
+        Some(_) => is_legacy_name_hash(id),
+    }
+}
+
+/// HKCU DeviceId is only a hint when there is no `State.device_id` and no
+/// signature-valid certificate. A minted registry value must not suppress
+/// seeding from a paid or trial cert that predates the stored-hash field.
+fn stored_and_certificate_ids<'a>(
+    state_device_id: Option<&'a str>,
+    registry_device_id: Option<&'a str>,
+    certificate_device_id: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(stored) = nonempty_device_id(state_device_id) {
+        return (Some(stored), None);
+    }
+    if let Some(certificate) = nonempty_device_id(certificate_device_id) {
+        return (None, Some(certificate));
+    }
+    (nonempty_device_id(registry_device_id), None)
 }
 
 fn read_machine_guid() -> Option<String> {
@@ -1327,21 +1372,16 @@ fn signed_device_id_from_state(state: &State) -> Option<String> {
 fn resolve_current_device_id(state: &State) -> Result<String> {
     let machine_guid = read_machine_guid();
     let from_registry = registry_device_id();
-    let stored = nonempty_device_id(state.device_id.as_deref())
-        .map(str::to_owned)
-        .or(from_registry.clone());
-    // Do not ask the certificate when a sticky id is already stored: a
-    // later-readable MachineGuid must not replace it, and neither must a
-    // different certificate copied onto the machine.
-    let from_certificate = if stored.is_none() {
-        signed_device_id_from_state(state)
-    } else {
-        None
-    };
+    let from_certificate = signed_device_id_from_state(state);
+    let (stored, certificate) = stored_and_certificate_ids(
+        state.device_id.as_deref(),
+        from_registry.as_deref(),
+        from_certificate.as_deref(),
+    );
     let resolved = resolve_device_id(DeviceIdInputs {
         machine_guid: machine_guid.as_deref(),
-        stored_hashed_id: stored.as_deref(),
-        certificate_device_id: from_certificate.as_deref(),
+        stored_hashed_id: stored,
+        certificate_device_id: certificate,
     })?;
     // Persist a freshly obtained hash (minted or certificate-seeded), and
     // backfill HKCU when license state already holds the sticky id so a
@@ -1362,7 +1402,7 @@ fn resolve_current_device_id(state: &State) -> Result<String> {
 /// callers can fail closed instead of minting a colliding or unstable
 /// identity.
 pub fn device_id() -> Result<String> {
-    let state = load_state().unwrap_or_default();
+    let state = load_state()?;
     resolve_current_device_id(&state)
 }
 
@@ -2033,18 +2073,78 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_id_wins_over_a_different_readable_guid() {
-        let stored = hash_machine_guid("original-activated-guid");
+    fn a_stored_id_from_another_machine_is_rejected_when_guid_is_readable() {
+        let stored = hash_machine_guid("foreign-guid");
+        let live = "8C4A3E12-91F0-4B2A-A6D1-0F3E8B7C2A19";
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(live),
+            stored_hashed_id: Some(&stored),
+            certificate_device_id: None,
+        })
+        .expect("a readable guid still produces this PC's identity");
+        assert_eq!(resolved.hashed_id, hash_machine_guid(live));
+        assert_ne!(resolved.hashed_id, stored);
+        assert!(resolved.persist);
+    }
+
+    #[test]
+    fn a_legacy_name_hash_is_kept_when_guid_becomes_readable() {
+        let stored = hash_machine_guid("COMPUTERNAME");
         let later = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF";
         let resolved = resolve_device_id(DeviceIdInputs {
             machine_guid: Some(later),
             stored_hashed_id: Some(&stored),
             certificate_device_id: None,
         })
-        .expect("a stored identity is sticky");
+        .expect("a COMPUTERNAME-era identity must keep working");
         assert_eq!(resolved.hashed_id, stored);
         assert_ne!(resolved.hashed_id, hash_machine_guid(later));
         assert!(!resolved.persist);
+    }
+
+    #[test]
+    fn a_stored_id_matching_this_pc_guid_is_kept() {
+        let guid = "8C4A3E12-91F0-4B2A-A6D1-0F3E8B7C2A19";
+        let stored = hash_machine_guid(guid);
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some(guid),
+            stored_hashed_id: Some(&stored),
+            certificate_device_id: None,
+        })
+        .expect("this PC's stored hash is sticky");
+        assert_eq!(resolved.hashed_id, stored);
+        assert!(!resolved.persist);
+    }
+
+    #[test]
+    fn registry_device_id_does_not_suppress_certificate_seeding() {
+        let registry = hash_machine_guid("8C4A3E12-91F0-4B2A-A6D1-0F3E8B7C2A19");
+        let certificate = hash_machine_guid("COMPUTERNAME");
+        let (stored, from_certificate) =
+            stored_and_certificate_ids(None, Some(&registry), Some(&certificate));
+        assert_eq!(stored, None);
+        assert_eq!(from_certificate, Some(certificate.as_str()));
+        let resolved = resolve_device_id(DeviceIdInputs {
+            machine_guid: Some("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"),
+            stored_hashed_id: stored,
+            certificate_device_id: from_certificate,
+        })
+        .expect("a COMPUTERNAME-issued cert must seed over a minted registry id");
+        assert_eq!(resolved.hashed_id, certificate);
+        assert!(resolved.persist);
+    }
+
+    #[test]
+    fn a_failed_state_load_does_not_mint_a_device_id() {
+        fn device_id_from_load(loaded: Result<State>) -> Result<String> {
+            resolve_current_device_id(&loaded?)
+        }
+        let error = device_id_from_load(Err(anyhow::anyhow!("parse license state")))
+            .expect_err("a corrupt license.json must fail closed");
+        assert!(
+            error.to_string().contains("parse license state"),
+            "{error:#}"
+        );
     }
 
     #[test]
