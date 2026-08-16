@@ -527,6 +527,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // own UI thread, allowing the message loop to unwind normally instead
         // of terminating the process during an active file operation.
         WM_CLOSE => {
+            // SBS-893: `--quit` is another process and cannot see our
+            // in-memory counter. Wait here so Finalize can publish or park
+            // the partial. Silent: a MessageBox would hang the installer
+            // on UI. Tray-menu Quit prompts and waits before this.
+            let _ = crate::record::wait_until_late_finalize_idle(
+                crate::record::LATE_FINALIZE_BOUND,
+            );
             PostQuitMessage(0);
             LRESULT(0)
         }

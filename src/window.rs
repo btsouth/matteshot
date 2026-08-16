@@ -318,11 +318,15 @@ pub const SURFACE_CLASSES: [&str; 10] = [
     "matteshot_pin",
 ];
 
-/// True while the user has any Matteshot window in front of them.
+/// True while the user has any Matteshot window in front of them, or while
+/// a late-finalize supervisor is still encoding (SBS-893). The supervisor
+/// has no window; quit and auto-update used to treat that as idle and tear
+/// the process down mid-write.
 pub fn any_surface_open() -> bool {
-    SURFACE_CLASSES
-        .iter()
-        .any(|class| find_by_class(class).is_some())
+    crate::record::late_finalize_outstanding()
+        || SURFACE_CLASSES
+            .iter()
+            .any(|class| find_by_class(class).is_some())
 }
 
 pub fn has_class(hwnd: HWND, class_name: &str) -> bool {
@@ -349,5 +353,28 @@ mod tests {
             monitor,
             RECT { left: -100, top: 20, right: 100, bottom: 500 }
         ));
+    }
+
+    /// Auto-update's idle check is `any_surface_open()`. A late-finalize
+    /// supervisor has no Matteshot window, so without the outstanding flag
+    /// a pending silent update launched the installer mid-Finalize (SBS-893).
+    #[test]
+    fn any_surface_open_is_true_while_late_finalize_is_outstanding() {
+        let _serial = crate::record::lock_late_finalize_for_test();
+        let guard = crate::record::LateFinalizeGuard::acquire();
+        assert!(
+            any_surface_open(),
+            "late-finalize work was invisible to the idle check"
+        );
+        drop(guard);
+        if SURFACE_CLASSES
+            .iter()
+            .all(|class| find_by_class(class).is_none())
+        {
+            assert!(
+                !any_surface_open(),
+                "dropping the guard did not return the idle check to false"
+            );
+        }
     }
 }

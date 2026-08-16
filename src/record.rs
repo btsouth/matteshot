@@ -3,7 +3,7 @@
 //! main thread shows a floating stop pill that excludes itself from the
 //! recording (WDA_EXCLUDEFROMCAPTURE).
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -703,6 +703,98 @@ fn partial_gif_path(destination: &std::path::Path, id: u64) -> std::path::PathBu
     parent.join(format!("{stem}.partial-{}-{id}.gif", std::process::id()))
 }
 
+/// Quit and auto-update only looked at windows (SBS-893). The late-finalize
+/// supervisor is a detached thread with no surface, so those paths tore the
+/// process down while Finalize was still writing. An `AtomicUsize`, not a
+/// bool: two overlapping recordings must not clobber each other.
+static LATE_FINALIZE_OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Supervisor bound, and the longest `--quit` / tray Quit will wait for it.
+pub const LATE_FINALIZE_BOUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Helper `--quit` cannot see this process's counter. Tray `WM_CLOSE` may
+/// sit behind the 60s join, then wait [`LATE_FINALIZE_BOUND`]. 90s is that
+/// join plus unwind slack so the helper does not taskkill mid-Finalize.
+pub const QUIT_TRAY_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60 + 90);
+
+/// Increments [`LATE_FINALIZE_OUTSTANDING`] for its lifetime, including panic.
+pub struct LateFinalizeGuard;
+
+impl LateFinalizeGuard {
+    pub fn acquire() -> Self {
+        LATE_FINALIZE_OUTSTANDING.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for LateFinalizeGuard {
+    fn drop(&mut self) {
+        LATE_FINALIZE_OUTSTANDING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub fn late_finalize_outstanding() -> bool {
+    LATE_FINALIZE_OUTSTANDING.load(Ordering::Acquire) > 0
+}
+
+/// True once every late-finalize guard has dropped. Does not cancel the work.
+/// Pumps queued messages except `WM_CLOSE` so the tray thread stays responsive
+/// instead of sitting in an unpumped sleep (Not Responding / taskkill).
+pub fn wait_until_late_finalize_idle(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !late_finalize_outstanding() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        pump_waiting_messages();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
+    }
+}
+
+/// Drain the thread queue while leaving `WM_CLOSE` on it.
+///
+/// The two filter ranges straddle `WM_CLOSE` so `PeekMessageW` never removes
+/// it. Removing it and skipping the dispatch would *discard* the message:
+/// `--quit` posts exactly one `WM_CLOSE` to the tray, and the 60s finalize
+/// join pumps on that same thread, so eating it here would lose the only
+/// quit signal and leave the installer to taskkill mid-Finalize. Leaving it
+/// queued still gives the property the skip was for — nothing dispatches a
+/// nested close until this wait returns.
+fn pump_waiting_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, PostQuitMessage, TranslateMessage, MSG, PM_REMOVE,
+        WM_CLOSE, WM_QUIT,
+    };
+    let mut msg = MSG::default();
+    unsafe {
+        for (min, max) in [(0, WM_CLOSE - 1), (WM_CLOSE + 1, u32::MAX)] {
+            while PeekMessageW(&mut msg, None, min, max, PM_REMOVE).as_bool() {
+                // WM_QUIT comes back whatever the filter says, and PM_REMOVE
+                // takes it off the queue. Put it back and stop, or the
+                // caller's message loop would never see the quit.
+                if msg.message == WM_QUIT {
+                    PostQuitMessage(msg.wParam.0 as i32);
+                    return;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
+
+/// Serializes tests that take a [`LateFinalizeGuard`]. The counter is
+/// process-global; overlapping tests would see each other's work.
+#[cfg(test)]
+pub(crate) fn lock_late_finalize_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Keep waiting on a capture worker the UI has already given up on, and
 /// publish its recording if finalization eventually succeeds. The GIF track
 /// is deliberately dropped on this path: the MP4 is the user's data.
@@ -716,8 +808,10 @@ fn supervise_late_finalize(
     progress: Arc<Progress>,
     partial: std::path::PathBuf,
     destination: std::path::PathBuf,
+    guard: LateFinalizeGuard,
 ) {
     std::thread::spawn(move || {
+        let _guard = guard;
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
         // Validation opens a Media Foundation source reader, which wants COM
         // up on the calling thread — every other worker that probes a video
@@ -730,7 +824,7 @@ fn supervise_late_finalize(
             &progress,
             &partial,
             &destination,
-            std::time::Duration::from_secs(15 * 60),
+            LATE_FINALIZE_BOUND,
         );
         if com.is_ok() {
             unsafe { CoUninitialize() };
@@ -921,6 +1015,11 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     // join the capture worker even if creating or running the controls fails.
     let ui_result = crate::recui::run(progress.clone(), target);
     progress.stop.store(true, Ordering::Relaxed);
+    // SBS-893: recui is gone and this 60s join has no window. Quit and
+    // auto-update only looked at surfaces, so the wait — and the supervisor
+    // it may hand off to — was invisible. The guard drops on the happy and
+    // error paths; the late path transfers it to the supervisor thread.
+    let late_guard = LateFinalizeGuard::acquire();
     let worker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !worker.is_finished() {
         if std::time::Instant::now() >= worker_deadline {
@@ -930,13 +1029,23 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
             // here used to orphan the file, and startup then deleted a
             // recording that had actually finished.
             crate::diagnostics::log("recording finalize timeout; supervising in the background");
-            supervise_late_finalize(worker, progress.clone(), partial_mp4.clone(), mp4.clone());
+            supervise_late_finalize(
+                worker,
+                progress.clone(),
+                partial_mp4.clone(),
+                mp4.clone(),
+                late_guard,
+            );
             bail!(
                 "This recording is taking unusually long to finish. Matteshot keeps finalizing it in the background; if that succeeds, the video appears in your videos folder."
             );
         }
+        pump_waiting_messages();
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+    // Keep the guard through validate/publish (and the error-path deletes).
+    // Dropping here used to make the few seconds after the 60s join look
+    // idle to auto-update. The late path already moved the guard.
     let worker_result = worker.join();
 
     if let Err(error) = ui_result {
@@ -975,6 +1084,9 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         let _ = std::fs::remove_file(&gif);
         return Err(error);
     }
+    // Recording is at its destination. Drop before recdone::show so tray
+    // Quit does not claim a finished file is still finalizing (SBS-893).
+    drop(late_guard);
 
     let mut gif_saved = None;
     let mut gif_failed = false;
@@ -1166,6 +1278,107 @@ mod tests {
         assert!(!destination.exists());
         std::fs::remove_file(partial).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Two overlapping recordings must not clobber a bool; dropping the last
+    /// guard is what returns quit/auto-update to idle (SBS-893).
+    #[test]
+    fn late_finalize_outstanding_is_true_while_a_guard_is_held() {
+        let _serial = lock_late_finalize_for_test();
+        assert!(!late_finalize_outstanding());
+        let first = LateFinalizeGuard::acquire();
+        assert!(late_finalize_outstanding());
+        let second = LateFinalizeGuard::acquire();
+        assert!(late_finalize_outstanding());
+        drop(first);
+        assert!(late_finalize_outstanding(), "dropping one of two guards went idle");
+        drop(second);
+        assert!(!late_finalize_outstanding());
+    }
+
+    /// A waiter must observe the drop from another thread. A same-thread
+    /// acquire-then-wait would deadlock on a broken implementation that
+    /// expected the caller to cancel (SBS-893).
+    #[test]
+    fn wait_until_late_finalize_idle_returns_true_after_the_guard_drops() {
+        let _serial = lock_late_finalize_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = LateFinalizeGuard::acquire();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        });
+        rx.recv().unwrap();
+        assert!(
+            wait_until_late_finalize_idle(std::time::Duration::from_secs(2)),
+            "wait did not become idle after the other thread dropped its guard"
+        );
+        assert!(!late_finalize_outstanding());
+    }
+
+    /// Waiting must not clear the counter or invent a cancel. Quit used to
+    /// treat "no window" as permission to tear the process down while
+    /// Finalize was still writing (SBS-893).
+    #[test]
+    fn wait_until_late_finalize_idle_times_out_while_work_remains() {
+        let _serial = lock_late_finalize_for_test();
+        let guard = LateFinalizeGuard::acquire();
+        assert!(!wait_until_late_finalize_idle(
+            std::time::Duration::from_millis(30)
+        ));
+        assert!(
+            late_finalize_outstanding(),
+            "the wait cancelled outstanding work instead of only observing it"
+        );
+        drop(guard);
+        assert!(!late_finalize_outstanding());
+    }
+
+    /// SBS-893: the pump must leave `WM_CLOSE` queued and still drain the
+    /// rest. `--quit` posts one `WM_CLOSE` to the tray while the 60s finalize
+    /// join is pumping on that thread; eating it there loses the only quit
+    /// signal and the installer taskkills mid-Finalize.
+    #[test]
+    fn the_pump_drains_other_messages_but_leaves_wm_close_queued() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, PM_REMOVE, WM_APP, WM_CLOSE,
+        };
+        let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        unsafe {
+            // A thread-message queue exists only once something is posted.
+            let _ = PostThreadMessageW(thread_id, WM_CLOSE, WPARAM(0), LPARAM(0));
+            let _ = PostThreadMessageW(thread_id, WM_APP + 77, WPARAM(0), LPARAM(0));
+        }
+
+        pump_waiting_messages();
+
+        let mut msg = MSG::default();
+        // Thread messages have no window, so nothing dispatches them; what is
+        // left in the queue is exactly what the pump refused to remove.
+        let remaining: Vec<u32> = std::iter::from_fn(|| unsafe {
+            PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE)
+                .as_bool()
+                .then_some(msg.message)
+        })
+        .collect();
+        assert_eq!(
+            remaining,
+            vec![WM_CLOSE],
+            "the pump must consume everything except WM_CLOSE"
+        );
+        assert!(
+            !unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) }.as_bool(),
+            "queue must be empty once WM_CLOSE is taken"
+        );
+    }
+
+    #[test]
+    fn quit_tray_wait_covers_the_join_plus_late_finalize_bound() {
+        assert!(
+            QUIT_TRAY_WAIT >= LATE_FINALIZE_BOUND + std::time::Duration::from_secs(90),
+            "helper --quit must outlast the 60s join plus the resident wait"
+        );
     }
 
     #[test]
