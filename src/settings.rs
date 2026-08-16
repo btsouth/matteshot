@@ -797,7 +797,31 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             }
         }
         Ctrl::Autostart => {
-            let _ = tray::set_autostart(!tray::autostart_enabled());
+            // SBS-759: the write can fail (denied, missing, or read-only
+            // Startup folder). Discarding that Result made the checkbox look
+            // like it changed or did nothing, with no explanation. Re-read
+            // the shortcut after the attempt so the paint pass, which uses
+            // `tray::autostart_enabled`, stays on the actual file, and show
+            // the same class of error dialog other Settings writes use.
+            let want = !tray::autostart_enabled();
+            let outcome = crate::autostart_toggle::apply_autostart_toggle(
+                want,
+                tray::set_autostart,
+                tray::autostart_enabled,
+            );
+            if let Some(event) = outcome.diagnostic {
+                crate::diagnostics::log(event);
+            }
+            if let Some(error) = outcome.error {
+                let title: Vec<u16> = "Matteshot\0".encode_utf16().collect();
+                let message: Vec<u16> = format!("{error}\0").encode_utf16().collect();
+                let _ = MessageBoxW(
+                    hwnd,
+                    windows::core::PCWSTR(message.as_ptr()),
+                    windows::core::PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
         }
         Ctrl::Prtscn => {
             let enabled = !state.cfg.capture_prtscn;

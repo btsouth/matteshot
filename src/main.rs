@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod annotate;
+mod autostart_toggle;
 mod capture;
 mod compose;
 mod completion;
