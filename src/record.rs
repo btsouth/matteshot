@@ -56,6 +56,11 @@ pub struct Progress {
     pub frames: AtomicU32,
     pub started: std::time::Instant,
     pub error: Mutex<Option<String>>,
+    /// A large part of every frame stayed black while the rest moved, which
+    /// is what DRM or hardware-overlay video captures as. Not an error: the
+    /// recording is still saved, because the chrome around the black region
+    /// is often exactly what the user wanted.
+    pub protected_content: AtomicBool,
 }
 
 pub(crate) const DEFAULT_FPS: u32 = 30;
@@ -108,6 +113,16 @@ fn encoder_slot(timestamp: i64, frame_interval: i64) -> i64 {
     timestamp.max(0) / frame_interval.max(1)
 }
 
+/// Black in the sense the capture path produces for a surface Windows refuses
+/// to hand over. Deliberately stricter than "dark": common dark themes sit at
+/// 0x0C0C0C or 0x1E1E1E and must never read as protected.
+const PROTECTED_BLACK_MAX: u8 = 4;
+/// Share of the frame that must stay black for the whole recording.
+const PROTECTED_MIN_DARK: f32 = 0.5;
+/// Share that must move at least once, so a deliberately black still (a blank
+/// desktop, a paused player) is not called protected.
+const PROTECTED_MIN_MOVED: f32 = 0.05;
+
 fn nearly_blank_bgra(bytes: &[u8]) -> bool {
     let mut sampled = 0usize;
     let mut dark = 0usize;
@@ -118,6 +133,77 @@ fn nearly_blank_bgra(bytes: &[u8]) -> bool {
         }
     }
     sampled > 0 && dark * 1000 >= sampled * 998
+}
+
+/// Watches for a large region that stays black for a whole recording while
+/// the rest of the picture moves.
+///
+/// That is what DRM and hardware-overlay video look like: Windows composites
+/// the film outside the surface `Direct3D11CaptureFramePool` can read, so the
+/// player chrome, subtitles and progress bar arrive and the picture does not.
+///
+/// [`nearly_blank_bgra`] cannot see this. It needs 99.8% of the frame to be
+/// black, and the visible player controls alone put a Netflix window under
+/// that, so the existing three-second bail never fires and the recording is
+/// saved as a black rectangle with no explanation.
+#[derive(Default)]
+struct ProtectedRegionWatch {
+    /// Per sample: has it ever been brighter than [`PROTECTED_BLACK_MAX`].
+    lit: Vec<bool>,
+    /// Per sample: has it ever differed from what the first frame put there.
+    moved: Vec<bool>,
+    first: Vec<[u8; 3]>,
+    frames: u32,
+}
+
+impl ProtectedRegionWatch {
+    /// One sample per this many pixels, so the cost stays flat as the capture
+    /// resolution grows.
+    const STRIDE: usize = 64;
+
+    fn observe(&mut self, bgra: &[u8]) {
+        let samples = bgra.len() / (4 * Self::STRIDE);
+        if samples == 0 {
+            return;
+        }
+        if self.lit.len() != samples {
+            // First frame, or the canvas resized. Start over rather than
+            // compare against sample positions that no longer line up.
+            self.lit = vec![false; samples];
+            self.moved = vec![false; samples];
+            self.first = vec![[0u8; 3]; samples];
+            self.frames = 0;
+        }
+        for (i, pixel) in bgra
+            .chunks_exact(4)
+            .step_by(Self::STRIDE)
+            .enumerate()
+            .take(samples)
+        {
+            let value = [pixel[0], pixel[1], pixel[2]];
+            if value.iter().any(|c| *c > PROTECTED_BLACK_MAX) {
+                self.lit[i] = true;
+            }
+            if self.frames == 0 {
+                self.first[i] = value;
+            } else if value != self.first[i] {
+                self.moved[i] = true;
+            }
+        }
+        self.frames += 1;
+    }
+
+    /// True when enough of the frame never lit up while enough of the rest
+    /// moved. `min_frames` keeps a one-frame recording from deciding this.
+    fn looks_protected(&self, min_frames: u32) -> bool {
+        if self.frames < min_frames || self.lit.is_empty() {
+            return false;
+        }
+        let total = self.lit.len() as f32;
+        let dark = self.lit.iter().filter(|lit| !**lit).count() as f32;
+        let moved = self.moved.iter().filter(|moved| **moved).count() as f32;
+        dark / total >= PROTECTED_MIN_DARK && moved / total >= PROTECTED_MIN_MOVED
+    }
 }
 
 /// Keep the recording canvas stable when a window changes size. The current
@@ -410,6 +496,7 @@ fn capture_loop(
     let mut gif_frames: Vec<(Vec<u8>, u32, u32)> = Vec::new();
     let mut last_slot: Option<i64> = None;
     let mut latest_buf: Option<Vec<u8>> = None;
+    let mut protected_watch = ProtectedRegionWatch::default();
     let mut blank_frames = 0u32;
     let mut awaiting_first_content = window_target;
     let frame_interval = 10_000_000i64 / fps as i64;
@@ -520,11 +607,16 @@ fn capture_loop(
             continue;
         };
 
+        // Runs for the whole recording, not only until the first lit frame:
+        // the black region this looks for sits next to player chrome that
+        // lights up immediately.
+        protected_watch.observe(&buf);
+
         if awaiting_first_content && nearly_blank_bgra(&buf) {
             blank_frames += 1;
             if blank_frames >= fps * 3 {
                 bail!(
-                    "The selected window returned only blank frames for three seconds. Try recording a region of the monitor, or disable protected/hardware-overlay video in the target app."
+                    "The selected window returned only blank frames for three seconds. Windows does not hand protected video (Netflix and other DRM players) to any screen recorder, and some apps draw video through a hardware overlay that capture cannot read either. Recording a region of the monitor will not help, because it reads the same surface."
                 );
             }
         } else {
@@ -642,6 +734,10 @@ fn capture_loop(
 
     if progress.frames.load(Ordering::Relaxed) == 0 {
         bail!("no frames captured");
+    }
+    // At least a second of frames before this can be decided at all.
+    if protected_watch.looks_protected(fps.max(1)) {
+        progress.protected_content.store(true, Ordering::Relaxed);
     }
     Ok(if want_gif { Some(gif_frames) } else { None })
 }
@@ -1018,6 +1114,7 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         frames: AtomicU32::new(0),
         started: std::time::Instant::now(),
         error: Mutex::new(None),
+        protected_content: AtomicBool::new(false),
     });
 
     // The freeze-frame selector owned foreground while the target was
@@ -1154,6 +1251,13 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     if gif_failed {
         notices.push("GIF unavailable");
     }
+    // Say it here rather than failing the recording: the chrome around the
+    // black region is often what the user wanted, and a black rectangle with
+    // no explanation is the confusing part, not the missing film.
+    if progress.protected_content.load(Ordering::Relaxed) {
+        crate::diagnostics::log("recording captured a protected or overlay video region");
+        notices.push("protected video not captured");
+    }
     match crate::output::file_to_clipboard(&mp4) {
         Ok(()) => {}
         Err(error) => {
@@ -1207,6 +1311,7 @@ mod tests {
             frames: AtomicU32::new(0),
             started: std::time::Instant::now(),
             error: Mutex::new(None),
+            protected_content: AtomicBool::new(false),
         }
     }
 
@@ -1693,5 +1798,96 @@ mod tests {
         assert!(nearly_blank_bgra(&blank));
         blank[0..4].copy_from_slice(&[80, 80, 80, 255]);
         assert!(!nearly_blank_bgra(&blank));
+    }
+
+    /// 256x64 BGRA. The first `dark_rows` rows are pure black, the rest are
+    /// filled with `chrome`. Stands in for a player window: protected film on
+    /// top, controls and subtitles underneath.
+    fn player_frame(dark_rows: usize, chrome: u8) -> Vec<u8> {
+        const W: usize = 256;
+        const H: usize = 64;
+        let mut buf = vec![0u8; W * H * 4];
+        for y in dark_rows..H {
+            for x in 0..W {
+                let at = (y * W + x) * 4;
+                buf[at..at + 4].copy_from_slice(&[chrome, chrome, chrome, 255]);
+            }
+        }
+        buf
+    }
+
+    fn watch_over(frames: u32, dark_rows: usize, chrome: impl Fn(u32) -> u8) -> ProtectedRegionWatch {
+        let mut watch = ProtectedRegionWatch::default();
+        for frame in 0..frames {
+            watch.observe(&player_frame(dark_rows, chrome(frame)));
+        }
+        watch
+    }
+
+    /// The Netflix case. `nearly_blank_bgra` cannot catch it, because the
+    /// visible player controls keep the frame under its 99.8% threshold.
+    #[test]
+    fn a_black_video_plane_beside_moving_chrome_reads_as_protected() {
+        let watch = watch_over(30, 48, |frame| 100 + (frame % 7) as u8);
+        assert!(watch.looks_protected(30));
+        // The guard this supplements would have let it through.
+        assert!(!nearly_blank_bgra(&player_frame(48, 100)));
+    }
+
+    /// Dark themes are not protected content. Windows Terminal sits at
+    /// 0x0C0C0C and VS Code at 0x1E1E1E, both above the black threshold.
+    #[test]
+    fn a_dark_themed_window_is_not_protected() {
+        for background in [12u8, 30] {
+            let mut watch = ProtectedRegionWatch::default();
+            for frame in 0..30u32 {
+                let mut buf = player_frame(0, background);
+                // A caret blinking in the corner: real motion, still not black.
+                let lit = if frame % 2 == 0 { 200 } else { background };
+                buf[0..4].copy_from_slice(&[lit, lit, lit, 255]);
+                watch.observe(&buf);
+            }
+            assert!(
+                !watch.looks_protected(30),
+                "0x{background:02X} background was called protected"
+            );
+        }
+    }
+
+    /// A still black frame is someone recording a blank screen, not a player
+    /// Windows refused to hand over.
+    #[test]
+    fn a_static_black_frame_is_not_protected() {
+        let watch = watch_over(30, 48, |_| 100);
+        assert!(!watch.looks_protected(30));
+    }
+
+    /// Ordinary bright content never trips it.
+    #[test]
+    fn a_fully_lit_window_is_not_protected() {
+        let watch = watch_over(30, 0, |frame| 80 + (frame % 5) as u8);
+        assert!(!watch.looks_protected(30));
+    }
+
+    /// One or two frames cannot decide this.
+    #[test]
+    fn too_few_frames_never_reads_as_protected() {
+        let watch = watch_over(5, 48, |frame| 100 + frame as u8);
+        assert!(!watch.looks_protected(30));
+        assert!(watch.looks_protected(5), "the same frames pass a lower bar");
+    }
+
+    /// A resize restarts the comparison instead of scoring against sample
+    /// positions that no longer line up.
+    #[test]
+    fn a_resized_canvas_restarts_the_watch() {
+        let mut watch = ProtectedRegionWatch::default();
+        for frame in 0..30u32 {
+            watch.observe(&player_frame(48, 100 + (frame % 7) as u8));
+        }
+        assert!(watch.looks_protected(30));
+        watch.observe(&vec![0u8; 128 * 4]);
+        assert_eq!(watch.frames, 1, "resize must reset the frame count");
+        assert!(!watch.looks_protected(30));
     }
 }
