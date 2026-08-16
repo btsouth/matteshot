@@ -58,7 +58,7 @@ All derived from the capture's dominant hue (indigo fallback for grayscale UIs),
 
 ## Theming
 
-Dark + light themes follow the system setting (`AppsUseLightTheme`), live-switch on `WM_SETTINGCHANGE`, and cover every surface: windows, popup menus (uxtheme ordinal 135 `SetPreferredAppMode`), titlebars (`DWMWA_USE_IMMERSIVE_DARK_MODE` + caption color). `MATTESHOT_THEME=dark|light` overrides for testing.
+Dark + light themes follow the system setting (`AppsUseLightTheme`), live-switch on `WM_SETTINGCHANGE`, and cover every surface: windows, popup menus (uxtheme ordinal 135 `SetPreferredAppMode`), titlebars (`DWMWA_USE_IMMERSIVE_DARK_MODE` + caption color). Text-bearing roles (`text`, `muted`, `faint`, `accent_text`) are at least 4.5:1 on `bg` / `panel` / `chip` in both modes. When High Contrast is on, the palette uses `GetSysColor` (`COLOR_WINDOW` / `COLOR_WINDOWTEXT` / `COLOR_BTNFACE` / `COLOR_HIGHLIGHT`); `COLOR_GRAYTEXT` is used for `muted`/`faint` only if it already meets 4.5:1, otherwise those roles use window text. A failed High Contrast query is not treated as High Contrast on. `MATTESHOT_THEME=dark|light` overrides for testing and still wins over High Contrast.
 
 ## Updating
 
