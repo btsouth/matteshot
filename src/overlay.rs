@@ -398,9 +398,12 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
         ) || (b.btn == Btn::Record && state.recording)
             || (b.btn == Btn::Scroll && state.scrolling)
             || (b.btn == Btn::Delay && (state.delayed || state.delay_list_open));
+        // Accent fill plus accent_text, the same pair settings and recdone
+        // use. High Contrast maps chip and panel to the same system color,
+        // so a chip-filled accent-labelled button would read as unselected.
         if selected {
-            let bg = CreateSolidBrush(state.theme.chip);
-            let nopen = CreatePen(PS_SOLID, 1, state.theme.chip);
+            let bg = CreateSolidBrush(state.theme.accent);
+            let nopen = CreatePen(PS_SOLID, 1, state.theme.accent);
             let ob = SelectObject(hdc, bg);
             let op = SelectObject(hdc, nopen);
             let _ = RoundRect(hdc, b.rect.left, b.rect.top, b.rect.right, b.rect.bottom, 12, 12);
@@ -412,7 +415,7 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
         SetTextColor(
             hdc,
             if selected {
-                state.theme.accent
+                state.theme.accent_text
             } else if i as i32 == state.toolbar_hover {
                 state.theme.text
             } else {
@@ -461,10 +464,14 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
     SetBkMode(hdc, TRANSPARENT);
     let current = crate::delay::sanitize(state.delay_secs);
     for (i, (rect, seconds)) in state.delay_list.iter().enumerate() {
-        let highlighted = *seconds == current || i as i32 == state.delay_list_hover;
+        // The armed row gets the accent pair so it stays distinct from a
+        // merely hovered row under High Contrast, where chip equals panel.
+        let armed = *seconds == current;
+        let highlighted = armed || i as i32 == state.delay_list_hover;
         if highlighted {
-            let bg = CreateSolidBrush(state.theme.chip);
-            let nopen = CreatePen(PS_SOLID, 1, state.theme.chip);
+            let fill = if armed { state.theme.accent } else { state.theme.chip };
+            let bg = CreateSolidBrush(fill);
+            let nopen = CreatePen(PS_SOLID, 1, fill);
             let ob = SelectObject(hdc, bg);
             let op = SelectObject(hdc, nopen);
             let _ =
@@ -474,7 +481,7 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
             let _ = DeleteObject(bg);
             let _ = DeleteObject(nopen);
         }
-        SetTextColor(hdc, if *seconds == current { state.theme.accent } else { state.theme.text });
+        SetTextColor(hdc, if armed { state.theme.accent_text } else { state.theme.text });
         let mut label = wide(&format!("{seconds}s"));
         let mut rc = *rect;
         DrawTextW(hdc, &mut label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);

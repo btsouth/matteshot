@@ -1413,6 +1413,7 @@ unsafe fn warn(hwnd: HWND, prefix: &str, error: &dyn std::fmt::Display) {
 /// reason spelled out above the action functions: it pumps WM_TIMER for this
 /// window while blocked.
 unsafe fn context_menu(hwnd: HWND, entry: Entry) {
+    crate::theme::enable_dark_menus();
     let Ok(menu) = CreatePopupMenu() else { return };
     let _ = AppendMenuW(menu, MF_STRING, 1, w!("Copy"));
     let _ = AppendMenuW(menu, MF_STRING, 2, w!("Open in editor"));

@@ -274,6 +274,9 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         state.active_window = Some(active);
     }
 
+    // Re-point the menu mode here so a High Contrast or app-mode flip since
+    // startup lands on this menu instead of the next process launch.
+    crate::theme::enable_dark_menus();
     let menu = CreatePopupMenu().expect("menu");
     let license = crate::license::status();
     let capture_flags = if license.can_capture() {
