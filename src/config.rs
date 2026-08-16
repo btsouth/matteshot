@@ -2,6 +2,7 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -132,20 +133,84 @@ fn config_path() -> Option<PathBuf> {
 
 const CONFIG_MUTEX: &str = "Local\\Matteshot.Config.State";
 
-fn load_from(path: &Path) -> anyhow::Result<Config> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Config::default()),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(serde_json::from_str(&body)?)
+/// What was actually on disk this read. Missing is a fresh install; a present
+/// file that will not parse is neither that nor last-known-good.
+enum DiskConfig {
+    Missing,
+    Present(Config),
 }
 
-fn load_unlocked() -> anyhow::Result<Config> {
-    let Some(path) = config_path() else {
-        return Ok(Config::default());
+fn read_from(path: &Path) -> anyhow::Result<DiskConfig> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(DiskConfig::Missing),
+        Err(error) => return Err(error.into()),
     };
-    load_from(&path)
+    Ok(DiskConfig::Present(serde_json::from_str(&body)?))
+}
+
+fn load_from(path: &Path) -> anyhow::Result<Config> {
+    match read_from(path) {
+        Ok(DiskConfig::Missing) => Ok(Config::default()),
+        Ok(DiskConfig::Present(config)) => Ok(config),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_unlocked() -> anyhow::Result<DiskConfig> {
+    let Some(path) = config_path() else {
+        return Ok(DiskConfig::Missing);
+    };
+    read_from(&path)
+}
+
+/// Factory defaults turn auto-update and PrtScn on. A present file we cannot
+/// read is not a fresh install, so those stay off until a later read succeeds.
+/// `onboarded` is true so first-run welcome does not rewrite the file.
+fn fail_closed() -> Config {
+    Config {
+        auto_update: false,
+        capture_prtscn: false,
+        telemetry: None,
+        capture_hotkey: crate::hotkey::NONE.to_owned(),
+        onboarded: true,
+        ..Config::default()
+    }
+}
+
+static LAST_GOOD: OnceLock<Mutex<Option<Config>>> = OnceLock::new();
+
+fn last_good_slot() -> MutexGuard<'static, Option<Config>> {
+    LAST_GOOD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn remember(config: &Config) {
+    *last_good_slot() = Some(config.clone());
+}
+
+/// Missing stays a fresh install and is not cached. A successful parse becomes
+/// last-known-good. An unreadable present file must not look like defaults.
+fn resolve_load(last_good: &mut Option<Config>, from_disk: anyhow::Result<DiskConfig>) -> Config {
+    match from_disk {
+        Ok(DiskConfig::Missing) => {
+            *last_good = None;
+            Config::default()
+        }
+        Ok(DiskConfig::Present(config)) => {
+            *last_good = Some(config.clone());
+            config
+        }
+        Err(_) => last_good.clone().unwrap_or_else(fail_closed),
+    }
+}
+
+/// True only when this disk read succeeded and the user left auto-update on.
+/// Last-known-good is for the session, not for authorizing a silent install.
+pub fn auto_update_from_load<E>(result: Result<Config, E>) -> bool {
+    matches!(result, Ok(config) if config.auto_update)
 }
 
 fn corrupt_backup_path(path: &Path) -> PathBuf {
@@ -156,14 +221,19 @@ fn corrupt_backup_path(path: &Path) -> PathBuf {
     path.with_extension(format!("json.corrupt-{unique}"))
 }
 
-fn load_for_update_from(path: &Path) -> anyhow::Result<Config> {
+fn load_for_update_from(path: &Path, last_good: Option<&Config>) -> anyhow::Result<Config> {
     match load_from(path) {
         Ok(config) => Ok(config),
         Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            let Some(last) = last_good.cloned() else {
+                return Err(error);
+            };
             let backup = corrupt_backup_path(path);
             std::fs::rename(path, &backup)?;
-            crate::diagnostics::log("corrupt config was quarantined before resetting settings");
-            Ok(Config::default())
+            crate::diagnostics::log(
+                "corrupt config was quarantined; restoring last-known-good settings",
+            );
+            Ok(last)
         }
         Err(error) => Err(error),
     }
@@ -173,7 +243,8 @@ fn load_for_update_unlocked() -> anyhow::Result<Config> {
     let Some(path) = config_path() else {
         return Ok(Config::default());
     };
-    load_for_update_from(&path)
+    let last = last_good_slot().clone();
+    load_for_update_from(&path, last.as_ref())
 }
 
 fn save_unlocked(config: &Config) -> anyhow::Result<()> {
@@ -188,10 +259,28 @@ fn save_unlocked(config: &Config) -> anyhow::Result<()> {
 impl Config {
     pub fn load() -> Config {
         let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
-        load_unlocked().unwrap_or_else(|error| {
+        let from_disk = read_unlocked();
+        if let Err(error) = &from_disk {
             crate::diagnostics::log(&format!("config could not be loaded: {error:#}"));
-            Config::default()
-        })
+        }
+        resolve_load(&mut last_good_slot(), from_disk)
+    }
+
+    /// This read only. Used by the updater so a stale last-known-good cannot
+    /// authorize a silent install after the file has become unreadable.
+    pub fn try_load() -> anyhow::Result<Config> {
+        let _guard = crate::state_lock::lock(CONFIG_MUTEX).ok();
+        match read_unlocked() {
+            Ok(DiskConfig::Missing) => {
+                *last_good_slot() = None;
+                Ok(Config::default())
+            }
+            Ok(DiskConfig::Present(config)) => {
+                remember(&config);
+                Ok(config)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Atomically update only the fields owned by one action. This prevents a
@@ -206,6 +295,7 @@ impl Config {
         })?;
         change(&mut config);
         save_unlocked(&config)?;
+        remember(&config);
         Ok(config)
     }
 
@@ -271,33 +361,20 @@ mod tests {
     }
 
     #[test]
-    fn updating_a_corrupt_config_quarantines_it_before_resetting() {
+    fn updating_a_corrupt_config_without_last_good_leaves_the_file_alone() {
         let path = temporary_path("recover");
         let corrupt = b"{ definitely not json";
         std::fs::write(&path, corrupt).unwrap();
+        assert!(
+            load_for_update_from(&path, None).is_err(),
+            "without last-known-good, a parse error must not write factory defaults"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        assert!(
+            corrupt_siblings(&path).is_empty(),
+            "a failed update must not quarantine the only copy"
+        );
 
-        let mut config = load_for_update_from(&path).expect("quarantine corrupt config");
-        config.capture_hotkey = "Ctrl+Shift+F9".into();
-        let json = serde_json::to_vec_pretty(&config).unwrap();
-        crate::state_lock::atomic_write(&path, &json).unwrap();
-
-        let recovered = load_from(&path).expect("read recovered config");
-        assert_eq!(recovered.capture_hotkey, "Ctrl+Shift+F9");
-        let backup = std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .filter_map(Result::ok)
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(&format!(
-                        "{}.corrupt-",
-                        path.file_name().unwrap().to_string_lossy()
-                    ))
-            })
-            .expect("corrupt backup");
-        assert_eq!(std::fs::read(backup.path()).unwrap(), corrupt);
-        let _ = std::fs::remove_file(backup.path());
         let _ = std::fs::remove_file(path);
     }
 
@@ -369,5 +446,224 @@ mod tests {
         };
         let parsed = cfg.capture_hotkey().expect("custom shortcut");
         assert_eq!(parsed.vk, 0x70 + 8);
+    }
+
+    fn write_fixture(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn load_session(path: &Path, last_good: &mut Option<Config>) -> Config {
+        resolve_load(last_good, read_from(path))
+    }
+
+    fn corrupt_siblings(path: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    fn opted_out_fixture() -> &'static str {
+        r#"{
+            "auto_update": false,
+            "capture_prtscn": false,
+            "capture_hotkey": "Ctrl+Shift+F9",
+            "telemetry": false,
+            "capture_delay_secs": 7
+        }"#
+    }
+
+    #[test]
+    fn a_missing_config_through_the_session_resolver_is_still_a_fresh_install() {
+        let path = temporary_path("session-missing");
+        let mut last_good = None;
+        let config = load_session(&path, &mut last_good);
+        assert!(config.auto_update);
+        assert!(config.capture_prtscn);
+        assert_eq!(config.capture_hotkey, crate::hotkey::DEFAULT);
+        assert!(
+            last_good.is_none(),
+            "absence is not a successful read of user settings"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unreadable_present_file_is_not_a_fresh_install() {
+        let path = temporary_path("unreadable-first");
+        write_fixture(&path, "{");
+        let mut last_good = None;
+        let config = load_session(&path, &mut last_good);
+        assert!(
+            last_good.is_none(),
+            "a failed first read must not invent last-known-good"
+        );
+        assert!(!config.auto_update);
+        assert!(!config.capture_prtscn);
+        assert_eq!(config.capture_hotkey, crate::hotkey::NONE);
+        assert!(
+            config.onboarded,
+            "a present unreadable file is not first-run and must not open welcome"
+        );
+        assert!(config.telemetry_unanswered());
+        assert!(!config.telemetry_enabled());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_directory_at_the_config_path_is_not_a_fresh_install() {
+        let path = temporary_path("unreadable-dir");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut last_good = None;
+        let config = load_session(&path, &mut last_good);
+        assert!(!config.auto_update);
+        assert!(!config.capture_prtscn);
+        assert_eq!(config.capture_hotkey, crate::hotkey::NONE);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn fail_closed_is_not_a_first_run() {
+        let config = fail_closed();
+        assert!(config.onboarded);
+        assert!(!config.auto_update);
+        assert!(!config.capture_prtscn);
+        assert_eq!(config.capture_hotkey, crate::hotkey::NONE);
+    }
+
+    #[test]
+    fn missing_clears_stale_last_good_so_a_later_corrupt_read_fails_closed() {
+        let path = temporary_path("missing-then-corrupt");
+        write_fixture(&path, opted_out_fixture());
+        let mut last_good = None;
+        let first = load_session(&path, &mut last_good);
+        assert!(!first.auto_update);
+        assert!(last_good.is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let missing = load_session(&path, &mut last_good);
+        assert!(missing.auto_update, "absence is a fresh install");
+        assert!(
+            last_good.is_none(),
+            "a missing file must not keep a previous session's settings"
+        );
+
+        write_fixture(&path, "{");
+        let corrupt = load_session(&path, &mut last_good);
+        assert!(!corrupt.auto_update);
+        assert_eq!(corrupt.capture_hotkey, crate::hotkey::NONE);
+        assert!(corrupt.onboarded);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_after_a_good_read_restores_last_good_instead_of_factory_defaults() {
+        let path = temporary_path("update-from-last-good");
+        write_fixture(&path, opted_out_fixture());
+        let mut last_good = None;
+        let loaded = load_session(&path, &mut last_good);
+
+        write_fixture(&path, "{");
+        let mut config =
+            load_for_update_from(&path, last_good.as_ref()).expect("seed from last-known-good");
+        assert!(!config.auto_update);
+        assert_eq!(config.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(config.telemetry, Some(false));
+        config.last_style = 3;
+        let json = serde_json::to_vec_pretty(&config).unwrap();
+        crate::state_lock::atomic_write(&path, &json).unwrap();
+
+        let saved = load_from(&path).expect("updated last-known-good");
+        assert!(!saved.auto_update);
+        assert_eq!(saved.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(saved.telemetry, Some(false));
+        assert_eq!(saved.last_style, 3);
+        assert_eq!(loaded.capture_delay_secs, 7);
+        assert_eq!(saved.capture_delay_secs, 7);
+        for backup in corrupt_siblings(&path) {
+            let _ = std::fs::remove_file(backup);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_later_unreadable_read_keeps_the_last_good_session() {
+        let path = temporary_path("keep-last-good");
+        write_fixture(&path, opted_out_fixture());
+        let mut last_good = None;
+        let first = load_session(&path, &mut last_good);
+        assert!(!first.auto_update);
+        assert!(!first.capture_prtscn);
+        assert_eq!(first.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(first.telemetry, Some(false));
+        assert_eq!(first.capture_delay_secs, 7);
+
+        write_fixture(&path, "{");
+        let second = load_session(&path, &mut last_good);
+        assert!(!second.auto_update);
+        assert!(!second.capture_prtscn);
+        assert_eq!(second.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(second.telemetry, Some(false));
+        assert_eq!(second.capture_delay_secs, 7);
+
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let third = load_session(&path, &mut last_good);
+        assert!(!third.auto_update);
+        assert!(!third.capture_prtscn);
+        assert_eq!(third.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(third.telemetry, Some(false));
+        assert_eq!(third.capture_delay_secs, 7);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn loading_a_corrupt_config_does_not_quarantine_it() {
+        let path = temporary_path("no-quarantine-on-read");
+        write_fixture(&path, "{ definitely not json");
+        let mut last_good = None;
+        let _ = load_session(&path, &mut last_good);
+        assert!(load_from(&path).is_err());
+        assert!(
+            corrupt_siblings(&path).is_empty(),
+            "a background read must leave the bytes in place"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_update_is_authorized_only_on_a_successful_opt_in_read() {
+        let missing = temporary_path("auto-update-missing");
+        assert!(
+            auto_update_from_load(load_from(&missing)),
+            "a missing file is a fresh install, which ships with auto-update on"
+        );
+
+        let on = temporary_path("auto-update-on");
+        write_fixture(&on, r#"{"auto_update":true}"#);
+        assert!(auto_update_from_load(load_from(&on)));
+        let _ = std::fs::remove_file(&on);
+
+        let off = temporary_path("auto-update-off");
+        write_fixture(&off, opted_out_fixture());
+        assert!(!auto_update_from_load(load_from(&off)));
+
+        write_fixture(&off, "{");
+        assert!(
+            !auto_update_from_load(load_from(&off)),
+            "truncated bytes must not authorize a silent install"
+        );
+        let _ = std::fs::remove_file(&off);
+
+        let locked = temporary_path("auto-update-locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        assert!(
+            !auto_update_from_load(load_from(&locked)),
+            "a locked or unreadable path must not authorize a silent install"
+        );
+        let _ = std::fs::remove_dir_all(locked);
     }
 }

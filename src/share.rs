@@ -18,9 +18,10 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    WinHttpWriteData, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+    WinHttpSetTimeouts, WinHttpWriteData, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    WINHTTP_FLAG_SECURE, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -58,6 +59,28 @@ fn share_content_type(path: &Path) -> Result<&'static str> {
         Some("png") => Ok("image/png"),
         Some("mp4") => Ok("video/mp4"),
         _ => bail!("This file type cannot be shared."),
+    }
+}
+
+/// Keep only ASCII alphanumeric plus `._-`. Empty after filtering becomes
+/// `capture.png` / `capture.mp4` from the already-validated content type,
+/// or `capture` if the type is unknown.
+///
+/// A renamed capture can put quotes/CR/LF in the on-disk name; the
+/// disposition must stay one inert token.
+fn sanitize_share_filename(name: &str, content_type: &str) -> String {
+    let filtered: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '_' | '-'))
+        .collect();
+    let stem = filtered.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&filtered);
+    if stem.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return filtered;
+    }
+    match content_type {
+        "image/png" => "capture.png".to_string(),
+        "video/mp4" => "capture.mp4".to_string(),
+        _ => "capture".to_string(),
     }
 }
 
@@ -182,13 +205,14 @@ struct ShareResponse {
 pub fn share_file(path: &Path) -> Result<String> {
     let (certificate, signature) = crate::license::signed_certificate()
         .context("Sharing needs an active Matteshot license.")?;
-    let device_id = crate::license::device_id();
+    let device_id = crate::license::device_id()
+        .context("Sharing needs a stable device identity.")?;
 
     let content_type = share_content_type(path)?;
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("capture");
+    let filename = sanitize_share_filename(
+        path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        content_type,
+    );
     let file_len = std::fs::metadata(path)
         .context("read the file to share")?
         .len();
@@ -200,7 +224,7 @@ pub fn share_file(path: &Path) -> Result<String> {
         &certificate,
         &signature,
         &device_id,
-        filename,
+        &filename,
         content_type,
     );
 
@@ -277,6 +301,61 @@ fn multipart_parts(
     }
 }
 
+fn winhttp_redirect_policy() -> u32 {
+    WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+}
+
+fn redirect_status_is_error(status: u32) -> bool {
+    (300..400).contains(&status)
+}
+
+fn redirect_refusal(service: &str, status: u32, location: Option<&str>) -> String {
+    format!(
+        "{service} service redirected the request: status={status} location={}",
+        location.filter(|value| !value.is_empty()).unwrap_or("none")
+    )
+}
+
+fn next_location_header_chars(current: usize, required_bytes: u32) -> Option<usize> {
+    const MAX_CHARS: usize = 8192;
+    let needed = (required_bytes as usize).div_ceil(2);
+    if needed <= current || needed > MAX_CHARS {
+        None
+    } else {
+        Some(needed)
+    }
+}
+
+fn query_location_header(request: *mut c_void) -> Option<String> {
+    let mut chars = 1024usize;
+    loop {
+        let mut buf = vec![0u16; chars];
+        let mut size = (buf.len() * 2) as u32;
+        let mut index = 0u32;
+        match unsafe {
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_LOCATION,
+                PCWSTR::null(),
+                Some(buf.as_mut_ptr() as *mut c_void),
+                &mut size,
+                &mut index,
+            )
+        } {
+            Ok(()) => {
+                let wide = (size as usize) / 2;
+                let text = String::from_utf16_lossy(&buf[..wide.min(buf.len())]);
+                let text = text.trim_end_matches('\0').trim();
+                return (!text.is_empty()).then(|| text.to_owned());
+            }
+            Err(_) => {
+                let next = next_location_header_chars(chars, size)?;
+                chars = next;
+            }
+        }
+    }
+}
+
 unsafe fn write_request_bytes(request: *mut c_void, bytes: &[u8]) -> Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -316,6 +395,15 @@ fn post_multipart(
             ),
             "open share connection",
         )?;
+        // WinHTTP follows 307/308 by default and would resubmit the
+        // capture bytes to Location.
+        let policy = winhttp_redirect_policy().to_ne_bytes();
+        WinHttpSetOption(
+            Some(session.0 as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(policy.as_slice()),
+        )
+        .context("disable share redirects")?;
         // A large recording needs real headroom on the send side; the
         // response is a small JSON body, so receive stays close to what
         // license.rs's post_json budgets for one.
@@ -384,6 +472,10 @@ fn post_multipart(
             &mut index,
         )
         .context("read share response status")?;
+        if redirect_status_is_error(status) {
+            let location = query_location_header(request.0);
+            bail!("{}", redirect_refusal("share", status, location.as_deref()));
+        }
 
         let mut response = Vec::new();
         loop {
@@ -446,6 +538,113 @@ mod tests {
             "video/mp4",
         );
         assert!(parts.before_file.len() + parts.after_file.len() < 2048);
+    }
+
+    fn assert_inert_share_filename(name: &str) {
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+            "unsafe chars survived: {name:?}"
+        );
+        for needle in ['"', '\r', '\n', '/', '\\'] {
+            assert!(!name.contains(needle), "{needle:?} survived in {name:?}");
+        }
+    }
+
+    #[test]
+    fn app_generated_share_filenames_are_unchanged() {
+        assert_eq!(
+            sanitize_share_filename("matteshot-20260815-133700123-adaptive.png", "image/png"),
+            "matteshot-20260815-133700123-adaptive.png"
+        );
+        assert_eq!(
+            sanitize_share_filename("matteshot-20260815-133700123.mp4", "video/mp4"),
+            "matteshot-20260815-133700123.mp4"
+        );
+    }
+
+    #[test]
+    fn quotes_cr_lf_and_path_separators_never_survive_in_share_filename() {
+        for (name, content_type) in [
+            ("evil\".png", "image/png"),
+            (
+                "shot.png\"\r\nContent-Disposition: form-data; name=\"certificate\"",
+                "image/png",
+            ),
+            ("shot.png\r\n\r\n--BOUND\r\n", "image/png"),
+            ("..\\..\\Windows\\win.ini", "image/png"),
+            ("foo/bar.png", "image/png"),
+            ("foo\\bar.png", "image/png"),
+        ] {
+            let sanitized = sanitize_share_filename(name, content_type);
+            assert_inert_share_filename(&sanitized);
+            assert_ne!(sanitized, name, "hostile name used as-is: {name:?}");
+        }
+    }
+
+    #[test]
+    fn sanitized_hostile_filename_cannot_inject_multipart_fields() {
+        let hostile =
+            "shot.png\"\r\nContent-Disposition: form-data; name=\"certificate\"\r\n\r\nforged\r\n--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"pwned.png";
+        let filename = sanitize_share_filename(hostile, "image/png");
+        assert_inert_share_filename(&filename);
+        let parts = multipart_parts(
+            "BOUND",
+            "cert-value",
+            "sig-value",
+            "device-value",
+            &filename,
+            "image/png",
+        );
+        let before = String::from_utf8(parts.before_file).unwrap();
+        assert!(
+            !before.contains(hostile),
+            "raw hostile payload leaked into before_file"
+        );
+        assert!(!before.contains("shot.png\""));
+        assert!(!before.contains("name=\"certificate\"\r\n\r\nforged"));
+        assert_eq!(before.matches("name=\"certificate\"").count(), 1);
+        assert_eq!(before.matches("name=\"signature\"").count(), 1);
+        assert_eq!(before.matches("name=\"device_id\"").count(), 1);
+        assert_eq!(before.matches("name=\"file\"").count(), 1);
+        assert_eq!(before.matches("filename=").count(), 1);
+        assert!(before.contains(&format!("filename=\"{filename}\"")));
+        assert!(before.contains("name=\"certificate\"\r\n\r\ncert-value\r\n"));
+    }
+
+    #[test]
+    fn empty_or_unusable_share_filenames_fall_back_from_content_type() {
+        for empty in ["", "...", "---", "._-", "\"\r\n", "/", "\\", "   "] {
+            assert_eq!(
+                sanitize_share_filename(empty, "image/png"),
+                "capture.png",
+                "{empty:?}"
+            );
+            assert_eq!(
+                sanitize_share_filename(empty, "video/mp4"),
+                "capture.mp4",
+                "{empty:?}"
+            );
+            assert_eq!(
+                sanitize_share_filename(empty, "application/octet-stream"),
+                "capture",
+                "{empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shareable_png_names_without_an_ascii_stem_use_the_capture_png_fallback() {
+        assert_eq!(
+            sanitize_share_filename("スクリーンショット.png", "image/png"),
+            "capture.png"
+        );
+        assert_eq!(sanitize_share_filename("---.png", "image/png"), "capture.png");
+        assert_eq!(sanitize_share_filename(".png", "image/png"), "capture.png");
+        assert_eq!(
+            sanitize_share_filename("matteshot.png", "image/png"),
+            "matteshot.png"
+        );
     }
 
     #[test]
@@ -547,5 +746,33 @@ mod tests {
         // The first byte past the cap fails, and nothing more is retained.
         assert!(append_bounded(&mut body, b"y").is_err());
         assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn winhttp_redirect_policy_is_never() {
+        assert_eq!(
+            winhttp_redirect_policy(),
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+        );
+        assert_eq!(winhttp_redirect_policy(), 0);
+    }
+
+    /// A 307 to a second host must not transmit the body — NEVER plus
+    /// treating 3xx as error is the probe.
+    #[test]
+    fn redirect_status_is_error_for_3xx_including_307_and_308() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(redirect_status_is_error(status), "HTTP {status}");
+        }
+        for status in [200, 403, 404, 500] {
+            assert!(!redirect_status_is_error(status), "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn a_307_is_an_error_and_not_a_successful_share() {
+        assert!(redirect_status_is_error(307));
+        // share_file only treats 200 as a share URL; a 307 cannot become one.
+        assert_ne!(307u32, 200);
     }
 }
