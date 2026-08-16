@@ -388,6 +388,53 @@ try {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# SBS-763: an ID in an inline comment is not an ignore entry.
+$ids = Get-RustsecIgnoreIdsFromToml -Toml @"
+[advisories]
+ignore = [] # RUSTSEC-2024-0001
+"@
+Assert-Rustsec `
+    -Name 'inline-comment-rustsec-id-is-not-an-ignore' `
+    -Condition (@($ids).Count -eq 0) `
+    -Detail "ids=$($ids -join ',')"
+
+# SBS-763: cargo audit exit 1 without an advisory report is Unknown.
+Use-FakeCargoAudit {
+    param($Arguments)
+    if ($Arguments -contains '--version') {
+        return [pscustomobject]@{ ExitCode = 0; Output = 'cargo-audit 0.22.2'; Found = $true }
+    }
+    return [pscustomobject]@{ ExitCode = 1; Output = 'error: could not fetch advisory-db'; Found = $true }
+}
+$dir = New-RustsecTestDir
+try {
+    Write-RustsecFixture -Directory $dir
+    $outcome = Invoke-RustsecAuditGate -RepoRoot $dir
+    Assert-Rustsec `
+        -Name 'cargo-audit-fetch-error-exit-1-is-unknown' `
+        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.Reason -eq 'AuditError' -and $outcome.ExitCode -ne 0) `
+        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason) ExitCode=$($outcome.ExitCode)"
+} finally {
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# SBS-763: an unreadable audit.toml is Unknown, not an unhandled throw.
+$dir = New-RustsecTestDir
+$lock = $null
+try {
+    Write-RustsecFixture -Directory $dir
+    $tomlPath = Join-Path $dir '.cargo/audit.toml'
+    $lock = [System.IO.File]::Open($tomlPath, 'Open', 'Read', 'None')
+    $outcome = Invoke-RustsecAuditGate -RepoRoot $dir
+    Assert-Rustsec `
+        -Name 'unreadable-audit-toml-is-unknown' `
+        -Condition ($outcome.Kind -eq 'Unknown' -and $outcome.Reason -eq 'AuditError' -and $outcome.ExitCode -ne 0) `
+        -Detail "Kind=$($outcome.Kind) Reason=$($outcome.Reason) ExitCode=$($outcome.ExitCode)"
+} finally {
+    if ($lock) { $lock.Dispose() }
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # SBS-763: the required CI script must actually invoke the gate.
 $verify = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'verify-code.ps1') -Raw
 Assert-Rustsec `

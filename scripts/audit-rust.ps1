@@ -125,13 +125,24 @@ function Get-RustsecIgnoreIdsFromToml {
     )
 
     $ids = [System.Collections.Generic.List[string]]::new()
+    $inIgnore = $false
     foreach ($line in ($Toml -split '\r?\n')) {
-        if ($line -match '^\s*#') {
-            continue
+        # Full-line comments and inline comments are not ignore entries.
+        $code = $line
+        if ($code -match '^([^#]*)') {
+            $code = $Matches[1]
         }
-        foreach ($match in [regex]::Matches($line, 'RUSTSEC-\d{4}-\d{4}')) {
-            if (-not $ids.Contains($match.Value)) {
-                $ids.Add($match.Value)
+        if ($code -match '^\s*ignore\s*=') {
+            $inIgnore = $true
+        }
+        if ($inIgnore) {
+            foreach ($match in [regex]::Matches($code, 'RUSTSEC-\d{4}-\d{4}')) {
+                if (-not $ids.Contains($match.Value)) {
+                    $ids.Add($match.Value)
+                }
+            }
+            if ($code -match '\]') {
+                $inIgnore = $false
             }
         }
     }
@@ -459,7 +470,11 @@ function Invoke-RustsecAuditGate {
         return $parsed
     }
 
-    $toml = Get-Content -LiteralPath $tomlPath -Raw
+    try {
+        $toml = Get-Content -LiteralPath $tomlPath -Raw -ErrorAction Stop
+    } catch {
+        return New-RustsecAuditOutcome -Kind Unknown -Reason AuditError
+    }
     $ignoreIds = Get-RustsecIgnoreIdsFromToml -Toml $toml
     $exceptions = Test-RustsecExceptionSet `
         -IgnoreIds $ignoreIds `
@@ -489,16 +504,16 @@ function Invoke-RustsecAuditGate {
     }
     if ($audit.ExitCode -eq 1) {
         # cargo-audit uses 1 for vulns and also for some config/runtime
-        # failures. A TOML/fatal error is not "advisories found".
-        if ($audit.Output -match 'fatal error|TOML parse error|parse error:') {
+        # failures. Only a report that names an advisory is "advisories found".
+        if ($audit.Output -match 'RUSTSEC-\d{4}-\d{4}|Advisory:') {
             return New-RustsecAuditOutcome `
-                -Kind Unknown `
-                -Reason AuditError `
+                -Kind Fail `
+                -Reason Advisories `
                 -Detail $audit.Output
         }
         return New-RustsecAuditOutcome `
-            -Kind Fail `
-            -Reason Advisories `
+            -Kind Unknown `
+            -Reason AuditError `
             -Detail $audit.Output
     }
     return New-RustsecAuditOutcome `
