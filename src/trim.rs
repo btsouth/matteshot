@@ -839,6 +839,12 @@ fn retime_pcm(
     Some((output, time_map.output_time(first), output_duration.max(1)))
 }
 
+/// Video still gates on the sample timestamp. Audio must not: a packet that
+/// starts before `start` can still contain in-range frames (SBS-751).
+fn sample_is_before_trim_start(is_video: bool, timestamp: i64, start: i64) -> bool {
+    is_video && timestamp < start
+}
+
 /// Clip one decoded PCM packet to the selected source interval and rebase
 /// it onto the output timeline. Ordinary trims and speed-section trims share
 /// this so a packet that straddles `[start, end)` is sliced instead of
@@ -1051,7 +1057,7 @@ pub fn cut_with_speed_edit_progress_cancel(
                 }
                 continue;
             }
-            if is_video && ts < start {
+            if sample_is_before_trim_start(is_video, ts, start) {
                 continue;
             }
             let rel = ts - start;
@@ -1207,6 +1213,7 @@ pub fn cut_with_speed_edit_progress_cancel(
 mod tests {
     use super::{
         bgra_to_rgba, crop_rect, cut_with_speed_edit_progress_cancel, export_pcm, fit_inside,
+        sample_is_before_trim_start,
         open_reader, read_video_frame, retime_pcm, retime_video_sample, rgba_to_bgra,
         scrub_cache_plan, validate_video,
     };
@@ -1347,6 +1354,22 @@ mod tests {
             src.contains("export_pcm("),
             "audio export must go through export_pcm"
         );
+    }
+
+    #[test]
+    fn audio_that_starts_before_the_trim_is_not_skipped() {
+        // A packet at 0.05s with 0.1s of PCM still overlaps a trim that
+        // starts at 0.1s. Video of the same timestamp is still dropped.
+        assert!(
+            !sample_is_before_trim_start(false, 500_000, 1_000_000),
+            "audio that straddles the start must reach export_pcm"
+        );
+        assert!(
+            sample_is_before_trim_start(true, 500_000, 1_000_000),
+            "video before the start stays gated on timestamp"
+        );
+        assert!(!sample_is_before_trim_start(false, 1_000_000, 1_000_000));
+        assert!(!sample_is_before_trim_start(true, 1_000_000, 1_000_000));
     }
 
     #[test]
