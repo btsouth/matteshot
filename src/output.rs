@@ -132,10 +132,14 @@ fn cleanup_stale_partials(
         }
         // SBS-893: another instance may still be inside Finalize. Live owner
         // → skip (do not validate, do not delete). Unknown liveness → keep.
-        // Unknown is not dead. Only a proven-dead owner (or this process
-        // after the 24h PID-reuse window) may be classified. Asking about
-        // our own PID would always look live and strand a day-old leftover.
-        if owner != std::process::id() {
+        // Unknown is not dead. Only a proven-dead owner may be classified.
+        //
+        // The 24h window applies to every PID, not just ours. Finalize is
+        // bounded at 15 minutes, so a day-old partial whose owner still
+        // looks live is a recycled PID — some other long-lived process now
+        // holds that number. Without the window one such reuse strands a
+        // playable recording for as long as that process runs.
+        if owner != std::process::id() && !old {
             match owner_may_be_running(owner) {
                 Some(true) => continue,
                 None => {
@@ -1028,6 +1032,55 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Move a file's last-write time back so the 24h PID-reuse window
+    /// applies. No test can wait a day for it.
+    fn backdate(path: &Path, by: std::time::Duration) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{FILETIME, HANDLE};
+        use windows::Win32::Storage::FileSystem::SetFileTime;
+
+        // FILETIME counts 100ns ticks from 1601-01-01.
+        const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+        let since_epoch = (std::time::SystemTime::now() - by)
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let ticks = UNIX_EPOCH_TICKS
+            + since_epoch.as_secs() * 10_000_000
+            + u64::from(since_epoch.subsec_nanos()) / 100;
+        let stamp = FILETIME {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        unsafe {
+            SetFileTime(HANDLE(file.as_raw_handle()), None, None, Some(&stamp)).unwrap();
+        }
+    }
+
+    /// SBS-893: PIDs get recycled. Finalize is bounded at 15 minutes, so a
+    /// day-old partial whose owner still answers "live" is some unrelated
+    /// long-running process holding that number. Without the 24h window one
+    /// such reuse strands the file for as long as that process runs.
+    #[test]
+    fn cleanup_classifies_a_day_old_partial_whose_owner_pid_was_recycled() {
+        let dir = leftover_dir("recycled-pid");
+        let other_pid = std::process::id().wrapping_add(1).max(1);
+        let partial = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
+        std::fs::write(&partial, b"not an mp4").unwrap();
+        backdate(&partial, std::time::Duration::from_secs(25 * 60 * 60));
+
+        let handled = cleanup_stale_partials(
+            &dir,
+            partial_recording_owner,
+            |_| Some(true),
+            |_| PartialDisposition::Delete,
+        );
+        assert_eq!(handled, 1, "a recycled PID stranded a day-old partial");
+        assert!(!partial.exists());
+
+        std::fs::remove_dir(dir).unwrap();
     }
 
     /// A live owner may still be inside Media Foundation Finalize.

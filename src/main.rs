@@ -1024,11 +1024,15 @@ fn run_resident() -> Result<()> {
                     tray::Action::Quit => {
                         diagnostics::log("resident quit requested");
                         if record::late_finalize_outstanding() {
+                            // Owned and topmost: the wait below can hold the
+                            // thread for 15 minutes, and an unowned box can
+                            // open behind the foreground app, which reads as
+                            // a hang with no visible prompt.
                             MessageBoxW(
-                                None,
+                                tray.hwnd,
                                 w!("A recording is still finishing. Matteshot will quit when it is done."),
                                 w!("Matteshot"),
-                                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+                                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
                             );
                             if !record::wait_until_late_finalize_idle(record::LATE_FINALIZE_BOUND) {
                                 bail!("the recorder is still busy; finish or cancel the current operation and try again");

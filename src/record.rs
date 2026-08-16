@@ -755,21 +755,34 @@ pub fn wait_until_late_finalize_idle(timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Drain the thread queue without dispatching `WM_CLOSE`. Nested close during
-/// a wait or the 60s join would re-enter this wait while this stack still
-/// holds the guard.
+/// Drain the thread queue while leaving `WM_CLOSE` on it.
+///
+/// The two filter ranges straddle `WM_CLOSE` so `PeekMessageW` never removes
+/// it. Removing it and skipping the dispatch would *discard* the message:
+/// `--quit` posts exactly one `WM_CLOSE` to the tray, and the 60s finalize
+/// join pumps on that same thread, so eating it here would lose the only
+/// quit signal and leave the installer to taskkill mid-Finalize. Leaving it
+/// queued still gives the property the skip was for — nothing dispatches a
+/// nested close until this wait returns.
 fn pump_waiting_messages() {
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_CLOSE,
+        DispatchMessageW, PeekMessageW, PostQuitMessage, TranslateMessage, MSG, PM_REMOVE,
+        WM_CLOSE, WM_QUIT,
     };
     let mut msg = MSG::default();
     unsafe {
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-            if msg.message == WM_CLOSE {
-                continue;
+        for (min, max) in [(0, WM_CLOSE - 1), (WM_CLOSE + 1, u32::MAX)] {
+            while PeekMessageW(&mut msg, None, min, max, PM_REMOVE).as_bool() {
+                // WM_QUIT comes back whatever the filter says, and PM_REMOVE
+                // takes it off the queue. Put it back and stop, or the
+                // caller's message loop would never see the quit.
+                if msg.message == WM_QUIT {
+                    PostQuitMessage(msg.wParam.0 as i32);
+                    return;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
         }
     }
 }
@@ -1319,6 +1332,45 @@ mod tests {
         );
         drop(guard);
         assert!(!late_finalize_outstanding());
+    }
+
+    /// SBS-893: the pump must leave `WM_CLOSE` queued and still drain the
+    /// rest. `--quit` posts one `WM_CLOSE` to the tray while the 60s finalize
+    /// join is pumping on that thread; eating it there loses the only quit
+    /// signal and the installer taskkills mid-Finalize.
+    #[test]
+    fn the_pump_drains_other_messages_but_leaves_wm_close_queued() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, PM_REMOVE, WM_APP, WM_CLOSE,
+        };
+        let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        unsafe {
+            // A thread-message queue exists only once something is posted.
+            let _ = PostThreadMessageW(thread_id, WM_CLOSE, WPARAM(0), LPARAM(0));
+            let _ = PostThreadMessageW(thread_id, WM_APP + 77, WPARAM(0), LPARAM(0));
+        }
+
+        pump_waiting_messages();
+
+        let mut msg = MSG::default();
+        // Thread messages have no window, so nothing dispatches them; what is
+        // left in the queue is exactly what the pump refused to remove.
+        let remaining: Vec<u32> = std::iter::from_fn(|| unsafe {
+            PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE)
+                .as_bool()
+                .then_some(msg.message)
+        })
+        .collect();
+        assert_eq!(
+            remaining,
+            vec![WM_CLOSE],
+            "the pump must consume everything except WM_CLOSE"
+        );
+        assert!(
+            !unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) }.as_bool(),
+            "queue must be empty once WM_CLOSE is taken"
+        );
     }
 
     #[test]
