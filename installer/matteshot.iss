@@ -112,9 +112,13 @@ begin
     if R <> 0 then
       // Older Matteshot builds do not know --quit. Ask Windows to close them
       // without /f; CloseApplications remains the final file-lock safeguard.
-      // taskkill is run directly: routing it through cmd would flash a console
-      // window during an otherwise invisible background update.
-      Exec('taskkill.exe', '/im matteshot.exe', '', SW_HIDE,
+      // The Windows system directory, never an unqualified name: a decoy
+      // taskkill.exe beside the installer must not run (SBS-764). Setup has
+      // no ArchitecturesInstallIn64BitMode, so {sys} is SysWOW64 on 64-bit
+      // Windows; that ships its own taskkill.exe and is just as
+      // system-protected, so the guarantee holds either way. Routing through
+      // cmd would flash a console during an otherwise invisible update.
+      Exec(ExpandConstant('{sys}\taskkill.exe'), '/im matteshot.exe', '', SW_HIDE,
         ewWaitUntilTerminated, R);
   end;
   Result := '';
