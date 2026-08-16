@@ -8,6 +8,7 @@
 
 use std::ffi::c_void;
 use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -423,12 +424,18 @@ pub fn stage(url: &str, version: &str, progress: impl FnMut(u32)) -> Result<Path
 
 const INSTALLER_ARGS: &str = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL";
 
-/// Quoted path plus Inno flags. `CreateProcessW` requires a mutable buffer.
+/// Quoted path plus Inno flags. `CreateProcessW` requires a mutable UTF-16
+/// buffer; the path is encoded losslessly so `lpCommandLine` matches
+/// `lpApplicationName` on non-UTF-8 temp directories.
 fn launch_command_line(path: &Path) -> Vec<u16> {
-    format!("\"{}\" {INSTALLER_ARGS}", path.display())
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect()
+    let mut line = Vec::new();
+    line.push(u16::from(b'"'));
+    line.extend(path.as_os_str().encode_wide());
+    line.push(u16::from(b'"'));
+    line.push(u16::from(b' '));
+    line.extend(INSTALLER_ARGS.encode_utf16());
+    line.push(0);
+    line
 }
 
 /// Image and command line for `CreateProcessW`. No shell verb: a hijacked
@@ -558,6 +565,25 @@ mod tests {
             line,
             r#""C:\Users\Tyler South\AppData\Local\Temp\MatteshotSetup-0.19.0.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL"#
         );
+    }
+
+    #[test]
+    fn launch_command_line_preserves_non_unicode_path_units() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut wide: Vec<u16> = OsString::from(r"C:\Users\").encode_wide().collect();
+        wide.push(0xD800); // unpaired surrogate, not valid UTF-8/WTF-8
+        wide.extend(OsString::from(r"\AppData\Local\Temp\MatteshotSetup.exe").encode_wide());
+        let path = PathBuf::from(OsString::from_wide(&wide));
+        let line = launch_command_line(&path);
+        assert_eq!(line.first().copied(), Some(u16::from(b'"')));
+        let quoted = &line[1..];
+        assert!(
+            quoted.windows(wide.len()).any(|window| window == wide),
+            "lossy Display must not replace unpaired surrogates in lpCommandLine"
+        );
+        let as_text = utf16_cstr(&line);
+        assert!(as_text.contains(INSTALLER_ARGS), "{as_text}");
     }
 
     #[test]
