@@ -1,0 +1,30 @@
+# Locked RustSec config for the PR/release gate (SBS-763).
+# Ignore IDs here must match .cargo/rustsec-exceptions.json
+# (owner, justification, expiry). An undocumented ignore fails the gate.
+
+[advisories]
+ignore = []
+informational_warnings = ["unmaintained"]
+severity_threshold = "low"
+
+[database]
+fetch = true
+stale = false
+url = "https://github.com/RustSec/advisory-db.git"
+
+[output]
+# Vulnerabilities already fail the process. Unsound is actionable too.
+# Unmaintained / yanked stay warnings unless they become ignores.
+deny = ["unsound"]
+format = "terminal"
+quiet = false
+show_tree = true
+
+[target]
+# Matteshot ships Windows only. Advisories that name another OS are ignored.
+os = ["windows"]
+arch = ["x86_64"]
+
+[yanked]
+enabled = true
+update_index = true

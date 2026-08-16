@@ -127,6 +127,8 @@ Run the same static code gate used by CI, signed candidates, and releases:
 .\scripts\verify-code.ps1
 ```
 
+That gate now includes a locked RustSec `cargo audit` (pinned `cargo-audit` 0.22.2 from crates.io). A missing or wrong-version tool, an expired or undocumented ignore, or an actionable advisory fails the run. Exceptions live in `.cargo/rustsec-exceptions.json` and must match `.cargo/audit.toml`.
+
 Release acceptance runs in Windows Sandbox with clipboard redirection disabled.
 The host waits for the guest `result.json` and exits 0 only when `passed` is
 true. It exits non-zero on guest FAIL, timeout, or an unreadable/missing
