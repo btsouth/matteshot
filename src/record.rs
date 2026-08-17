@@ -898,6 +898,38 @@ fn finish_late_recording(
     }
 }
 
+/// After in-process `validate_video` fails, decide whether the partial
+/// (and its GIF sibling) may be thrown away. Unavailable is not a verdict
+/// on the bytes — a Defender/OneDrive sharing violation used to delete a
+/// finished recording here (SBS-918). Late-finalize and startup cleanup
+/// already keep those files; this path still deletes only proven-undecodable
+/// bytes.
+fn dispose_in_process_validation_failure(
+    error: anyhow::Error,
+    partial: &std::path::Path,
+    gif: &std::path::Path,
+) -> anyhow::Error {
+    match crate::trim::validation_fault(&error) {
+        crate::trim::ValidationFault::Undecodable => {
+            crate::diagnostics::log("recording validation failed");
+            let _ = std::fs::remove_file(partial);
+            let _ = std::fs::remove_file(gif);
+            error.context("recording failed its final integrity check")
+        }
+        crate::trim::ValidationFault::Unavailable => {
+            crate::diagnostics::log("recording validation unavailable; partial kept for retry");
+            error.context(
+                "recording could not be checked this time; the file is still in your videos folder and will be retried",
+            )
+        }
+    }
+}
+
+fn validate_in_process_recording(partial: &std::path::Path, gif: &std::path::Path) -> Result<()> {
+    crate::trim::validate_video(partial)
+        .map_err(|error| dispose_in_process_validation_failure(error, partial, gif))
+}
+
 fn publish_recording_with(
     partial: &std::path::Path,
     destination: &std::path::Path,
@@ -1071,12 +1103,10 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
         bail!(err);
     }
 
-    if let Err(error) = crate::trim::validate_video(&partial_mp4) {
-        crate::diagnostics::log("recording validation failed");
-        let _ = std::fs::remove_file(&partial_mp4);
-        let _ = std::fs::remove_file(&gif);
-        return Err(error).context("recording failed its final integrity check");
-    }
+    // Unavailable is keep/retry, not delete (SBS-918). A sharing violation
+    // from Defender or OneDrive is not a verdict on the bytes; late-finalize
+    // and startup cleanup already keep those files.
+    validate_in_process_recording(&partial_mp4, &gif)?;
     if let Err(error) =
         publish_recording_with(&partial_mp4, &mp4, |from, to| std::fs::rename(from, to))
     {
@@ -1229,6 +1259,158 @@ mod tests {
         assert!(!partial.exists());
         assert!(crate::trim::validate_video(&destination).is_ok());
         std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    fn unavailable_faults() -> [anyhow::Error; 2] {
+        use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        [
+            anyhow::Error::from(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sharing violation",
+            ))
+            .context("read video metadata"),
+            anyhow::Error::from(windows::core::Error::from(
+                windows::core::HRESULT::from_win32(ERROR_SHARING_VIOLATION.0),
+            ))
+            .context("decode finalized video"),
+        ]
+    }
+
+    /// Pins SBS-918: in-process finalize used to delete the partial on any
+    /// `validate_video` error, including a check that could not run.
+    #[test]
+    fn in_process_validation_keeps_a_file_when_the_check_cannot_run() {
+        let dir = temp_dir("in-process-unavailable");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (index, fault) in unavailable_faults().into_iter().enumerate() {
+            let partial = dir.join(format!("capture.partial-1-{index}.mp4"));
+            let gif = dir.join(format!("capture-{index}.gif"));
+            std::fs::write(&partial, b"maybe a finished recording").unwrap();
+            std::fs::write(&gif, b"maybe a gif").unwrap();
+
+            assert_eq!(
+                crate::trim::validation_fault(&fault),
+                crate::trim::ValidationFault::Unavailable,
+                "{fault:#}"
+            );
+            let error = dispose_in_process_validation_failure(fault, &partial, &gif);
+            let message = format!("{error:#}");
+            assert!(
+                partial.exists(),
+                "Unavailable deleted the recording: {message}"
+            );
+            assert!(
+                gif.exists(),
+                "Unavailable deleted the gif sibling: {message}"
+            );
+            assert!(
+                message.contains("could not be checked"),
+                "user-facing error must say the check did not run: {message}"
+            );
+            assert!(
+                !message.contains("integrity check"),
+                "Unavailable must not be described as a failed integrity check: {message}"
+            );
+            std::fs::remove_file(partial).unwrap();
+            std::fs::remove_file(gif).unwrap();
+        }
+
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Proven-bad bytes are still thrown away. SBS-918 must not weaken that.
+    #[test]
+    fn in_process_validation_deletes_proven_undecodable_bytes() {
+        let dir = temp_dir("in-process-undecodable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("capture.partial-1-1.mp4");
+        let gif = dir.join("capture.gif");
+        std::fs::write(&partial, b"not an mp4").unwrap();
+        std::fs::write(&gif, b"not a gif").unwrap();
+
+        let fault = anyhow::anyhow!("video has no decodable frames");
+        assert_eq!(
+            crate::trim::validation_fault(&fault),
+            crate::trim::ValidationFault::Undecodable,
+            "{fault:#}"
+        );
+        let error = dispose_in_process_validation_failure(fault, &partial, &gif);
+        let message = format!("{error:#}");
+        assert!(
+            !partial.exists(),
+            "Undecodable left the recording in place: {message}"
+        );
+        assert!(!gif.exists(), "Undecodable left the gif sibling: {message}");
+        assert!(
+            message.contains("integrity check"),
+            "Undecodable must still be a failed integrity check: {message}"
+        );
+
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// The session wrapper must still delete through a real `validate_video`
+    /// rejection, not only a constructed fault.
+    #[test]
+    fn in_process_validation_deletes_a_file_validate_video_rejects() {
+        let dir = temp_dir("in-process-validate-video");
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("capture.partial-1-1.mp4");
+        let gif = dir.join("capture.gif");
+        std::fs::write(&partial, b"not an mp4").unwrap();
+        std::fs::write(&gif, b"not a gif").unwrap();
+
+        let error = validate_in_process_recording(&partial, &gif).unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(
+            crate::trim::validation_fault(&error),
+            crate::trim::ValidationFault::Undecodable,
+            "{message}"
+        );
+        assert!(
+            !partial.exists(),
+            "a real validate_video rejection left the recording: {message}"
+        );
+        assert!(
+            !gif.exists(),
+            "a real validate_video rejection left the gif: {message}"
+        );
+        assert!(
+            message.contains("integrity check"),
+            "a real validate_video rejection must still be a failed integrity check: {message}"
+        );
+
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// A real `validate_video` miss (file gone / unreadable) is Unavailable:
+    /// the wrapper must not delete a sibling just because the check could
+    /// not run.
+    #[test]
+    fn in_process_validation_keeps_siblings_when_validate_video_cannot_run() {
+        let dir = temp_dir("in-process-validate-unavailable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("capture.partial-1-1.mp4");
+        let gif = dir.join("capture.gif");
+        std::fs::write(&gif, b"maybe a gif").unwrap();
+
+        let error = validate_in_process_recording(&missing, &gif).unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(
+            crate::trim::validation_fault(&error),
+            crate::trim::ValidationFault::Unavailable,
+            "{message}"
+        );
+        assert!(
+            gif.exists(),
+            "a check that could not run deleted the gif sibling: {message}"
+        );
+        assert!(message.contains("could not be checked"), "{message}");
+        assert!(!message.contains("integrity check"), "{message}");
+
+        std::fs::remove_file(gif).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
