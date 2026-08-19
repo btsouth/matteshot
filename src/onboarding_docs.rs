@@ -73,5 +73,9 @@ mod tests {
             REGRESSION.contains("native welcome surface"),
             "interactive regression must check the shipped welcome surface"
         );
+        assert!(
+            REGRESSION.contains("`--welcome` opens the same surface"),
+            "interactive regression must not treat --welcome as having a balloon fallback"
+        );
     }
 }
