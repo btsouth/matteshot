@@ -272,6 +272,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          MATTESHOT_RELEASE_SIGNING_KEY: ${{ secrets.MATTESHOT_RELEASE_SIGNING_KEY }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_API_TOKEN)) {
             Write-Error "CLOUDFLARE_R2_API_TOKEN is required for releases."
@@ -279,6 +280,10 @@ jobs:
           }
           if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_ACCOUNT_ID)) {
             Write-Error "CLOUDFLARE_ACCOUNT_ID is required for releases."
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($env:MATTESHOT_RELEASE_SIGNING_KEY)) {
+            Write-Error "MATTESHOT_RELEASE_SIGNING_KEY is required. New clients refuse an unsigned installer (SBS-747)."
             exit 1
           }
           $headers = @{
@@ -312,9 +317,49 @@ jobs:
           $stable = Join-Path $env:RUNNER_TEMP "MatteshotSetup.exe.sha256"
           "$expected  MatteshotSetup-$version.exe" | Set-Content -Encoding ascii -NoNewline $versioned
           "$expected  MatteshotSetup.exe" | Set-Content -Encoding ascii -NoNewline $stable
+          $length = (Get-Item $path).Length
           "path=$path" >> $env:GITHUB_OUTPUT
           "versioned=$versioned" >> $env:GITHUB_OUTPUT
           "stable=$stable" >> $env:GITHUB_OUTPUT
+          "length=$length" >> $env:GITHUB_OUTPUT
+
+      - name: Sign the release record
+        id: signed
+        shell: pwsh
+        env:
+          MATTESHOT_RELEASE_SIGNING_KEY: ${{ secrets.MATTESHOT_RELEASE_SIGNING_KEY }}
+        run: |
+          $version = '${{ needs.build.outputs.version }}'
+          $hash = '${{ needs.build.outputs.hash }}'
+          $length = '${{ steps.checksums.outputs.length }}'
+          $url = "https://download.matteshot.app/MatteshotSetup-$version.exe"
+          $python = Get-Command python3, python, py -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $python) {
+            Write-Error "python3 is required to sign the release record."
+            exit 1
+          }
+          $versioned = Join-Path $env:RUNNER_TEMP "MatteshotSetup-$version.exe.release.json"
+          $stable = Join-Path $env:RUNNER_TEMP "MatteshotSetup.exe.release.json"
+          & $python.Source scripts/sign-release-manifest.py `
+            --version $version `
+            --url $url `
+            --length $length `
+            --sha256 $hash `
+            --key-id 2026.1 `
+            --output $versioned
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The stable installer is the same bytes. The signed URL stays the
+          # immutable versioned name; clients that download the stable name
+          # still fetch this record from the versioned URL in version.json.
+          Copy-Item $versioned $stable
+          $doc = Get-Content -Raw $versioned | ConvertFrom-Json
+          if ($doc.sha256 -cne $hash -or $doc.version -cne $version -or $doc.url -cne $url) {
+            Write-Error "Signed release record does not bind this installer."
+            exit 1
+          }
+          "versioned=$versioned" >> $env:GITHUB_OUTPUT
+          "stable=$stable" >> $env:GITHUB_OUTPUT
+          Write-Host "Signed release record for $url ($length bytes, $hash)"
 
       - name: Publish the installer to Cloudflare R2
         shell: pwsh
@@ -342,6 +387,12 @@ jobs:
           npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup.exe.sha256" `
             --file '${{ steps.checksums.outputs.stable }}' --content-type text/plain --cache-control $mutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe.release.json" `
+            --file '${{ steps.signed.outputs.versioned }}' --content-type application/json --cache-control $immutable --remote
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup.exe.release.json" `
+            --file '${{ steps.signed.outputs.stable }}' --content-type application/json --cache-control $mutable --remote
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Purge the stable download from the edge
         id: purge
@@ -365,7 +416,8 @@ jobs:
           } else {
             $body = @{ files = @(
               "https://download.matteshot.app/MatteshotSetup.exe",
-              "https://download.matteshot.app/MatteshotSetup.exe.sha256"
+              "https://download.matteshot.app/MatteshotSetup.exe.sha256",
+              "https://download.matteshot.app/MatteshotSetup.exe.release.json"
             ) } | ConvertTo-Json
           # Say exactly why a refusal happened. Swallowing the Cloudflare error
           # made a failing purge indistinguishable from a missing permission.
@@ -466,6 +518,7 @@ jobs:
           gh release create "v$version" `
             '${{ steps.checksums.outputs.path }}' `
             '${{ steps.checksums.outputs.versioned }}' `
+            '${{ steps.signed.outputs.versioned }}' `
             --title "Matteshot $version" `
             --notes $notes `
             --draft `

@@ -14,6 +14,7 @@ mod thumb_decode;
 mod hotkey;
 mod icon;
 mod installer;
+mod release_manifest;
 mod license;
 mod license_ui;
 mod number_prompt;
@@ -2049,8 +2050,8 @@ fn main() -> Result<()> {
         }
         Some("--quit") => request_graceful_shutdown(),
         // Download and fully verify the published installer without running
-        // it. Proves the hash and signature gates before anything is trusted
-        // enough to execute.
+        // it. Proves the signed-release and Authenticode gates before anything
+        // is trusted enough to execute.
         // Authenticode gate probe: must accept our installer and reject
         // everything else, including files Windows itself trusts.
         Some("--verify-signature-test") => {
@@ -2084,7 +2085,7 @@ fn main() -> Result<()> {
             })?;
             let bytes = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
             eprintln!(
-                "verified hash + signature: {} ({bytes} bytes)",
+                "verified signed release + Authenticode: {} ({bytes} bytes)",
                 staged.display()
             );
             eprintln!("not installing (probe only)");
