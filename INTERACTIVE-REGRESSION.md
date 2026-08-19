@@ -89,6 +89,11 @@ Two things to know before running these:
 
 - [ ] `not-started`: capture works and the tray reads "14-day trial ready".
 - [ ] `trial:3`: the tray reads "Trial: 3 days left" and capture is unaffected.
+- [ ] Share follows the real certificate, not the override: on a machine
+      without a paid `license.json`, picker hint has no "S share", History
+      omits "Share link", and tweak/recdone have no Share control. A licensed
+      machine still offers Share even under `trial:3`, because it can actually
+      upload.
 - [ ] `expired`: PrtScn no longer captures and the activation window appears.
 - [ ] Buy from the expired window, and from the tray, opens the pricing card at
       matteshot.app rather than the top of the page.

@@ -552,6 +552,8 @@ struct State {
     copy_hint: Option<(String, std::time::Instant)>,
     /// Correlates asynchronous Share completions with the latest click.
     pending_share: Option<u64>,
+    /// Cached at open: Share is a paid-license action (SBS-906).
+    can_share: bool,
     /// The crop drag in flight. Lives on the window rather than the document
     /// because, like the slider drags, it belongs to the mouse rather than to
     /// the picture.
@@ -778,6 +780,9 @@ fn text_context(state: &State) -> bool {
 }
 
 fn control_visible(state: &State, control: Ctl) -> bool {
+    if matches!(control, Ctl::Share) {
+        return state.can_share;
+    }
     let custom_size = state.custom_size_edit.is_some();
     if matches!(
         control,
@@ -2918,6 +2923,13 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
 /// closer in spirit to Copy, since sharing is not "finished with this
 /// capture" the way saving is.
 unsafe fn share_current(hwnd: HWND, state: &mut State) {
+    if let crate::share::ShareStart::Unavailable(reason) =
+        crate::share::share_start(crate::license::can_share())
+    {
+        state.copy_hint = Some((reason.into(), std::time::Instant::now()));
+        let _ = InvalidateRect(hwnd, None, false);
+        return;
+    }
     commit_editing(state);
     let img = final_image(state);
     let cfg = Config::load();
@@ -4551,6 +4563,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         custom_size_edit: None,
         copy_hint: None,
         pending_share: None,
+        can_share: crate::license::can_share(),
         crop_drag: None,
         crop_click_owed: false,
         font: unsafe { make_font(-sc(14), 400) },
