@@ -26,27 +26,31 @@ mod tests {
     }
 
     /// `src/tray.rs` always appends delayed capture and History.
+    ///
+    /// Anchored to the tray-menu sentence itself. A bare `contains("History")`
+    /// passes on any other mention in the file, so it would not notice the
+    /// tray list losing the entry.
     #[test]
     fn readme_tray_menu_includes_delayed_capture_and_history() {
         assert!(
-            README.contains("delayed-capture"),
-            "README tray menu must mention delayed capture"
+            README.contains("the active-window and delayed-capture variants"),
+            "README tray-menu sentence must mention delayed capture"
         );
         assert!(
-            README.contains("History"),
-            "README tray menu must mention History"
+            README.contains("open captures/videos folders, History, license, and Settings"),
+            "README tray-menu sentence must list History"
         );
     }
 
+    /// Anchored to the tray-menu check line for the same reason as the
+    /// README test: a loose `contains` passes on an unrelated mention.
     #[test]
     fn interactive_regression_tray_menu_includes_delayed_capture_and_history() {
         assert!(
-            REGRESSION.contains("delayed capture"),
-            "interactive regression tray check must mention delayed capture"
-        );
-        assert!(
-            REGRESSION.contains("History"),
-            "interactive regression tray check must mention History"
+            REGRESSION.contains(
+                "Tray menu lists capture, active window, delayed capture, open captures/videos folders, History, license, and Settings"
+            ),
+            "interactive regression tray check must list delayed capture and History in order"
         );
         assert!(
             !REGRESSION.contains(
