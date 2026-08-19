@@ -127,6 +127,66 @@ struct ExportDone {
     result: std::result::Result<(), String>,
 }
 
+/// After export encode returns, decide whether the same-folder `.partial`
+/// may be thrown away. Unavailable is not a verdict on the bytes — a
+/// Defender/OneDrive sharing violation used to delete a finished export
+/// here (SBS-923). Recording publish and startup cleanup already keep
+/// those files; this path still deletes a cancelled or failed encode,
+/// and proven-undecodable bytes.
+enum ExportCleanup {
+    Cancelled,
+    Encode(String),
+    Validate(anyhow::Error),
+    Rename(std::io::Error),
+}
+
+fn dispose_export_partial(temporary: &std::path::Path, error: ExportCleanup) -> String {
+    match error {
+        ExportCleanup::Cancelled => {
+            let _ = std::fs::remove_file(temporary);
+            "export cancelled".into()
+        }
+        ExportCleanup::Encode(message) => {
+            let _ = std::fs::remove_file(temporary);
+            message
+        }
+        ExportCleanup::Validate(error) => match crate::trim::validation_fault(&error) {
+            crate::trim::ValidationFault::Undecodable => {
+                let _ = std::fs::remove_file(temporary);
+                format!("validate export: {error:#}")
+            }
+            crate::trim::ValidationFault::Unavailable => {
+                crate::diagnostics::log(&format!(
+                    "export validation unavailable: {error:#}; partial kept for recovery on the next start"
+                ));
+                "export could not be checked this time; the file is still in your videos folder and will be recovered the next time Matteshot starts"
+                    .into()
+            }
+        },
+        ExportCleanup::Rename(error) => {
+            crate::diagnostics::log(&format!(
+                "export publish failed: {error}; partial kept for recovery on the next start"
+            ));
+            format!(
+                "finalize export: {error}; recovery file kept at {}",
+                temporary.display()
+            )
+        }
+    }
+}
+
+fn export_failure_status(error: &str) -> String {
+    if error == "export cancelled" {
+        "export cancelled · original kept".into()
+    } else if error.contains("could not be checked") {
+        "export could not be checked · edit kept".into()
+    } else if error.contains("recovery file kept") {
+        "export save failed · edit kept".into()
+    } else {
+        format!("export failed: {error}")
+    }
+}
+
 static EXPORT_COMPLETIONS: crate::completion::CompletionMailbox<ExportDone> =
     crate::completion::CompletionMailbox::new();
 static PROBE_COMPLETIONS: crate::completion::CompletionMailbox<crate::trim::Probe> =
@@ -3181,11 +3241,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         Err(error) if error == "export cancelled" => {
                             crate::diagnostics::log("video export cancelled");
-                            state.status = Some("export cancelled · original kept".into());
+                            state.status = Some(export_failure_status(error));
                         }
                         Err(error) => {
                             crate::diagnostics::log("video export failed");
-                            state.status = Some(format!("export failed: {error}"));
+                            state.status = Some(export_failure_status(error));
                         }
                     }
                     close = state.close_after_export;
@@ -4221,7 +4281,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let temporary = crate::output::partial_video_path(&dst, export_id);
                                 let _ = std::fs::remove_file(&temporary);
                                 let mut last_progress = u32::MAX;
-                                let result = crate::trim::cut_with_speed_edit_progress_cancel(
+                                let encoded = crate::trim::cut_with_speed_edit_progress_cancel(
                                     &src,
                                     &temporary,
                                     start,
@@ -4245,21 +4305,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                             }
                                         }
                                     },
-                                )
-                                .map_err(|error| format!("{error:#}"))
-                                .and_then(|()| {
-                                    if export_cancel.load(Ordering::Relaxed) {
-                                        Err("export cancelled".into())
-                                    } else {
-                                        crate::trim::validate_video(&temporary)
-                                            .map_err(|error| format!("validate export: {error:#}"))?;
-                                        std::fs::rename(&temporary, &dst)
-                                            .map_err(|error| format!("finalize export: {error}"))
+                                );
+                                // Unavailable / rename-after-validate keep the
+                                // `.partial` (SBS-923). Cancel, encode failure,
+                                // and proven-undecodable bytes still delete.
+                                let result = match encoded {
+                                    Err(error) => Err(dispose_export_partial(
+                                        &temporary,
+                                        ExportCleanup::Encode(format!("{error:#}")),
+                                    )),
+                                    Ok(()) if export_cancel.load(Ordering::Relaxed) => {
+                                        Err(dispose_export_partial(
+                                            &temporary,
+                                            ExportCleanup::Cancelled,
+                                        ))
                                     }
-                                });
-                                if result.is_err() {
-                                    let _ = std::fs::remove_file(&temporary);
-                                }
+                                    Ok(()) => match crate::trim::validate_video(&temporary) {
+                                        Err(error) => Err(dispose_export_partial(
+                                            &temporary,
+                                            ExportCleanup::Validate(error),
+                                        )),
+                                        Ok(()) => match std::fs::rename(&temporary, &dst) {
+                                            Err(error) => Err(dispose_export_partial(
+                                                &temporary,
+                                                ExportCleanup::Rename(error),
+                                            )),
+                                            Ok(()) => Ok(()),
+                                        },
+                                    },
+                                };
                                 if com.is_ok() {
                                     unsafe { CoUninitialize() };
                                 }
@@ -5065,8 +5139,9 @@ mod tests {
 
     use super::{
         add_chip_label, annotation_preview_time, apply_caption_input, available_export_path,
-        delete_recording_files, delete_recording_files_with, layout, minimum_client_size,
-        next_counter_number, recording_delete_prompt, speed_gap, tool_after_pick, CaptionInput,
+        delete_recording_files, delete_recording_files_with, dispose_export_partial,
+        export_failure_status, layout, minimum_client_size, next_counter_number,
+        recording_delete_prompt, speed_gap, tool_after_pick, CaptionInput, ExportCleanup,
         NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
     use std::sync::atomic::Ordering;
@@ -5450,5 +5525,194 @@ mod tests {
         };
         let (tol_x, tol_y) = crop_grab_tolerance(empty, 10);
         assert!(tol_x.is_finite() && tol_y.is_finite());
+    }
+
+    fn export_partial_dir(label: &str) -> std::path::PathBuf {
+        let id = NEXT_EXPORT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-export-partial-{label}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn unavailable_export_faults() -> [anyhow::Error; 2] {
+        use windows::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        [
+            anyhow::Error::from(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sharing violation",
+            ))
+            .context("read video metadata"),
+            anyhow::Error::from(windows::core::Error::from(
+                windows::core::HRESULT::from_win32(ERROR_SHARING_VIOLATION.0),
+            ))
+            .context("decode finalized video"),
+        ]
+    }
+
+    /// Pins SBS-923: export used to delete the same-folder `.partial` on
+    /// any post-encode error, including a check that could not run.
+    #[test]
+    fn export_keeps_a_partial_when_the_check_cannot_run() {
+        let dir = export_partial_dir("unavailable");
+        for (index, fault) in unavailable_export_faults().into_iter().enumerate() {
+            let temporary = dir.join(format!("edit.partial-1-{index}.mp4"));
+            std::fs::write(&temporary, b"maybe a finished export").unwrap();
+
+            assert_eq!(
+                crate::trim::validation_fault(&fault),
+                crate::trim::ValidationFault::Unavailable,
+                "{fault:#}"
+            );
+            let message = dispose_export_partial(&temporary, ExportCleanup::Validate(fault));
+            assert!(
+                temporary.exists(),
+                "Unavailable deleted the export: {message}"
+            );
+            assert!(
+                message.contains("could not be checked"),
+                "user-facing error must say the check did not run: {message}"
+            );
+            assert!(
+                message.contains("recovered the next time Matteshot starts"),
+                "Unavailable must not promise a same-session retry: {message}"
+            );
+            assert!(
+                !message.contains("will be retried"),
+                "Unavailable must not promise a retry this session does not run: {message}"
+            );
+            assert!(
+                !message.contains("integrity check"),
+                "Unavailable must not be described as a failed integrity check: {message}"
+            );
+            assert_eq!(
+                export_failure_status(&message),
+                "export could not be checked · edit kept"
+            );
+            std::fs::remove_file(temporary).unwrap();
+        }
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Proven-bad bytes are still thrown away. SBS-923 must not weaken that.
+    #[test]
+    fn export_deletes_proven_undecodable_bytes() {
+        let dir = export_partial_dir("undecodable");
+        let temporary = dir.join("edit.partial-1-1.mp4");
+        std::fs::write(&temporary, b"not an mp4").unwrap();
+
+        let fault = anyhow::anyhow!("video has no decodable frames");
+        assert_eq!(
+            crate::trim::validation_fault(&fault),
+            crate::trim::ValidationFault::Undecodable,
+            "{fault:#}"
+        );
+        let message = dispose_export_partial(&temporary, ExportCleanup::Validate(fault));
+        assert!(
+            !temporary.exists(),
+            "Undecodable left the export in place: {message}"
+        );
+        assert!(
+            message.contains("validate export"),
+            "Undecodable must still be a validate export error: {message}"
+        );
+        assert_eq!(
+            export_failure_status(&message),
+            format!("export failed: {message}")
+        );
+
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// The worker must still delete through a real `validate_video`
+    /// rejection, not only a constructed fault.
+    #[test]
+    fn export_deletes_a_file_validate_video_rejects() {
+        let dir = export_partial_dir("validate-video");
+        let temporary = dir.join("edit.partial-1-1.mp4");
+        std::fs::write(&temporary, b"not an mp4").unwrap();
+
+        let error = crate::trim::validate_video(&temporary).unwrap_err();
+        assert_eq!(
+            crate::trim::validation_fault(&error),
+            crate::trim::ValidationFault::Undecodable,
+            "{error:#}"
+        );
+        let message = dispose_export_partial(&temporary, ExportCleanup::Validate(error));
+        assert!(
+            !temporary.exists(),
+            "a real validate_video rejection left the export: {message}"
+        );
+        assert!(message.contains("validate export"), "{message}");
+
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// A lost rename after a successful validate used to delete the
+    /// `.partial`. The bytes are user data now; keep them for retry.
+    #[test]
+    fn export_keeps_a_partial_when_rename_fails_after_validate() {
+        let dir = export_partial_dir("rename");
+        let temporary = dir.join("edit.partial-1-1.mp4");
+        std::fs::write(&temporary, b"validated export bytes").unwrap();
+
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "destination is in use",
+        );
+        let message = dispose_export_partial(&temporary, ExportCleanup::Rename(error));
+        assert!(
+            temporary.exists(),
+            "rename-after-validate deleted the export: {message}"
+        );
+        assert!(
+            message.contains("recovery file kept"),
+            "rename failure must name the kept file: {message}"
+        );
+        assert_eq!(
+            export_failure_status(&message),
+            "export save failed · edit kept"
+        );
+
+        std::fs::remove_file(temporary).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Cancel and a failed encode are not "validated or uncheckable".
+    /// Those files are incomplete and still go away.
+    #[test]
+    fn export_deletes_a_partial_on_cancel_or_encode_failure() {
+        let dir = export_partial_dir("cancel-encode");
+        let cancelled = dir.join("edit.partial-1-cancel.mp4");
+        let encoded = dir.join("edit.partial-1-encode.mp4");
+        std::fs::write(&cancelled, b"incomplete export").unwrap();
+        std::fs::write(&encoded, b"incomplete export").unwrap();
+
+        let cancel_message = dispose_export_partial(&cancelled, ExportCleanup::Cancelled);
+        assert_eq!(cancel_message, "export cancelled");
+        assert!(
+            !cancelled.exists(),
+            "cancel left the export: {cancel_message}"
+        );
+        assert_eq!(
+            export_failure_status(&cancel_message),
+            "export cancelled · original kept"
+        );
+
+        let encode_message =
+            dispose_export_partial(&encoded, ExportCleanup::Encode("encoder failed".into()));
+        assert_eq!(encode_message, "encoder failed");
+        assert!(
+            !encoded.exists(),
+            "encode failure left the export: {encode_message}"
+        );
+        assert_eq!(
+            export_failure_status(&encode_message),
+            "export failed: encoder failed"
+        );
+
+        std::fs::remove_dir(dir).unwrap();
     }
 }
