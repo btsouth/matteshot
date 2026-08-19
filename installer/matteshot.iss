@@ -123,3 +123,65 @@ begin
   end;
   Result := '';
 end;
+
+function HistoryMetadataDir: String;
+begin
+  // dirs::config_dir() on Windows is %APPDATA% (Roaming), which Inno calls {userappdata}.
+  Result := ExpandConstant('{userappdata}\matteshot');
+end;
+
+function HistoryMetadataPresent: Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := FileExists(HistoryMetadataDir + '\history.json')
+    or FileExists(HistoryMetadataDir + '\history.json.tmp');
+  if Result then
+    Exit;
+  if FindFirst(HistoryMetadataDir + '\history.json.corrupt-*', FindRec) then
+  begin
+    Result := True;
+    FindClose(FindRec);
+  end;
+end;
+
+function DeleteHistoryMetadata: Boolean;
+var
+  FindRec: TFindRec;
+  Dir: String;
+begin
+  Result := True;
+  Dir := HistoryMetadataDir;
+  if FileExists(Dir + '\history.json') and not DeleteFile(Dir + '\history.json') then
+    Result := False;
+  if FileExists(Dir + '\history.json.tmp') and not DeleteFile(Dir + '\history.json.tmp') then
+    Result := False;
+  if FindFirst(Dir + '\history.json.corrupt-*', FindRec) then
+  try
+    repeat
+      if not DeleteFile(Dir + '\' + FindRec.Name) then
+        Result := False;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // Offer only. Captures live in the save/video folders and stay there
+  // unless the user already deleted them. SBS-765.
+  if (CurUninstallStep = usUninstall) and HistoryMetadataPresent then
+  begin
+    if MsgBox(
+      'Remove Matteshot History metadata?'#13#10#13#10
+      + 'This deletes stored window titles from AppData. Screenshot and video files stay on disk.',
+      mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      if not DeleteHistoryMetadata then
+        MsgBox(
+          'Matteshot could not remove History metadata. You can delete history.json from AppData\Roaming\matteshot yourself.',
+          mbError, MB_OK);
+    end;
+  end;
+end;

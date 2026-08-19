@@ -28,11 +28,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
     GetWindowRect, IsWindow, LoadCursorW, MessageBoxW, RegisterClassW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL,
-    WM_CLOSE, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN,
-    WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
+    GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDYES, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SIZE, WM_SYSKEYDOWN, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU,
+    WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -61,6 +62,7 @@ enum Ctrl {
     CaptureDelay(u32),
     Diagnostics,
     Deactivate,
+    ClearHistoryTitles,
 }
 
 /// Painted furniture: section headers, the folder paths, and the one inline
@@ -747,6 +749,8 @@ fn build_layout(scale: f32, cw: i32, license: &crate::license::Status) -> LaidOu
     // for anyone without a license to give up.
     l.gap(6);
     l.button_pair(Ctrl::Diagnostics, Ctrl::Deactivate, 190, 198);
+    l.gap(4);
+    l.chips(&[Ctrl::ClearHistoryTitles], 220, 0, 0, 30);
 
     let height = l.finish();
     LaidOut {
@@ -1182,6 +1186,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     draw_chip_button(hdc, *r, "Deactivate this PC\u{2026}", state, false, hot);
                 }
             }
+            Ctrl::ClearHistoryTitles => {
+                draw_chip_button(hdc, *r, "Clear History titles\u{2026}", state, false, hot)
+            }
         }
     }
 
@@ -1392,6 +1399,46 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
                     w!("Matteshot"),
                     MB_OK | MB_ICONERROR,
                 );
+            }
+        }
+        Ctrl::ClearHistoryTitles => {
+            // Confirmation is the explicit request. Yes clears titles only;
+            // capture files stay unless the user uses History Delete.
+            let confirmed = MessageBoxW(
+                hwnd,
+                w!("Remove stored window titles from History?\r\n\r\nScreenshot and video files stay on disk."),
+                w!("Matteshot"),
+                MB_YESNO | MB_ICONWARNING,
+            ) == IDYES;
+            if confirmed {
+                match crate::history::clear_source_metadata() {
+                    Ok(cleared) => {
+                        crate::history::reload_if_open();
+                        let text = if cleared == 0 {
+                            "History had no stored titles.".to_string()
+                        } else {
+                            format!(
+                                "Cleared {cleared} stored title{}. Capture files were not deleted.",
+                                if cleared == 1 { "" } else { "s" }
+                            )
+                        };
+                        let _ = MessageBoxW(
+                            hwnd,
+                            PCWSTR(HSTRING::from(text).as_ptr()),
+                            w!("Matteshot"),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
+                    }
+                    Err(error) => {
+                        let text = format!("History titles could not be cleared.\n\n{error:#}");
+                        let _ = MessageBoxW(
+                            hwnd,
+                            PCWSTR(HSTRING::from(text).as_ptr()),
+                            w!("Matteshot"),
+                            MB_OK | MB_ICONERROR,
+                        );
+                    }
+                }
             }
         }
     }

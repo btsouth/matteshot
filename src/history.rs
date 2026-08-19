@@ -5,6 +5,12 @@
 //! save folder — nothing here deletes a capture on its own. The retention
 //! cap bounds how much the *browser* has to show and decode, not how long a
 //! file survives on disk; only an explicit Delete removes one.
+//!
+//! `source` is the captured window title (or a region-size label), stored
+//! in plaintext on this PC. Opening History drops entries whose files are
+//! gone and rewrites that pruned list (SBS-765). Clear titles strips
+//! `source` without deleting captures. Uninstall may offer to delete the
+//! index; it never deletes the files it pointed at.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -208,21 +214,43 @@ fn append_at(index: &Path, entry: Entry) {
 }
 
 /// Every entry whose file still exists, most recent first.
+///
+/// Missing files are dropped from the on-disk index as well (SBS-765).
+/// A transient or corrupt read still shows an empty window this open and
+/// leaves the bytes exactly as they were: quarantine-and-start-fresh
+/// belongs to explicit mutating paths, which pair it with a replacement
+/// write. Browsing only rewrites after a successful parse that actually
+/// dropped something.
 pub fn list() -> Vec<Entry> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
     let Some(path) = history_path() else {
         return Vec::new();
     };
-    // Strictly read-only: any failure — transient or corrupt — shows an
-    // empty window this open and leaves the file exactly as it was. The
-    // quarantine-and-start-fresh recovery belongs to the mutating paths,
-    // which pair it with a replacement write; browsing must not move the
-    // index aside and leave nothing behind.
-    let log: Log = std::fs::read(&path)
-        .ok()
-        .and_then(|body| serde_json::from_slice(&body).ok())
-        .unwrap_or_default();
-    let mut entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
+    list_at(&path)
+}
+
+fn list_at(index: &Path) -> Vec<Entry> {
+    let body = match std::fs::read(index) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            crate::diagnostics::log(&format!(
+                "history unreadable this open, index left unchanged: {error}"
+            ));
+            return Vec::new();
+        }
+    };
+    let Ok(log) = serde_json::from_slice::<Log>(&body) else {
+        return Vec::new();
+    };
+    let original_len = log.entries.len();
+    let pruned = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
+    if pruned.len() != original_len {
+        if let Err(error) = save_unlocked_at(index, &Log { entries: pruned.clone() }) {
+            crate::diagnostics::log(&format!("history prune not persisted: {error:#}"));
+        }
+    }
+    let mut entries = pruned;
     entries.reverse();
     entries
 }
@@ -354,6 +382,71 @@ pub fn remove(path: &Path) -> Result<()> {
     let roots = [config.save_dir(), config.video_dir()];
     let index = history_path().context("Windows has no application data directory")?;
     remove_at(&index, path, &roots)
+}
+
+/// Strip stored window titles from the index. Capture files stay on disk.
+/// Missing files are dropped in the same rewrite so a title cannot linger
+/// on an already-gone path.
+pub fn clear_source_metadata() -> Result<usize> {
+    let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
+    let index = history_path().context("Windows has no application data directory")?;
+    clear_source_metadata_at(&index)
+}
+
+fn clear_source_metadata_at(index: &Path) -> Result<usize> {
+    let mut log = load_for_mutation(index)?;
+    let cleared = log
+        .entries
+        .iter()
+        .filter(|entry| entry.source.as_ref().is_some_and(|source| !source.is_empty()))
+        .count();
+    for entry in &mut log.entries {
+        entry.source = None;
+    }
+    let before = log.entries.len();
+    log.entries = trim_entries(std::mem::take(&mut log.entries), MAX_ENTRIES, |p| p.is_file());
+    if cleared > 0 || log.entries.len() != before {
+        save_unlocked_at(index, &log)?;
+    }
+    Ok(cleared)
+}
+
+/// Files uninstall / data-removal may delete after an explicit yes.
+/// Capture files are never in this list — only the index, a leftover
+/// atomic-write temp, and quarantined copies, all under the app-data folder.
+fn is_history_metadata_name(name: &str) -> bool {
+    name == "history.json"
+        || name == "history.json.tmp"
+        || name.starts_with("history.json.corrupt-")
+}
+
+fn history_metadata_files(config_dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(config_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read history directory"),
+    };
+    Ok(entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| is_history_metadata_name(&name.to_string_lossy()))
+        })
+        .collect())
+}
+
+fn remove_history_metadata_in(dir: &Path) -> Result<()> {
+    for path in history_metadata_files(dir)? {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove history metadata"),
+        }
+    }
+    Ok(())
 }
 
 fn format_when(saved_at: i64) -> String {
@@ -888,6 +981,215 @@ mod persistence_tests {
         );
         let _ = std::fs::remove_dir(&save);
         let _ = std::fs::rename(&real_save, &save);
+    }
+
+    fn entry_with_source(path: &Path, source: &str) -> Entry {
+        let mut entry = entry_at(path);
+        entry.source = Some(source.to_string());
+        entry
+    }
+
+    fn write_log(index: &Path, entries: Vec<Entry>) {
+        save_unlocked_at(index, &Log { entries }).unwrap();
+    }
+
+    #[test]
+    fn history_metadata_names_are_the_index_temp_and_quarantine_only() {
+        assert!(is_history_metadata_name("history.json"));
+        assert!(is_history_metadata_name("history.json.tmp"));
+        assert!(is_history_metadata_name("history.json.corrupt-1"));
+        assert!(!is_history_metadata_name("config.json"));
+        assert!(!is_history_metadata_name("license.json"));
+        assert!(!is_history_metadata_name("shot.png"));
+        assert!(!is_history_metadata_name("history.json.bak"));
+    }
+
+    /// SBS-765: browsing used to hide a missing file only in memory, so
+    /// its window title stayed in history.json until the next save.
+    #[test]
+    fn opening_history_persists_a_missing_file_drop() {
+        let dir = temp_dir("list-persist-prune");
+        let kept = capture(&dir, "kept.png");
+        let gone = capture(&dir, "gone.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&kept, "Confidential.docx"),
+                entry_with_source(&gone, "Secret subject"),
+            ],
+        );
+        std::fs::remove_file(&gone).unwrap();
+
+        let listed = list_at(&index);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, kept);
+        assert_eq!(listed[0].source.as_deref(), Some("Confidential.docx"));
+
+        let on_disk = load_for_mutation(&index).unwrap();
+        assert_eq!(on_disk.entries.len(), 1, "the missing file's title stayed on disk");
+        assert_eq!(on_disk.entries[0].path, kept);
+        assert!(kept.is_file(), "persist-prune must not delete the remaining capture");
+    }
+
+    #[test]
+    fn opening_history_does_not_create_an_index_when_none_exists() {
+        let dir = temp_dir("list-missing-index");
+        let index = dir.join("history.json");
+        assert!(list_at(&index).is_empty());
+        assert!(!index.exists(), "a first History open must not mint an empty index");
+    }
+
+    #[test]
+    fn opening_history_does_not_rewrite_when_every_file_still_exists() {
+        let dir = temp_dir("list-no-rewrite");
+        let shot = capture(&dir, "a.png");
+        let index = dir.join("history.json");
+        write_log(&index, vec![entry_with_source(&shot, "Notepad")]);
+        let before = std::fs::read(&index).unwrap();
+        let listed = list_at(&index);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unreadable_index_is_not_pruned_over_on_open() {
+        let dir = temp_dir("list-unreadable");
+        let index = dir.join("history.json");
+        std::fs::create_dir_all(&index).unwrap();
+        assert!(list_at(&index).is_empty());
+        assert!(index.is_dir(), "a transient/unreadable index must not be replaced");
+    }
+
+    #[test]
+    fn a_corrupt_index_is_left_in_place_when_history_opens() {
+        let dir = temp_dir("list-corrupt");
+        let index = dir.join("history.json");
+        std::fs::write(&index, b"{ not json").unwrap();
+        assert!(list_at(&index).is_empty());
+        assert_eq!(std::fs::read(&index).unwrap(), b"{ not json");
+    }
+
+    /// SBS-765: Clear History strips titles and leaves the files.
+    #[test]
+    fn clear_source_metadata_strips_titles_and_leaves_files() {
+        let dir = temp_dir("clear-titles");
+        let a = capture(&dir, "a.png");
+        let b = capture(&dir, "b.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&a, "Inbox — Q3 plan"),
+                entry_with_source(&b, "https://internal.example/doc"),
+            ],
+        );
+
+        assert_eq!(clear_source_metadata_at(&index).unwrap(), 2);
+        assert!(a.is_file());
+        assert!(b.is_file());
+        let log = load_for_mutation(&index).unwrap();
+        assert_eq!(log.entries.len(), 2);
+        assert!(log.entries.iter().all(|entry| entry.source.is_none()));
+        assert_eq!(log.entries[0].path, a);
+        assert_eq!(log.entries[1].path, b);
+    }
+
+    #[test]
+    fn clear_source_metadata_also_drops_missing_files() {
+        let dir = temp_dir("clear-and-prune");
+        let kept = capture(&dir, "kept.png");
+        let gone = capture(&dir, "gone.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&kept, "Kept title"),
+                entry_with_source(&gone, "Gone title"),
+            ],
+        );
+        std::fs::remove_file(&gone).unwrap();
+
+        assert_eq!(clear_source_metadata_at(&index).unwrap(), 2);
+        let log = load_for_mutation(&index).unwrap();
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].path, kept);
+        assert!(log.entries[0].source.is_none());
+        assert!(kept.is_file());
+    }
+
+    #[test]
+    fn clear_source_metadata_does_not_write_when_nothing_changed() {
+        let dir = temp_dir("clear-noop");
+        let shot = capture(&dir, "a.png");
+        let index = dir.join("history.json");
+        write_log(&index, vec![entry_at(&shot)]);
+        let before = std::fs::read(&index).unwrap();
+        assert_eq!(clear_source_metadata_at(&index).unwrap(), 0);
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+        assert!(shot.is_file());
+    }
+
+    #[test]
+    fn an_unreadable_index_is_not_cleared_over() {
+        let dir = temp_dir("clear-unreadable");
+        let index = dir.join("history.json");
+        std::fs::create_dir_all(&index).unwrap();
+        assert!(clear_source_metadata_at(&index).is_err());
+        assert!(index.is_dir());
+    }
+
+    /// SBS-765: data-removal deletes only the index (and quarantines), never captures.
+    #[test]
+    fn remove_history_metadata_deletes_index_and_quarantine_not_captures_or_config() {
+        let dir = temp_dir("remove-metadata");
+        let captures = dir.join("captures");
+        std::fs::create_dir_all(&captures).unwrap();
+        let shot = capture(&captures, "shot.png");
+        let index = dir.join("history.json");
+        write_log(&index, vec![entry_with_source(&shot, "Payroll.xlsx")]);
+        let quarantined = dir.join("history.json.corrupt-1");
+        std::fs::write(&quarantined, b"{ not json").unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, b"{}").unwrap();
+        let license = dir.join("license.json");
+        std::fs::write(&license, b"{}").unwrap();
+        let tmp = dir.join("history.json.tmp");
+        std::fs::write(&tmp, b"partial").unwrap();
+
+        let targets = history_metadata_files(&dir).unwrap();
+        assert!(targets.iter().any(|p| p == &index));
+        assert!(targets.iter().any(|p| p == &quarantined));
+        assert!(targets.iter().any(|p| p == &tmp), "a leftover atomic-write temp still holds titles");
+        assert!(!targets.iter().any(|p| p == &shot), "a capture must not be an uninstall target");
+        assert!(!targets.iter().any(|p| p == &config));
+        assert!(!targets.iter().any(|p| p == &license));
+
+        remove_history_metadata_in(&dir).unwrap();
+        assert!(!index.exists());
+        assert!(!quarantined.exists());
+        assert!(!tmp.exists());
+        assert!(shot.is_file(), "data-removal must not delete the capture");
+        assert!(config.is_file(), "data-removal must not delete config.json");
+        assert!(license.is_file(), "data-removal must not delete license.json");
+    }
+
+    #[test]
+    fn remove_history_metadata_is_ok_when_nothing_is_there() {
+        let dir = temp_dir("remove-missing");
+        remove_history_metadata_in(&dir).unwrap();
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn an_unreadable_history_dir_does_not_look_empty() {
+        let dir = temp_dir("metadata-unreadable");
+        let not_a_dir = dir.join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert!(
+            history_metadata_files(&not_a_dir).is_err(),
+            "a failed directory read is not 'no metadata'"
+        );
     }
 }
 
@@ -1840,5 +2142,16 @@ pub fn is_open() -> bool {
     unsafe {
         let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
         !hwnd.0.is_null() && IsWindow(hwnd).as_bool()
+    }
+}
+
+/// Rebuild an already-open browser after an out-of-window metadata change
+/// (Settings → Clear History titles). No-op when the window is closed.
+pub fn reload_if_open() {
+    unsafe {
+        let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
+        if !hwnd.0.is_null() && IsWindow(hwnd).as_bool() {
+            reload(hwnd);
+        }
     }
 }
