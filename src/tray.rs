@@ -315,9 +315,11 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_VIDEOS, w!("Open videos folder"));
     let _ = AppendMenuW(menu, MF_STRING, CMD_HISTORY, w!("History\u{2026}"));
     if let Some(update) = &state.update {
-        // A staged installer is already downloaded and verified, so the menu
-        // promises an install rather than a trip to the browser.
-        let staged = crate::installer::staged_path(&update.version).is_file();
+        // A staged installer plus its hash sidecar means we can re-check
+        // before launch. A leftover file alone is not an install (SBS-911).
+        let staged = crate::installer::is_ready_to_launch(&crate::installer::staged_path(
+            &update.version,
+        ));
         let text = if staged {
             format!("Install update v{} now", update.version)
         } else {
