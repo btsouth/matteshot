@@ -780,6 +780,9 @@ fn text_context(state: &State) -> bool {
 }
 
 fn control_visible(state: &State, control: Ctl) -> bool {
+    if matches!(control, Ctl::Share) {
+        return state.can_share;
+    }
     let custom_size = state.custom_size_edit.is_some();
     if matches!(
         control,
@@ -1519,23 +1522,6 @@ fn custom_size_result(input: &str, dimensions: (u32, u32)) -> Option<(u32, u32)>
         .map(|maximum| output::resized_dimensions(dimensions.0, dimensions.1, maximum))
 }
 
-unsafe fn chip_disabled(hdc: HDC, r: RECT, label: &str, state: &State) {
-    let fill = CreateSolidBrush(state.theme.chip);
-    let pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
-    let ob = SelectObject(hdc, fill);
-    let op = SelectObject(hdc, pen);
-    let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, 10, 10);
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    let _ = DeleteObject(fill);
-    let _ = DeleteObject(pen);
-    SelectObject(hdc, state.font);
-    SetTextColor(hdc, state.theme.faint);
-    let mut t = wide(label);
-    let mut rc = r;
-    DrawTextW(hdc, &mut t, &mut rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-}
-
 unsafe fn chip(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot: bool) {
     let fill = CreateSolidBrush(if active { state.theme.accent } else { state.theme.chip });
     let pen = CreatePen(PS_SOLID, 1, if active { state.theme.accent } else { state.theme.chip_line });
@@ -2090,13 +2076,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::CustomSizeCancel => chip(hdc, *r, "Cancel", state, false, hot),
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
-            Ctl::Share => {
-                if state.can_share {
-                    chip(hdc, *r, "Share", state, false, hot)
-                } else {
-                    chip_disabled(hdc, *r, "Share", state)
-                }
-            }
+            Ctl::Share => chip(hdc, *r, "Share", state, false, hot),
             Ctl::Crop => {
                 // Says what it will do rather than what it is called: with a
                 // crop already applied, the button is how you get back to the

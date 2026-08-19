@@ -469,7 +469,7 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut State> {
 }
 
 /// Layout for a client size. Rerun on resize.
-fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
+fn layout(scale: f32, cw: i32, ch: i32, style_count: usize, can_share: bool) -> WindowLayout {
     let sc = |v: i32| (v as f32 * scale) as i32;
     // Programmatic resizes and bad restored placements are not constrained by
     // WM_GETMINMAXINFO. Normalize defensively so no rectangle can invert even
@@ -568,6 +568,9 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize) -> WindowLayout {
     ];
     let mut x = m;
     for (act, label, w) in labels {
+        if act == Act::Share && !can_share {
+            continue;
+        }
         controls.push((
             RECT {
                 left: x,
@@ -3108,8 +3111,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
             hdc,
             if primary {
                 state.theme.accent_text
-            } else if *act == Act::Share && !state.can_share {
-                state.theme.faint
             } else if hot {
                 state.theme.text
             } else {
@@ -4558,7 +4559,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     state.width = w;
                     state.height = h;
-                    let next = layout(state.scale, w, h, state.styles.len());
+                    let next = layout(state.scale, w, h, state.styles.len(), state.can_share);
                     state.crop_control = next.crop_control;
                     state.controls = next.controls;
                     state.matte_controls = next.matte_controls;
@@ -4732,7 +4733,7 @@ pub fn show(
 
     // Filmstrip: best-effort, never blocks showing the window.
     let (probe_w, probe_h, preview_w, preview_h) = {
-        let initial = layout(scale, cw, ch, 7);
+        let initial = layout(scale, cw, ch, 7, true);
         (
             (initial.strip.right - initial.strip.left) as u32,
             (initial.strip.bottom - initial.strip.top) as u32,
@@ -4782,7 +4783,7 @@ pub fn show(
         summary.push_str("   \u{00b7}   + GIF");
     }
 
-    let initial = layout(scale, cw, ch, styles.len());
+    let initial = layout(scale, cw, ch, styles.len(), crate::license::can_share());
     // The frame the opening probe already decoded; re-decoding it here cost
     // another seek for the same picture.
     let preview_raw = scrub_previews.first().cloned();
@@ -5039,7 +5040,7 @@ mod tests {
     fn the_crop_chip_closes_the_settings_row_without_crowding_the_aspects() {
         // Real editor sizes, including the wide one this was first driven at.
         for (scale, cw, ch) in [(1.0, 1280, 760), (1.36, 2176, 1183), (1.0, 900, 640)] {
-            let l = super::layout(scale, cw, ch, 7);
+            let l = super::layout(scale, cw, ch, 7, true);
             let m = (20.0 * scale) as i32;
             assert!(
                 l.crop_control.right <= cw - m,
@@ -5103,7 +5104,7 @@ mod tests {
         // A 1920x1080 display at 125% scaling leaves roughly a 1000px client
         // after the title bar/taskbar. Caption placement should still get the
         // majority of that height rather than a postage-stamp preview.
-        let window = layout(1.25, 1920, 1000, 7);
+        let window = layout(1.25, 1920, 1000, 7, true);
         let preview_h = window.preview.bottom - window.preview.top;
         let timeline_h = window.strip.bottom - window.strip.top;
         assert!(preview_h >= 600, "preview was only {preview_h}px tall");
@@ -5116,7 +5117,7 @@ mod tests {
     fn assert_layout_is_usable(scale: f32, requested_w: i32, requested_h: i32) {
         let (minimum_w, minimum_h) = minimum_client_size(scale);
         let (width, height) = (requested_w.max(minimum_w), requested_h.max(minimum_h));
-        let window = layout(scale, requested_w, requested_h, 7);
+        let window = layout(scale, requested_w, requested_h, 7, true);
         let preview_h = window.preview.bottom - window.preview.top;
         let timeline_h = window.strip.bottom - window.strip.top;
         assert!(preview_h >= (180.0 * scale) as i32, "preview was {preview_h}px");
@@ -5186,7 +5187,7 @@ mod tests {
         // Copy and Show in folder always act on the recorded original, and
         // Share follows the same rule (see the click handler), so it belongs
         // in the same row rather than the annotation tool panel.
-        let window = layout(1.0, 1280, 720, 7);
+        let window = layout(1.0, 1280, 720, 7, true);
         let find = |act: super::Act| {
             window
                 .controls
@@ -5202,6 +5203,18 @@ mod tests {
         assert!(copy_rect.right < share_rect.left, "Share overlaps Copy");
         assert!(share_rect.right < delete_rect.left, "Delete overlaps Share");
         assert!(share_rect.right <= 1280, "Share runs off the minimum-width window");
+    }
+
+    #[test]
+    fn share_is_hidden_without_a_paid_license() {
+        let window = layout(1.0, 1280, 720, 7, false);
+        assert!(
+            window
+                .controls
+                .iter()
+                .all(|(_, act, _)| *act != super::Act::Share),
+            "trial and unlicensed editors must not show Share"
+        );
     }
 
     #[test]
@@ -5275,7 +5288,7 @@ mod tests {
             VIDEO_TOOLS.map(|(_, label)| label),
             ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"]
         );
-        let controls = layout(1.0, 1280, 720, 7).tool_controls;
+        let controls = layout(1.0, 1280, 720, 7, true).tool_controls;
         assert_eq!(controls.len(), VIDEO_TOOLS.len());
         for row in controls.chunks(3) {
             assert_eq!(row.len(), 3);

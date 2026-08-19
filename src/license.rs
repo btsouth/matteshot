@@ -791,8 +791,11 @@ pub fn status() -> Status {
 /// Whether this device can actually share: a verifiable paid certificate
 /// is present. Same condition `share_file` uses; a trial certificate is
 /// not enough (SBS-906).
+///
+/// Uses `status()` so a transient `license.json` lock does not hide Share
+/// from a paid user the way a fresh `signed_certificate()` read would.
 pub fn can_share() -> bool {
-    signed_certificate().is_some()
+    status().can_share()
 }
 
 /// The signed certificate + signature this device's license holds, for
@@ -1683,6 +1686,10 @@ mod tests {
         assert_eq!(
             status_after_load_error(&io_error, Some(cached.clone())),
             cached
+        );
+        assert!(
+            status_after_load_error(&io_error, Some(cached)).can_share(),
+            "a paid user must still be able to share through a transient license.json lock"
         );
     }
 
