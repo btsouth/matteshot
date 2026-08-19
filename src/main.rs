@@ -1012,7 +1012,14 @@ fn run_resident() -> Result<()> {
                                         "Installing now. Matteshot will restart on its own.",
                                     );
                                     std::thread::sleep(std::time::Duration::from_millis(1200));
-                                    installer::launch(&staged)?;
+                                    if let Err(error) = installer::launch(&staged) {
+                                        crate::diagnostics::log(&format!(
+                                            "staged installer launch failed: {error:#}"
+                                        ));
+                                        if let Some(url) = tray.update_url() {
+                                            output::open_url(&url);
+                                        }
+                                    }
                                 }
                             }
                             _ => {
