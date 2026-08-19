@@ -232,6 +232,8 @@ fn load_for_update_from(path: &Path, last_good: Option<&Config>) -> anyhow::Resu
             // the path missing; the next load/try_load then treats that as a
             // fresh install and re-authorizes silent install (SBS-910).
             let backup = corrupt_backup_path(path);
+            // Unlink first so a planted symlink is dropped, not followed.
+            let _ = std::fs::remove_file(&backup);
             std::fs::copy(path, &backup)?;
             crate::diagnostics::log(
                 "corrupt config was quarantined; restoring last-known-good settings",
