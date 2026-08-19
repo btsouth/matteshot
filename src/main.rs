@@ -270,6 +270,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         path: Option<std::path::PathBuf>,
     }
     let auto = std::sync::Arc::new(std::sync::Mutex::new(AutoCopy { canceled: false, path: None }));
+    let auto_copy_hint = picker::AutoCopyHintSlot::new();
     let preselect = cfg.last_style.min(styles.len().saturating_sub(1));
     let mut auto_worker = None;
 
@@ -283,6 +284,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         None => {
             {
                 let auto = auto.clone();
+                let auto_copy_hint = auto_copy_hint.clone();
                 let raw = raw.clone();
                 let style = styles[preselect].clone();
                 let (scale, max_edge, dir) =
@@ -306,20 +308,25 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                             Ok(()) => {
                                 eprintln!("auto-copy [{}]: {}", style.name, path.display());
                                 st.path = Some(path);
+                                // Path first, then the hint: a picker that
+                                // paints ✓ copied must already have a reusable file.
+                                auto_copy_hint.set(picker::AutoCopyHint::Succeeded);
                             }
                             Err(error) => {
                                 eprintln!("auto-copy failed [{}]: {error:#}", style.name);
+                                auto_copy_hint.set(picker::AutoCopyHint::Failed);
                                 let _ = std::fs::remove_file(path);
                             }
                         }
                     } else {
                         eprintln!("auto-copy failed [{}]: could not save capture", style.name);
+                        auto_copy_hint.set(picker::AutoCopyHint::Failed);
                     }
                 });
                 auto_worker = Some(worker);
             }
             let previews = previews_for(&raw, &styles);
-            picker::pick(&previews, &names, monitor, cfg.last_style)?
+            picker::pick(&previews, &names, monitor, cfg.last_style, auto_copy_hint)?
         }
     };
 

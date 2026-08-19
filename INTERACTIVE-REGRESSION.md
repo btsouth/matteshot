@@ -18,7 +18,7 @@ layout/DPI, theme, and audio mode with the result.
 
 ## Picker and zero-touch output
 
-- [ ] The preselected matte is saved and already on the clipboard when the picker appears.
+- [ ] The picker does not paint ✓ copied until the background auto-copy has landed; an in-flight write shows copying… and a failed write shows not copied. Once it lands, paste matches the preselected matte.
 - [ ] Click, 1-7, Left/Right wrapping, and Enter all choose the displayed variant.
 - [ ] T opens the selected variant in the tweak editor.
 - [ ] P pins the raw capture; C copies recognized text; both leave the picker cleanly.
