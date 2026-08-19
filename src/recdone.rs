@@ -156,13 +156,17 @@ fn dispose_export_partial(temporary: &std::path::Path, error: ExportCleanup) -> 
                 format!("validate export: {error:#}")
             }
             crate::trim::ValidationFault::Unavailable => {
-                crate::diagnostics::log("export validation unavailable; partial kept for retry");
-                "export could not be checked this time; the file is still in your videos folder and will be retried"
+                crate::diagnostics::log(&format!(
+                    "export validation unavailable: {error:#}; partial kept for recovery on the next start"
+                ));
+                "export could not be checked this time; the file is still in your videos folder and will be recovered the next time Matteshot starts"
                     .into()
             }
         },
         ExportCleanup::Rename(error) => {
-            crate::diagnostics::log("export publish failed; partial kept for retry");
+            crate::diagnostics::log(&format!(
+                "export publish failed: {error}; partial kept for recovery on the next start"
+            ));
             format!(
                 "finalize export: {error}; recovery file kept at {}",
                 temporary.display()
@@ -5140,7 +5144,6 @@ mod tests {
         recording_delete_prompt, speed_gap, tool_after_pick, CaptionInput, ExportCleanup,
         NEXT_EXPORT_ID, VIDEO_TOOLS,
     };
-    use anyhow::Context;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -5571,6 +5574,14 @@ mod tests {
             assert!(
                 message.contains("could not be checked"),
                 "user-facing error must say the check did not run: {message}"
+            );
+            assert!(
+                message.contains("recovered the next time Matteshot starts"),
+                "Unavailable must not promise a same-session retry: {message}"
+            );
+            assert!(
+                !message.contains("will be retried"),
+                "Unavailable must not promise a retry this session does not run: {message}"
             );
             assert!(
                 !message.contains("integrity check"),
