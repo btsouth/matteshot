@@ -899,35 +899,44 @@ fn finish_late_recording(
 }
 
 /// After in-process `validate_video` fails, decide whether the partial
-/// (and its GIF sibling) may be thrown away. Unavailable is not a verdict
-/// on the bytes — a Defender/OneDrive sharing violation used to delete a
-/// finished recording here (SBS-918). Late-finalize and startup cleanup
-/// already keep those files; this path still deletes only proven-undecodable
-/// bytes.
+/// may be thrown away. Unavailable is not a verdict on the bytes — a
+/// Defender/OneDrive sharing violation used to delete a finished recording
+/// here (SBS-918). Late-finalize and startup cleanup already keep those
+/// files; this path still deletes only proven-undecodable bytes.
+///
+/// Do not touch the GIF destination. GIF publish happens after a successful
+/// MP4 validate; that path is a final filename, not a partial owned by this
+/// recording.
 fn dispose_in_process_validation_failure(
     error: anyhow::Error,
     partial: &std::path::Path,
-    gif: &std::path::Path,
 ) -> anyhow::Error {
     match crate::trim::validation_fault(&error) {
         crate::trim::ValidationFault::Undecodable => {
             crate::diagnostics::log("recording validation failed");
             let _ = std::fs::remove_file(partial);
-            let _ = std::fs::remove_file(gif);
             error.context("recording failed its final integrity check")
         }
         crate::trim::ValidationFault::Unavailable => {
-            crate::diagnostics::log("recording validation unavailable; partial kept for retry");
-            error.context(
-                "recording could not be checked this time; the file is still in your videos folder and will be retried",
-            )
+            crate::diagnostics::log(
+                "recording validation unavailable; partial kept for recovery on the next start",
+            );
+            if partial.exists() {
+                error.context(
+                    "recording could not be checked this time; the file is still in your videos folder and will be recovered the next time Matteshot starts",
+                )
+            } else {
+                error.context(
+                    "recording could not be checked this time; the file was not found",
+                )
+            }
         }
     }
 }
 
-fn validate_in_process_recording(partial: &std::path::Path, gif: &std::path::Path) -> Result<()> {
+fn validate_in_process_recording(partial: &std::path::Path) -> Result<()> {
     crate::trim::validate_video(partial)
-        .map_err(|error| dispose_in_process_validation_failure(error, partial, gif))
+        .map_err(|error| dispose_in_process_validation_failure(error, partial))
 }
 
 fn publish_recording_with(
@@ -1106,7 +1115,7 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     // Unavailable is keep/retry, not delete (SBS-918). A sharing violation
     // from Defender or OneDrive is not a verdict on the bytes; late-finalize
     // and startup cleanup already keep those files.
-    validate_in_process_recording(&partial_mp4, &gif)?;
+    validate_in_process_recording(&partial_mp4)?;
     if let Err(error) =
         publish_recording_with(&partial_mp4, &mp4, |from, to| std::fs::rename(from, to))
     {
@@ -1295,7 +1304,7 @@ mod tests {
                 crate::trim::ValidationFault::Unavailable,
                 "{fault:#}"
             );
-            let error = dispose_in_process_validation_failure(fault, &partial, &gif);
+            let error = dispose_in_process_validation_failure(fault, &partial);
             let message = format!("{error:#}");
             assert!(
                 partial.exists(),
@@ -1303,11 +1312,19 @@ mod tests {
             );
             assert!(
                 gif.exists(),
-                "Unavailable deleted the gif sibling: {message}"
+                "Unavailable deleted a pre-existing GIF destination: {message}"
             );
             assert!(
                 message.contains("could not be checked"),
                 "user-facing error must say the check did not run: {message}"
+            );
+            assert!(
+                message.contains("recovered the next time Matteshot starts"),
+                "Unavailable must not promise a same-session retry: {message}"
+            );
+            assert!(
+                !message.contains("will be retried"),
+                "Unavailable must not promise a retry this session does not run: {message}"
             );
             assert!(
                 !message.contains("integrity check"),
@@ -1336,18 +1353,22 @@ mod tests {
             crate::trim::ValidationFault::Undecodable,
             "{fault:#}"
         );
-        let error = dispose_in_process_validation_failure(fault, &partial, &gif);
+        let error = dispose_in_process_validation_failure(fault, &partial);
         let message = format!("{error:#}");
         assert!(
             !partial.exists(),
             "Undecodable left the recording in place: {message}"
         );
-        assert!(!gif.exists(), "Undecodable left the gif sibling: {message}");
+        assert!(
+            gif.exists(),
+            "Undecodable MP4 cleanup must not delete a GIF destination: {message}"
+        );
         assert!(
             message.contains("integrity check"),
             "Undecodable must still be a failed integrity check: {message}"
         );
 
+        std::fs::remove_file(gif).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -1362,7 +1383,7 @@ mod tests {
         std::fs::write(&partial, b"not an mp4").unwrap();
         std::fs::write(&gif, b"not a gif").unwrap();
 
-        let error = validate_in_process_recording(&partial, &gif).unwrap_err();
+        let error = validate_in_process_recording(&partial).unwrap_err();
         let message = format!("{error:#}");
         assert_eq!(
             crate::trim::validation_fault(&error),
@@ -1374,14 +1395,15 @@ mod tests {
             "a real validate_video rejection left the recording: {message}"
         );
         assert!(
-            !gif.exists(),
-            "a real validate_video rejection left the gif: {message}"
+            gif.exists(),
+            "a real validate_video rejection must not delete a GIF destination: {message}"
         );
         assert!(
             message.contains("integrity check"),
             "a real validate_video rejection must still be a failed integrity check: {message}"
         );
 
+        std::fs::remove_file(gif).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -1396,7 +1418,7 @@ mod tests {
         let gif = dir.join("capture.gif");
         std::fs::write(&gif, b"maybe a gif").unwrap();
 
-        let error = validate_in_process_recording(&missing, &gif).unwrap_err();
+        let error = validate_in_process_recording(&missing).unwrap_err();
         let message = format!("{error:#}");
         assert_eq!(
             crate::trim::validation_fault(&error),
@@ -1407,6 +1429,16 @@ mod tests {
             gif.exists(),
             "a check that could not run deleted the gif sibling: {message}"
         );
+        assert!(message.contains("could not be checked"), "{message}");
+        assert!(
+            message.contains("the file was not found"),
+            "a missing partial must not claim the file is still in the videos folder: {message}"
+        );
+        assert!(
+            !message.contains("still in your videos folder"),
+            "{message}"
+        );
+        assert!(!message.contains("integrity check"), "{message}");
         assert!(message.contains("could not be checked"), "{message}");
         assert!(!message.contains("integrity check"), "{message}");
 
