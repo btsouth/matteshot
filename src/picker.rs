@@ -2,6 +2,9 @@
 //! styled variants. Click / 1-7 / arrows+Enter chooses, T opens the tweak
 //! editor, Esc cancels. Plain Win32 + GDI, double-buffered.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use image::RgbaImage;
 use windows::core::w;
@@ -20,10 +23,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    GetWindowLongPtrW, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, IDC_ARROW, MSG, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WNDCLASSW,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_HOTKEY, WM_USER};
@@ -40,6 +44,72 @@ const BOTTOM_INSET: i32 = 28;
 const STACK_ASPECT: f32 = 3.0;
 /// Posted to the strip when the resident PrtScn hotkey fires mid-pick.
 const WM_RETAKE: u32 = WM_USER + 41;
+
+/// Polls the auto-copy slot so the hint can leave "copying…" after the worker lands.
+const AUTO_COPY_TIMER: usize = 1;
+const AUTO_COPY_TIMER_MS: u32 = 50;
+
+/// Checkmark the strip may paint only after auto-copy has landed (SBS-905).
+const COPIED_MARK: &str = "\u{2713} copied";
+const HINT_ACTIONS: &str = "1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   S share   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc";
+
+/// Outcome of the background auto-copy that starts when the picker opens.
+///
+/// Pending is its own state: the write has not landed, so the strip must not
+/// paint ✓ copied. Failed is not Pending — the user should see that it did
+/// not land (SBS-905).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoCopyHint {
+    Pending = 0,
+    Succeeded = 1,
+    Failed = 2,
+}
+
+/// Shared slot the auto-copy worker writes and the picker paints.
+///
+/// The slot is an atomic only — it does not hold an HWND. The picker polls
+/// it from a window-owned timer so a late worker cannot post into a
+/// destroyed strip (SBS-905).
+#[derive(Clone, Debug)]
+pub struct AutoCopyHintSlot {
+    hint: Arc<AtomicU8>,
+}
+
+impl AutoCopyHintSlot {
+    pub fn new() -> Self {
+        Self {
+            hint: Arc::new(AtomicU8::new(AutoCopyHint::Pending as u8)),
+        }
+    }
+
+    pub fn set(&self, hint: AutoCopyHint) {
+        self.hint.store(hint as u8, Ordering::Release);
+    }
+
+    pub fn get(&self) -> AutoCopyHint {
+        match self.hint.load(Ordering::Acquire) {
+            1 => AutoCopyHint::Succeeded,
+            2 => AutoCopyHint::Failed,
+            _ => AutoCopyHint::Pending,
+        }
+    }
+
+    #[cfg(test)]
+    fn store_raw(&self, value: u8) {
+        self.hint.store(value, Ordering::Release);
+    }
+}
+
+/// Hint line for the contact strip. Only a landed auto-copy may paint ✓ copied.
+fn picker_hint(status: AutoCopyHint) -> String {
+    let prefix = match status {
+        AutoCopyHint::Succeeded => COPIED_MARK,
+        AutoCopyHint::Pending => "copying\u{2026}",
+        AutoCopyHint::Failed => "not copied",
+    };
+    format!("{prefix} \u{2014} {HINT_ACTIONS}")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyAction {
@@ -218,6 +288,8 @@ struct State {
     /// cancel-on-focus-loss behavior.
     suspended: bool,
     theme: crate::theme::Theme,
+    auto_copy: AutoCopyHintSlot,
+    painted_hint: AutoCopyHint,
 }
 
 fn to_bgra(img: &RgbaImage) -> Vec<u8> {
@@ -339,9 +411,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // Hint line along the bottom.
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.faint);
-    let mut hint = wide(
-        "\u{2713} copied \u{2014} 1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   S share   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc",
-    );
+    let mut hint = wide(&picker_hint(state.auto_copy.get()));
     let mut hint_rect = RECT {
         left: 0,
         top: state.height - HINT_H - 4,
@@ -483,7 +553,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_TIMER => {
+            if let Some(state) = state_of(hwnd) {
+                let status = state.auto_copy.get();
+                if status != state.painted_hint {
+                    state.painted_hint = status;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                if status != AutoCopyHint::Pending {
+                    let _ = KillTimer(hwnd, AUTO_COPY_TIMER);
+                }
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            let _ = KillTimer(hwnd, AUTO_COPY_TIMER);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -497,6 +581,7 @@ pub fn pick(
     names: &[&'static str],
     monitor: HMONITOR,
     initial: usize,
+    auto_copy: AutoCopyHintSlot,
 ) -> Result<PickAction> {
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -550,6 +635,8 @@ pub fn pick(
         height: total_h,
         suspended: false,
         theme: crate::theme::current(),
+        auto_copy,
+        painted_hint: AutoCopyHint::Pending,
     });
 
     unsafe {
@@ -579,6 +666,16 @@ pub fn pick(
             Some(&mut *state as *mut State as *const _),
         )?;
 
+        // Window-owned timer: a late worker cannot post into a destroyed HWND.
+        // CreateWindow(WS_VISIBLE) may have painted Pending already. If the
+        // write landed in that gap, repaint now; otherwise poll until it does.
+        let status = state.auto_copy.get();
+        if status == AutoCopyHint::Pending {
+            let _ = SetTimer(hwnd, AUTO_COPY_TIMER, AUTO_COPY_TIMER_MS, None);
+        } else {
+            state.painted_hint = status;
+            let _ = InvalidateRect(hwnd, None, false);
+        }
         let region = CreateRoundRectRgn(0, 0, total_w, total_h, 16, 16);
         SetWindowRgn(hwnd, region, true);
         let _ = SetForegroundWindow(hwnd);
@@ -604,7 +701,10 @@ pub fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::{key_action, layout, should_cancel_on_deactivate, KeyAction, THUMB_H};
+    use super::{
+        key_action, layout, picker_hint, should_cancel_on_deactivate, AutoCopyHint,
+        AutoCopyHintSlot, KeyAction, COPIED_MARK, THUMB_H,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
     };
@@ -699,6 +799,50 @@ mod tests {
         assert!(should_cancel_on_deactivate(false, false, 501));
         assert!(!should_cancel_on_deactivate(true, false, 1_000));
         assert!(!should_cancel_on_deactivate(false, true, 1_000));
+    }
+
+    /// In-flight write is not a landed copy. The strip must not paint ✓ copied
+    /// just because the worker was spawned (SBS-905).
+    #[test]
+    fn in_flight_auto_copy_does_not_paint_copied() {
+        let hint = picker_hint(AutoCopyHint::Pending);
+        assert!(!hint.contains(COPIED_MARK), "{hint}");
+        assert!(!hint.contains('\u{2713}'), "{hint}");
+        assert!(!hint.contains("copied"), "{hint}");
+        assert!(hint.contains("copying"), "{hint}");
+    }
+
+    /// A failed clipboard or save is not "nothing happened" and not success.
+    #[test]
+    fn failed_auto_copy_does_not_paint_copied() {
+        let hint = picker_hint(AutoCopyHint::Failed);
+        assert!(!hint.contains(COPIED_MARK), "{hint}");
+        assert!(!hint.contains('\u{2713}'), "{hint}");
+        assert!(hint.contains("not copied"), "{hint}");
+        assert_ne!(hint, picker_hint(AutoCopyHint::Pending));
+    }
+
+    #[test]
+    fn landed_auto_copy_paints_copied() {
+        let hint = picker_hint(AutoCopyHint::Succeeded);
+        assert!(hint.contains(COPIED_MARK), "{hint}");
+        assert!(hint.starts_with(COPIED_MARK), "{hint}");
+    }
+
+    /// Garbage in the slot is Pending, never a forged success (SBS-905).
+    #[test]
+    fn unknown_slot_value_is_pending_not_copied() {
+        let slot = AutoCopyHintSlot::new();
+        assert_eq!(slot.get(), AutoCopyHint::Pending);
+        slot.set(AutoCopyHint::Succeeded);
+        assert_eq!(slot.get(), AutoCopyHint::Succeeded);
+        slot.set(AutoCopyHint::Failed);
+        assert_eq!(slot.get(), AutoCopyHint::Failed);
+        for raw in [0, 3, 255] {
+            slot.store_raw(raw);
+            assert_eq!(slot.get(), AutoCopyHint::Pending, "raw {raw}");
+            assert!(!picker_hint(slot.get()).contains(COPIED_MARK));
+        }
     }
 }
 
