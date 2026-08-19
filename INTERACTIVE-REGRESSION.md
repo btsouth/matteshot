@@ -61,7 +61,8 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Light/dark changes repaint every open surface, popup, and title bar.
 - [ ] 100%, 125%, 150%, and mixed-DPI layouts keep controls visible and captures sharp.
 - [ ] Duplicate launch opens Settings on the resident; quitting restores PrtScn to Windows.
-- [ ] Tray menu is slim: capture, active window, open captures/videos folders, license, Settings. Deactivate and Copy diagnostics appear only in Settings, and Deactivate frees the license slot with the confirmation and hotkey teardown.
+- [ ] Tray menu lists capture, active window, delayed capture, open captures/videos folders, History, license, and Settings. Deactivate and Copy diagnostics appear only in Settings, and Deactivate frees the license slot with the confirmation and hotkey teardown.
+- [ ] First run shows the native welcome surface, not a tray balloon. A balloon is only the resident fallback if that window fails to open. `--welcome` opens the same surface; if it cannot, the process exits and no balloon is shown.
 - [ ] Sleep/resume and display connect/disconnect leave the resident responsive.
 - [ ] An available update defers while a capture, recording, editor, or export is active.
 

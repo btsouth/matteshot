@@ -44,6 +44,8 @@ mod video_speed;
 mod welcome;
 mod window;
 mod telemetry;
+#[cfg(test)]
+mod onboarding_docs;
 
 use anyhow::{bail, Context, Result};
 use image::RgbaImage;
