@@ -322,6 +322,9 @@ fn apply(hwnd_value: isize, generation: u64, update: &AvailableUpdate) -> Result
         waited += IDLE_POLL;
     }
 
+    // Re-check before the balloon. The file has sat in %TEMP% for up to a
+    // day; existence is not proof it is still the one we staged (SBS-911).
+    crate::installer::verify_still_ours(&staged)?;
     post_installing(hwnd_value, generation, update.version.clone());
     thread::sleep(BALLOON_GRACE);
     crate::diagnostics::log("update installing");

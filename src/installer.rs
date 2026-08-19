@@ -3,8 +3,11 @@
 //!
 //! Nothing here trusts the network. A download is only ever executed after it
 //! matches the published SHA-256 *and* carries a valid Authenticode signature
-//! whose subject is our own certificate. Any failure leaves the app exactly
-//! where it was and falls back to the download page.
+//! whose subject is our own certificate. Those same checks run again
+//! immediately before `CreateProcessW`, because the staged file sits unlocked
+//! in %TEMP% until apply's idle wait or a tray "install now" click (SBS-911).
+//! Any failure leaves the app exactly where it was and falls back to the
+//! download page.
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -223,9 +226,9 @@ fn download(url: &str, dest: &Path, mut progress: impl FnMut(u32)) -> Result<()>
 }
 
 fn sha256_of(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path).context("open download for hashing")?;
+    let mut file = std::fs::File::open(path).context("open installer for hashing")?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("hash download")?;
+    std::io::copy(&mut file, &mut hasher).context("hash installer")?;
     Ok(hasher
         .finalize()
         .iter()
@@ -394,31 +397,116 @@ pub fn staged_path(version: &str) -> PathBuf {
     std::env::temp_dir().join(format!("MatteshotSetup-{name}.exe"))
 }
 
-/// Download the installer, prove it is ours, and leave it staged on disk.
-/// Returns the verified path. Never executes anything.
+/// SHA-256 sidecar written next to a staged installer. Launch re-reads this
+/// so a replacement in %TEMP% cannot keep the hash we checked at stage time.
+fn hash_sidecar_path(installer: &Path) -> PathBuf {
+    let mut sidecar = installer.as_os_str().to_os_string();
+    sidecar.push(".sha256");
+    PathBuf::from(sidecar)
+}
+
+fn write_staged_hash(installer: &Path, hash: &str) -> Result<()> {
+    let dest = hash_sidecar_path(installer);
+    let mut partial = dest.as_os_str().to_os_string();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    std::fs::write(&partial, format!("{hash}\n")).context("write staged hash")?;
+    let _ = std::fs::remove_file(&dest);
+    std::fs::rename(&partial, &dest).context("stage verified hash")?;
+    Ok(())
+}
+
+fn read_staged_hash(installer: &Path) -> Result<String> {
+    let dest = hash_sidecar_path(installer);
+    match std::fs::read_to_string(&dest) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("staged installer hash is missing");
+        }
+        Err(error) => Err(error).context("staged installer hash could not be read"),
+        Ok(body) => expected_hash(&body).context("staged installer hash is unreadable"),
+    }
+}
+
+fn discard_tampered_stage(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(hash_sidecar_path(path));
+}
+
+/// File plus hash sidecar. The menu must not promise "install now" for a
+/// leftover installer we can no longer re-check.
+pub fn is_ready_to_launch(path: &Path) -> bool {
+    path.is_file() && hash_sidecar_path(path).is_file()
+}
+
+/// Re-prove the staged installer is still the one we verified.
+///
+/// `stage` checks hash + Authenticode, then the file sits in shared %TEMP%
+/// until apply's idle wait (up to 24h) or a tray "install now" click.
+/// Existence is not proof it is still ours (SBS-911).
+pub fn verify_still_ours(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        bail!("staged installer is missing");
+    }
+    let expected = match read_staged_hash(path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            // Without a sidecar we cannot prove the bytes are still ours.
+            discard_tampered_stage(path);
+            return Err(error);
+        }
+    };
+    let actual = sha256_of(path)?;
+    if actual != expected {
+        discard_tampered_stage(path);
+        bail!("staged installer hash {actual} does not match staged {expected}");
+    }
+    // Hash match means the bytes are still what we staged. Authenticode or
+    // revocation can fail transiently (OCSP/network); keep the pair so a
+    // later retry can still install.
+    verify_signature(path)
+}
+
+/// Drop only an in-progress download. Dest and its hash sidecar stay so a
+/// failed re-download leaves a previously verified pair launchable.
+fn drop_in_progress_partial(dest: &Path) {
+    let _ = std::fs::remove_file(dest.with_extension("exe.partial"));
+}
+
+/// Download the installer, prove it is ours, and leave it staged on disk
+/// with the verified hash beside it. Returns the verified path. Never
+/// executes anything.
 pub fn stage(url: &str, version: &str, progress: impl FnMut(u32)) -> Result<PathBuf> {
     let dest = staged_path(version);
     let partial = dest.with_extension("exe.partial");
-    let _ = std::fs::remove_file(&partial);
+    drop_in_progress_partial(&dest);
 
     download(url, &partial, progress)?;
 
-    let verified = (|| -> Result<()> {
+    let hash = (|| -> Result<String> {
         let published = expected_hash(&get_text(&format!("{url}.sha256"))?)?;
         let actual = sha256_of(&partial)?;
         if actual != published {
             bail!("installer hash {actual} does not match published {published}");
         }
-        verify_signature(&partial)
+        verify_signature(&partial)?;
+        Ok(actual)
     })();
 
-    if let Err(error) = verified {
-        let _ = std::fs::remove_file(&partial);
-        return Err(error);
-    }
+    let hash = match hash {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(error);
+        }
+    };
 
     let _ = std::fs::remove_file(&dest);
     std::fs::rename(&partial, &dest).context("stage verified installer")?;
+    if let Err(error) = write_staged_hash(&dest, &hash) {
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(hash_sidecar_path(&dest));
+        return Err(error);
+    }
     Ok(dest)
 }
 
@@ -463,10 +551,11 @@ fn launch_plan(path: &Path) -> LaunchPlan {
 ///
 /// The installer stops the resident through `--quit`, replaces the binary, and
 /// relaunches it, so this call is the last thing this process usefully does.
+///
+/// Hash + Authenticode are checked again here, not only at stage time. The
+/// staged file is unlocked in %TEMP% for up to a day (SBS-911).
 pub fn launch(path: &Path) -> Result<()> {
-    if !path.is_file() {
-        bail!("staged installer is missing");
-    }
+    verify_still_ours(path)?;
     let plan = launch_plan(path);
     let application = HSTRING::from(plan.application_name.as_os_str());
     let mut command_line = plan.command_line;
@@ -608,6 +697,170 @@ mod tests {
         let _ = std::fs::remove_file(&missing);
         let error = launch(&missing).unwrap_err().to_string();
         assert!(error.contains("staged installer is missing"), "{error}");
+    }
+
+    fn sbs_911_temp(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "MatteshotSetup-sbs-911-{label}-{}.exe",
+            std::process::id()
+        ))
+    }
+
+    fn cleanup_staged(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(hash_sidecar_path(path));
+    }
+
+    /// Pins SBS-911: the sidecar lives next to the installer, not under a
+    /// path the version string can steer.
+    #[test]
+    fn hash_sidecar_sits_beside_the_installer() {
+        let path = Path::new(r"C:\Users\Tyler South\AppData\Local\Temp\MatteshotSetup-0.20.0.exe");
+        assert_eq!(
+            hash_sidecar_path(path).file_name().unwrap(),
+            "MatteshotSetup-0.20.0.exe.sha256"
+        );
+        assert_eq!(
+            hash_sidecar_path(path).parent().unwrap(),
+            path.parent().unwrap()
+        );
+    }
+
+    /// Pins SBS-911: a leftover installer without its hash is not "ready".
+    #[test]
+    fn is_ready_to_launch_requires_both_the_installer_and_its_hash() {
+        let path = sbs_911_temp("ready");
+        cleanup_staged(&path);
+        assert!(!is_ready_to_launch(&path));
+        std::fs::write(&path, b"not-an-installer").unwrap();
+        assert!(
+            !is_ready_to_launch(&path),
+            "file without sidecar is not ready"
+        );
+        write_staged_hash(
+            &path,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        assert!(is_ready_to_launch(&path));
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-911: missing vs garbage sidecar are both refused, and are
+    /// not collapsed into one message.
+    #[test]
+    fn read_staged_hash_keeps_missing_and_unreadable_distinct() {
+        let path = sbs_911_temp("hash-states");
+        cleanup_staged(&path);
+        let missing = read_staged_hash(&path).unwrap_err().to_string();
+        assert!(missing.contains("hash is missing"), "{missing}");
+        assert!(!missing.contains("unreadable"), "{missing}");
+
+        std::fs::write(hash_sidecar_path(&path), "not-a-sha256\n").unwrap();
+        let garbage = read_staged_hash(&path).unwrap_err().to_string();
+        assert!(garbage.contains("unreadable"), "{garbage}");
+        assert!(!garbage.contains("hash is missing"), "{garbage}");
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-911: launch must not CreateProcessW a file that is merely
+    /// present. The old gate was `is_file()` only.
+    #[test]
+    fn launch_refuses_a_present_installer_with_no_hash_sidecar() {
+        let path = sbs_911_temp("no-sidecar");
+        cleanup_staged(&path);
+        std::fs::write(&path, b"not-an-installer").unwrap();
+        let error = launch(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("staged installer hash is missing"),
+            "must fail the re-check, not CreateProcessW: {error}"
+        );
+        assert!(
+            !error.contains("could not start the installer"),
+            "reached CreateProcessW without a hash re-check: {error}"
+        );
+        assert!(!path.is_file(), "unprovable installer must be discarded");
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-911: bytes that no longer match the staged hash are
+    /// discarded and never launched.
+    #[test]
+    fn launch_refuses_a_present_installer_whose_hash_changed() {
+        let path = sbs_911_temp("hash-changed");
+        cleanup_staged(&path);
+        std::fs::write(&path, b"not-an-installer").unwrap();
+        write_staged_hash(
+            &path,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let error = launch(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("does not match staged"),
+            "must fail the hash re-check, not CreateProcessW: {error}"
+        );
+        assert!(
+            !error.contains("could not start the installer"),
+            "reached CreateProcessW after a hash change: {error}"
+        );
+        assert!(!path.is_file(), "tampered installer must be discarded");
+        assert!(
+            !hash_sidecar_path(&path).is_file(),
+            "tampered hash sidecar must be discarded"
+        );
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-911: a hash match is not enough. Authenticode + subject
+    /// must still pass on the bytes about to run.
+    #[test]
+    fn launch_refuses_a_present_installer_that_fails_authenticode() {
+        let path = sbs_911_temp("unsigned");
+        cleanup_staged(&path);
+        std::fs::write(&path, b"not-an-installer").unwrap();
+        let hash = sha256_of(&path).unwrap();
+        write_staged_hash(&path, &hash).unwrap();
+        let error = launch(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("signature") || error.contains("signed"),
+            "must fail Authenticode, not CreateProcessW: {error}"
+        );
+        assert!(
+            !error.contains("could not start the installer"),
+            "reached CreateProcessW without an Authenticode re-check: {error}"
+        );
+        assert!(
+            path.is_file() && hash_sidecar_path(&path).is_file(),
+            "hash-verified bytes stay staged when Authenticode is transiently unavailable"
+        );
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-911: a failed re-download must not drop the hash sidecar
+    /// of a previously verified pair, or Install now disappears.
+    #[test]
+    fn a_failed_restage_leaves_a_verified_pair_launchable() {
+        let path = sbs_911_temp("restage-keep");
+        cleanup_staged(&path);
+        std::fs::write(&path, b"previously-verified").unwrap();
+        write_staged_hash(
+            &path,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        assert!(is_ready_to_launch(&path));
+        std::fs::write(path.with_extension("exe.partial"), b"in-progress").unwrap();
+        drop_in_progress_partial(&path);
+        assert!(
+            is_ready_to_launch(&path),
+            "clearing the in-progress partial must not drop dest or its hash"
+        );
+        assert!(
+            !path.with_extension("exe.partial").is_file(),
+            "the leftover partial is what restage is allowed to drop"
+        );
+        cleanup_staged(&path);
     }
 
     /// Pins SBS-764: the legacy nonzero `--quit` path must still exist, and
