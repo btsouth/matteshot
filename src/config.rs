@@ -214,11 +214,10 @@ pub fn auto_update_from_load<E>(result: Result<Config, E>) -> bool {
 }
 
 fn corrupt_backup_path(path: &Path) -> PathBuf {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    path.with_extension(format!("json.corrupt-{unique}"))
+    // One sidecar, not a unique sibling per retry. A failed rewrite leaves the
+    // live path unreadable, so the next Config::update would otherwise copy
+    // again and fill %APPDATA%\matteshot.
+    path.with_extension("json.corrupt")
 }
 
 fn load_for_update_from(path: &Path, last_good: Option<&Config>) -> anyhow::Result<Config> {
@@ -480,13 +479,13 @@ mod tests {
     }
 
     fn corrupt_siblings(path: &Path) -> Vec<PathBuf> {
-        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
-        std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-            .map(|entry| entry.path())
-            .collect()
+        let name = path.file_name().unwrap().to_string_lossy();
+        let backup = path.parent().unwrap().join(format!("{name}.corrupt"));
+        if backup.exists() {
+            vec![backup]
+        } else {
+            Vec::new()
+        }
     }
 
     fn opted_out_fixture() -> &'static str {
@@ -743,6 +742,29 @@ mod tests {
             !auto_update_from_load(load_from(&path)),
             "a failed rewrite must not authorize a silent install"
         );
+
+        for backup in corrupt_siblings(&path) {
+            let _ = std::fs::remove_file(backup);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failed_rewrite_does_not_accumulate_corrupt_siblings() {
+        let path = temporary_path("one-corrupt-sidecar");
+        write_fixture(&path, opted_out_fixture());
+        let mut last_good = None;
+        load_session(&path, &mut last_good);
+        write_fixture(&path, "{");
+
+        load_for_update_from(&path, last_good.as_ref()).expect("first restore");
+        load_for_update_from(&path, last_good.as_ref()).expect("retry restore");
+        assert_eq!(
+            corrupt_siblings(&path).len(),
+            1,
+            "retries must overwrite one sidecar, not mint a new sibling"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
 
         for backup in corrupt_siblings(&path) {
             let _ = std::fs::remove_file(backup);
