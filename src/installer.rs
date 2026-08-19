@@ -469,7 +469,7 @@ pub fn verify_still_ours(path: &Path) -> Result<()> {
 /// Drop only an in-progress download. Dest and its hash sidecar stay so a
 /// failed re-download leaves a previously verified pair launchable.
 fn drop_in_progress_partial(dest: &Path) {
-    let _ = std::fs::remove_file(&dest.with_extension("exe.partial"));
+    let _ = std::fs::remove_file(dest.with_extension("exe.partial"));
 }
 
 /// Download the installer, prove it is ours, and leave it staged on disk
