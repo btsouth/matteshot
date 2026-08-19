@@ -989,13 +989,23 @@ fn run_resident() -> Result<()> {
                             Some(staged) if installer::is_ready_to_launch(&staged) => {
                                 // Re-check before the balloon. A file that is
                                 // merely still in %TEMP% is not ours (SBS-911).
-                                installer::verify_still_ours(&staged)?;
-                                tray.notify(
-                                    "Matteshot is updating",
-                                    "Installing now. Matteshot will restart on its own.",
-                                );
-                                std::thread::sleep(std::time::Duration::from_millis(1200));
-                                installer::launch(&staged)?;
+                                // Do not `?`: a failed re-check must open the
+                                // download page, not surface as a tray error.
+                                if let Err(error) = installer::verify_still_ours(&staged) {
+                                    crate::diagnostics::log(&format!(
+                                        "staged installer re-check failed: {error:#}"
+                                    ));
+                                    if let Some(url) = tray.update_url() {
+                                        output::open_url(&url);
+                                    }
+                                } else {
+                                    tray.notify(
+                                        "Matteshot is updating",
+                                        "Installing now. Matteshot will restart on its own.",
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                                    installer::launch(&staged)?;
+                                }
                             }
                             _ => {
                                 if let Some(url) = tray.update_url() {

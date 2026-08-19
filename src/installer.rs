@@ -447,13 +447,29 @@ pub fn verify_still_ours(path: &Path) -> Result<()> {
     if !path.is_file() {
         bail!("staged installer is missing");
     }
-    let expected = read_staged_hash(path)?;
+    let expected = match read_staged_hash(path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            // Without a sidecar we cannot prove the bytes are still ours.
+            discard_tampered_stage(path);
+            return Err(error);
+        }
+    };
     let actual = sha256_of(path)?;
     if actual != expected {
         discard_tampered_stage(path);
         bail!("staged installer hash {actual} does not match staged {expected}");
     }
+    // Hash match means the bytes are still what we staged. Authenticode or
+    // revocation can fail transiently (OCSP/network); keep the pair so a
+    // later retry can still install.
     verify_signature(path)
+}
+
+/// Drop only an in-progress download. Dest and its hash sidecar stay so a
+/// failed re-download leaves a previously verified pair launchable.
+fn drop_in_progress_partial(dest: &Path) {
+    let _ = std::fs::remove_file(&dest.with_extension("exe.partial"));
 }
 
 /// Download the installer, prove it is ours, and leave it staged on disk
@@ -462,8 +478,7 @@ pub fn verify_still_ours(path: &Path) -> Result<()> {
 pub fn stage(url: &str, version: &str, progress: impl FnMut(u32)) -> Result<PathBuf> {
     let dest = staged_path(version);
     let partial = dest.with_extension("exe.partial");
-    let _ = std::fs::remove_file(&partial);
-    let _ = std::fs::remove_file(hash_sidecar_path(&dest));
+    drop_in_progress_partial(&dest);
 
     download(url, &partial, progress)?;
 
@@ -756,7 +771,6 @@ mod tests {
         cleanup_staged(&path);
         std::fs::write(&path, b"not-an-installer").unwrap();
         let error = launch(&path).unwrap_err().to_string();
-        cleanup_staged(&path);
         assert!(
             error.contains("staged installer hash is missing"),
             "must fail the re-check, not CreateProcessW: {error}"
@@ -765,6 +779,8 @@ mod tests {
             !error.contains("could not start the installer"),
             "reached CreateProcessW without a hash re-check: {error}"
         );
+        assert!(!path.is_file(), "unprovable installer must be discarded");
+        cleanup_staged(&path);
     }
 
     /// Pins SBS-911: bytes that no longer match the staged hash are
@@ -806,7 +822,6 @@ mod tests {
         let hash = sha256_of(&path).unwrap();
         write_staged_hash(&path, &hash).unwrap();
         let error = launch(&path).unwrap_err().to_string();
-        cleanup_staged(&path);
         assert!(
             error.contains("signature") || error.contains("signed"),
             "must fail Authenticode, not CreateProcessW: {error}"
@@ -815,6 +830,37 @@ mod tests {
             !error.contains("could not start the installer"),
             "reached CreateProcessW without an Authenticode re-check: {error}"
         );
+        assert!(
+            path.is_file() && hash_sidecar_path(&path).is_file(),
+            "hash-verified bytes stay staged when Authenticode is transiently unavailable"
+        );
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-911: a failed re-download must not drop the hash sidecar
+    /// of a previously verified pair, or Install now disappears.
+    #[test]
+    fn a_failed_restage_leaves_a_verified_pair_launchable() {
+        let path = sbs_911_temp("restage-keep");
+        cleanup_staged(&path);
+        std::fs::write(&path, b"previously-verified").unwrap();
+        write_staged_hash(
+            &path,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        assert!(is_ready_to_launch(&path));
+        std::fs::write(path.with_extension("exe.partial"), b"in-progress").unwrap();
+        drop_in_progress_partial(&path);
+        assert!(
+            is_ready_to_launch(&path),
+            "clearing the in-progress partial must not drop dest or its hash"
+        );
+        assert!(
+            !path.with_extension("exe.partial").is_file(),
+            "the leftover partial is what restage is allowed to drop"
+        );
+        cleanup_staged(&path);
     }
 
     /// Pins SBS-764: the legacy nonzero `--quit` path must still exist, and
