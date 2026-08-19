@@ -52,6 +52,7 @@ const AUTO_COPY_TIMER_MS: u32 = 50;
 /// Checkmark the strip may paint only after auto-copy has landed (SBS-905).
 const COPIED_MARK: &str = "\u{2713} copied";
 const HINT_ACTIONS: &str = "1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   S share   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc";
+const HINT_ACTIONS_WITHOUT_SHARE: &str = "1\u{2013}7 or click to switch   \u{00b7}   T tweak   \u{00b7}   C copy text   \u{00b7}   P pin   \u{00b7}   PrtScn snip again   \u{00b7}   Esc";
 
 /// Outcome of the background auto-copy that starts when the picker opens.
 ///
@@ -102,13 +103,18 @@ impl AutoCopyHintSlot {
 }
 
 /// Hint line for the contact strip. Only a landed auto-copy may paint ✓ copied.
-fn picker_hint(status: AutoCopyHint) -> String {
+fn picker_hint(status: AutoCopyHint, can_share: bool) -> String {
     let prefix = match status {
         AutoCopyHint::Succeeded => COPIED_MARK,
         AutoCopyHint::Pending => "copying\u{2026}",
         AutoCopyHint::Failed => "not copied",
     };
-    format!("{prefix} \u{2014} {HINT_ACTIONS}")
+    let actions = if can_share {
+        HINT_ACTIONS
+    } else {
+        HINT_ACTIONS_WITHOUT_SHARE
+    };
+    format!("{prefix} \u{2014} {actions}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,13 +128,14 @@ enum KeyAction {
     Hover(i32),
 }
 
-fn key_action(vk: u16, hover: i32, count: usize) -> Option<KeyAction> {
+fn key_action(vk: u16, hover: i32, count: usize, can_share: bool) -> Option<KeyAction> {
     let selected = (count > 0).then(|| (hover.max(0) as usize).min(count - 1));
     match vk {
         v if v == VK_ESCAPE.0 => Some(KeyAction::Cancel),
         v if v == VK_RETURN.0 => selected.map(KeyAction::Choose),
         0x54 => selected.map(KeyAction::Tweak), // T
-        0x53 => selected.map(KeyAction::Share), // S
+        // S is Share only when a paid license can actually upload (SBS-906).
+        0x53 if can_share => selected.map(KeyAction::Share),
         0x50 => Some(KeyAction::Pin),           // P
         0x43 => Some(KeyAction::CopyText),      // C
         v if v == VK_LEFT.0 && count > 0 => Some(KeyAction::Hover(
@@ -288,6 +295,8 @@ struct State {
     /// cancel-on-focus-loss behavior.
     suspended: bool,
     theme: crate::theme::Theme,
+    /// Cached at open: Share is a paid-license action (SBS-906).
+    can_share: bool,
     auto_copy: AutoCopyHintSlot,
     painted_hint: AutoCopyHint,
 }
@@ -411,7 +420,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // Hint line along the bottom.
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.faint);
-    let mut hint = wide(&picker_hint(state.auto_copy.get()));
+    let mut hint = wide(&picker_hint(state.auto_copy.get(), state.can_share));
     let mut hint_rect = RECT {
         left: 0,
         top: state.height - HINT_H - 4,
@@ -520,7 +529,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_KEYDOWN => {
             if let Some(state) = state_of(hwnd) {
                 let vk = wparam.0 as u16;
-                match key_action(vk, state.hover, state.thumbs.len()) {
+                match key_action(vk, state.hover, state.thumbs.len(), state.can_share) {
                     Some(KeyAction::Cancel) => finish(hwnd, state, PickAction::Cancel),
                     Some(KeyAction::Choose(index)) => {
                         finish(hwnd, state, PickAction::Choose(index))
@@ -635,6 +644,7 @@ pub fn pick(
         height: total_h,
         suspended: false,
         theme: crate::theme::current(),
+        can_share: crate::license::can_share(),
         auto_copy,
         painted_hint: AutoCopyHint::Pending,
     });
@@ -711,29 +721,42 @@ mod tests {
 
     #[test]
     fn picker_shortcuts_choose_the_visible_variant() {
-        assert_eq!(key_action(VK_RETURN.0, 3, 7), Some(KeyAction::Choose(3)));
-        assert_eq!(key_action(0x54, 3, 7), Some(KeyAction::Tweak(3)));
-        assert_eq!(key_action(0x53, 3, 7), Some(KeyAction::Share(3)));
-        assert_eq!(key_action(0x50, 3, 7), Some(KeyAction::Pin));
-        assert_eq!(key_action(0x43, 3, 7), Some(KeyAction::CopyText));
-        assert_eq!(key_action(VK_ESCAPE.0, 3, 7), Some(KeyAction::Cancel));
+        assert_eq!(key_action(VK_RETURN.0, 3, 7, true), Some(KeyAction::Choose(3)));
+        assert_eq!(key_action(0x54, 3, 7, true), Some(KeyAction::Tweak(3)));
+        assert_eq!(key_action(0x53, 3, 7, true), Some(KeyAction::Share(3)));
+        assert_eq!(key_action(0x50, 3, 7, true), Some(KeyAction::Pin));
+        assert_eq!(key_action(0x43, 3, 7, true), Some(KeyAction::CopyText));
+        assert_eq!(key_action(VK_ESCAPE.0, 3, 7, true), Some(KeyAction::Cancel));
+    }
+
+    /// SBS-906: trial (and any other unpaid state) must not be offered Share.
+    #[test]
+    fn picker_does_not_offer_share_without_a_paid_license() {
+        assert_eq!(key_action(0x53, 3, 7, false), None);
+        assert_eq!(key_action(0x54, 3, 7, false), Some(KeyAction::Tweak(3)));
+        let licensed = picker_hint(AutoCopyHint::Succeeded, true);
+        let trial = picker_hint(AutoCopyHint::Succeeded, false);
+        assert!(licensed.contains("S share"), "{licensed}");
+        assert!(!trial.contains("S share"), "{trial}");
+        assert!(trial.contains("T tweak"), "{trial}");
+        assert!(trial.contains("C copy text"), "{trial}");
     }
 
     #[test]
     fn picker_arrows_wrap_and_recover_an_unset_hover() {
-        assert_eq!(key_action(VK_LEFT.0, 0, 7), Some(KeyAction::Hover(6)));
-        assert_eq!(key_action(VK_RIGHT.0, 6, 7), Some(KeyAction::Hover(0)));
-        assert_eq!(key_action(VK_RIGHT.0, -1, 7), Some(KeyAction::Hover(0)));
-        assert_eq!(key_action(VK_LEFT.0, -1, 7), Some(KeyAction::Hover(6)));
+        assert_eq!(key_action(VK_LEFT.0, 0, 7, true), Some(KeyAction::Hover(6)));
+        assert_eq!(key_action(VK_RIGHT.0, 6, 7, true), Some(KeyAction::Hover(0)));
+        assert_eq!(key_action(VK_RIGHT.0, -1, 7, true), Some(KeyAction::Hover(0)));
+        assert_eq!(key_action(VK_LEFT.0, -1, 7, true), Some(KeyAction::Hover(6)));
     }
 
     #[test]
     fn numeric_shortcuts_cannot_select_a_missing_variant() {
-        assert_eq!(key_action(0x31, 0, 7), Some(KeyAction::Choose(0)));
-        assert_eq!(key_action(0x37, 0, 7), Some(KeyAction::Choose(6)));
-        assert_eq!(key_action(0x38, 0, 7), None);
-        assert_eq!(key_action(VK_RETURN.0, 0, 0), None);
-        assert_eq!(key_action(VK_RIGHT.0, 0, 0), None);
+        assert_eq!(key_action(0x31, 0, 7, true), Some(KeyAction::Choose(0)));
+        assert_eq!(key_action(0x37, 0, 7, true), Some(KeyAction::Choose(6)));
+        assert_eq!(key_action(0x38, 0, 7, true), None);
+        assert_eq!(key_action(VK_RETURN.0, 0, 0, true), None);
+        assert_eq!(key_action(VK_RIGHT.0, 0, 0, true), None);
     }
 
     /// Every cell inside the window, and the window inside the work area.
@@ -805,7 +828,7 @@ mod tests {
     /// just because the worker was spawned (SBS-905).
     #[test]
     fn in_flight_auto_copy_does_not_paint_copied() {
-        let hint = picker_hint(AutoCopyHint::Pending);
+        let hint = picker_hint(AutoCopyHint::Pending, true);
         assert!(!hint.contains(COPIED_MARK), "{hint}");
         assert!(!hint.contains('\u{2713}'), "{hint}");
         assert!(!hint.contains("copied"), "{hint}");
@@ -815,16 +838,16 @@ mod tests {
     /// A failed clipboard or save is not "nothing happened" and not success.
     #[test]
     fn failed_auto_copy_does_not_paint_copied() {
-        let hint = picker_hint(AutoCopyHint::Failed);
+        let hint = picker_hint(AutoCopyHint::Failed, true);
         assert!(!hint.contains(COPIED_MARK), "{hint}");
         assert!(!hint.contains('\u{2713}'), "{hint}");
         assert!(hint.contains("not copied"), "{hint}");
-        assert_ne!(hint, picker_hint(AutoCopyHint::Pending));
+        assert_ne!(hint, picker_hint(AutoCopyHint::Pending, true));
     }
 
     #[test]
     fn landed_auto_copy_paints_copied() {
-        let hint = picker_hint(AutoCopyHint::Succeeded);
+        let hint = picker_hint(AutoCopyHint::Succeeded, true);
         assert!(hint.contains(COPIED_MARK), "{hint}");
         assert!(hint.starts_with(COPIED_MARK), "{hint}");
     }
@@ -841,7 +864,7 @@ mod tests {
         for raw in [0, 3, 255] {
             slot.store_raw(raw);
             assert_eq!(slot.get(), AutoCopyHint::Pending, "raw {raw}");
-            assert!(!picker_hint(slot.get()).contains(COPIED_MARK));
+            assert!(!picker_hint(slot.get(), true).contains(COPIED_MARK));
         }
     }
 }

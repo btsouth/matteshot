@@ -25,6 +25,28 @@ use windows::Win32::Networking::WinHttp::{
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+/// Shown when Share is refused because this device has no paid license.
+/// Same sentence `share_file` returns so every surface tells the same
+/// truth (SBS-906).
+pub const LICENSE_REQUIRED: &str = "Sharing needs an active Matteshot license.";
+
+/// Outcome of a Share click before any upload starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareStart {
+    Begin,
+    Unavailable(&'static str),
+}
+
+/// SBS-906: do not start a share unless a paid license can attach a
+/// certificate. Callers pass the live `license::can_share()` result.
+pub fn share_start(can_share: bool) -> ShareStart {
+    if can_share {
+        ShareStart::Begin
+    } else {
+        ShareStart::Unavailable(LICENSE_REQUIRED)
+    }
+}
+
 const SHARE_HOST: &str = "share.matteshot.app";
 const SHARE_PATH: &str = "/v1/share";
 // Matches the worker's own MAX_UPLOAD_BYTES; caught here too so a failure
@@ -217,8 +239,7 @@ struct ShareResponse {
 /// callers on a UI thread must run this on a worker thread, the same way the
 /// app already backgrounds auto-update downloads.
 pub fn share_file(path: &Path) -> Result<String> {
-    let (certificate, signature) = crate::license::signed_certificate()
-        .context("Sharing needs an active Matteshot license.")?;
+    let (certificate, signature) = crate::license::signed_certificate().context(LICENSE_REQUIRED)?;
     let device_id = crate::license::device_id()
         .context("Sharing needs a stable device identity.")?;
 
@@ -681,6 +702,19 @@ mod tests {
         assert_ne!(
             a, b,
             "two boundaries generated back to back must still differ"
+        );
+    }
+
+    #[test]
+    fn share_is_refused_without_a_paid_license() {
+        assert_eq!(
+            share_start(false),
+            ShareStart::Unavailable(LICENSE_REQUIRED)
+        );
+        assert_eq!(share_start(true), ShareStart::Begin);
+        assert_eq!(
+            LICENSE_REQUIRED,
+            "Sharing needs an active Matteshot license."
         );
     }
 
