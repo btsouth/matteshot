@@ -1428,36 +1428,71 @@ fn render_final(
     output_max_edge: u32,
 ) -> RgbaImage {
     let plain = compose::is_plain(style);
-    let scale = if plain || content.width().max(content.height()) >= 1600 {
-        1
+    let (pad_factor, aspect) = matte;
+    let (ox, oy) = origin;
+    if plain {
+        // None: no matte, so no aspect-padded canvas. Keep the native
+        // content (plus the small-capture supersample) and cap afterward.
+        let scale = if content.width().max(content.height()) >= 1600 {
+            1
+        } else {
+            export_scale.clamp(1, 4)
+        };
+        let mut scaled = if scale > 1 {
+            image::imageops::resize(
+                content,
+                content.width() * scale,
+                content.height() * scale,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            content.clone()
+        };
+        crate::annotate::render(
+            &mut scaled,
+            anns,
+            scale as f32,
+            (-ox * scale as f32, -oy * scale as f32),
+            None,
+        );
+        return output::resize_to_max_edge(&scaled, output_max_edge);
+    }
+    // SBS-1020: size the framed canvas *before* compose_base. Cap-then-compose
+    // (or the 9.4 MP Original+aspect budget) so a 19k-px scroll + 16:9 cannot
+    // allocate a 2.8 GB RGBA matte on the resident UI thread.
+    let plan = compose::plan_framed_export(
+        content.width(),
+        content.height(),
+        pad_factor,
+        aspect,
+        true,
+        export_scale,
+        output_max_edge,
+    );
+    let mut scaled = if (plan.content_w, plan.content_h) == content.dimensions() {
+        content.clone()
     } else {
-        export_scale.clamp(1, 4)
-    };
-    let mut scaled = if scale > 1 {
         image::imageops::resize(
             content,
-            content.width() * scale,
-            content.height() * scale,
+            plan.content_w,
+            plan.content_h,
             image::imageops::FilterType::Lanczos3,
         )
-    } else {
-        content.clone()
     };
-    let (ox, oy) = origin;
+    let ann_scale = plan.content_w as f32 / content.width().max(1) as f32;
     crate::annotate::render(
         &mut scaled,
         anns,
-        scale as f32,
-        (-ox * scale as f32, -oy * scale as f32),
+        ann_scale,
+        (-ox * ann_scale, -oy * ann_scale),
         None,
     );
-    let finished = if plain {
-        scaled
-    } else {
-        let (pad_factor, aspect) = matte;
-        let opts = ComposeOpts { metric_scale: scale as f32, pad_factor, aspect };
-        compose::compose_with(&scaled, style, &opts)
+    let opts = ComposeOpts {
+        metric_scale: plan.metric_scale,
+        pad_factor,
+        aspect,
     };
+    let finished = compose::compose_with(&scaled, style, &opts);
     output::resize_to_max_edge(&finished, output_max_edge)
 }
 
@@ -1487,8 +1522,24 @@ fn composed_dimensions(state: &State) -> (u32, u32) {
 
 /// Exact Copy/Save dimensions without rendering the full-size image.
 fn final_dimensions(state: &State) -> (u32, u32) {
-    let (width, height) = composed_dimensions(state);
-    output::resized_dimensions(width, height, state.doc().output_max_edge)
+    let max_edge = state.doc().output_max_edge;
+    if compose::is_plain(&state.doc().styles[state.doc().sel]) {
+        let (width, height) = composed_dimensions(state);
+        return output::resized_dimensions(width, height, max_edge);
+    }
+    // Same plan Copy/Save uses, so Original + a forced aspect reports the
+    // 9.4 MP canvas rather than the native padded size we will not allocate.
+    let (cw, ch) = state.doc().content_dimensions();
+    let plan = compose::plan_framed_export(
+        cw,
+        ch,
+        state.doc().pad_factor,
+        ASPECTS[state.doc().aspect_idx].1,
+        true,
+        state.export_scale,
+        max_edge,
+    );
+    output::resized_dimensions(plan.canvas_w, plan.canvas_h, max_edge)
 }
 
 fn output_size_summary(max_edge: u32, dimensions: (u32, u32)) -> String {
@@ -5132,6 +5183,97 @@ mod tests {
         );
         assert_eq!(exported.dimensions(), (120, 80));
         assert_eq!(exported.get_pixel(7, 9), &Rgba([255, 0, 0, 255]));
+    }
+
+    fn aurora_style() -> crate::style::Style {
+        crate::style::Style {
+            name: "Test",
+            backdrop: crate::style::Backdrop::Linear {
+                c1: crate::style::Rgb(0.2, 0.3, 0.6),
+                c2: crate::style::Rgb(0.4, 0.2, 0.5),
+            },
+        }
+    }
+
+    /// SBS-1020: Copy/Save of a tall capture + 16:9 used to compose the
+    /// native padded canvas (here ~11 MP) before the Original no-op cap.
+    /// The export must land at the planned size, not the native frame.
+    #[test]
+    fn copy_of_a_tall_capture_with_forced_aspect_composes_at_the_budget() {
+        let raw = RgbaImage::from_pixel(160, 2400, Rgba([24, 32, 48, 255]));
+        let native = crate::compose::framed_size(
+            160,
+            2400,
+            &crate::compose::ComposeOpts {
+                aspect: Some(16.0 / 9.0),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(
+            native.0 as u64 * native.1 as u64 > crate::compose::MAX_FRAMED_PIXELS,
+            "fixture is not past the budget: {native:?}"
+        );
+        let exported = render_final(
+            &raw,
+            &[],
+            (0.0, 0.0),
+            &aurora_style(),
+            (crate::compose::DEFAULT_PAD_FACTOR, Some(16.0 / 9.0)),
+            1,
+            crate::output::OUTPUT_ORIGINAL,
+        );
+        let pixels = exported.width() as u64 * exported.height() as u64;
+        assert!(
+            pixels <= crate::compose::MAX_FRAMED_PIXELS,
+            "exported {}×{} = {pixels} px",
+            exported.width(),
+            exported.height()
+        );
+        assert!(exported.width() < native.0);
+        assert!(exported.height() < native.1);
+        let ratio = exported.width() as f64 / exported.height() as f64;
+        assert!((ratio - 16.0 / 9.0).abs() < 0.03);
+    }
+
+    #[test]
+    fn email_copy_of_a_tall_forced_aspect_fits_the_edge_cap() {
+        let raw = RgbaImage::from_pixel(400, 2000, Rgba([24, 32, 48, 255]));
+        let exported = render_final(
+            &raw,
+            &[],
+            (0.0, 0.0),
+            &aurora_style(),
+            (crate::compose::DEFAULT_PAD_FACTOR, Some(16.0 / 9.0)),
+            1,
+            crate::output::OUTPUT_EMAIL,
+        );
+        assert!(
+            exported.width().max(exported.height()) <= crate::output::OUTPUT_EMAIL,
+            "exported {}×{}",
+            exported.width(),
+            exported.height()
+        );
+        let plan = crate::compose::plan_framed_export(
+            400,
+            2000,
+            crate::compose::DEFAULT_PAD_FACTOR,
+            Some(16.0 / 9.0),
+            true,
+            1,
+            crate::output::OUTPUT_EMAIL,
+        );
+        assert_eq!(exported.dimensions(), (plan.canvas_w, plan.canvas_h));
+        let native = crate::compose::framed_size(
+            400,
+            2000,
+            &crate::compose::ComposeOpts {
+                aspect: Some(16.0 / 9.0),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(native.0.max(native.1) > crate::output::OUTPUT_EMAIL);
     }
 
     #[test]

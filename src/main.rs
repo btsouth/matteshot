@@ -298,6 +298,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                         compose::DEFAULT_PAD_FACTOR,
                         None,
                         scale,
+                        max_edge,
                     );
                     let styled = output::resize_to_max_edge(&styled, max_edge);
                     let mut st = auto.lock().unwrap();
@@ -396,6 +397,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 compose::DEFAULT_PAD_FACTOR,
                 None,
                 cfg.export_scale,
+                cfg.output_max_edge,
             );
             let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
             let path = output::save_png(&styled, styles[i].name, &cfg.save_dir(), Some(&capture_title))?;
@@ -479,6 +481,7 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         compose::DEFAULT_PAD_FACTOR,
         None,
         cfg.export_scale,
+        cfg.output_max_edge,
     );
     let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
     let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir(), Some(&capture_title))?;
@@ -1467,7 +1470,7 @@ fn main() -> Result<()> {
             let raw = capture::capture_window(hwnd).context("capture failed")?;
             license::record_successful_capture();
             for s in style::variants(&raw) {
-                let img = compose::export(&raw, &s, compose::DEFAULT_PAD_FACTOR, None, 2);
+                let img = compose::export(&raw, &s, compose::DEFAULT_PAD_FACTOR, None, 2, 0);
                 let p = outdir.join(format!("matte-{}.png", s.name.to_lowercase()));
                 img.save(&p)?;
                 eprintln!("{} {}x{}", p.display(), img.width(), img.height());

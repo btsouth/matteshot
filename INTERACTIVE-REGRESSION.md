@@ -39,6 +39,7 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] OCR selection tracks words after matte, padding, aspect, and window-size changes.
 - [ ] Pixelated words cannot be selected or copied through the redaction.
 - [ ] Copy keeps the active tab open with a brief confirmation (or closes it when the Settings toggle is off); Save closes only the active tab after output succeeds.
+- [ ] A tall scroll capture with 16:9 or 1:1 Copy/Save stays responsive and lands at Email/Compact/Original size; Original reports a ~4K-class frame, not a 35k-wide canvas.
 - [ ] If saving or clipboard copy fails, the error is visible and the active tab remains open.
 
 ## Recording and video editor
