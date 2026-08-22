@@ -1,9 +1,11 @@
 name: CI
 
+# Pull requests only. main is protected and squash-merged from a branch that
+# had to be up to date, so the tree main lands on is the tree this workflow
+# already passed on the PR. Re-running it after the merge bought a second
+# answer to the same question, and on a private repo that answer is billed at
+# the Windows rate.
 on:
-  push:
-    branches:
-      - main
   pull_request:
 
 permissions:
@@ -17,6 +19,9 @@ jobs:
   validate:
     name: Test, lint and build
     runs-on: windows-latest
+    # A ceiling, not a target: observed cold-cache runs are around 20 minutes.
+    # Without one, a hung job bills against GitHub's six-hour default.
+    timeout-minutes: 25
     # Self-hosted runners execute PR code on this host, not an ephemeral one,
     # and the same machine later runs the signing workflows. Nobody but the
     # owner may schedule it — on pushes too, or the push arm is a fail-open
