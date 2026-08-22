@@ -371,7 +371,7 @@ fn frame_to_image(
         context.Unmap(&staging, 0);
     }
     let t_copy = t0.elapsed();
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0.iter_mut() {
         px.swap(0, 2);
     }
     // Phase timings are opt-in: they are only meaningful on an idle machine,

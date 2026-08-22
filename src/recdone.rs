@@ -812,7 +812,7 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize, can_share: bool) -> 
 
 fn thumb_image(bytes: &[u8], w: u32, h: u32) -> RgbaImage {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for pixel in bytes.chunks_exact(4) {
+    for pixel in bytes.as_chunks::<4>().0.iter() {
         rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
     RgbaImage::from_raw(w, h, rgba).expect("filmstrip frame has exact dimensions")
