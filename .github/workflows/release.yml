@@ -258,9 +258,12 @@ jobs:
     needs: [build, probe]
     runs-on: windows-latest
     environment: release
-    # An upload and a release edit. The old 30 was loose enough that a hang
-    # cost half an hour of billed Windows time before it was noticed.
-    timeout-minutes: 15
+    # Deliberately loose. This job downloads the probed installer, re-verifies
+    # it, pushes four objects to R2 through a `npx --yes wrangler` that fetches
+    # the package each time, then purges the edge with retries. A ceiling tight
+    # enough to save minutes here is tight enough to abandon a release
+    # half-published, which costs far more than the minutes do.
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
