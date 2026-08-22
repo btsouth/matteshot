@@ -237,7 +237,7 @@ fn raster_text(text: &str, px_height: i32) -> Option<(Vec<u8>, i32, i32)> {
 
         let src = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
         // Any channel works — white on black, grayscale AA.
-        let alpha: Vec<u8> = src.chunks_exact(4).map(|p| p[2]).collect();
+        let alpha: Vec<u8> = src.as_chunks::<4>().0.iter().map(|p| p[2]).collect();
 
         SelectObject(hdc, old_bmp);
         SelectObject(hdc, old_font);

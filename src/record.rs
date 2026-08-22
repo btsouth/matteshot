@@ -111,7 +111,7 @@ fn encoder_slot(timestamp: i64, frame_interval: i64) -> i64 {
 fn nearly_blank_bgra(bytes: &[u8]) -> bool {
     let mut sampled = 0usize;
     let mut dark = 0usize;
-    for pixel in bytes.chunks_exact(4).step_by(16) {
+    for pixel in bytes.as_chunks::<4>().0.iter().step_by(16) {
         sampled += 1;
         if pixel[0] <= 4 && pixel[1] <= 4 && pixel[2] <= 4 {
             dark += 1;
@@ -132,7 +132,7 @@ fn letterbox_bgra(source: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> 
     let ox = (dw - rw) / 2;
     let oy = (dh - rh) / 2;
     let mut out = vec![0u8; (dw * dh * 4) as usize];
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0.iter_mut() {
         pixel[3] = 255;
     }
     for y in 0..rh {
@@ -1675,7 +1675,7 @@ mod tests {
     #[test]
     fn resized_windows_are_letterboxed_without_distortion() {
         let mut source = vec![0u8; 4 * 2 * 4];
-        for pixel in source.chunks_exact_mut(4) {
+        for pixel in source.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[0, 0, 255, 255]);
         }
         let output = letterbox_bgra(&source, 4, 2, 4, 4);
@@ -1687,7 +1687,7 @@ mod tests {
     #[test]
     fn blank_window_detection_ignores_normal_dark_content() {
         let mut blank = vec![0u8; 32 * 4];
-        for pixel in blank.chunks_exact_mut(4) {
+        for pixel in blank.as_chunks_mut::<4>().0.iter_mut() {
             pixel[3] = 255;
         }
         assert!(nearly_blank_bgra(&blank));

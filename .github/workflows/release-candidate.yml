@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 jobs:
-  # Build, test and sign on the free self-hosted runner. Only the desktop
-  # probes in the job below need a real GitHub-hosted VM, so everything that
-  # doesn't is kept off billed minutes.
+  # Build, test and sign. The desktop probes are split into the job below so
+  # they run against the signed artifact this one uploads, rather than against
+  # its working copy.
   build:
     name: Build and sign private candidate
-    runs-on: [self-hosted, windows, matteshot]
+    runs-on: windows-latest
     environment: release
     timeout-minutes: 30
     permissions:
@@ -72,10 +72,11 @@ jobs:
         shell: pwsh
         run: .\scripts\verify-code.ps1
 
-      # GitHub-hosted images ship the Azure CLI preinstalled; this self-hosted
-      # one does not. The runner service's own process PATH predates any
-      # install, so a fresh choco install is invisible to later steps unless
-      # its directory is added to GITHUB_PATH explicitly.
+      # A no-op on the hosted image, which ships the Azure CLI, and kept as
+      # the guard for one that does not: the install is skipped when `az` is
+      # already on PATH. When it does run, the directory has to be added to
+      # GITHUB_PATH explicitly, because a fresh choco install is invisible to
+      # later steps otherwise.
       - name: Install Azure CLI
         shell: pwsh
         run: |
@@ -177,8 +178,8 @@ jobs:
           "$hash  MatteshotSetup-${{ steps.package.outputs.version }}.exe" |
             Set-Content -Encoding ascii -NoNewline 'installer\Output\MatteshotSetup.exe.sha256'
 
-      # Handed to the probe job below, which needs a real GitHub-hosted desktop
-      # session the self-hosted runner cannot provide.
+      # Handed to the probe job below, which runs the desktop probes against
+      # this signed artifact rather than against the working copy.
       - name: Upload unverified candidate for probing
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -190,11 +191,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # A real interactive desktop session is the one thing a Windows *service*
-  # (what the self-hosted runner is) fundamentally cannot provide, no matter
-  # which account it runs as — Session 0 has no desktop to record. This job
-  # exists only for the two steps that need one, so billed time here is a
-  # couple of minutes rather than the ~10 the whole candidate used to take.
+  # The two steps here need a real interactive desktop session to record
+  # from, and they run against the signed artifact the build job uploaded, so
+  # what is probed is what would ship. Keeping them in their own job also
+  # keeps the desktop requirement explicit rather than implicit in whichever
+  # runner the build happens to land on.
   probe:
     name: Probe the signed candidate
     needs: build

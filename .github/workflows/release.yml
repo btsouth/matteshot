@@ -9,13 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  # Build and sign on the self-hosted runner, but do not publish yet: the
-  # strict probe suite needs a GitHub-hosted desktop session (the probe job
-  # below), and nothing may reach R2 until the exact artifact has passed the
-  # same signer-identity gate every installed client enforces.
+  # Build and sign first, but do not publish yet: nothing may reach R2 until
+  # the exact artifact has passed the same signer-identity gate every
+  # installed client enforces, which the probe job below applies to the
+  # tagged build rather than to a local copy of it.
   build:
     name: Build and sign
-    runs-on: [self-hosted, windows, matteshot]
+    runs-on: windows-latest
     environment: release
     timeout-minutes: 30
     permissions:
@@ -68,10 +68,11 @@ jobs:
         shell: pwsh
         run: .\scripts\verify-code.ps1
 
-      # GitHub-hosted images ship the Azure CLI preinstalled; this self-hosted
-      # one does not. The runner service's own process PATH predates any
-      # install, so a fresh choco install is invisible to later steps unless
-      # its directory is added to GITHUB_PATH explicitly.
+      # A no-op on the hosted image, which ships the Azure CLI, and kept as
+      # the guard for one that does not: the install is skipped when `az` is
+      # already on PATH. When it does run, the directory has to be added to
+      # GITHUB_PATH explicitly, because a fresh choco install is invisible to
+      # later steps otherwise.
       - name: Install Azure CLI
         shell: pwsh
         run: |
@@ -187,10 +188,11 @@ jobs:
 
   # The strict probe suite includes the updater's own --verify-signature-test
   # gate (accept ours, reject tampered, reject foreign), run against the exact
-  # tagged artifact. It needs a GitHub-hosted desktop session: the self-hosted
-  # runner is a Session 0 service with no desktop for --record-test to encode
-  # from. Releases are rare enough that the couple of billed minutes is cheap
-  # against publishing an installer every installed client would reject.
+  # tagged artifact rather than against the build job's own copy of it. It
+  # also needs a real desktop session for --record-test to encode from, which
+  # is why it cannot fold back into a runner without one. Publishing an
+  # installer every installed client would reject is the failure this buys
+  # against.
   probe:
     name: Probe the tagged release
     needs: build
@@ -254,7 +256,7 @@ jobs:
   publish:
     name: Publish
     needs: [build, probe]
-    runs-on: [self-hosted, windows, matteshot]
+    runs-on: windows-latest
     environment: release
     timeout-minutes: 30
     permissions:

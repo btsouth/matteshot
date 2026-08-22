@@ -54,7 +54,7 @@ unsafe fn context_menu(hwnd: HWND) {
         1 => {
             if let Some(state) = state_of(hwnd) {
                 let mut rgba = Vec::with_capacity(state.bgra.len());
-                for px in state.bgra.chunks_exact(4) {
+                for px in state.bgra.as_chunks::<4>().0.iter() {
                     rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
                 }
                 if let Some(img) =
