@@ -1,11 +1,14 @@
 name: CI
 
-# Pull requests only. main is protected and squash-merged from a branch that
-# had to be up to date, so the tree main lands on is the tree this workflow
-# already passed on the PR. Re-running it after the merge bought a second
-# answer to the same question, and on a private repo that answer is billed at
-# the Windows rate.
+# Both triggers, deliberately. Dropping the main run looked like a saving and
+# was the opposite: Actions caches restore from the current branch or the
+# default branch, so with nothing ever running on main there is no shared
+# cache and every pull request starts cold. Two warm runs cost less than one
+# cold one.
 on:
+  push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -25,12 +28,12 @@ jobs:
     # The original reason for this gate is gone: runners are hosted and
     # ephemeral now, so PR code no longer executes on the machine that signs
     # releases. What it still does is keep a branch nobody vetted from
-    # spending billed minutes, which is why it stays. The push arm went with
-    # the push trigger.
+    # spending billed minutes, which is why it stays.
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login == github.repository_owner &&
-      github.actor == github.repository_owner
+      (github.event_name == 'push' && github.actor == github.repository_owner) ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login == github.repository_owner &&
+       github.actor == github.repository_owner)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -43,6 +46,31 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # `cargo install cargo-audit --locked` builds the auditor from source,
+      # which measured at 12.5 of this job's 19.3 minutes - two thirds of the
+      # run, for a binary that only changes when the pin does. rust-cache
+      # covers target/ and the registry, not ~/.cargo/bin, so it needs its own
+      # entry. The key is read out of the pin itself rather than written here,
+      # so bumping the pin invalidates the cache instead of serving the old
+      # binary to a check whose whole job is refusing the wrong version.
+      - name: Read the pinned cargo-audit version
+        id: audit-pin
+        shell: pwsh
+        run: |
+          $pin = [regex]::Match(
+            (Get-Content -Raw scripts/audit-rust.ps1),
+            "(?ms)function Get-CargoAuditPin\s*\{.*?return\s*'([^']+)'"
+          ).Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($pin)) {
+            throw 'could not read the cargo-audit pin from scripts/audit-rust.ps1'
+          }
+          "version=$pin" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-audit.exe
+          key: cargo-audit-${{ runner.os }}-${{ steps.audit-pin.outputs.version }}
 
       - name: Check workflow dependency pins
         shell: pwsh
