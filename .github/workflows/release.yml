@@ -258,7 +258,9 @@ jobs:
     needs: [build, probe]
     runs-on: windows-latest
     environment: release
-    timeout-minutes: 30
+    # An upload and a release edit. The old 30 was loose enough that a hang
+    # cost half an hour of billed Windows time before it was noticed.
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
