@@ -16,7 +16,7 @@ concurrency:
 jobs:
   validate:
     name: Test, lint and build
-    runs-on: [self-hosted, windows, matteshot]
+    runs-on: windows-latest
     # Self-hosted runners execute PR code on this host, not an ephemeral one,
     # and the same machine later runs the signing workflows. Nobody but the
     # owner may schedule it — on pushes too, or the push arm is a fail-open
