@@ -1,5 +1,8 @@
 //! Silent background update checks against matteshot.app/version.json.
 //!
+//! version.json is discovery only. A candidate is offered only after its
+//! `{download}.release.json` verifies (SBS-747).
+//!
 //! Network work stays off the UI thread. When a newer version is found, the
 //! worker posts an owned `AvailableUpdate` to the tray window, which takes
 //! ownership on the main thread.
@@ -256,7 +259,15 @@ pub fn check_once() -> Result<Option<AvailableUpdate>> {
             ));
         }
     }
-    Ok(update)
+    let Some(update) = update else {
+        return Ok(None);
+    };
+    // Discovery is unsigned version.json. Authorization is the signed
+    // record next to the installer (SBS-747). Do not advertise a download
+    // we will refuse to install.
+    let record = crate::installer::verify_published_release(&update.download_url)?;
+    crate::release_manifest::bind_download(&record, &update.download_url, Some(&update.version))?;
+    Ok(Some(update))
 }
 
 static AVAILABLE_UPDATES: crate::completion::CompletionMailbox<AvailableUpdate> =
@@ -426,7 +437,9 @@ mod tests {
             }
         )));
         assert!(!crate::config::auto_update_from_load::<&str>(Err("locked")));
-        assert!(!crate::config::auto_update_from_load::<&str>(Err("truncated")));
+        assert!(!crate::config::auto_update_from_load::<&str>(Err(
+            "truncated"
+        )));
     }
 
     #[test]
@@ -533,7 +546,10 @@ mod tests {
     /// update check down with it.
     #[test]
     fn a_non_https_url_is_never_offered() {
-        for bad in ["file:///tmp/setup.exe", "http://download.matteshot.app/x.exe"] {
+        for bad in [
+            "file:///tmp/setup.exe",
+            "http://download.matteshot.app/x.exe",
+        ] {
             assert!(
                 available_from(&manifest("1.0.0", bad), "0.9.1", None)
                     .unwrap()
@@ -610,9 +626,11 @@ mod tests {
     /// falling back to the newest one.
     #[test]
     fn a_term_older_than_every_build_offers_nothing() {
-        assert!(available_from(&history(), "1.0.0", Some("2026-01-01T00:00:00Z"))
-            .unwrap()
-            .is_none());
+        assert!(
+            available_from(&history(), "1.0.0", Some("2026-01-01T00:00:00Z"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A build put out during the last day of a term belongs to that term.
@@ -631,9 +649,13 @@ mod tests {
     /// Our own mistake must never withhold an update someone paid for.
     #[test]
     fn a_manifest_without_dates_is_not_treated_as_expired() {
-        let update = available_from(&manifest("1.0.0", SETUP), "0.9.1", Some("2020-01-01T00:00:00Z"))
-            .unwrap()
-            .unwrap();
+        let update = available_from(
+            &manifest("1.0.0", SETUP),
+            "0.9.1",
+            Some("2020-01-01T00:00:00Z"),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(update.version, "1.0.0");
         for unusable in [None, Some("not a date"), Some("")] {
             assert!(

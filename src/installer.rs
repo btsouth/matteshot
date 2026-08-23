@@ -1,9 +1,11 @@
 //! Silent self-update: fetch the signed installer, prove it is ours, run it
 //! without a single visible window.
 //!
-//! Nothing here trusts the network. A download is only ever executed after it
-//! matches the published SHA-256 *and* carries a valid Authenticode signature
-//! whose subject is our own certificate. Those same checks run again
+//! Nothing here trusts the network. A download is only ever executed after an
+//! Ed25519-signed release record (version, immutable URL, length, SHA-256)
+//! verifies against an embedded key (SBS-747) *and* the bytes carry a valid
+//! Authenticode signature whose subject is our own certificate. A same-origin
+//! `.sha256` sidecar is not authorization. Those same checks run again
 //! immediately before `CreateProcessW`, because the staged file sits unlocked
 //! in %TEMP% until apply's idle wait or a tray "install now" click (SBS-911).
 //! Any failure leaves the app exactly where it was and falls back to the
@@ -149,7 +151,7 @@ fn read_chunk(request: &InternetHandle, buffer: &mut [u8]) -> Result<usize> {
     Ok(read as usize)
 }
 
-/// Small HTTPS GET into a string, for the published checksum file.
+/// Small HTTPS GET into a string, for the signed release record.
 fn get_text(url: &str) -> Result<String> {
     let (host, path) = split_https(url)?;
     let (_session, _connection, request) = begin_get(&host, &path)?;
@@ -161,11 +163,11 @@ fn get_text(url: &str) -> Result<String> {
             break;
         }
         if body.len() + read > MAX_TEXT_BYTES {
-            bail!("checksum response is too large");
+            bail!("text response is too large");
         }
         body.extend_from_slice(&chunk[..read]);
     }
-    String::from_utf8(body).context("checksum response is not UTF-8")
+    String::from_utf8(body).context("text response is not UTF-8")
 }
 
 /// Stream an HTTPS GET to disk, reporting percent when the length is known.
@@ -253,17 +255,17 @@ fn expected_hash(body: &str) -> Result<String> {
 /// trusts signed this, so the certificate subject is pinned as well.
 pub fn verify_signature(path: &Path) -> Result<()> {
     use windows::Win32::Security::Cryptography::{
-        CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext,
-        CertGetNameStringW, CryptMsgClose, CryptMsgGetParam, CryptQueryObject,
-        CERT_FIND_SUBJECT_CERT, CERT_INFO, CERT_NAME_SIMPLE_DISPLAY_TYPE,
-        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED, CERT_QUERY_ENCODING_TYPE,
-        CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE, CMSG_SIGNER_INFO,
-        CMSG_SIGNER_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext, CertGetNameStringW,
+        CryptMsgClose, CryptMsgGetParam, CryptQueryObject, CERT_FIND_SUBJECT_CERT, CERT_INFO,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_ENCODING_TYPE, CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE,
+        CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING,
+        X509_ASN_ENCODING,
     };
     use windows::Win32::Security::WinTrust::{
-        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA,
-        WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_WHOLECHAIN,
-        WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+        WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE,
+        WTD_STATEACTION_VERIFY, WTD_UI_NONE,
     };
 
     let wide = HSTRING::from(path.as_os_str());
@@ -279,7 +281,9 @@ pub fn verify_signature(path: &Path) -> Result<()> {
             dwUIChoice: WTD_UI_NONE,
             fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
             dwUnionChoice: WTD_CHOICE_FILE,
-            Anonymous: WINTRUST_DATA_0 { pFile: &mut file_info },
+            Anonymous: WINTRUST_DATA_0 {
+                pFile: &mut file_info,
+            },
             dwStateAction: WTD_STATEACTION_VERIFY,
             ..Default::default()
         };
@@ -405,15 +409,46 @@ fn hash_sidecar_path(installer: &Path) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
-fn write_staged_hash(installer: &Path, hash: &str) -> Result<()> {
-    let dest = hash_sidecar_path(installer);
+fn release_sidecar_path(installer: &Path) -> PathBuf {
+    let mut sidecar = installer.as_os_str().to_os_string();
+    sidecar.push(".release.json");
+    PathBuf::from(sidecar)
+}
+
+fn write_atomic_sidecar(dest: &Path, body: &str) -> Result<()> {
     let mut partial = dest.as_os_str().to_os_string();
     partial.push(".partial");
     let partial = PathBuf::from(partial);
-    std::fs::write(&partial, format!("{hash}\n")).context("write staged hash")?;
-    let _ = std::fs::remove_file(&dest);
-    std::fs::rename(&partial, &dest).context("stage verified hash")?;
+    std::fs::write(&partial, body).context("write staged sidecar")?;
+    let _ = std::fs::remove_file(dest);
+    std::fs::rename(&partial, dest).context("stage sidecar")?;
     Ok(())
+}
+
+fn write_staged_hash(installer: &Path, hash: &str) -> Result<()> {
+    write_atomic_sidecar(&hash_sidecar_path(installer), &format!("{hash}\n"))
+        .context("stage verified hash")
+}
+
+fn write_staged_release(installer: &Path, body: &str) -> Result<()> {
+    write_atomic_sidecar(&release_sidecar_path(installer), body)
+        .context("stage signed release record")
+}
+
+fn read_staged_release(installer: &Path) -> Result<String> {
+    let dest = release_sidecar_path(installer);
+    match std::fs::read_to_string(&dest) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("signed release record is missing");
+        }
+        Err(error) => Err(error).context("signed release record could not be read"),
+        Ok(body) => {
+            if body.trim().is_empty() {
+                bail!("signed release record is unreadable");
+            }
+            Ok(body)
+        }
+    }
 }
 
 fn read_staged_hash(installer: &Path) -> Result<String> {
@@ -430,69 +465,105 @@ fn read_staged_hash(installer: &Path) -> Result<String> {
 fn discard_tampered_stage(path: &Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(hash_sidecar_path(path));
+    let _ = std::fs::remove_file(release_sidecar_path(path));
 }
 
-/// File plus hash sidecar. The menu must not promise "install now" for a
-/// leftover installer we can no longer re-check.
+/// File plus signed release sidecar. The menu must not promise "install now"
+/// for a leftover installer we can no longer re-check. A hash sidecar alone
+/// is not authorization (SBS-747).
 pub fn is_ready_to_launch(path: &Path) -> bool {
-    path.is_file() && hash_sidecar_path(path).is_file()
+    path.is_file() && release_sidecar_path(path).is_file()
 }
 
 /// Re-prove the staged installer is still the one we verified.
 ///
-/// `stage` checks hash + Authenticode, then the file sits in shared %TEMP%
-/// until apply's idle wait (up to 24h) or a tray "install now" click.
-/// Existence is not proof it is still ours (SBS-911).
+/// `stage` checks the signed release record + Authenticode, then the file
+/// sits in shared %TEMP% until apply's idle wait (up to 24h) or a tray
+/// "install now" click. Existence, or a hash sidecar we ourselves wrote,
+/// is not proof it is still ours (SBS-911, SBS-747).
 pub fn verify_still_ours(path: &Path) -> Result<()> {
     if !path.is_file() {
         bail!("staged installer is missing");
     }
-    let expected = match read_staged_hash(path) {
-        Ok(hash) => hash,
+    let body = match read_staged_release(path) {
+        Ok(body) => body,
         Err(error) => {
-            // Without a sidecar we cannot prove the bytes are still ours.
+            discard_tampered_stage(path);
+            return Err(error);
+        }
+    };
+    let record = match crate::release_manifest::verify_signed_release(&body) {
+        Ok(record) => record,
+        Err(error) => {
             discard_tampered_stage(path);
             return Err(error);
         }
     };
     let actual = sha256_of(path)?;
-    if actual != expected {
+    let length = std::fs::metadata(path)
+        .context("staged installer metadata could not be read")?
+        .len();
+    if let Err(error) = record.require_bytes(&actual, length) {
         discard_tampered_stage(path);
-        bail!("staged installer hash {actual} does not match staged {expected}");
+        return Err(error);
     }
-    // Hash match means the bytes are still what we staged. Authenticode or
-    // revocation can fail transiently (OCSP/network); keep the pair so a
-    // later retry can still install.
+    // A leftover hash sidecar is not authorization. If one is present it
+    // must agree with the signed digest; a rewrite in TEMP is tamper.
+    if let Ok(sidecar) = read_staged_hash(path) {
+        if sidecar != actual {
+            discard_tampered_stage(path);
+            bail!("staged installer hash {actual} does not match staged {sidecar}");
+        }
+    }
+    // Bytes still match the signed record. Authenticode or revocation can
+    // fail transiently (OCSP/network); keep the pair so a later retry can
+    // still install.
     verify_signature(path)
 }
 
-/// Drop only an in-progress download. Dest and its hash sidecar stay so a
+/// Drop only an in-progress download. Dest and its sidecars stay so a
 /// failed re-download leaves a previously verified pair launchable.
 fn drop_in_progress_partial(dest: &Path) {
     let _ = std::fs::remove_file(dest.with_extension("exe.partial"));
 }
 
+/// Fetch and verify `{url}.release.json` against the embedded release key.
+pub fn verify_published_release(url: &str) -> Result<crate::release_manifest::SignedRelease> {
+    let body = get_text(&crate::release_manifest::release_manifest_url(url))?;
+    crate::release_manifest::verify_signed_release(&body)
+}
+
 /// Download the installer, prove it is ours, and leave it staged on disk
-/// with the verified hash beside it. Returns the verified path. Never
-/// executes anything.
+/// with the signed release record beside it. Returns the verified path.
+/// Never executes anything. A same-origin `.sha256` sidecar is not read
+/// and cannot authorize the bytes (SBS-747).
 pub fn stage(url: &str, version: &str, progress: impl FnMut(u32)) -> Result<PathBuf> {
     let dest = staged_path(version);
     let partial = dest.with_extension("exe.partial");
     drop_in_progress_partial(&dest);
 
+    // Authorize before the multi-megabyte download. A CDN that serves an
+    // installer without a valid record must not cost the user that transfer.
+    let body = get_text(&crate::release_manifest::release_manifest_url(url))?;
+    let record = crate::release_manifest::verify_signed_release(&body)?;
+    let claimed = if version == "probe" {
+        None
+    } else {
+        Some(version)
+    };
+    crate::release_manifest::bind_download(&record, url, claimed)?;
+
     download(url, &partial, progress)?;
 
-    let hash = (|| -> Result<String> {
-        let published = expected_hash(&get_text(&format!("{url}.sha256"))?)?;
+    let hash = match (|| -> Result<String> {
         let actual = sha256_of(&partial)?;
-        if actual != published {
-            bail!("installer hash {actual} does not match published {published}");
-        }
+        let length = std::fs::metadata(&partial)
+            .context("downloaded installer metadata could not be read")?
+            .len();
+        record.require_bytes(&actual, length)?;
         verify_signature(&partial)?;
         Ok(actual)
-    })();
-
-    let hash = match hash {
+    })() {
         Ok(hash) => hash,
         Err(error) => {
             let _ = std::fs::remove_file(&partial);
@@ -502,9 +573,12 @@ pub fn stage(url: &str, version: &str, progress: impl FnMut(u32)) -> Result<Path
 
     let _ = std::fs::remove_file(&dest);
     std::fs::rename(&partial, &dest).context("stage verified installer")?;
+    if let Err(error) = write_staged_release(&dest, &body) {
+        discard_tampered_stage(&dest);
+        return Err(error);
+    }
     if let Err(error) = write_staged_hash(&dest, &hash) {
-        let _ = std::fs::remove_file(&dest);
-        let _ = std::fs::remove_file(hash_sidecar_path(&dest));
+        discard_tampered_stage(&dest);
         return Err(error);
     }
     Ok(dest)
@@ -552,8 +626,9 @@ fn launch_plan(path: &Path) -> LaunchPlan {
 /// The installer stops the resident through `--quit`, replaces the binary, and
 /// relaunches it, so this call is the last thing this process usefully does.
 ///
-/// Hash + Authenticode are checked again here, not only at stage time. The
-/// staged file is unlocked in %TEMP% for up to a day (SBS-911).
+/// The signed release record + Authenticode are checked again here, not
+/// only at stage time. The staged file is unlocked in %TEMP% for up to a
+/// day (SBS-911, SBS-747).
 pub fn launch(path: &Path) -> Result<()> {
     verify_still_ours(path)?;
     let plan = launch_plan(path);
@@ -595,7 +670,10 @@ mod tests {
     fn only_plain_https_urls_are_accepted() {
         assert_eq!(
             split_https("https://download.matteshot.app/MatteshotSetup.exe").unwrap(),
-            ("download.matteshot.app".into(), "/MatteshotSetup.exe".into())
+            (
+                "download.matteshot.app".into(),
+                "/MatteshotSetup.exe".into()
+            )
         );
         assert_eq!(
             split_https("https://matteshot.app").unwrap(),
@@ -610,7 +688,8 @@ mod tests {
 
     #[test]
     fn published_checksum_files_parse_and_bad_ones_do_not() {
-        let good = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  MatteshotSetup.exe";
+        let good =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  MatteshotSetup.exe";
         assert_eq!(
             expected_hash(good).unwrap(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -709,6 +788,36 @@ mod tests {
     fn cleanup_staged(path: &Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(hash_sidecar_path(path));
+        let _ = std::fs::remove_file(release_sidecar_path(path));
+    }
+
+    fn test_release_url(path: &Path) -> String {
+        format!(
+            "https://download.matteshot.app/{}",
+            path.file_name().unwrap().to_string_lossy()
+        )
+    }
+
+    fn write_test_release(path: &Path, bytes: &[u8]) -> String {
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(bytes);
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let body = crate::release_manifest::sign_release_json(
+            crate::release_manifest::TEST_RELEASE_KEY_ID,
+            &crate::release_manifest::TEST_RELEASE_KEY_SEED,
+            "0.21.0",
+            &test_release_url(path),
+            bytes.len() as u64,
+            &hash,
+        );
+        write_staged_release(path, &body).unwrap();
+        write_staged_hash(path, &hash).unwrap();
+        hash
     }
 
     /// Pins SBS-911: the sidecar lives next to the installer, not under a
@@ -726,22 +835,42 @@ mod tests {
         );
     }
 
-    /// Pins SBS-911: a leftover installer without its hash is not "ready".
+    /// Pins SBS-747: the signed record lives next to the installer.
     #[test]
-    fn is_ready_to_launch_requires_both_the_installer_and_its_hash() {
+    fn release_sidecar_sits_beside_the_installer() {
+        let path = Path::new(r"C:\Users\Tyler South\AppData\Local\Temp\MatteshotSetup-0.20.0.exe");
+        assert_eq!(
+            release_sidecar_path(path).file_name().unwrap(),
+            "MatteshotSetup-0.20.0.exe.release.json"
+        );
+        assert_eq!(
+            release_sidecar_path(path).parent().unwrap(),
+            path.parent().unwrap()
+        );
+    }
+
+    /// Pins SBS-747: a leftover installer with only a hash sidecar is not
+    /// "ready". The hash sidecar is not authorization.
+    #[test]
+    fn is_ready_to_launch_requires_the_signed_release_sidecar() {
         let path = sbs_911_temp("ready");
         cleanup_staged(&path);
         assert!(!is_ready_to_launch(&path));
         std::fs::write(&path, b"not-an-installer").unwrap();
         assert!(
             !is_ready_to_launch(&path),
-            "file without sidecar is not ready"
+            "file without release sidecar is not ready"
         );
         write_staged_hash(
             &path,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         )
         .unwrap();
+        assert!(
+            !is_ready_to_launch(&path),
+            "hash sidecar alone must not make Install now appear"
+        );
+        write_test_release(&path, b"not-an-installer");
         assert!(is_ready_to_launch(&path));
         cleanup_staged(&path);
     }
@@ -763,8 +892,33 @@ mod tests {
         cleanup_staged(&path);
     }
 
-    /// Pins SBS-911: launch must not CreateProcessW a file that is merely
-    /// present. The old gate was `is_file()` only.
+    /// Pins SBS-747: a hash sidecar we wrote is not authorization. Launch
+    /// must see a signed release record.
+    #[test]
+    fn launch_refuses_a_present_installer_with_only_a_hash_sidecar() {
+        let path = sbs_911_temp("hash-only");
+        cleanup_staged(&path);
+        std::fs::write(&path, b"not-an-installer").unwrap();
+        write_staged_hash(
+            &path,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        let error = launch(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("signed release record is missing"),
+            "must fail the signed-record re-check, not CreateProcessW: {error}"
+        );
+        assert!(
+            !error.contains("could not start the installer"),
+            "reached CreateProcessW without a signed-record re-check: {error}"
+        );
+        assert!(!path.is_file(), "unprovable installer must be discarded");
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-911 / SBS-747: launch must not CreateProcessW a file that
+    /// is merely present. The old gate was `is_file()` only.
     #[test]
     fn launch_refuses_a_present_installer_with_no_hash_sidecar() {
         let path = sbs_911_temp("no-sidecar");
@@ -772,33 +926,30 @@ mod tests {
         std::fs::write(&path, b"not-an-installer").unwrap();
         let error = launch(&path).unwrap_err().to_string();
         assert!(
-            error.contains("staged installer hash is missing"),
+            error.contains("signed release record is missing"),
             "must fail the re-check, not CreateProcessW: {error}"
         );
         assert!(
             !error.contains("could not start the installer"),
-            "reached CreateProcessW without a hash re-check: {error}"
+            "reached CreateProcessW without a signed-record re-check: {error}"
         );
         assert!(!path.is_file(), "unprovable installer must be discarded");
         cleanup_staged(&path);
     }
 
-    /// Pins SBS-911: bytes that no longer match the staged hash are
+    /// Pins SBS-747: bytes that no longer match the signed record are
     /// discarded and never launched.
     #[test]
     fn launch_refuses_a_present_installer_whose_hash_changed() {
         let path = sbs_911_temp("hash-changed");
         cleanup_staged(&path);
         std::fs::write(&path, b"not-an-installer").unwrap();
-        write_staged_hash(
-            &path,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .unwrap();
+        write_test_release(&path, b"the-bytes-we-signed");
+        std::fs::write(&path, b"not-an-installer").unwrap();
         let error = launch(&path).unwrap_err().to_string();
         assert!(
-            error.contains("does not match staged"),
-            "must fail the hash re-check, not CreateProcessW: {error}"
+            error.contains("does not match signed"),
+            "must fail the signed-hash re-check, not CreateProcessW: {error}"
         );
         assert!(
             !error.contains("could not start the installer"),
@@ -806,21 +957,20 @@ mod tests {
         );
         assert!(!path.is_file(), "tampered installer must be discarded");
         assert!(
-            !hash_sidecar_path(&path).is_file(),
-            "tampered hash sidecar must be discarded"
+            !release_sidecar_path(&path).is_file(),
+            "tampered release sidecar must be discarded"
         );
         cleanup_staged(&path);
     }
 
-    /// Pins SBS-911: a hash match is not enough. Authenticode + subject
-    /// must still pass on the bytes about to run.
+    /// Pins SBS-911: a signed-record match is not enough. Authenticode +
+    /// subject must still pass on the bytes about to run.
     #[test]
     fn launch_refuses_a_present_installer_that_fails_authenticode() {
         let path = sbs_911_temp("unsigned");
         cleanup_staged(&path);
         std::fs::write(&path, b"not-an-installer").unwrap();
-        let hash = sha256_of(&path).unwrap();
-        write_staged_hash(&path, &hash).unwrap();
+        write_test_release(&path, b"not-an-installer");
         let error = launch(&path).unwrap_err().to_string();
         assert!(
             error.contains("signature") || error.contains("signed"),
@@ -831,35 +981,54 @@ mod tests {
             "reached CreateProcessW without an Authenticode re-check: {error}"
         );
         assert!(
-            path.is_file() && hash_sidecar_path(&path).is_file(),
-            "hash-verified bytes stay staged when Authenticode is transiently unavailable"
+            !error.contains("does not match signed"),
+            "signed record matched; this must be the Authenticode gate: {error}"
+        );
+        assert!(
+            path.is_file() && release_sidecar_path(&path).is_file(),
+            "record-verified bytes stay staged when Authenticode is transiently unavailable"
         );
         cleanup_staged(&path);
     }
 
-    /// Pins SBS-911: a failed re-download must not drop the hash sidecar
+    /// Pins SBS-911: a failed re-download must not drop the signed record
     /// of a previously verified pair, or Install now disappears.
     #[test]
     fn a_failed_restage_leaves_a_verified_pair_launchable() {
         let path = sbs_911_temp("restage-keep");
         cleanup_staged(&path);
         std::fs::write(&path, b"previously-verified").unwrap();
-        write_staged_hash(
-            &path,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        )
-        .unwrap();
+        write_test_release(&path, b"previously-verified");
         assert!(is_ready_to_launch(&path));
         std::fs::write(path.with_extension("exe.partial"), b"in-progress").unwrap();
         drop_in_progress_partial(&path);
         assert!(
             is_ready_to_launch(&path),
-            "clearing the in-progress partial must not drop dest or its hash"
+            "clearing the in-progress partial must not drop dest or its signed record"
         );
         assert!(
             !path.with_extension("exe.partial").is_file(),
             "the leftover partial is what restage is allowed to drop"
         );
+        cleanup_staged(&path);
+    }
+
+    /// Pins SBS-747: missing vs garbage signed records stay distinct.
+    #[test]
+    fn read_staged_release_keeps_missing_and_unreadable_distinct() {
+        let path = sbs_911_temp("release-states");
+        cleanup_staged(&path);
+        let missing = read_staged_release(&path).unwrap_err().to_string();
+        assert!(
+            missing.contains("signed release record is missing"),
+            "{missing}"
+        );
+        assert!(!missing.contains("unreadable"), "{missing}");
+
+        std::fs::write(release_sidecar_path(&path), "   \n").unwrap();
+        let garbage = read_staged_release(&path).unwrap_err().to_string();
+        assert!(garbage.contains("unreadable"), "{garbage}");
+        assert!(!garbage.contains("missing"), "{garbage}");
         cleanup_staged(&path);
     }
 

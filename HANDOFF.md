@@ -32,7 +32,7 @@ Read `README.md` for the full feature map and architecture — it is accurate.
 | Downloads | R2 bucket `matteshot-downloads`, custom domain `download.matteshot.app` | upload: `npx wrangler r2 object put "matteshot-downloads/<name>" --file <f> --content-type application/octet-stream --remote` |
 | Code signing | Azure Trusted Signing, account `southforgesigning`, profile `conduit`, endpoint `https://eus.codesigning.azure.net/` | via GitHub Actions OIDC only (federated credential on Entra app `35f2e38f-8e1d-43a3-b4e2-c3b0be34b0e0`, tenant `b87fd204-c1aa-47fb-a84c-2e89f6ec5073`). Credential subject: `repo:tsouth89@258147599/matteshot@1317701781:environment:release`. |
 | Release CI | `.github/workflows/release.yml` | push tag `v*` → build → sign exe → Inno installer (version from tag) → sign installer → verify → GitHub release → R2 publish (skips itself until the `CLOUDFLARE_R2_API_TOKEN` secret exists — see TODO). Signing config lives in GitHub **environment `release`** variables (not repo vars). |
-| Version endpoint | https://matteshot.app/version.json | `{version, url, download, released, notes, releases[]}`. `releases` is the full served history, newest first; the app picks the newest entry it is entitled to. |
+| Version endpoint | https://matteshot.app/version.json | `{version, url, download, released, notes, releases[]}`. Discovery only. Authorization is `{download}.release.json`, an Ed25519-signed record binding version, URL, length, and SHA-256 (SBS-747). |
 
 ## Trial licensing (server-authoritative, done both sides)
 
@@ -105,17 +105,23 @@ src/telemetry.rs). No event ever carries an email or device name.
    `Get-AuthenticodeSignature` must be `Valid`, signer `CN=Brandon South`.
 4. R2 publishing is automatic — the `CLOUDFLARE_R2_API_TOKEN` secret exists in
    the `release` environment. CI uploads both `MatteshotSetup-X.Y.Z.exe` and
-   the stable `MatteshotSetup.exe`, then re-downloads the public URLs and fails
-   the release if an installer and its checksum disagree.
+   the stable `MatteshotSetup.exe`, the leftover `.sha256` sidecars, and the
+   Ed25519-signed `{name}.release.json` records. It re-downloads the public
+   URLs and fails the release if an installer and its checksum disagree.
+   `MATTESHOT_RELEASE_SIGNING_KEY` (standard-base64 32-byte seed, key id
+   `2026.1`) is required: new clients refuse an unsigned installer. Sign
+   offline with `scripts/sign-release-manifest.py`. To roll the key, append
+   the next public key in `src/release_manifest.rs`, ship that build, then
+   start signing with the new id.
 5. Update `public/version.json` in the site repo and deploy. Add the new build
    to the top of the `releases` array with its real `released` date, and set
    the matching top-level `version`/`download`/`released`. `check-site.mjs`
    gates all of it. **Never remove an entry, and never delete an installer from
    R2**: the update term is enforced by offering a lapsed license the newest
    build its year covered, which may be several versions back. **`download` must
-   point at the VERSIONED installer**: the stable name is mutable and can be
-   momentarily out of step with its checksum, which would fail every client's
-   hash gate. The custom domain can lag a Pages deploy by ~15s.
+   point at the VERSIONED installer**: the stable name is mutable and is not
+   the URL the signed record binds. The custom domain can lag a Pages deploy
+   by ~15s.
 
 **v0.14.10 is fully shipped**, as are 0.14.8 and 0.14.9 before it: each signed, uploaded to R2 (versioned + stable), GitHub release published, version.json bumped and deployed. Verified the same way every time: the published SHA-256 matches the GitHub asset digest, and the *installed* build is pointed at the live manifest and made to download and verify the new installer through the app's own trust gates (`--update-test` then `--update-stage-test`), which is the path a customer actually takes.
 
@@ -157,7 +163,7 @@ Note: releases are still created as GitHub drafts (`--draft` in release.yml); pu
 **Before taking real money**, the Lemon Squeezy store is still in test mode and `activation_status: "in_review"`. `LEMON_PRODUCT_ID` (1258447), `LEMON_VARIANT_ID` (1966803), and `LEMON_WEBHOOK_SECRET` in `license-worker/wrangler.toml` are all **test-mode** objects and will need re-pointing at the live equivalents once approval lands, or `validateProduct` rejects every real purchase. Tester keys minted in test mode will not survive the switch.
 
 **The app updates itself.** `installer.rs` downloads the signed installer,
-requires the published SHA-256 to match and Authenticode to be valid with the
+requires a valid Ed25519-signed release record and Authenticode to be valid with the
 subject `Brandon South`, writes that hash beside the staged file, and runs
 those same two checks again immediately before `CreateProcessW` (the file
 sits in `%TEMP%` until apply's idle wait or a tray install click). Then it

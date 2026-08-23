@@ -67,9 +67,9 @@ Matteshot updates itself, and you never see it happen. A daily silent check agai
 Nothing downloaded is trusted on the strength of where it came from:
 
 - HTTPS only, to a fixed host. Plaintext, embedded credentials, and alternate ports are rejected before a connection is opened.
-- The download must match the SHA-256 published beside it.
-- It must carry a valid Authenticode signature **and** the certificate subject must be ours. A validly signed binary from anyone else is refused, which is what stops a compromised mirror from shipping somebody else's real installer.
-- Immediately before that installer is executed — after it has sat in `%TEMP%` through an idle wait, or until you click **Install update now** — the same hash and Authenticode checks run again. A file that is merely still present is not enough.
+- An Ed25519-signed release record, verified against an embedded release public key, binds version, immutable URL, length, and SHA-256. A same-origin `.sha256` sidecar is not authorization: compromising the CDN and the checksum cannot approve an installer without the release key.
+- It must carry a valid Authenticode signature **and** the certificate subject must be ours. Authenticode is Windows reputation, not the authorization that binds the release.
+- Immediately before that installer is executed — after it has sat in `%TEMP%` through an idle wait, or until you click **Install update now** — the signed record and Authenticode checks run again. A file that is merely still present, or that still matches a hash sidecar we wrote, is not enough.
 
 Any failure leaves the running app untouched and the tray menu still offers the manual download. A failure that proves the bytes are wrong — a hash mismatch, or a missing hash to check against — also deletes the staged file. A signature check that fails on its own does not: revocation and timestamp checks need the network, so the verified file is kept and the download page is offered instead, and a later attempt can still install it. The installer is per-user, so nothing prompts for elevation, and it runs `/VERYSILENT` under `SW_HIDE` with no shell in the chain, so no console window ever appears. Work in progress is never interrupted: a recording, an export, or an open editor defers the restart until it is finished. **Install updates automatically** in Settings turns the whole thing off and goes back to notify-only.
 
@@ -100,7 +100,7 @@ matteshot --welcome          # preview first-run onboarding without changing con
 matteshot --ocr <substr>     # capture a window and print its OCR text
 matteshot --ocr-words <substr|png> # print every OCR word box in capture coordinates
 matteshot --update-test      # probe version.json; never downloads
-matteshot --update-stage-test [url] # download + verify hash and signature; never installs
+matteshot --update-stage-test [url] # download + verify signed release and Authenticode; never installs
 matteshot --verify-signature-test <exe> # Authenticode gate: accept ours, reject everything else
 matteshot --update-install-now [url] # the real thing: download, verify, install silently
 matteshot --settings         # open the settings window directly
