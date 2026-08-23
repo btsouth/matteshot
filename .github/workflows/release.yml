@@ -267,6 +267,89 @@ jobs:
           # gh release create authenticates through GH_TOKEN env, not git.
           persist-credentials: false
 
+      - name: Require Python 3 and OpenSSL 3
+        shell: pwsh
+        run: |
+          # Hosted windows-latest ships Git's OpenSSL 3 and the py launcher.
+          # The signer needs pkeyutl -rawin (OpenSSL 3 only). Probe that, and
+          # never invoke the WindowsApps python stub, which hangs.
+          $openssl = $null
+          foreach ($candidate in @(
+            "$env:ProgramFiles\Git\usr\bin\openssl.exe",
+            "${env:ProgramFiles(x86)}\Git\usr\bin\openssl.exe",
+            "$env:ProgramFiles\OpenSSL-Win64\bin\openssl.exe"
+          )) {
+            if (-not (Test-Path $candidate)) { continue }
+            $help = & $candidate pkeyutl -help 2>&1 | Out-String
+            if ($help -match '-rawin') {
+              $openssl = $candidate
+              break
+            }
+          }
+          if (-not $openssl) {
+            $onPath = Get-Command openssl -ErrorAction SilentlyContinue |
+              Where-Object { $_.Source -notmatch 'WindowsApps' } |
+              Select-Object -First 1
+            if ($onPath) {
+              $help = & $onPath.Source pkeyutl -help 2>&1 | Out-String
+              if ($help -match '-rawin') { $openssl = $onPath.Source }
+            }
+          }
+          if (-not $openssl) {
+            Write-Error "OpenSSL 3 with pkeyutl -rawin is required to sign a release record. Install Git for Windows so usr\bin\openssl.exe is present."
+            exit 1
+          }
+
+          function Resolve-PythonExe {
+            $py = Get-Command py -ErrorAction SilentlyContinue |
+              Where-Object { $_.Source -notmatch 'WindowsApps' } |
+              Select-Object -First 1
+            if ($py) {
+              $exe = & $py.Source -3 -c "import sys; print(sys.executable)" 2>$null
+              if ($LASTEXITCODE -eq 0 -and $exe) {
+                $exe = [string]$exe
+                if ($exe -match '[\r\n]') {
+                  $exe = ($exe -split '[\r\n]+' | Where-Object { $_ } | Select-Object -Last 1)
+                }
+                $exe = $exe.Trim()
+                if ($exe -and (Test-Path $exe) -and $exe -notmatch 'WindowsApps') {
+                  return $exe
+                }
+              }
+            }
+            foreach ($name in @('python3', 'python')) {
+              $cmd = Get-Command $name -ErrorAction SilentlyContinue |
+                Where-Object { $_.Source -notmatch 'WindowsApps' } |
+                Select-Object -First 1
+              if (-not $cmd) { continue }
+              & $cmd.Source -c "import sys; raise SystemExit(0 if sys.version_info -ge (3, 9) else 1)" 2>$null
+              if ($LASTEXITCODE -eq 0) { return $cmd.Source }
+            }
+            if ($env:RUNNER_TOOL_CACHE) {
+              $found = Get-ChildItem -Path (Join-Path $env:RUNNER_TOOL_CACHE 'Python') -Recurse -Filter python.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -notmatch 'WindowsApps' } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+              if ($found) { return $found.FullName }
+            }
+            return $null
+          }
+
+          $python = Resolve-PythonExe
+          if (-not $python) {
+            Write-Error "Python 3 is required to sign the release record. Hosted windows-latest should provide the py launcher; WindowsApps stubs are ignored."
+            exit 1
+          }
+
+          "OPENSSL_BIN=$openssl" >> $env:GITHUB_ENV
+          "PYTHON_EXE=$python" >> $env:GITHUB_ENV
+          Write-Host "OpenSSL: $openssl"
+          Write-Host "Python: $python"
+          & $openssl version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -c "import sys; print(sys.version)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Require release credentials
         shell: pwsh
         env:
@@ -333,20 +416,31 @@ jobs:
           $hash = '${{ needs.build.outputs.hash }}'
           $length = '${{ steps.checksums.outputs.length }}'
           $url = "https://download.matteshot.app/MatteshotSetup-$version.exe"
-          $python = Get-Command python3, python, py -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $python) {
-            Write-Error "python3 is required to sign the release record."
+          $python = $env:PYTHON_EXE
+          if (-not $python -or -not (Test-Path $python)) {
+            Write-Error "PYTHON_EXE was not resolved."
             exit 1
           }
           $versioned = Join-Path $env:RUNNER_TEMP "MatteshotSetup-$version.exe.release.json"
           $stable = Join-Path $env:RUNNER_TEMP "MatteshotSetup.exe.release.json"
-          & $python.Source scripts/sign-release-manifest.py `
+          & $python scripts/sign-release-manifest.py `
             --version $version `
             --url $url `
             --length $length `
             --sha256 $hash `
             --key-id 2026.1 `
             --output $versioned
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The signer already checked the seed against the embedded 2026.1
+          # public key. Verify the written file again so a swapped output
+          # cannot publish, and require the 64-byte signature length.
+          & $python scripts/sign-release-manifest.py `
+            --verify $versioned `
+            --expect-version $version `
+            --expect-url $url `
+            --expect-length $length `
+            --expect-sha256 $hash `
+            --expect-key-id 2026.1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # The stable installer is the same bytes. The signed URL stays the
           # immutable versioned name; clients that download the stable name
@@ -357,9 +451,23 @@ jobs:
             Write-Error "Signed release record does not bind this installer."
             exit 1
           }
+          if ([int64]$doc.length -ne [int64]$length) {
+            Write-Error "Signed release length $($doc.length) does not match installer $length."
+            exit 1
+          }
+          try {
+            $sig = [Convert]::FromBase64String([string]$doc.signature)
+          } catch {
+            Write-Error "Signed release signature is not standard base64."
+            exit 1
+          }
+          if ($sig.Length -ne 64) {
+            Write-Error "Signed release signature is $($sig.Length) bytes, expected 64."
+            exit 1
+          }
           "versioned=$versioned" >> $env:GITHUB_OUTPUT
           "stable=$stable" >> $env:GITHUB_OUTPUT
-          Write-Host "Signed release record for $url ($length bytes, $hash)"
+          Write-Host "Signed and verified release record for $url ($length bytes, $hash)"
 
       - name: Publish the installer to Cloudflare R2
         shell: pwsh
@@ -478,6 +586,30 @@ jobs:
             }
           }
           Write-Host "Versioned and stable public installers match SHA-256 $expected."
+
+          $manifest = Join-Path $env:RUNNER_TEMP "verify-MatteshotSetup-$v.exe.release.json"
+          Invoke-WebRequest `
+            -Uri "https://download.matteshot.app/MatteshotSetup-$v.exe.release.json?verify=$nonce" `
+            -Headers @{ "Cache-Control" = "no-cache"; Pragma = "no-cache" } `
+            -OutFile $manifest
+          $python = $env:PYTHON_EXE
+          if (-not $python -or -not (Test-Path $python)) {
+            Write-Error "PYTHON_EXE was not resolved."
+            exit 1
+          }
+          $publishedLength = (Get-Item $versioned).Length
+          & $python scripts/sign-release-manifest.py `
+            --verify $manifest `
+            --expect-version $v `
+            --expect-url "https://download.matteshot.app/MatteshotSetup-$v.exe" `
+            --expect-length $publishedLength `
+            --expect-sha256 $expected `
+            --expect-key-id 2026.1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Published release record did not verify against the embedded 2026.1 public key."
+            exit 1
+          }
+          Write-Host "Published MatteshotSetup-$v.exe.release.json verified against key 2026.1."
 
           # The checks above bypass the edge with a nonce, so they prove the
           # object landed but not what a user receives. Auto-update reads the

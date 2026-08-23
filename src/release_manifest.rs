@@ -31,25 +31,24 @@ pub struct ReleaseKey {
 
 /// Keys this build will accept. Tests inject a well-known test key so
 /// installer launch tests can sign without the production seed.
+#[cfg(not(test))]
 pub fn trusted_release_keys() -> &'static [ReleaseKey] {
-    #[cfg(test)]
-    {
-        static KEYS: &[ReleaseKey] = &[
-            ReleaseKey {
-                id: "test.1",
-                public_key_base64: "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
-            },
-            ReleaseKey {
-                id: "2026.1",
-                public_key_base64: "JludjKQ0arQ6IRN5dQqncMzc8IoLeFFXFoI8oDelfqo=",
-            },
-        ];
-        return KEYS;
-    }
-    #[cfg(not(test))]
-    {
-        PROD_RELEASE_KEYS
-    }
+    PROD_RELEASE_KEYS
+}
+
+#[cfg(test)]
+pub fn trusted_release_keys() -> &'static [ReleaseKey] {
+    static KEYS: &[ReleaseKey] = &[
+        ReleaseKey {
+            id: "test.1",
+            public_key_base64: "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+        },
+        ReleaseKey {
+            id: "2026.1",
+            public_key_base64: "JludjKQ0arQ6IRN5dQqncMzc8IoLeFFXFoI8oDelfqo=",
+        },
+    ];
+    KEYS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +569,194 @@ mod tests {
                 .iter()
                 .map(|k| k.id)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn is_windows_apps(path: &std::path::Path) -> bool {
+        path.components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+    }
+
+    fn where_all(name: &str) -> Vec<std::path::PathBuf> {
+        let output = std::process::Command::new("where.exe").arg(name).output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(std::path::PathBuf::from)
+            .filter(|path| !is_windows_apps(path))
+            .collect()
+    }
+
+    fn python_exe() -> std::path::PathBuf {
+        if let Some(from_env) = std::env::var_os("MATTESHOT_PYTHON") {
+            let path = std::path::PathBuf::from(from_env);
+            if path.is_file() && !is_windows_apps(&path) {
+                return path;
+            }
+        }
+
+        for py in where_all("py") {
+            let probe = std::process::Command::new(&py)
+                .args(["-3", "-c", "import sys; print(sys.executable)"])
+                .output();
+            if let Ok(out) = probe {
+                if out.status.success() {
+                    let exe = String::from_utf8_lossy(&out.stdout);
+                    let exe = exe
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .next_back()
+                        .unwrap_or("");
+                    let exe = std::path::PathBuf::from(exe);
+                    if exe.is_file() && !is_windows_apps(&exe) {
+                        return exe;
+                    }
+                }
+            }
+        }
+
+        for name in ["python3", "python"] {
+            if let Some(path) = where_all(name).into_iter().next() {
+                return path;
+            }
+        }
+
+        panic!(
+            "Python 3 is required for the openssl release-signer round-trip (SBS-747). \
+             Install Python 3 or set MATTESHOT_PYTHON. WindowsApps stubs are ignored."
+        );
+    }
+
+    fn signer_script() -> std::path::PathBuf {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("sign-release-manifest.py");
+        assert!(
+            script.is_file(),
+            "missing release signer {}",
+            script.display()
+        );
+        script
+    }
+
+    fn run_signer(
+        args: &[&str],
+        seed: &[u8; 32],
+        output: Option<&std::path::Path>,
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new(python_exe());
+        cmd.arg(signer_script()).args(args);
+        if let Some(path) = output {
+            cmd.arg("--output").arg(path);
+        }
+        cmd.env("MATTESHOT_RELEASE_SIGNING_KEY", STANDARD.encode(seed))
+            .output()
+            .unwrap_or_else(|error| panic!("failed to spawn sign-release-manifest.py: {error}"))
+    }
+
+    fn require_signer_tools(output: &std::process::Output, context: &str) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if combined.contains("pkeyutl -rawin") || combined.contains("OpenSSL 3") {
+            panic!("OpenSSL 3 with pkeyutl -rawin is required for {context}: {combined}");
+        }
+        if combined.to_ascii_lowercase().contains("python")
+            && combined.to_ascii_lowercase().contains("not found")
+        {
+            panic!("Python 3 is required for {context}: {combined}");
+        }
+    }
+
+    /// Pins SBS-747: CI signs with openssl; clients verify with dalek.
+    #[test]
+    fn openssl_python_signer_is_accepted_by_the_rust_verifier() {
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-openssl-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let output_path = dir.join("MatteshotSetup-0.21.0.exe.release.json");
+        let output = run_signer(
+            &[
+                "--version",
+                "0.21.0",
+                "--url",
+                URL,
+                "--length",
+                "10",
+                "--sha256",
+                HASH,
+                "--key-id",
+                TEST_RELEASE_KEY_ID,
+            ],
+            &TEST_RELEASE_KEY_SEED,
+            Some(&output_path),
+        );
+        require_signer_tools(&output, "the openssl release-signer round-trip");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "sign-release-manifest.py failed: status={} stdout={stdout} stderr={stderr}",
+            output.status
+        );
+        let body = std::fs::read_to_string(&output_path).unwrap_or_else(|error| {
+            panic!(
+                "signed record was not written to {}: {error}",
+                output_path.display()
+            );
+        });
+        let record = verify_signed_release(&body).expect("openssl signature must verify in Rust");
+        assert_eq!(record.key_id, TEST_RELEASE_KEY_ID);
+        assert_eq!(record.version, "0.21.0");
+        assert_eq!(record.url, URL);
+        assert_eq!(record.length, 10);
+        assert_eq!(record.sha256, HASH);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins SBS-747: a seed that is not the embedded 2026.1 key cannot sign.
+    #[test]
+    fn openssl_python_signer_rejects_a_seed_that_is_not_the_embedded_key() {
+        let output = run_signer(
+            &[
+                "--version",
+                "0.21.0",
+                "--url",
+                URL,
+                "--length",
+                "10",
+                "--sha256",
+                HASH,
+                "--key-id",
+                "2026.1",
+            ],
+            &TEST_RELEASE_KEY_SEED,
+            None,
+        );
+        require_signer_tools(&output, "the openssl release-signer wrong-seed check");
+        assert!(
+            !output.status.success(),
+            "a test seed must not produce a 2026.1 record: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("embedded") || stderr.contains("does not match"),
+            "{stderr}"
         );
     }
 }
