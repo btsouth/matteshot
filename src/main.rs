@@ -702,14 +702,14 @@ fn enable_capture_hotkeys() -> Result<bool> {
     ))
 }
 
-fn disable_capture_hotkeys(restore_windows_prtscn: bool) {
+fn disable_capture_hotkeys(_restore_windows_prtscn: bool) {
     unsafe {
         let _ = UnregisterHotKey(None, HOTKEY_ID);
     }
+    // release() puts HKCU back only if we flipped it. The old `true` path
+    // wrote PrintScreenKeyForSnippingEnabled=1 even when the LL hook never
+    // touched the value, which is SBS-1050.
     prtscn::release(HOTKEY_ID_PRTSCN);
-    if restore_windows_prtscn {
-        let _ = prtscn::set_snipping_binding(true);
-    }
 }
 
 /// Confirm and deactivate this machine's license. Lives here rather than in the
