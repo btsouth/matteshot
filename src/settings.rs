@@ -169,13 +169,22 @@ impl Layout {
     /// shares its line with a label.
     fn chips(&mut self, items: &[Ctrl], width: i32, stride: i32, indent: i32, height: i32) {
         let rect = self.band(height);
+        let start = self.margin + self.sc(indent);
+        let inner_right = self.width - self.margin;
+        let (chip_w, chip_stride) = fit_equal_row(
+            start,
+            inner_right,
+            items.len(),
+            self.sc(width),
+            self.sc(stride),
+        );
         for (i, ctrl) in items.iter().enumerate() {
-            let x = self.margin + self.sc(indent) + i as i32 * self.sc(stride);
+            let x = start + i as i32 * chip_stride;
             self.controls.push((
                 RECT {
                     left: x,
                     top: rect.top,
-                    right: x + self.sc(width),
+                    right: x + chip_w,
                     bottom: rect.bottom,
                 },
                 *ctrl,
@@ -216,13 +225,17 @@ impl Layout {
     /// Two side-by-side actions at the foot of the window.
     fn button_pair(&mut self, left: Ctrl, right: Ctrl, width: i32, stride: i32) {
         let rect = self.band(30);
+        let start = self.margin;
+        let inner_right = self.width - self.margin;
+        let (chip_w, chip_stride) =
+            fit_equal_row(start, inner_right, 2, self.sc(width), self.sc(stride));
         for (i, ctrl) in [left, right].into_iter().enumerate() {
-            let x = self.margin + i as i32 * self.sc(stride);
+            let x = start + i as i32 * chip_stride;
             self.controls.push((
                 RECT {
                     left: x,
                     top: rect.top,
-                    right: x + self.sc(width),
+                    right: x + chip_w,
                     bottom: rect.bottom,
                 },
                 ctrl,
@@ -234,6 +247,35 @@ impl Layout {
     fn finish(&self) -> i32 {
         self.y + self.sc(38)
     }
+}
+
+/// Chip width and stride so `n` equal controls starting at `start` end on
+/// or left of `inner_right`. Designed metrics are kept when they already fit;
+/// a clamped client shrinks width and stride together.
+fn fit_equal_row(start: i32, inner_right: i32, n: usize, chip_w: i32, stride: i32) -> (i32, i32) {
+    let n = n.max(1) as i32;
+    let available = (inner_right - start).max(1);
+    let mut chip_w = chip_w.max(1);
+    if n == 1 {
+        return (chip_w.min(available), 0);
+    }
+    let mut stride = stride.max(1);
+    let span = (n - 1) * stride + chip_w;
+    if span > available {
+        let q = available as f32 / span as f32;
+        chip_w = ((chip_w as f32) * q) as i32;
+        stride = ((stride as f32) * q) as i32;
+        chip_w = chip_w.max(1);
+        stride = stride.max(1);
+        if (n - 1) * stride >= available {
+            stride = ((available - 1) / (n - 1)).max(1);
+        }
+        let last = (n - 1) * stride + chip_w;
+        if last > available {
+            chip_w = (available - (n - 1) * stride).max(1);
+        }
+    }
+    (chip_w, stride)
 }
 
 /// Logical client width Settings is designed around, before DPI scale.
@@ -1924,9 +1966,10 @@ pub fn is_open() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_layout, chip_focus_ring_visible, control_is_reachable, fit_settings_window,
-        hit_test_control, key_activates_focus, layout_to_work, max_scroll, next_reachable,
-        reachable_index, scroll_rect_into_view, Ctrl, WorkRect, LOGICAL_WIDTH, MIN_VISIBLE_CLIENT,
+        build_layout, chip_focus_ring_visible, control_is_reachable, fit_equal_row,
+        fit_settings_window, hit_test_control, key_activates_focus, layout_to_work, max_scroll,
+        next_reachable, reachable_index, scroll_rect_into_view, Ctrl, WorkRect, LOGICAL_WIDTH,
+        MIN_VISIBLE_CLIENT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_SPACE};
 
@@ -2367,11 +2410,11 @@ mod tests {
     }
 
     /// 800px-wide work at 200% is narrower than the designed 1000px client.
-    /// Rebuilding at the clamped client keeps every reachable control inside
-    /// the window so hit-testing still finds it.
+    /// Rebuilding at the clamped client keeps every control fully inside
+    /// the window so hit-testing still finds it, including the right edge.
     #[test]
     fn a_narrow_work_area_keeps_controls_hit_testable() {
-        let license = trial();
+        let license = licensed_term();
         let scale = 2.0f32;
         let (nc_w, nc_h) = non_client(scale);
         let designed_cw = (LOGICAL_WIDTH as f32 * scale) as i32;
@@ -2388,17 +2431,60 @@ mod tests {
         assert!(fitted.client_w < designed_cw);
         assert_eq!(fitted.client_w, (fitted.outer_w - nc_w).max(1));
         for (i, (rect, ctrl)) in laid.controls.iter().enumerate() {
+            assert!(
+                rect.left >= 0 && rect.right <= fitted.client_w,
+                "{ctrl:?} {}-{} is outside client {}",
+                rect.left,
+                rect.right,
+                fitted.client_w
+            );
+            assert!(
+                rect.right > rect.left,
+                "{ctrl:?} must have a positive width"
+            );
             if !control_is_reachable(*ctrl, &license) {
                 continue;
             }
-            assert!(
-                rect.left >= 0 && rect.left < fitted.client_w,
-                "{ctrl:?} left {} is outside client {}",
-                rect.left,
-                fitted.client_w
+            let y = rect.top + 1;
+            assert_eq!(
+                hit_test_control(&laid.controls, &license, rect.left + 1, y, 0),
+                i as i32,
+                "{ctrl:?} left edge must remain hit-testable"
             );
-            let hit = hit_test_control(&laid.controls, &license, rect.left + 1, rect.top + 1, 0);
-            assert_eq!(hit, i as i32, "{ctrl:?} must remain hit-testable");
+            assert_eq!(
+                hit_test_control(&laid.controls, &license, rect.right - 1, y, 0),
+                i as i32,
+                "{ctrl:?} right edge must remain hit-testable"
+            );
         }
+    }
+
+    #[test]
+    fn designed_width_does_not_shrink_chip_rows() {
+        let laid = build_layout(1.0, LOGICAL_WIDTH, &licensed_term());
+        let custom = laid
+            .controls
+            .iter()
+            .find(|(_, c)| matches!(c, Ctrl::CustomSize))
+            .expect("screenshot-size row");
+        assert_eq!(custom.0.left, 24 + 3 * 110);
+        assert_eq!(custom.0.right, 24 + 3 * 110 + 102);
+        let deactivate = laid
+            .controls
+            .iter()
+            .find(|(_, c)| matches!(c, Ctrl::Deactivate))
+            .expect("footer pair");
+        assert_eq!(deactivate.0.left, 24 + 198);
+        assert_eq!(deactivate.0.right, 24 + 198 + 190);
+    }
+
+    #[test]
+    fn equal_row_shrinks_only_when_the_designed_span_overflows() {
+        assert_eq!(fit_equal_row(24, 476, 4, 102, 110), (102, 110));
+        let (w, stride) = fit_equal_row(48, 720, 4, 204, 220);
+        assert!(w < 204 && stride < 220);
+        assert!(48 + 3 * stride + w <= 720);
+        let (w1, stride1) = fit_equal_row(48, 720, 1, 380, 0);
+        assert_eq!((w1, stride1), (380, 0));
     }
 }
