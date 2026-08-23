@@ -2230,7 +2230,10 @@ mod tests {
             .expect("settings has reachable controls");
         let (idx, (rect, ctrl)) = last;
         assert!(
-            matches!(*ctrl, Ctrl::Diagnostics | Ctrl::Deactivate),
+            matches!(
+                *ctrl,
+                Ctrl::Diagnostics | Ctrl::Deactivate | Ctrl::ClearHistoryTitles
+            ),
             "bottom control should be a footer action, got {ctrl:?}"
         );
         assert!(
