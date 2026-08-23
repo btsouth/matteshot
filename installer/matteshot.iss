@@ -92,9 +92,13 @@ Filename: "{app}\matteshot.exe"; Flags: nowait runhidden; Check: WizardSilent
 Type: files; Name: "{userstartup}\Matteshot.lnk"
 
 [UninstallRun]
-; Stop through Matteshot's own cleanup path, then restore the Windows binding.
+; Stop through Matteshot's own cleanup path. --quit is enough: the resident
+; hands PrtScn back via release(), which restores the prior HKCU binding
+; (SBS-1050) or leaves it alone when we never wrote it. Do not follow with
+; --restore-printscreen: that flag force-writes
+; PrintScreenKeyForSnippingEnabled=1 in a new process and turns Snipping
+; on for anyone who had it off (SBS-1072). Explicit undo stays a CLI command.
 Filename: "{app}\matteshot.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "StopApp"
-Filename: "{app}\matteshot.exe"; Parameters: "--restore-printscreen"; Flags: runhidden waituntilterminated; RunOnceId: "RestorePrtScn"
 
 [Code]
 function StopResident: Boolean;

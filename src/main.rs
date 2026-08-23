@@ -786,6 +786,11 @@ fn run_app() -> Result<()> {
         return Ok(());
     };
     let result = run_resident();
+    // --quit posts WM_CLOSE and the loop returns Ok. release() must still
+    // run: it puts HKCU back only if we flipped it (SBS-1050). Uninstall
+    // used to follow --quit with --restore-printscreen, which wrote 1 in
+    // a new process and undid a prior-off (SBS-1072).
+    disable_capture_hotkeys(true);
     if let Err(error) = &result {
         // Reported here, not in main: the resident mutex is still held, so
         // nothing races into the slot while the dialog is up, and the tray
@@ -793,7 +798,6 @@ fn run_app() -> Result<()> {
         // out of run_resident, so the dialog's message pump has no freed
         // state to reach. Hand the capture hooks back first — "start
         // Matteshot again" has to be able to take them.
-        disable_capture_hotkeys(true);
         report_resident_failure(error, RESIDENT_READY.load(Ordering::Relaxed));
     }
     result
@@ -2047,6 +2051,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("--restore-printscreen") => {
+            // Explicit user undo: write 1. Must not run from uninstall after
+            // --quit — that is a new process with no prior, so this force-
+            // enables Snipping for anyone who had it off (SBS-1072).
             prtscn::set_snipping_binding(true)?;
             eprintln!("PrtScn re-bound to Snipping Tool.");
             Ok(())
