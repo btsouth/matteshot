@@ -97,29 +97,38 @@ Filename: "{app}\matteshot.exe"; Parameters: "--quit"; Flags: runhidden waitunti
 Filename: "{app}\matteshot.exe"; Parameters: "--restore-printscreen"; Flags: runhidden waituntilterminated; RunOnceId: "RestorePrtScn"
 
 [Code]
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function StopResident: Boolean;
 var
   R: Integer;
 begin
   // Never force-kill an active recording or export. Matteshot closes its UI
   // surfaces, waits for their cleanup paths, then exits the resident loop.
-  if FileExists(ExpandConstant('{app}\matteshot.exe')) then begin
-    if not Exec(ExpandConstant('{app}\matteshot.exe'), '--quit', '', SW_HIDE,
-      ewWaitUntilTerminated, R) then begin
-      Result := 'Matteshot could not be closed. Close it from the tray and try again.';
-      exit;
-    end;
-    if R <> 0 then
-      // Older Matteshot builds do not know --quit. Ask Windows to close them
-      // without /f; CloseApplications remains the final file-lock safeguard.
-      // The Windows system directory, never an unqualified name: a decoy
-      // taskkill.exe beside the installer must not run (SBS-764). Setup has
-      // no ArchitecturesInstallIn64BitMode, so {sys} is SysWOW64 on 64-bit
-      // Windows; that ships its own taskkill.exe and is just as
-      // system-protected, so the guarantee holds either way. Routing through
-      // cmd would flash a console during an otherwise invisible update.
-      Exec(ExpandConstant('{sys}\taskkill.exe'), '/im matteshot.exe', '', SW_HIDE,
-        ewWaitUntilTerminated, R);
+  Result := True;
+  if not FileExists(ExpandConstant('{app}\matteshot.exe')) then
+    Exit;
+  if not Exec(ExpandConstant('{app}\matteshot.exe'), '--quit', '', SW_HIDE,
+    ewWaitUntilTerminated, R) then begin
+    Result := False;
+    Exit;
+  end;
+  if R <> 0 then
+    // Older Matteshot builds do not know --quit. Ask Windows to close them
+    // without /f; CloseApplications remains the final file-lock safeguard.
+    // The Windows system directory, never an unqualified name: a decoy
+    // taskkill.exe beside the installer must not run (SBS-764). Setup has
+    // no ArchitecturesInstallIn64BitMode, so {sys} is SysWOW64 on 64-bit
+    // Windows; that ships its own taskkill.exe and is just as
+    // system-protected, so the guarantee holds either way. Routing through
+    // cmd would flash a console during an otherwise invisible update.
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/im matteshot.exe', '', SW_HIDE,
+      ewWaitUntilTerminated, R);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  if not StopResident then begin
+    Result := 'Matteshot could not be closed. Close it from the tray and try again.';
+    exit;
   end;
   Result := '';
 end;
@@ -172,18 +181,23 @@ begin
   // Offer only. Captures live in the save/video folders and stay there
   // unless the user already deleted them. Silent / unattended uninstall
   // leaves the metadata in place so winget does not delete titles without
-  // a human Yes. SBS-765.
-  if (CurUninstallStep = usUninstall) and HistoryMetadataPresent then
+  // a human Yes. Quit first: usUninstall runs before [UninstallRun] --quit,
+  // and a live record() after Yes would recreate history.json. SBS-765.
+  if CurUninstallStep = usUninstall then
   begin
-    if SuppressibleMsgBox(
-      'Remove Matteshot History metadata?'#13#10#13#10
-      + 'This deletes stored window titles from AppData. Screenshot and video files stay on disk.',
-      mbConfirmation, MB_YESNO, IDNO) = IDYES then
+    StopResident;
+    if HistoryMetadataPresent then
     begin
-      if not DeleteHistoryMetadata then
-        SuppressibleMsgBox(
-          'Matteshot could not remove History metadata. You can delete history.json from AppData\Roaming\matteshot yourself.',
-          mbError, MB_OK, IDOK);
+      if SuppressibleMsgBox(
+        'Remove Matteshot History metadata?'#13#10#13#10
+        + 'This deletes stored window titles from AppData. Screenshot and video files stay on disk.',
+        mbConfirmation, MB_YESNO, IDNO) = IDYES then
+      begin
+        if not DeleteHistoryMetadata then
+          SuppressibleMsgBox(
+            'Matteshot could not remove History metadata. You can delete history.json from AppData\Roaming\matteshot yourself.',
+            mbError, MB_OK, IDOK);
+      end;
     end;
   end;
 end;
