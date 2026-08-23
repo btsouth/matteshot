@@ -4785,29 +4785,42 @@ mod tests {
     #[test]
     fn tweak_share_refuses_a_second_in_flight_request() {
         let mut pending_share = None;
-        let mut saved = 0u32;
-        let mut uploads = 0u64;
-        let click = |pending: &mut Option<u64>| {
-            if !share_upload_idle(*pending) {
-                return false;
-            }
-            saved += 1;
-            start_share_upload(pending, || {
-                uploads += 1;
-                uploads
-            })
-        };
-        assert!(click(&mut pending_share));
-        assert!(!click(&mut pending_share));
-        assert_eq!(saved, 1, "a second tweak Share saved another PNG");
-        assert_eq!(uploads, 1, "a second tweak Share started another upload");
+        let mut saved = Vec::new();
+        let mut uploads = Vec::new();
+        let first_idle = share_upload_idle(pending_share);
+        if first_idle {
+            saved.push(1);
+        }
+        assert!(first_idle && start_share_upload(&mut pending_share, || {
+            uploads.push(1);
+            1
+        }));
+        let second_idle = share_upload_idle(pending_share);
+        if second_idle {
+            saved.push(2);
+        }
+        assert!(
+            !second_idle
+                && !start_share_upload(&mut pending_share, || {
+                    uploads.push(2);
+                    2
+                }),
+            "a second tweak Share saved or started another upload"
+        );
+        assert_eq!(saved, [1], "a second tweak Share saved another PNG");
+        assert_eq!(uploads, [1], "a second tweak Share started another upload");
         assert_eq!(pending_share, Some(1));
         assert!(!crate::share::accept_completion(&mut pending_share, 2));
         assert_eq!(pending_share, Some(1));
         assert!(crate::share::accept_completion(&mut pending_share, 1));
-        assert!(click(&mut pending_share));
-        assert_eq!(saved, 2);
-        assert_eq!(uploads, 2);
+        assert!(share_upload_idle(pending_share));
+        saved.push(3);
+        assert!(start_share_upload(&mut pending_share, || {
+            uploads.push(3);
+            3
+        }));
+        assert_eq!(saved, [1, 3]);
+        assert_eq!(uploads, [1, 3]);
     }
 
     #[test]

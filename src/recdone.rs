@@ -5278,24 +5278,38 @@ mod tests {
     fn recording_share_refuses_a_second_in_flight_request() {
         let mut sharing = false;
         let mut share_request_id = None;
-        let mut uploads = 0u64;
-        let click = |sharing: &mut bool, pending: &mut Option<u64>| {
-            super::start_share_upload(sharing, pending, || {
-                uploads += 1;
-                uploads
-            })
-        };
-        assert!(click(&mut sharing, &mut share_request_id));
+        let mut uploads = Vec::new();
+        assert!(super::start_share_upload(
+            &mut sharing,
+            &mut share_request_id,
+            || {
+                uploads.push(1);
+                1
+            }
+        ));
         assert!(sharing);
-        assert!(!click(&mut sharing, &mut share_request_id));
-        assert_eq!(uploads, 1, "a second recording Share started another upload");
+        assert!(
+            !super::start_share_upload(&mut sharing, &mut share_request_id, || {
+                uploads.push(2);
+                2
+            }),
+            "a second recording Share started another upload"
+        );
+        assert_eq!(uploads, [1]);
         assert_eq!(share_request_id, Some(1));
         assert!(!crate::share::accept_completion(&mut share_request_id, 2));
         assert_eq!(share_request_id, Some(1));
         assert!(crate::share::accept_completion(&mut share_request_id, 1));
         sharing = false;
-        assert!(click(&mut sharing, &mut share_request_id));
-        assert_eq!(uploads, 2);
+        assert!(super::start_share_upload(
+            &mut sharing,
+            &mut share_request_id,
+            || {
+                uploads.push(3);
+                3
+            }
+        ));
+        assert_eq!(uploads, [1, 3]);
     }
 
     #[test]
