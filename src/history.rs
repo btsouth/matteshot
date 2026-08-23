@@ -1781,7 +1781,7 @@ mod thumb_tests {
         let path = dir.join("not-a-png.png");
         std::fs::write(&path, b"not a png").unwrap();
         let entry = named_entry(&path, Some("Notepad"));
-        let thumbs = placeholders(&[entry.clone()]);
+        let thumbs = placeholders(std::slice::from_ref(&entry));
         assert_eq!(thumbs.len(), 1);
         assert!(thumbs[0].bgra.is_empty(), "a placeholder must not hold pixels");
         assert_eq!(thumbs[0].img_w, 0);
