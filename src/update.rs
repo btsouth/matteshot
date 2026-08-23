@@ -312,10 +312,18 @@ pub fn discard_window(hwnd: isize) {
     INSTALLING_VERSIONS.unbind(hwnd);
 }
 
+/// What `apply` did with this version. Only `Installed` consumes
+/// `handled_version`; a defer or error must retry (SBS-1044).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyOutcome {
+    Installed,
+    Deferred,
+}
+
 /// Fetch and verify the installer, then install it the moment the user is not
-/// in the middle of something. Returns only if the update could not be applied;
-/// a successful install replaces this process.
-fn apply(hwnd_value: isize, generation: u64, update: &AvailableUpdate) -> Result<()> {
+/// in the middle of something. Returns only if the update could not be applied
+/// or was deferred; a successful install replaces this process.
+fn apply(hwnd_value: isize, generation: u64, update: &AvailableUpdate) -> Result<ApplyOutcome> {
     let staged = crate::installer::stage(&update.download_url, &update.version, |_| {})?;
     crate::diagnostics::log("update staged and verified");
 
@@ -327,7 +335,7 @@ fn apply(hwnd_value: isize, generation: u64, update: &AvailableUpdate) -> Result
         // A whole day of waiting means the next check can supersede this.
         if waited >= CHECK_EVERY {
             crate::diagnostics::log("update deferred: surfaces stayed open");
-            return Ok(());
+            return Ok(ApplyOutcome::Deferred);
         }
         thread::sleep(IDLE_POLL);
         waited += IDLE_POLL;
@@ -339,7 +347,8 @@ fn apply(hwnd_value: isize, generation: u64, update: &AvailableUpdate) -> Result
     post_installing(hwnd_value, generation, update.version.clone());
     thread::sleep(BALLOON_GRACE);
     crate::diagnostics::log("update installing");
-    crate::installer::launch(&staged)
+    crate::installer::launch(&staged)?;
+    Ok(ApplyOutcome::Installed)
 }
 
 /// A failed disk read is not an opt-out: retry on the next 24-hour loop.
@@ -356,6 +365,13 @@ fn auto_install_decision<E>(loaded: Result<crate::config::Config, E>) -> AutoIns
         Ok(config) if config.auto_update => AutoInstallDecision::Apply,
         Ok(_) => AutoInstallDecision::Decline,
     }
+}
+
+/// Stage/verify/launch errors and a surfaces-open defer are not a handled
+/// install. Contrast `RetryRead`, which already leaves `handled_version`
+/// unset so the 24-hour loop can try again (SBS-1044).
+fn apply_marks_handled<E>(result: &Result<ApplyOutcome, E>) -> bool {
+    matches!(result, Ok(ApplyOutcome::Installed))
 }
 
 /// Check immediately, then once every 24 hours while Matteshot stays open.
@@ -387,11 +403,15 @@ pub fn start(hwnd: HWND) {
                             handled_version = Some(update.version.clone());
                         }
                         AutoInstallDecision::Apply => {
-                            handled_version = Some(update.version.clone());
-                            if let Err(error) = apply(hwnd_value, installing_generation, &update) {
+                            let result = apply(hwnd_value, installing_generation, &update);
+                            if apply_marks_handled(&result) {
+                                handled_version = Some(update.version.clone());
+                            }
+                            if let Err(error) = result {
                                 // Staging failed or the installer would not start.
-                                // The tray still offers the manual download, so
-                                // this is a quiet degradation, not a dead end.
+                                // The next 24-hour tick retries this version
+                                // (SBS-1044). The tray still offers the
+                                // manual download in the meantime.
                                 //
                                 // Quiet for the user, but not for us: a silent
                                 // update failure strands people on an old build
@@ -473,6 +493,18 @@ mod tests {
         }));
         assert_eq!(after_error, AutoInstallDecision::RetryRead);
         assert_eq!(after_repair, AutoInstallDecision::Apply);
+    }
+
+    /// Pins SBS-1044: apply used to mark the version handled before stage,
+    /// verify, or launch ran, and a surfaces-open defer returned Ok. Either
+    /// way the 24-hour loop skipped the same version until restart.
+    #[test]
+    fn a_failed_or_deferred_apply_retries_auto_install_for_the_same_version() {
+        assert!(!apply_marks_handled::<&str>(&Err("stage failed")));
+        assert!(!apply_marks_handled::<&str>(&Err("verify failed")));
+        assert!(!apply_marks_handled::<&str>(&Err("launch failed")));
+        assert!(!apply_marks_handled::<()>(&Ok(ApplyOutcome::Deferred)));
+        assert!(apply_marks_handled::<()>(&Ok(ApplyOutcome::Installed)));
     }
 
     /// A manifest listing several served builds, each with a release date.
