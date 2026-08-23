@@ -55,7 +55,7 @@ pub fn generate(outdir: &std::path::Path) -> Result<()> {
             ],
         },
     };
-    let big = crate::compose::export(&content, &aurora, 0.17, Some(1.0), 2);
+    let big = crate::compose::export(&content, &aurora, 0.17, Some(1.0), 2, 0);
 
     let sizes: [u32; 7] = [256, 128, 64, 48, 32, 24, 16];
     let mut pngs: Vec<(u32, Vec<u8>)> = Vec::new();
