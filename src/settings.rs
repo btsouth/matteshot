@@ -30,9 +30,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION,
     MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL,
-    WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION,
-    WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN,
+    WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -287,6 +287,10 @@ struct FittedWindow {
     y: i32,
     outer_w: i32,
     outer_h: i32,
+    /// Client width after clamping `outer_w` to the work area. Layout must
+    /// use this, not the designed width, or the right-hand chips sit past
+    /// the client and cannot be hit-tested.
+    client_w: i32,
     viewport_h: i32,
     scrollable: bool,
 }
@@ -294,9 +298,9 @@ struct FittedWindow {
 /// Fit a designed client into `work`.
 ///
 /// `non_client_*` is `outer - client` from `dpi::outer_bounds` (or a stand-in
-/// in tests). When `work` is unreadable the designed size is kept: inventing a
-/// desktop would hide the same overflow this helper exists to stop, and
-/// inventing a 0x0 desktop would hide the window.
+/// in tests). When `work` is unreadable the designed size and preferred
+/// origin are kept: inventing a desktop would hide the same overflow this
+/// helper exists to stop, and inventing a 0x0 desktop would hide the window.
 fn fit_settings_window(
     content_w: i32,
     content_h: i32,
@@ -312,11 +316,13 @@ fn fit_settings_window(
     let desired_outer_w = content_w + nc_w;
     let desired_outer_h = content_h + nc_h;
     if !work.is_usable() {
+        let (x, y) = preferred_origin.unwrap_or((0, 0));
         return FittedWindow {
-            x: 0,
-            y: 0,
+            x,
+            y,
             outer_w: desired_outer_w,
             outer_h: desired_outer_h,
+            client_w: content_w,
             viewport_h: content_h,
             scrollable: false,
         };
@@ -326,6 +332,7 @@ fn fit_settings_window(
     let outer_w = desired_outer_w.min(work_w).max(1);
     let min_outer_h = (MIN_VISIBLE_CLIENT + nc_h).min(work_h).max(1);
     let outer_h = desired_outer_h.min(work_h).max(min_outer_h);
+    let client_w = (outer_w - nc_w).max(1);
     let viewport_h = (outer_h - nc_h).max(1);
     let scrollable = content_h > viewport_h;
     let (x, y) = match preferred_origin {
@@ -352,9 +359,31 @@ fn fit_settings_window(
         y,
         outer_w,
         outer_h,
+        client_w,
         viewport_h,
         scrollable,
     }
+}
+
+/// Designed layout, then the same pass at the clamped client width so
+/// right-aligned controls stay inside a work area narrower than 500 logical.
+fn layout_to_work(
+    scale: f32,
+    license: &crate::license::Status,
+    work: WorkRect,
+    preferred_origin: Option<(i32, i32)>,
+    nc_w: i32,
+    nc_h: i32,
+) -> (LaidOut, FittedWindow) {
+    let designed_cw = (LOGICAL_WIDTH as f32 * scale) as i32;
+    let laid = build_layout(scale, designed_cw, license);
+    let fitted = fit_settings_window(designed_cw, laid.height, nc_w, nc_h, work, preferred_origin);
+    let laid = if fitted.client_w != designed_cw {
+        build_layout(scale, fitted.client_w, license)
+    } else {
+        laid
+    };
+    (laid, fitted)
 }
 
 fn max_scroll(content_h: i32, viewport_h: i32) -> i32 {
@@ -383,6 +412,23 @@ fn control_is_reachable(ctrl: Ctrl, license: &crate::license::Status) -> bool {
         Ctrl::Deactivate => matches!(license, crate::license::Status::Licensed { .. }),
         _ => true,
     }
+}
+
+/// Keyboard/hover index, or -1 when that slot is gone or Deactivate is hidden.
+fn reachable_index(index: i32, controls: &[(RECT, Ctrl)], license: &crate::license::Status) -> i32 {
+    if index < 0 {
+        return -1;
+    }
+    match controls.get(index as usize) {
+        Some((_, ctrl)) if control_is_reachable(*ctrl, license) => index,
+        _ => -1,
+    }
+}
+
+/// Space/Return activate the focused control. Alt+Space is the system menu
+/// (WM_SYSKEYDOWN) and must reach DefWindowProc.
+fn key_activates_focus(vk: u32, alt_down: bool) -> bool {
+    !alt_down && (vk == VK_RETURN.0 as u32 || vk == VK_SPACE.0 as u32)
 }
 
 fn hit_test_control(
@@ -495,6 +541,12 @@ struct State {
     viewport_h: i32,
     scroll_y: i32,
     theme: crate::theme::Theme,
+    /// Last work area we fitted to. Compared on WM_WINDOWPOSCHANGED so a
+    /// same-DPI drag onto a smaller monitor refits without fighting a drag
+    /// that stays on the same monitor.
+    last_work: WorkRect,
+    /// SetWindowPos from apply_fit re-enters WM_WINDOWPOSCHANGED.
+    reclamping: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -675,16 +727,29 @@ unsafe fn draw_text_in(hdc: HDC, font: HFONT, color: COLORREF, r: RECT, text: &s
     );
 }
 
+/// Selected chips fill *and* stroke with the accent, so hover/focus would
+/// match the unfocused selected chip unless the ring is a distinct stroke.
+fn chip_focus_ring_visible(_active: bool, focused: bool) -> bool {
+    focused
+}
+
 unsafe fn draw_chip_button(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot: bool) {
     let fill = CreateSolidBrush(if active {
         state.theme.accent
     } else {
         state.theme.chip
     });
+    let ring = chip_focus_ring_visible(active, hot);
     let pen = CreatePen(
         PS_SOLID,
-        1,
-        if active {
+        if ring { 2 } else { 1 },
+        if ring {
+            if active {
+                state.theme.accent_text
+            } else {
+                state.theme.text
+            }
+        } else if active {
             state.theme.accent
         } else {
             state.theme.chip_line
@@ -1308,6 +1373,85 @@ unsafe fn sync_viewport(hwnd: HWND, state: &mut State) {
         .clamp(0, max_scroll(state.height, state.viewport_h));
 }
 
+fn window_origin(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rc = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rc) }.is_ok() {
+        Some((rc.left, rc.top))
+    } else {
+        None
+    }
+}
+
+fn work_area_for_origin(origin: Option<(i32, i32)>) -> WorkRect {
+    match origin {
+        Some((x, y)) => work_area_at(POINT { x, y }),
+        None => WorkRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+    }
+}
+
+/// Relayout, clamp to `work`, and move. `reclamping` stops SetWindowPos
+/// from re-entering WM_WINDOWPOSCHANGED.
+unsafe fn apply_fit(hwnd: HWND, state: &mut State, work: WorkRect, origin: Option<(i32, i32)>) {
+    state.reclamping = true;
+    let (nc_w, nc_h) = {
+        let designed_cw = (LOGICAL_WIDTH as f32 * state.scale) as i32;
+        let laid = build_layout(state.scale, designed_cw, &state.license);
+        non_client_delta(designed_cw, laid.height, state.scale)
+    };
+    let (laid, fitted) = layout_to_work(state.scale, &state.license, work, origin, nc_w, nc_h);
+    state.controls = laid.controls;
+    state.chrome = laid.chrome;
+    state.width = fitted.client_w;
+    state.height = laid.height;
+    state.hover = reachable_index(state.hover, &state.controls, &state.license);
+    state.focus = reachable_index(state.focus, &state.controls, &state.license);
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        fitted.x,
+        fitted.y,
+        fitted.outer_w,
+        fitted.outer_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    sync_viewport(hwnd, state);
+    state.last_work = work;
+    state.reclamping = false;
+    if state.focus >= 0 {
+        move_focus(state, state.focus);
+    }
+}
+
+/// Refit using the window's current origin. Used when the window is already
+/// open and when the display topology changes.
+unsafe fn reclamp_to_monitor(hwnd: HWND, state: &mut State) {
+    if state.reclamping {
+        return;
+    }
+    let origin = window_origin(hwnd);
+    let work = work_area_for_origin(origin);
+    apply_fit(hwnd, state, work, origin);
+}
+
+/// Same-DPI monitor changes do not send WM_DPICHANGED. Skip when the
+/// nearest work rect is unchanged so a drag on one monitor is not fought.
+unsafe fn reclamp_if_work_changed(hwnd: HWND, state: &mut State) {
+    if state.reclamping {
+        return;
+    }
+    let origin = window_origin(hwnd);
+    let work = work_area_for_origin(origin);
+    if work == state.last_work {
+        return;
+    }
+    apply_fit(hwnd, state, work, origin);
+}
+
 fn move_focus(state: &mut State, index: i32) {
     state.focus = index;
     if index < 0 {
@@ -1350,7 +1494,8 @@ unsafe fn handle_settings_key(
         let _ = InvalidateRect(hwnd, None, false);
         return LRESULT(0);
     }
-    if (vk == VK_RETURN.0 as u32 || vk == VK_SPACE.0 as u32) && state.focus >= 0 {
+    let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+    if key_activates_focus(vk, alt) && state.focus >= 0 {
         if let Some((_, ctrl)) = state.controls.get(state.focus as usize) {
             let ctrl = *ctrl;
             activate(hwnd, state, ctrl);
@@ -1397,13 +1542,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         windows::Win32::UI::WindowsAndMessaging::WM_DPICHANGED => {
             if let Some(state) = state_of(hwnd) {
                 let scale = crate::dpi::scale_from_message(wparam);
-                let cw = (LOGICAL_WIDTH as f32 * scale) as i32;
-                let laid_out = build_layout(scale, cw, &state.license);
                 state.scale = scale;
-                state.controls = laid_out.controls;
-                state.chrome = laid_out.chrome;
-                state.width = cw;
-                state.height = laid_out.height;
                 // Create first, then swap: deleting up front leaves the
                 // window with no font at all if a creation fails.
                 for (slot, height) in [
@@ -1421,43 +1560,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 // Hover is an index into the controls just replaced.
                 state.hover = -1;
-                if state.focus >= state.controls.len() as i32 {
-                    state.focus = -1;
-                }
-                let (nc_w, nc_h) = non_client_delta(cw, state.height, scale);
-                // Suggested origin is what keeps the window on the monitor
-                // it was dragged to; the size is ours, then clamped to that
-                // monitor's work area so the bottom row does not go missing.
-                let suggested = (lparam.0 as *const RECT).as_ref();
-                let (origin, work) = match suggested {
-                    Some(bounds) => (
-                        Some((bounds.left, bounds.top)),
-                        work_area_at(POINT {
-                            x: bounds.left,
-                            y: bounds.top,
-                        }),
-                    ),
-                    None => (
-                        None,
-                        WorkRect {
-                            left: 0,
-                            top: 0,
-                            right: 0,
-                            bottom: 0,
-                        },
-                    ),
-                };
-                let fitted = fit_settings_window(cw, state.height, nc_w, nc_h, work, origin);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    fitted.x,
-                    fitted.y,
-                    fitted.outer_w,
-                    fitted.outer_h,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                sync_viewport(hwnd, state);
+                // Suggested origin keeps the window on the monitor it was
+                // dragged to; apply_fit then clamps size to that work area.
+                let origin = crate::dpi::suggested_origin(lparam).or_else(|| window_origin(hwnd));
+                let work = work_area_for_origin(origin);
+                apply_fit(hwnd, state, work, origin);
                 state.scroll_y = 0;
                 if state.focus >= 0 {
                     move_focus(state, state.focus);
@@ -1465,6 +1572,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = InvalidateRect(hwnd, None, true);
             }
             LRESULT(0)
+        }
+        // Resolution / monitor topology. Same-DPI moves are handled below.
+        WM_DISPLAYCHANGE => {
+            if let Some(state) = state_of(hwnd) {
+                reclamp_to_monitor(hwnd, state);
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+            LRESULT(0)
+        }
+        // Dragging onto a smaller same-DPI monitor does not send
+        // WM_DPICHANGED. Refit only when the nearest work rect changes.
+        WM_WINDOWPOSCHANGED => {
+            let result = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if let Some(state) = state_of(hwnd) {
+                reclamp_if_work_changed(hwnd, state);
+            }
+            result
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
@@ -1657,6 +1781,12 @@ pub fn open() -> Result<()> {
                 SWP_NOMOVE | SWP_NOSIZE,
             );
             let _ = SetForegroundWindow(existing);
+            // The window may have been dragged onto a smaller same-DPI
+            // monitor, or the taskbar may have grown, since it last fitted.
+            if let Some(state) = state_of(existing) {
+                reclamp_to_monitor(existing, state);
+                let _ = InvalidateRect(existing, None, false);
+            }
             eprintln!("settings: focused existing window");
             return Ok(());
         }
@@ -1680,14 +1810,14 @@ pub fn open() -> Result<()> {
         // to make room for, and the window then keeps the same answer.
         let license = crate::license::status();
 
-        let laid_out = build_layout(scale, cw, &license);
-        let (controls, chrome, ch) = (laid_out.controls, laid_out.chrome, laid_out.height);
-        let (nc_w, nc_h) = non_client_delta(cw, ch, scale);
         // Same cursor reading that chose the scale. Sampling it twice lets
         // the pointer cross monitors in between, pairing one monitor's scale
         // with another's work area.
         let work = work_area_at(cursor);
-        let fitted = fit_settings_window(cw, ch, nc_w, nc_h, work, None);
+        let probe_h = build_layout(scale, cw, &license).height;
+        let (nc_w, nc_h) = non_client_delta(cw, probe_h, scale);
+        let (laid_out, fitted) = layout_to_work(scale, &license, work, None, nc_w, nc_h);
+        let (controls, chrome, ch) = (laid_out.controls, laid_out.chrome, laid_out.height);
 
         let state = Box::new(State {
             cfg: Config::load(),
@@ -1700,11 +1830,13 @@ pub fn open() -> Result<()> {
             hover: -1,
             focus: -1,
             scale,
-            width: cw,
+            width: fitted.client_w,
             height: ch,
             viewport_h: fitted.viewport_h,
             scroll_y: 0,
             theme: crate::theme::current(),
+            last_work: work,
+            reclamping: false,
         });
 
         let hinstance = GetModuleHandleW(None).context("get app module for settings")?;
@@ -1768,41 +1900,9 @@ pub fn refresh() {
                 state.license = crate::license::status();
                 state.cfg = Config::load();
                 // Rebuild: a license flip can add or remove the update-term
-                // note, which changes content height (SBS-753).
-                let laid_out = build_layout(state.scale, state.width, &state.license);
-                state.controls = laid_out.controls;
-                state.chrome = laid_out.chrome;
-                state.height = laid_out.height;
+                // note, which changes content height, and can hide Deactivate.
                 state.hover = -1;
-                if state.focus >= state.controls.len() as i32 {
-                    state.focus = -1;
-                }
-                let (nc_w, nc_h) = non_client_delta(state.width, state.height, state.scale);
-                let mut rc = RECT::default();
-                let origin = if GetWindowRect(hwnd, &mut rc).is_ok() {
-                    Some((rc.left, rc.top))
-                } else {
-                    None
-                };
-                let work = work_area_at(POINT {
-                    x: rc.left,
-                    y: rc.top,
-                });
-                let fitted =
-                    fit_settings_window(state.width, state.height, nc_w, nc_h, work, origin);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    fitted.x,
-                    fitted.y,
-                    fitted.outer_w,
-                    fitted.outer_h,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                sync_viewport(hwnd, state);
-                if state.focus >= 0 {
-                    move_focus(state, state.focus);
-                }
+                reclamp_to_monitor(hwnd, state);
             }
             let _ = InvalidateRect(hwnd, None, false);
         }
@@ -1824,9 +1924,11 @@ pub fn is_open() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_layout, control_is_reachable, fit_settings_window, hit_test_control, max_scroll,
-        next_reachable, scroll_rect_into_view, Ctrl, WorkRect, LOGICAL_WIDTH, MIN_VISIBLE_CLIENT,
+        build_layout, chip_focus_ring_visible, control_is_reachable, fit_settings_window,
+        hit_test_control, key_activates_focus, layout_to_work, max_scroll, next_reachable,
+        reachable_index, scroll_rect_into_view, Ctrl, WorkRect, LOGICAL_WIDTH, MIN_VISIBLE_CLIENT,
     };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_SPACE};
 
     /// The window is laid out for the monitor it is on, and `WM_DPICHANGED`
     /// re-runs this same pass. Both only work if the pass is a pure function of
@@ -2095,6 +2197,22 @@ mod tests {
             }
         }
         assert!(saw_deactivate, "licensed Tab should reach Deactivate");
+
+        let deactivate = trial_layout
+            .controls
+            .iter()
+            .position(|(_, c)| matches!(c, Ctrl::Deactivate))
+            .expect("Deactivate stays in the trial layout") as i32;
+        let next = next_reachable(&trial_layout.controls, &trial(), deactivate, false);
+        assert!(next >= 0);
+        assert!(
+            control_is_reachable(trial_layout.controls[next as usize].1, &trial()),
+            "Tab from hidden Deactivate must land on a reachable control"
+        );
+        assert!(
+            !matches!(trial_layout.controls[next as usize].1, Ctrl::Deactivate),
+            "Tab from hidden Deactivate must not stay on Deactivate"
+        );
     }
 
     #[test]
@@ -2132,6 +2250,14 @@ mod tests {
         assert_eq!(fitted.outer_h, 715);
         assert!(!fitted.scrollable);
         assert_eq!(fitted.viewport_h, 676);
+        assert_eq!(fitted.client_w, 500);
+        assert_eq!((fitted.x, fitted.y), (0, 0));
+
+        let kept = fit_settings_window(500, 676, 16, 39, empty, Some((100, 200)));
+        assert_eq!((kept.x, kept.y), (100, 200));
+        assert_eq!(kept.outer_w, 516);
+        assert_eq!(kept.outer_h, 715);
+        assert_eq!(kept.client_w, 500);
     }
 
     #[test]
@@ -2152,5 +2278,127 @@ mod tests {
         assert_eq!(fitted.outer_h, 120);
         assert!(fitted.viewport_h < MIN_VISIBLE_CLIENT);
         assert!(fitted.scrollable);
+    }
+
+    /// Same-DPI laptop + external: a window fitted to the desktop hangs past
+    /// the laptop taskbar until it is re-fitted (SBS-753).
+    #[test]
+    fn a_taller_window_becomes_scrollable_on_a_shorter_same_dpi_work_area() {
+        let license = licensed_term();
+        let scale = 1.25f32;
+        let width = (LOGICAL_WIDTH as f32 * scale) as i32;
+        let laid = build_layout(scale, width, &license);
+        let (nc_w, nc_h) = non_client(scale);
+        let on_desktop = fit_settings_window(width, laid.height, nc_w, nc_h, DESKTOP, None);
+        assert!(
+            laid.height + nc_h > LAPTOP.height(),
+            "125% licensed layout must overflow a 728px laptop work area"
+        );
+        assert!(
+            on_desktop.outer_h > LAPTOP.height(),
+            "desktop outer height {} must exceed the laptop work area",
+            on_desktop.outer_h
+        );
+        let on_laptop = fit_settings_window(
+            width,
+            laid.height,
+            nc_w,
+            nc_h,
+            LAPTOP,
+            Some((on_desktop.x, on_desktop.y)),
+        );
+        assert!(
+            on_laptop.scrollable,
+            "moving onto the laptop must enable scroll"
+        );
+        assert!(on_laptop.outer_h <= LAPTOP.height());
+    }
+
+    #[test]
+    fn active_and_focused_chip_has_a_visible_focus_ring() {
+        assert!(
+            chip_focus_ring_visible(true, true),
+            "selected+focused chip must show a ring"
+        );
+        assert!(
+            !chip_focus_ring_visible(true, false),
+            "selected without focus must not look focused"
+        );
+        assert!(chip_focus_ring_visible(false, true));
+    }
+
+    #[test]
+    fn alt_space_is_not_treated_as_activate() {
+        assert!(!key_activates_focus(VK_SPACE.0 as u32, true));
+        assert!(!key_activates_focus(VK_RETURN.0 as u32, true));
+        assert!(key_activates_focus(VK_SPACE.0 as u32, false));
+        assert!(key_activates_focus(VK_RETURN.0 as u32, false));
+    }
+
+    #[test]
+    fn refresh_clears_focus_when_deactivate_becomes_unreachable() {
+        let licensed = licensed_term();
+        let licensed_layout = build_layout(1.0, LOGICAL_WIDTH, &licensed);
+        let deactivate = licensed_layout
+            .controls
+            .iter()
+            .position(|(_, c)| matches!(c, Ctrl::Deactivate))
+            .expect("licensed layout includes Deactivate") as i32;
+        assert_eq!(
+            reachable_index(deactivate, &licensed_layout.controls, &licensed),
+            deactivate
+        );
+
+        let trial_layout = build_layout(1.0, LOGICAL_WIDTH, &trial());
+        assert!(matches!(
+            trial_layout.controls[deactivate as usize].1,
+            Ctrl::Deactivate
+        ));
+        assert_eq!(
+            reachable_index(deactivate, &trial_layout.controls, &trial()),
+            -1
+        );
+        assert_eq!(reachable_index(-1, &trial_layout.controls, &trial()), -1);
+        assert_eq!(
+            reachable_index(99, &trial_layout.controls, &trial()),
+            -1,
+            "out-of-range focus also clears"
+        );
+    }
+
+    /// 800px-wide work at 200% is narrower than the designed 1000px client.
+    /// Rebuilding at the clamped client keeps every reachable control inside
+    /// the window so hit-testing still finds it.
+    #[test]
+    fn a_narrow_work_area_keeps_controls_hit_testable() {
+        let license = trial();
+        let scale = 2.0f32;
+        let (nc_w, nc_h) = non_client(scale);
+        let designed_cw = (LOGICAL_WIDTH as f32 * scale) as i32;
+        let desired_outer_w = designed_cw + nc_w;
+        let work = WorkRect {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 728,
+        };
+        assert!(work.width() < desired_outer_w);
+        let (laid, fitted) = layout_to_work(scale, &license, work, None, nc_w, nc_h);
+        assert!(fitted.outer_w <= work.width());
+        assert!(fitted.client_w < designed_cw);
+        assert_eq!(fitted.client_w, (fitted.outer_w - nc_w).max(1));
+        for (i, (rect, ctrl)) in laid.controls.iter().enumerate() {
+            if !control_is_reachable(*ctrl, &license) {
+                continue;
+            }
+            assert!(
+                rect.left >= 0 && rect.left < fitted.client_w,
+                "{ctrl:?} left {} is outside client {}",
+                rect.left,
+                fitted.client_w
+            );
+            let hit = hit_test_control(&laid.controls, &license, rect.left + 1, rect.top + 1, 0);
+            assert_eq!(hit, i as i32, "{ctrl:?} must remain hit-testable");
+        }
     }
 }

@@ -123,30 +123,25 @@ pub fn outer_bounds(
     bounds
 }
 
-/// Move to the position `WM_DPICHANGED` suggests, at a size the window works
-/// out for itself.
+/// Origin `WM_DPICHANGED` suggests in `lParam`.
 ///
-/// For a window whose height falls out of its own layout pass, the suggested
-/// size is only the old size scaled by the DPI ratio, which rounds differently
-/// from re-running the layout and leaves a sliver of dead space. The suggested
-/// *position* is still worth taking: it is what keeps the window on the
-/// monitor it was dragged to.
+/// For a window whose size falls out of its own layout pass (then clamped to
+/// the work area), the suggested size is only the old one scaled by the DPI
+/// ratio. The suggested *position* is still what keeps the window on the
+/// monitor it was dragged to. Callers apply the fitted size themselves.
 ///
 /// # Safety
-/// `lparam` must be the one delivered with `WM_DPICHANGED`.
-pub unsafe fn apply_suggested_origin(hwnd: HWND, lparam: LPARAM, width: i32, height: i32) {
+/// `lparam` must be the one delivered with `WM_DPICHANGED`; it points at a
+/// `RECT` owned by the message. A null pointer is an empty origin, not (0, 0).
+pub unsafe fn suggested_origin(lparam: LPARAM) -> Option<(i32, i32)> {
     let suggested = lparam.0 as *const RECT;
-    let (x, y) = match suggested.as_ref() {
-        Some(bounds) => (bounds.left, bounds.top),
-        None => return,
-    };
-    let _ = SetWindowPos(hwnd, None, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    suggested.as_ref().map(|bounds| (bounds.left, bounds.top))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{scale_from_message, scale_of};
-    use windows::Win32::Foundation::WPARAM;
+    use super::{scale_from_message, scale_of, suggested_origin};
+    use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 
     #[test]
     fn scale_reads_the_low_word_and_survives_a_useless_dpi() {
@@ -158,5 +153,18 @@ mod tests {
         // Nothing usable must read as 100%, never as zero: a zero scale would
         // multiply every control in the window down to nothing.
         assert_eq!(scale_of(0), 1.0);
+    }
+
+    #[test]
+    fn suggested_origin_reads_the_rect_and_survives_a_null_lparam() {
+        let bounds = RECT {
+            left: 120,
+            top: 80,
+            right: 640,
+            bottom: 480,
+        };
+        let lparam = LPARAM((&bounds as *const RECT) as isize);
+        assert_eq!(unsafe { suggested_origin(lparam) }, Some((120, 80)));
+        assert_eq!(unsafe { suggested_origin(LPARAM(0)) }, None);
     }
 }
