@@ -8,11 +8,12 @@
 //!
 //! `source` is the captured window title (or a region-size label), stored
 //! in plaintext on this PC. Opening History drops entries whose files are
-//! confirmed gone (NotFound, or a path that exists and is not a file) and
-//! rewrites that pruned list (SBS-765). A transient metadata error keeps
-//! the row. Clear titles strips `source` without deleting captures.
-//! Uninstall may offer to delete the index; it never deletes the files it
-//! pointed at.
+//! confirmed gone (deleted while a parent is still reachable, or a path
+//! that exists and is not a file) and rewrites that pruned list (SBS-765).
+//! NotFound on an ejected USB or offline share is not that proof (SBS-1038);
+//! a transient metadata error also keeps the row. Clear titles strips
+//! `source` without deleting captures. Uninstall may offer to delete the
+//! index; it never deletes the files it pointed at.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -147,16 +148,39 @@ fn trim_entries(mut entries: Vec<Entry>, cap: usize, exists: impl Fn(&Path) -> b
 /// `Path::is_file` is `metadata().map(is_file).unwrap_or(false)`, so
 /// ACCESS_DENIED, a disconnected USB/NAS, and an AV lock all look like a
 /// delete. Opening History would then persist that shorter list.
-fn keep_capture_after_metadata(result: std::io::Result<std::fs::Metadata>) -> bool {
+///
+/// NotFound on the file is the same report as an ejected volume (SBS-1038).
+/// Only a reachable ancestor proves the file was deleted.
+fn keep_capture_after_metadata(path: &Path, result: std::io::Result<std::fs::Metadata>) -> bool {
     match result {
         Ok(meta) => meta.is_file(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            !missing_capture_is_confirmed_gone(path)
+        }
         Err(_) => true,
     }
 }
 
+/// After the capture path itself was NotFound, walk parents. A directory
+/// that still stats means the volume is online and the file is gone. A
+/// chain of NotFound (ejected USB, offline share) is not that proof, nor
+/// is any other parent error — the ACCESS_DENIED case, keep the row.
+fn missing_capture_is_confirmed_gone(path: &Path) -> bool {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            return false;
+        }
+        match std::fs::metadata(ancestor) {
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 fn capture_file_present(path: &Path) -> bool {
-    keep_capture_after_metadata(std::fs::metadata(path))
+    keep_capture_after_metadata(path, std::fs::metadata(path))
 }
 
 /// A window title is not bounded by Windows the way a control's own text
@@ -235,9 +259,10 @@ fn append_at(index: &Path, entry: Entry) {
 /// Every entry whose file still exists, most recent first.
 ///
 /// Files confirmed gone are dropped from the on-disk index as well
-/// (SBS-765). A transient metadata error keeps the row rather than
-/// treating it as a delete. A transient or corrupt read still shows an
-/// empty window this open and leaves the bytes exactly as they were:
+/// (SBS-765). A transient metadata error, or NotFound on an offline
+/// volume (SBS-1038), keeps the row rather than treating it as a delete.
+/// A transient or corrupt read still shows an empty window this open and
+/// leaves the bytes exactly as they were:
 /// quarantine-and-start-fresh belongs to explicit mutating paths, which
 /// pair it with a replacement write. Browsing only rewrites after a
 /// successful parse that actually dropped something.
@@ -409,8 +434,9 @@ pub fn remove(path: &Path) -> Result<()> {
 }
 
 /// Strip stored window titles from the index. Capture files stay on disk.
-/// Missing files are dropped in the same rewrite so a title cannot linger
-/// on an already-gone path.
+/// Files confirmed gone are dropped in the same rewrite so a title cannot
+/// linger on an already-deleted path. An ejected or offline volume is
+/// left in the index (SBS-1038).
 pub fn clear_source_metadata() -> Result<usize> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
     let index = history_path().context("Windows has no application data directory")?;
@@ -1113,15 +1139,14 @@ mod persistence_tests {
 
     #[test]
     fn a_permission_error_does_not_prune_the_entry() {
+        let probe = Path::new(r"C:\matteshot-denied-probe.png");
         assert!(
-            keep_capture_after_metadata(Err(std::io::Error::from(
-                std::io::ErrorKind::PermissionDenied
-            ))),
+            keep_capture_after_metadata(
+                probe,
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            ),
             "ACCESS_DENIED is not proof the capture is gone"
         );
-        assert!(!keep_capture_after_metadata(Err(std::io::Error::from(
-            std::io::ErrorKind::NotFound
-        ))));
 
         let dir = temp_dir("list-denied");
         let shot = capture(&dir, "a.png");
@@ -1133,9 +1158,10 @@ mod persistence_tests {
         let before = std::fs::read(&index).unwrap();
 
         let listed = list_at_with(&index, |_| {
-            keep_capture_after_metadata(Err(std::io::Error::from(
-                std::io::ErrorKind::PermissionDenied,
-            )))
+            keep_capture_after_metadata(
+                probe,
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            )
         });
         assert_eq!(listed.len(), 1, "an unreadable capture must stay in the open list");
         assert_eq!(listed[0].path, shot);
@@ -1195,6 +1221,189 @@ mod persistence_tests {
         assert_eq!(on_disk.entries[0].path, kept);
         assert!(kept.is_file());
         assert!(not_a_file.is_dir());
+    }
+
+    /// A letter with no volume: file and every ancestor are NotFound, the
+    /// same report an ejected USB / offline share gives. Skip if this box
+    /// has every letter mounted, or if the unused one is NotReady rather
+    /// than NotFound — that other-error path is already a keep.
+    fn offline_not_found_capture(name: &str) -> Option<PathBuf> {
+        for letter in b'A'..=b'Z' {
+            let root = PathBuf::from(format!("{}:\\", letter as char));
+            let path = root.join("matteshot-sbs-1038").join(name);
+            let not_found = |p: &Path| {
+                matches!(
+                    std::fs::metadata(p),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            };
+            if not_found(&path) && not_found(&root) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// SBS-1038: NotFound is not enough. A deleted file whose folder is
+    /// still there is gone; the same error on an offline volume is not.
+    #[test]
+    fn not_found_is_a_delete_only_when_a_parent_is_still_there() {
+        let dir = temp_dir("notfound-vs-offline");
+        let deleted = capture(&dir, "deleted.png");
+        std::fs::remove_file(&deleted).unwrap();
+        assert!(
+            missing_capture_is_confirmed_gone(&deleted),
+            "parent folder still exists, so the file was deleted"
+        );
+        assert!(!keep_capture_after_metadata(
+            &deleted,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        ));
+        assert!(!capture_file_present(&deleted));
+
+        let nested_dir = dir.join("removed");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = capture(&nested_dir, "nested.png");
+        std::fs::remove_dir_all(&nested_dir).unwrap();
+        assert!(
+            missing_capture_is_confirmed_gone(&nested),
+            "a deleted folder is gone if the volume is still there"
+        );
+        assert!(!capture_file_present(&nested));
+
+        let Some(offline) = offline_not_found_capture("usb.png") else {
+            eprintln!("skipping: no unused drive letter reported NotFound");
+            return;
+        };
+        assert!(
+            !missing_capture_is_confirmed_gone(&offline),
+            "an offline volume must not look like a delete: {offline:?}"
+        );
+        assert!(keep_capture_after_metadata(
+            &offline,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        ));
+        assert!(capture_file_present(&offline));
+    }
+
+    /// SBS-1038: persist callers used to rewrite the shorter list after a
+    /// USB eject, because every path on that volume is NotFound.
+    #[test]
+    fn opening_history_keeps_an_offline_volume_and_drops_a_deleted_file() {
+        let Some(offline) = offline_not_found_capture("usb.png") else {
+            eprintln!("skipping: no unused drive letter reported NotFound");
+            return;
+        };
+        let dir = temp_dir("list-offline");
+        let kept = capture(&dir, "kept.png");
+        let gone = capture(&dir, "gone.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&offline, "USB Confidential.docx"),
+                entry_with_source(&kept, "Local.docx"),
+                entry_with_source(&gone, "Deleted subject"),
+            ],
+        );
+        std::fs::remove_file(&gone).unwrap();
+
+        let listed = list_at(&index);
+        let listed_paths: Vec<_> = listed.iter().map(|e| e.path.as_path()).collect();
+        assert!(
+            listed_paths.contains(&offline.as_path()),
+            "offline USB row vanished from the open list"
+        );
+        assert!(listed_paths.contains(&kept.as_path()));
+        assert!(
+            !listed_paths.contains(&gone.as_path()),
+            "a real delete must still persist-prune"
+        );
+
+        let on_disk = load_for_mutation(&index).unwrap();
+        let disk_paths: Vec<_> = on_disk.entries.iter().map(|e| e.path.as_path()).collect();
+        assert!(
+            disk_paths.contains(&offline.as_path()),
+            "ejected/offline NotFound must not persist as a prune"
+        );
+        assert_eq!(
+            on_disk
+                .entries
+                .iter()
+                .find(|e| e.path == offline)
+                .and_then(|e| e.source.as_deref()),
+            Some("USB Confidential.docx")
+        );
+        assert!(disk_paths.contains(&kept.as_path()));
+        assert!(!disk_paths.contains(&gone.as_path()));
+        assert!(kept.is_file());
+    }
+
+    #[test]
+    fn append_at_keeps_an_offline_volume_and_drops_a_deleted_file() {
+        let Some(offline) = offline_not_found_capture("usb.png") else {
+            eprintln!("skipping: no unused drive letter reported NotFound");
+            return;
+        };
+        let dir = temp_dir("append-offline");
+        let kept = capture(&dir, "kept.png");
+        let gone = capture(&dir, "gone.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&offline, "USB title"),
+                entry_at(&kept),
+                entry_at(&gone),
+            ],
+        );
+        std::fs::remove_file(&gone).unwrap();
+
+        let added = capture(&dir, "new.png");
+        append_at(&index, entry_at(&added));
+
+        let on_disk = load_for_mutation(&index).unwrap();
+        let disk_paths: Vec<_> = on_disk.entries.iter().map(|e| e.path.as_path()).collect();
+        assert!(
+            disk_paths.contains(&offline.as_path()),
+            "append must not persist-prune an offline USB path"
+        );
+        assert!(disk_paths.contains(&kept.as_path()));
+        assert!(disk_paths.contains(&added.as_path()));
+        assert!(!disk_paths.contains(&gone.as_path()));
+    }
+
+    #[test]
+    fn clear_source_metadata_keeps_an_offline_volume_and_drops_a_deleted_file() {
+        let Some(offline) = offline_not_found_capture("usb.png") else {
+            eprintln!("skipping: no unused drive letter reported NotFound");
+            return;
+        };
+        let dir = temp_dir("clear-offline");
+        let kept = capture(&dir, "kept.png");
+        let gone = capture(&dir, "gone.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&offline, "USB title"),
+                entry_with_source(&kept, "Kept title"),
+                entry_with_source(&gone, "Gone title"),
+            ],
+        );
+        std::fs::remove_file(&gone).unwrap();
+
+        assert_eq!(clear_source_metadata_at(&index).unwrap(), 3);
+        let on_disk = load_for_mutation(&index).unwrap();
+        let disk_paths: Vec<_> = on_disk.entries.iter().map(|e| e.path.as_path()).collect();
+        assert!(
+            disk_paths.contains(&offline.as_path()),
+            "clear titles must not persist-prune an offline USB path"
+        );
+        assert!(disk_paths.contains(&kept.as_path()));
+        assert!(!disk_paths.contains(&gone.as_path()));
+        assert!(on_disk.entries.iter().all(|entry| entry.source.is_none()));
+        assert!(kept.is_file());
     }
 
     /// SBS-765: Clear History strips titles and leaves the files.
