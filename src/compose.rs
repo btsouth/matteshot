@@ -132,6 +132,31 @@ pub fn compose_scaled(window: &RgbaImage, style: &Style, metric_scale: f32) -> R
     compose_with(window, style, &ComposeOpts { metric_scale, ..Default::default() })
 }
 
+/// Small captures are supersampled so a 400px window does not look mushy.
+/// Captures already at 1600px or more skip it.
+pub fn export_super_scale(width: u32, height: u32, export_scale: u32) -> u32 {
+    if width.max(height) >= 1600 {
+        1
+    } else {
+        export_scale.clamp(1, 4)
+    }
+}
+
+/// Plain (no-matte) pixels at export scale. Callers still apply
+/// `resize_to_max_edge` when an output-size cap is in play.
+pub fn scale_plain(raw: &RgbaImage, export_scale: u32) -> RgbaImage {
+    let scale = export_super_scale(raw.width(), raw.height(), export_scale);
+    if scale <= 1 {
+        return raw.clone();
+    }
+    image::imageops::resize(
+        raw,
+        raw.width() * scale,
+        raw.height() * scale,
+        image::imageops::FilterType::Lanczos3,
+    )
+}
+
 /// Export-path composite: applies supersampling before framing. Large
 /// captures skip upscaling — it only bloats files viewers have to shrink.
 ///
@@ -147,9 +172,9 @@ pub fn export(
     max_edge: u32,
 ) -> RgbaImage {
     if is_plain(style) {
-        // "Just the screenshot": native pixels, untouched. Callers still
-        // apply `resize_to_max_edge` to the raw capture.
-        return raw.clone();
+        // Same small-capture supersample as the editor Copy/Save path.
+        // Callers still apply `resize_to_max_edge`.
+        return scale_plain(raw, export_scale);
     }
     let plan = plan_framed_export(
         raw.width(),
@@ -271,10 +296,10 @@ pub fn plan_framed_export(
 ) -> FramePlan {
     let content_w = content_w.max(1);
     let content_h = content_h.max(1);
-    let super_scale = if !framed || content_w.max(content_h) >= 1600 {
+    let super_scale = if !framed {
         1
     } else {
-        export_scale.clamp(1, 4)
+        export_super_scale(content_w, content_h, export_scale)
     };
     let max_pixels = if framed && aspect.is_some() && max_edge == 0 {
         MAX_FRAMED_PIXELS
@@ -554,8 +579,8 @@ pub fn blend_bgra_content(
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_with, framed_size, layout, plan_framed_export, ComposeOpts,
-        DEFAULT_PAD_FACTOR, MAX_FRAMED_PIXELS, PAD_SLIDER_MAX, PAD_SLIDER_MIN,
+        compose_with, export, export_super_scale, framed_size, layout, plan_framed_export,
+        ComposeOpts, DEFAULT_PAD_FACTOR, MAX_FRAMED_PIXELS, PAD_SLIDER_MAX, PAD_SLIDER_MIN,
     };
     use crate::style::{Backdrop, Rgb, Style};
     use image::{Rgba, RgbaImage};
@@ -706,6 +731,23 @@ mod tests {
         let plan = plan_framed_export(400, 225, DEFAULT_PAD_FACTOR, None, true, 2, 0);
         assert_eq!((plan.content_w, plan.content_h), (800, 450));
         assert!((plan.metric_scale - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn plain_export_supersamples_a_small_capture() {
+        let raw = RgbaImage::from_pixel(400, 225, Rgba([24, 32, 48, 255]));
+        let plain = Style {
+            name: "None",
+            backdrop: Backdrop::Plain,
+        };
+        let exported = export(&raw, &plain, DEFAULT_PAD_FACTOR, None, 2, 0);
+        assert_eq!(exported.dimensions(), (800, 450));
+        assert_eq!(export_super_scale(400, 225, 2), 2);
+        assert_eq!(export_super_scale(1600, 900, 2), 1);
+
+        let large = RgbaImage::from_pixel(1600, 900, Rgba([24, 32, 48, 255]));
+        let large_out = export(&large, &plain, DEFAULT_PAD_FACTOR, None, 2, 0);
+        assert_eq!(large_out.dimensions(), (1600, 900));
     }
 
     #[test]

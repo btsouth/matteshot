@@ -1431,23 +1431,10 @@ fn render_final(
     let (pad_factor, aspect) = matte;
     let (ox, oy) = origin;
     if plain {
-        // None: no matte, so no aspect-padded canvas. Keep the native
-        // content (plus the small-capture supersample) and cap afterward.
-        let scale = if content.width().max(content.height()) >= 1600 {
-            1
-        } else {
-            export_scale.clamp(1, 4)
-        };
-        let mut scaled = if scale > 1 {
-            image::imageops::resize(
-                content,
-                content.width() * scale,
-                content.height() * scale,
-                image::imageops::FilterType::Lanczos3,
-            )
-        } else {
-            content.clone()
-        };
+        // None: no matte, so no aspect-padded canvas. Same supersample
+        // compose::export uses, then the output-size cap.
+        let scale = compose::export_super_scale(content.width(), content.height(), export_scale);
+        let mut scaled = compose::scale_plain(content, export_scale);
         crate::annotate::render(
             &mut scaled,
             anns,
@@ -1501,11 +1488,7 @@ fn render_final(
 fn composed_dimensions(state: &State) -> (u32, u32) {
     let (mut width, mut height) = state.doc().content_dimensions();
     if !compose::is_plain(&state.doc().styles[state.doc().sel]) {
-        let scale = if width.max(height) >= 1600 {
-            1
-        } else {
-            state.export_scale.clamp(1, 4)
-        };
+        let scale = compose::export_super_scale(width, height, state.export_scale);
         width *= scale;
         height *= scale;
         let opts = ComposeOpts {
@@ -1522,21 +1505,40 @@ fn composed_dimensions(state: &State) -> (u32, u32) {
 
 /// Exact Copy/Save dimensions without rendering the full-size image.
 fn final_dimensions(state: &State) -> (u32, u32) {
-    let max_edge = state.doc().output_max_edge;
-    if compose::is_plain(&state.doc().styles[state.doc().sel]) {
-        let (width, height) = composed_dimensions(state);
-        return output::resized_dimensions(width, height, max_edge);
+    let (cw, ch) = state.doc().content_dimensions();
+    final_size(
+        cw,
+        ch,
+        compose::is_plain(&state.doc().styles[state.doc().sel]),
+        state.doc().pad_factor,
+        ASPECTS[state.doc().aspect_idx].1,
+        state.export_scale,
+        state.doc().output_max_edge,
+    )
+}
+
+fn final_size(
+    content_w: u32,
+    content_h: u32,
+    plain: bool,
+    pad_factor: f32,
+    aspect: Option<f32>,
+    export_scale: u32,
+    max_edge: u32,
+) -> (u32, u32) {
+    if plain {
+        let scale = compose::export_super_scale(content_w, content_h, export_scale);
+        return output::resized_dimensions(content_w * scale, content_h * scale, max_edge);
     }
     // Same plan Copy/Save uses, so Original + a forced aspect reports the
     // 9.4 MP canvas rather than the native padded size we will not allocate.
-    let (cw, ch) = state.doc().content_dimensions();
     let plan = compose::plan_framed_export(
-        cw,
-        ch,
-        state.doc().pad_factor,
-        ASPECTS[state.doc().aspect_idx].1,
+        content_w,
+        content_h,
+        pad_factor,
+        aspect,
         true,
-        state.export_scale,
+        export_scale,
         max_edge,
     );
     output::resized_dimensions(plan.canvas_w, plan.canvas_h, max_edge)
@@ -1566,6 +1568,19 @@ fn custom_size_value(input: &str, dimensions: (u32, u32)) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|value| (minimum..=maximum).contains(value))
+}
+
+/// Prefill for the custom-size field. Original (`0`) is out of the typeable
+/// range; use the long edge Copy/Save actually writes, not the native canvas
+/// the 9.4 MP plan refused to allocate. Bounds still allow typing up to
+/// `min(native long edge, OUTPUT_CUSTOM_MAX)`.
+fn custom_size_initial(current: u32, native: (u32, u32), shown: (u32, u32)) -> u32 {
+    let (minimum, maximum) = custom_size_bounds(native);
+    if (minimum..=maximum).contains(&current) {
+        current
+    } else {
+        shown.0.max(shown.1).clamp(minimum, maximum)
+    }
 }
 
 fn custom_size_result(input: &str, dimensions: (u32, u32)) -> Option<(u32, u32)> {
@@ -2461,14 +2476,9 @@ fn begin_custom_size(state: &mut State) {
     commit_editing(state);
     state.tool = None;
     state.doc_mut().text_select = None;
-    let dimensions = composed_dimensions(state);
-    let (minimum, maximum) = custom_size_bounds(dimensions);
+    let native = composed_dimensions(state);
     let current = state.doc().output_max_edge;
-    let initial = if (minimum..=maximum).contains(&current) {
-        current
-    } else {
-        maximum
-    };
+    let initial = custom_size_initial(current, native, final_dimensions(state));
     state.custom_size_edit = Some(CustomSizeEdit {
         input: initial.to_string(),
         replace_on_type: true,
@@ -4704,8 +4714,9 @@ mod tests {
 
     use super::{
         active_after_close, ann_bounds, annotation_tool_index, apply_custom_size_input,
-        apply_text_input, custom_size_axis, custom_size_bounds, custom_size_result,
-        freehand_length, join_words, layout_controls, nearest_word, persist_and_copy_with,
+        apply_text_input, custom_size_axis, custom_size_bounds, custom_size_initial,
+        custom_size_result, custom_size_value, final_size, freehand_length, join_words,
+        layout_controls, nearest_word, persist_and_copy_with,
         output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
         corner_index, crop_contains, crop_drag_for, crop_from_points, deliver_ocr, move_crop,
         preview_sources, preview_target_edge, redacted, render_final, resize_crop, tab_for_digit,
@@ -5276,6 +5287,88 @@ mod tests {
         assert!(native.0.max(native.1) > crate::output::OUTPUT_EMAIL);
     }
 
+    fn plain_style() -> crate::style::Style {
+        crate::style::Style {
+            name: "Plain",
+            backdrop: crate::style::Backdrop::Plain,
+        }
+    }
+
+    #[test]
+    fn plain_copy_and_batch_export_agree_on_small_capture_size() {
+        let raw = RgbaImage::from_pixel(400, 225, Rgba([24, 32, 48, 255]));
+        let copy = render_final(
+            &raw,
+            &[],
+            (0.0, 0.0),
+            &plain_style(),
+            (0.14, None),
+            2,
+            crate::output::OUTPUT_ORIGINAL,
+        );
+        let batch = crate::compose::export(
+            &raw,
+            &plain_style(),
+            0.14,
+            None,
+            2,
+            crate::output::OUTPUT_ORIGINAL,
+        );
+        assert_eq!(copy.dimensions(), (800, 450));
+        assert_eq!(batch.dimensions(), copy.dimensions());
+    }
+
+    #[test]
+    fn plain_size_label_matches_the_file_for_a_small_capture() {
+        let raw = RgbaImage::from_pixel(400, 225, Rgba([24, 32, 48, 255]));
+        let copy = render_final(
+            &raw,
+            &[],
+            (0.0, 0.0),
+            &plain_style(),
+            (0.14, None),
+            2,
+            crate::output::OUTPUT_ORIGINAL,
+        );
+        let shown = final_size(400, 225, true, 0.14, None, 2, crate::output::OUTPUT_ORIGINAL);
+        assert_eq!(shown, (800, 450));
+        assert_eq!(shown, copy.dimensions());
+    }
+
+    #[test]
+    fn opening_custom_size_from_original_prefills_the_capped_long_edge() {
+        let native = crate::compose::framed_size(
+            1920,
+            19_000,
+            &crate::compose::ComposeOpts {
+                aspect: Some(16.0 / 9.0),
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(native, (35_200, 19_800));
+        let shown = final_size(
+            1920,
+            19_000,
+            false,
+            crate::compose::DEFAULT_PAD_FACTOR,
+            Some(16.0 / 9.0),
+            1,
+            crate::output::OUTPUT_ORIGINAL,
+        );
+        let long = shown.0.max(shown.1);
+        assert!(
+            (3500..=4500).contains(&long),
+            "Original 16:9 label should be ~4K, got {shown:?}"
+        );
+        assert_eq!(custom_size_initial(0, native, shown), long);
+        assert_eq!(custom_size_value("10000", native), Some(10_000));
+        assert_eq!(
+            custom_size_initial(crate::output::OUTPUT_EMAIL, native, shown),
+            crate::output::OUTPUT_EMAIL
+        );
+    }
+
     #[test]
     fn a_sweep_past_the_edge_keeps_pinning_the_crop_to_the_capture() {
         // What the drag path does with a point the cursor has taken well
@@ -5538,6 +5631,7 @@ mod tests {
         // custom value; very tall captures retain the existing 10k guardrail.
         assert_eq!(custom_size_bounds((200, 100)), (200, 200));
         assert_eq!(custom_size_bounds((1200, 19_000)), (320, 10_000));
+        assert_eq!(custom_size_value("10000", (1200, 19_000)), Some(10_000));
     }
 
     #[test]
