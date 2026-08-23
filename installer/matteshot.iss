@@ -170,18 +170,20 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   // Offer only. Captures live in the save/video folders and stay there
-  // unless the user already deleted them. SBS-765.
+  // unless the user already deleted them. Silent / unattended uninstall
+  // leaves the metadata in place so winget does not delete titles without
+  // a human Yes. SBS-765.
   if (CurUninstallStep = usUninstall) and HistoryMetadataPresent then
   begin
-    if MsgBox(
+    if SuppressibleMsgBox(
       'Remove Matteshot History metadata?'#13#10#13#10
       + 'This deletes stored window titles from AppData. Screenshot and video files stay on disk.',
-      mbConfirmation, MB_YESNO) = IDYES then
+      mbConfirmation, MB_YESNO, IDNO) = IDYES then
     begin
       if not DeleteHistoryMetadata then
-        MsgBox(
+        SuppressibleMsgBox(
           'Matteshot could not remove History metadata. You can delete history.json from AppData\Roaming\matteshot yourself.',
-          mbError, MB_OK);
+          mbError, MB_OK, IDOK);
     end;
   end;
 end;

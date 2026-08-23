@@ -8,9 +8,11 @@
 //!
 //! `source` is the captured window title (or a region-size label), stored
 //! in plaintext on this PC. Opening History drops entries whose files are
-//! gone and rewrites that pruned list (SBS-765). Clear titles strips
-//! `source` without deleting captures. Uninstall may offer to delete the
-//! index; it never deletes the files it pointed at.
+//! confirmed gone (NotFound, or a path that exists and is not a file) and
+//! rewrites that pruned list (SBS-765). A transient metadata error keeps
+//! the row. Clear titles strips `source` without deleting captures.
+//! Uninstall may offer to delete the index; it never deletes the files it
+//! pointed at.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -140,6 +142,23 @@ fn trim_entries(mut entries: Vec<Entry>, cap: usize, exists: impl Fn(&Path) -> b
     entries
 }
 
+/// Keep an index row unless the capture is confirmed gone or is not a file.
+///
+/// `Path::is_file` is `metadata().map(is_file).unwrap_or(false)`, so
+/// ACCESS_DENIED, a disconnected USB/NAS, and an AV lock all look like a
+/// delete. Opening History would then persist that shorter list.
+fn keep_capture_after_metadata(result: std::io::Result<std::fs::Metadata>) -> bool {
+    match result {
+        Ok(meta) => meta.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn capture_file_present(path: &Path) -> bool {
+    keep_capture_after_metadata(std::fs::metadata(path))
+}
+
 /// A window title is not bounded by Windows the way a control's own text
 /// often is; capping it here (same reasoning as diagnostics.rs's own event
 /// log) keeps one pathological title from bloating every future read of the
@@ -207,7 +226,7 @@ fn append_at(index: &Path, entry: Entry) {
         }
     };
     log.entries.push(entry);
-    log.entries = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
+    log.entries = trim_entries(log.entries, MAX_ENTRIES, capture_file_present);
     if let Err(error) = save_unlocked_at(index, &log) {
         crate::diagnostics::log(&format!("capture not indexed, history write failed: {error:#}"));
     }
@@ -215,12 +234,13 @@ fn append_at(index: &Path, entry: Entry) {
 
 /// Every entry whose file still exists, most recent first.
 ///
-/// Missing files are dropped from the on-disk index as well (SBS-765).
-/// A transient or corrupt read still shows an empty window this open and
-/// leaves the bytes exactly as they were: quarantine-and-start-fresh
-/// belongs to explicit mutating paths, which pair it with a replacement
-/// write. Browsing only rewrites after a successful parse that actually
-/// dropped something.
+/// Files confirmed gone are dropped from the on-disk index as well
+/// (SBS-765). A transient metadata error keeps the row rather than
+/// treating it as a delete. A transient or corrupt read still shows an
+/// empty window this open and leaves the bytes exactly as they were:
+/// quarantine-and-start-fresh belongs to explicit mutating paths, which
+/// pair it with a replacement write. Browsing only rewrites after a
+/// successful parse that actually dropped something.
 pub fn list() -> Vec<Entry> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
     let Some(path) = history_path() else {
@@ -230,6 +250,10 @@ pub fn list() -> Vec<Entry> {
 }
 
 fn list_at(index: &Path) -> Vec<Entry> {
+    list_at_with(index, capture_file_present)
+}
+
+fn list_at_with(index: &Path, present: impl Fn(&Path) -> bool) -> Vec<Entry> {
     let body = match std::fs::read(index) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -244,7 +268,7 @@ fn list_at(index: &Path) -> Vec<Entry> {
         return Vec::new();
     };
     let original_len = log.entries.len();
-    let pruned = trim_entries(log.entries, MAX_ENTRIES, |p| p.is_file());
+    let pruned = trim_entries(log.entries, MAX_ENTRIES, present);
     if pruned.len() != original_len {
         if let Err(error) = save_unlocked_at(index, &Log { entries: pruned.clone() }) {
             crate::diagnostics::log(&format!("history prune not persisted: {error:#}"));
@@ -394,7 +418,15 @@ pub fn clear_source_metadata() -> Result<usize> {
 }
 
 fn clear_source_metadata_at(index: &Path) -> Result<usize> {
-    let mut log = load_for_mutation(index)?;
+    // Do not use `load_for_mutation`: a parse failure there quarantines the
+    // file and returns an empty log, so Settings would report "no stored
+    // titles" while the titles sit in history.json.corrupt-*. A corrupt or
+    // unreadable index must surface as Err and stay put.
+    let mut log = match std::fs::read(index) {
+        Ok(body) => serde_json::from_slice(&body).context("parse history index")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Log::default(),
+        Err(error) => return Err(error).context("read history index"),
+    };
     let cleared = log
         .entries
         .iter()
@@ -404,7 +436,11 @@ fn clear_source_metadata_at(index: &Path) -> Result<usize> {
         entry.source = None;
     }
     let before = log.entries.len();
-    log.entries = trim_entries(std::mem::take(&mut log.entries), MAX_ENTRIES, |p| p.is_file());
+    log.entries = trim_entries(
+        std::mem::take(&mut log.entries),
+        MAX_ENTRIES,
+        capture_file_present,
+    );
     if cleared > 0 || log.entries.len() != before {
         save_unlocked_at(index, &log)?;
     }
@@ -414,12 +450,16 @@ fn clear_source_metadata_at(index: &Path) -> Result<usize> {
 /// Files uninstall / data-removal may delete after an explicit yes.
 /// Capture files are never in this list — only the index, a leftover
 /// atomic-write temp, and quarantined copies, all under the app-data folder.
+/// The installer is the production deleter; these helpers pin the naming
+/// that Pascal script must match.
+#[cfg(test)]
 fn is_history_metadata_name(name: &str) -> bool {
     name == "history.json"
         || name == "history.json.tmp"
         || name.starts_with("history.json.corrupt-")
 }
 
+#[cfg(test)]
 fn history_metadata_files(config_dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(config_dir) {
         Ok(entries) => entries,
@@ -438,6 +478,7 @@ fn history_metadata_files(config_dir: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+#[cfg(test)]
 fn remove_history_metadata_in(dir: &Path) -> Result<()> {
     for path in history_metadata_files(dir)? {
         match std::fs::remove_file(&path) {
@@ -1070,6 +1111,92 @@ mod persistence_tests {
         assert_eq!(std::fs::read(&index).unwrap(), b"{ not json");
     }
 
+    #[test]
+    fn a_permission_error_does_not_prune_the_entry() {
+        assert!(
+            keep_capture_after_metadata(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            "ACCESS_DENIED is not proof the capture is gone"
+        );
+        assert!(!keep_capture_after_metadata(Err(std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        ))));
+
+        let dir = temp_dir("list-denied");
+        let shot = capture(&dir, "a.png");
+        let index = dir.join("history.json");
+        write_log(&index, vec![entry_with_source(&shot, "Secret subject")]);
+        // Gone on disk, which Path::is_file treats as a prune. A metadata
+        // PermissionDenied must not persist that drop.
+        std::fs::remove_file(&shot).unwrap();
+        let before = std::fs::read(&index).unwrap();
+
+        let listed = list_at_with(&index, |_| {
+            keep_capture_after_metadata(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+        });
+        assert_eq!(listed.len(), 1, "an unreadable capture must stay in the open list");
+        assert_eq!(listed[0].path, shot);
+        assert_eq!(listed[0].source.as_deref(), Some("Secret subject"));
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "ACCESS_DENIED must not persist as a prune"
+        );
+    }
+
+    #[test]
+    fn list_at_does_not_prune_a_permission_denied_path() {
+        let probe = PathBuf::from(r"C:\System Volume Information\matteshot-history-probe.png");
+        match std::fs::metadata(&probe) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => {
+                eprintln!("skipping: metadata({probe:?}) was {other:?}, not PermissionDenied");
+                return;
+            }
+        }
+        let dir = temp_dir("list-denied-real");
+        let index = dir.join("history.json");
+        write_log(&index, vec![entry_with_source(&probe, "Secret subject")]);
+        let before = std::fs::read(&index).unwrap();
+        let listed = list_at(&index);
+        assert_eq!(listed.len(), 1, "an unreadable capture must stay in the open list");
+        assert_eq!(listed[0].path, probe);
+        assert_eq!(listed[0].source.as_deref(), Some("Secret subject"));
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "ACCESS_DENIED must not persist as a prune"
+        );
+    }
+
+    #[test]
+    fn a_directory_at_the_capture_path_is_dropped_like_a_missing_file() {
+        let dir = temp_dir("list-not-a-file");
+        let kept = capture(&dir, "kept.png");
+        let not_a_file = dir.join("folder.png");
+        std::fs::create_dir_all(&not_a_file).unwrap();
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&kept, "Kept"),
+                entry_with_source(&not_a_file, "Was a folder"),
+            ],
+        );
+
+        let listed = list_at(&index);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, kept);
+        let on_disk = load_for_mutation(&index).unwrap();
+        assert_eq!(on_disk.entries.len(), 1);
+        assert_eq!(on_disk.entries[0].path, kept);
+        assert!(kept.is_file());
+        assert!(not_a_file.is_dir());
+    }
+
     /// SBS-765: Clear History strips titles and leaves the files.
     #[test]
     fn clear_source_metadata_strips_titles_and_leaves_files() {
@@ -1137,6 +1264,28 @@ mod persistence_tests {
         std::fs::create_dir_all(&index).unwrap();
         assert!(clear_source_metadata_at(&index).is_err());
         assert!(index.is_dir());
+    }
+
+    #[test]
+    fn clear_source_metadata_leaves_a_corrupt_index_in_place() {
+        let dir = temp_dir("clear-corrupt");
+        let index = dir.join("history.json");
+        std::fs::write(&index, b"{ not json").unwrap();
+        assert!(clear_source_metadata_at(&index).is_err());
+        assert_eq!(std::fs::read(&index).unwrap(), b"{ not json");
+        let quarantined = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("history.json.corrupt-")
+            });
+        assert!(
+            !quarantined,
+            "clear titles must not rename a corrupt index aside"
+        );
     }
 
     /// SBS-765: data-removal deletes only the index (and quarantines), never captures.
