@@ -1484,13 +1484,14 @@ fn render_final(
 }
 
 /// Exact matte dimensions before the optional output-size cap, without
-/// rendering the full-size image.
+/// rendering the full-size image. Includes the small-capture supersample so
+/// custom-size bounds match Copy/Save.
 fn composed_dimensions(state: &State) -> (u32, u32) {
     let (mut width, mut height) = state.doc().content_dimensions();
+    let scale = compose::export_super_scale(width, height, state.export_scale);
+    width *= scale;
+    height *= scale;
     if !compose::is_plain(&state.doc().styles[state.doc().sel]) {
-        let scale = compose::export_super_scale(width, height, state.export_scale);
-        width *= scale;
-        height *= scale;
         let opts = ComposeOpts {
             metric_scale: scale as f32,
             pad_factor: state.doc().pad_factor,
@@ -1572,8 +1573,8 @@ fn custom_size_value(input: &str, dimensions: (u32, u32)) -> Option<u32> {
 
 /// Prefill for the custom-size field. Original (`0`) is out of the typeable
 /// range; use the long edge Copy/Save actually writes, not the native canvas
-/// the 9.4 MP plan refused to allocate. Bounds still allow typing up to
-/// `min(native long edge, OUTPUT_CUSTOM_MAX)`.
+/// the 9.4 MP plan refused to allocate. Bounds follow `composed_dimensions`
+/// (supersampled plain, native padded framed) up to `OUTPUT_CUSTOM_MAX`.
 fn custom_size_initial(current: u32, native: (u32, u32), shown: (u32, u32)) -> u32 {
     let (minimum, maximum) = custom_size_bounds(native);
     if (minimum..=maximum).contains(&current) {
@@ -5333,6 +5334,29 @@ mod tests {
         let shown = final_size(400, 225, true, 0.14, None, 2, crate::output::OUTPUT_ORIGINAL);
         assert_eq!(shown, (800, 450));
         assert_eq!(shown, copy.dimensions());
+    }
+
+    #[test]
+    fn confirming_custom_size_from_plain_original_keeps_the_supersampled_export() {
+        let raw = RgbaImage::from_pixel(400, 225, Rgba([24, 32, 48, 255]));
+        let shown = final_size(400, 225, true, 0.14, None, 2, crate::output::OUTPUT_ORIGINAL);
+        let scale = crate::compose::export_super_scale(400, 225, 2);
+        let composed = (400 * scale, 225 * scale);
+        assert_eq!(shown, (800, 450));
+        assert_eq!(composed, shown);
+        let committed = custom_size_initial(0, composed, shown);
+        assert_eq!(committed, 800);
+        assert_eq!(custom_size_value(&committed.to_string(), composed), Some(800));
+        let confirmed = render_final(
+            &raw,
+            &[],
+            (0.0, 0.0),
+            &plain_style(),
+            (0.14, None),
+            2,
+            committed,
+        );
+        assert_eq!(confirmed.dimensions(), shown);
     }
 
     #[test]
