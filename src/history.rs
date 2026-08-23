@@ -40,11 +40,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE}
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GetCursorPos, GetWindowLongPtrW, IsWindow, KillTimer, LoadCursorW,
-    MessageBoxW, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TrackPopupMenu, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDYES, MB_ICONWARNING, MB_OK, MB_YESNO, MF_STRING,
-    SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
-    WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
+    MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TrackPopupMenu, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDYES, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MF_STRING, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
+    WM_APP, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
 };
@@ -53,9 +53,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // Persistence — pure logic + file IO, no Win32.
 // ---------------------------------------------------------------------------
 
-/// Recent-history cap: bounds the log file and how much a window open has to
-/// decode. Entries past the cap are just no longer browsable; their files are
-/// untouched, exactly like a save that predates this feature.
+/// Recent-history cap: bounds the log file and how many thumbs the worker
+/// has to decode after ShowWindow (SBS-1054). Entries past the cap are just
+/// no longer browsable; their files are untouched, exactly like a save that
+/// predates this feature.
 const MAX_ENTRIES: usize = 150;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1573,6 +1574,9 @@ const STATUS_TIMER_ID: usize = 1;
 /// One-shot, armed on WM_LBUTTONUP and cancelled by WM_LBUTTONDBLCLK: what
 /// tells a single click from the first half of a double-click.
 const CLICK_TIMER_ID: usize = 2;
+/// Posted when the thumb worker finishes. `lparam` is an opaque token from
+/// `THUMB_COMPLETIONS` (SBS-743) — never a pointer.
+const WM_THUMBS_READY: u32 = WM_APP + 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cell {
@@ -1756,6 +1760,96 @@ mod thumb_tests {
         );
         assert_eq!(thumb.source_label, "Notepad");
     }
+
+    fn named_entry(path: &Path, source: Option<&str>) -> Entry {
+        Entry {
+            path: path.to_path_buf(),
+            saved_at: 1,
+            width: 10,
+            height: 10,
+            style: "Deep".into(),
+            source: source.map(str::to_string),
+        }
+    }
+
+    /// Pins SBS-1054: the grid that reaches ShowWindow is labels only. A
+    /// corrupt or huge file on disk must not be opened just to put the
+    /// window on screen — that decode belongs to the worker.
+    #[test]
+    fn opening_placeholders_do_not_decode_the_png() {
+        let dir = temp_dir("no-decode");
+        let path = dir.join("not-a-png.png");
+        std::fs::write(&path, b"not a png").unwrap();
+        let entry = named_entry(&path, Some("Notepad"));
+        let thumbs = placeholders(&[entry.clone()]);
+        assert_eq!(thumbs.len(), 1);
+        assert!(thumbs[0].bgra.is_empty(), "a placeholder must not hold pixels");
+        assert_eq!(thumbs[0].img_w, 0);
+        assert_eq!(thumbs[0].img_h, 0);
+        assert_eq!(thumbs[0].source_label, "Notepad");
+        assert!(
+            make_thumb(&entry, CELL_W, CELL_IMG_H).is_none(),
+            "the same path is undecodable; placeholders must not have called make_thumb"
+        );
+    }
+
+    #[test]
+    fn a_stale_thumb_generation_is_not_applied() {
+        let current = placeholders(&[named_entry(Path::new("a.png"), None)]);
+        let batch = ThumbBatch {
+            generation: 1,
+            thumbs: placeholders(&[named_entry(Path::new("a.png"), None)]),
+        };
+        assert!(
+            take_ready_thumbs(&current, 2, batch).is_none(),
+            "a reload's in-flight worker must not replace the newer grid"
+        );
+    }
+
+    #[test]
+    fn a_deleted_path_is_not_restored_by_a_late_batch() {
+        let current = placeholders(&[named_entry(Path::new("keep.png"), Some("Keep"))]);
+        let mut keep = placeholder(&named_entry(Path::new("keep.png"), Some("Keep")));
+        keep.bgra = vec![1, 2, 3, 255];
+        keep.img_w = 1;
+        keep.img_h = 1;
+        let gone = placeholder(&named_entry(Path::new("gone.png"), Some("Gone")));
+        let applied = take_ready_thumbs(
+            &current,
+            0,
+            ThumbBatch {
+                generation: 0,
+                thumbs: vec![keep, gone],
+            },
+        )
+        .expect("matching generation should apply");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].entry.path, Path::new("keep.png"));
+        assert_eq!(applied[0].bgra, vec![1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn a_batch_that_omits_a_path_drops_that_placeholder() {
+        let current = placeholders(&[
+            named_entry(Path::new("ok.png"), None),
+            named_entry(Path::new("bad.png"), None),
+        ]);
+        let mut ok = placeholder(&named_entry(Path::new("ok.png"), None));
+        ok.bgra = vec![9, 8, 7, 255];
+        ok.img_w = 1;
+        ok.img_h = 1;
+        let applied = take_ready_thumbs(
+            &current,
+            0,
+            ThumbBatch {
+                generation: 0,
+                thumbs: vec![ok],
+            },
+        )
+        .expect("matching generation should apply");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].entry.path, Path::new("ok.png"));
+    }
 }
 
 struct Thumb {
@@ -1787,6 +1881,10 @@ fn to_bgra(img: &RgbaImage) -> Vec<u8> {
 /// the decoder still only holds one scanline, then letterboxed into the cell.
 /// Copy / reopen-in-editor still load the file at native size; those are
 /// one image on demand, not every indexed PNG on window open.
+///
+/// Called from the thumb worker, not the UI thread that shows the window
+/// (SBS-1054). Video editor does the same split: `probe_opening` puts one
+/// frame on screen, then `probe_editor` fills the rest off-thread.
 fn make_thumb(entry: &Entry, max_w: i32, max_h: i32) -> Option<Thumb> {
     let cap = crate::thumb_decode::THUMB_DECODE_MAX
         .max(max_w.max(1) as u32)
@@ -1809,6 +1907,78 @@ fn make_thumb(entry: &Entry, max_w: i32, max_h: i32) -> Option<Thumb> {
 
 fn build_thumbs(entries: &[Entry], max_w: i32, max_h: i32) -> Vec<Thumb> {
     entries.par_iter().filter_map(|e| make_thumb(e, max_w, max_h)).collect()
+}
+
+/// What `open` / `reload` put on screen before the worker posts. Labels and
+/// layout only — no IDAT. A card with empty `bgra` paints as a blank cell
+/// until `take_ready_thumbs` replaces it.
+fn placeholder(entry: &Entry) -> Thumb {
+    Thumb {
+        entry: entry.clone(),
+        bgra: Vec::new(),
+        img_w: 0,
+        img_h: 0,
+        source_label: normalize_source(entry.source.as_deref())
+            .unwrap_or_else(|| "\u{2014}".to_string()),
+    }
+}
+
+fn placeholders(entries: &[Entry]) -> Vec<Thumb> {
+    entries.iter().map(placeholder).collect()
+}
+
+struct ThumbBatch {
+    generation: u64,
+    thumbs: Vec<Thumb>,
+}
+
+static THUMB_COMPLETIONS: crate::completion::CompletionMailbox<ThumbBatch> =
+    crate::completion::CompletionMailbox::new();
+
+/// Keep a worker result only when it belongs to this open/reload, and only
+/// for paths still in the grid. A late batch must not revive a row the user
+/// already deleted, and a stale generation must not replace a newer reload.
+fn take_ready_thumbs(
+    current: &[Thumb],
+    generation: u64,
+    batch: ThumbBatch,
+) -> Option<Vec<Thumb>> {
+    if batch.generation != generation {
+        return None;
+    }
+    Some(
+        batch
+            .thumbs
+            .into_iter()
+            .filter(|ready| current.iter().any(|slot| slot.entry.path == ready.entry.path))
+            .collect(),
+    )
+}
+
+/// Decode on a worker and post `WM_THUMBS_READY`. The UI thread that just
+/// called ShowWindow (or painted placeholders on reload) must not wait.
+fn start_thumb_build(hwnd: HWND, generation: u64, entries: Vec<Entry>, max_w: i32, max_h: i32) {
+    if entries.is_empty() {
+        return;
+    }
+    let target = hwnd.0 as isize;
+    let mailbox_generation = THUMB_COMPLETIONS.generation_of(target);
+    std::thread::spawn(move || {
+        let thumbs = build_thumbs(&entries, max_w, max_h);
+        let hwnd = HWND(target as *mut _);
+        THUMB_COMPLETIONS.post_with_at(
+            target,
+            mailbox_generation,
+            ThumbBatch { generation, thumbs },
+            |token| {
+                crate::window::has_class(hwnd, "matteshot_history")
+                    && unsafe {
+                        PostMessageW(hwnd, WM_THUMBS_READY, WPARAM(0), LPARAM(token as isize))
+                            .is_ok()
+                    }
+            },
+        );
+    });
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -1866,6 +2036,8 @@ struct State {
     pending_click: Option<usize>,
     /// Only the latest Share click may update the browser or clipboard.
     pending_share: Option<u64>,
+    /// Bumped on each open/reload so a late worker cannot replace a newer grid.
+    thumb_generation: u64,
 }
 
 /// Singleton like Settings: reopening focuses the existing window instead of
@@ -1937,36 +2109,40 @@ unsafe fn paint(hdc: HDC, state: &State) {
             SelectObject(hdc, old_brush);
         }
 
-        // Letterboxed, centered within the image area.
-        let ix = cx + (state.cell_w - thumb.img_w) / 2;
-        let iy = cy + (state.cell_img_h - thumb.img_h) / 2;
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: thumb.img_w,
-                biHeight: -thumb.img_h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
+        // Letterboxed, centered within the image area. A placeholder from
+        // open/reload has no pixels yet (SBS-1054); the card and labels
+        // still paint so the window can show before the worker finishes.
+        if !thumb.bgra.is_empty() && thumb.img_w > 0 && thumb.img_h > 0 {
+            let ix = cx + (state.cell_w - thumb.img_w) / 2;
+            let iy = cy + (state.cell_img_h - thumb.img_h) / 2;
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: thumb.img_w,
+                    biHeight: -thumb.img_h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        StretchDIBits(
-            hdc,
-            ix,
-            iy,
-            thumb.img_w,
-            thumb.img_h,
-            0,
-            0,
-            thumb.img_w,
-            thumb.img_h,
-            Some(thumb.bgra.as_ptr() as *const _),
-            &info,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
+            };
+            StretchDIBits(
+                hdc,
+                ix,
+                iy,
+                thumb.img_w,
+                thumb.img_h,
+                0,
+                0,
+                thumb.img_w,
+                thumb.img_h,
+                Some(thumb.bgra.as_ptr() as *const _),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
 
         // Split the already DPI-scaled label band proportionally rather than
         // storing a second scaled field: SOURCE_LABEL_H : LABEL_H at 1x scale
@@ -2312,6 +2488,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_THUMBS_READY => {
+            let Some(batch) = THUMB_COMPLETIONS.take(lparam.0 as u64, hwnd.0 as isize) else {
+                return LRESULT(0);
+            };
+            if let Some(state) = state_of(hwnd) {
+                if let Some(thumbs) = take_ready_thumbs(&state.thumbs, state.thumb_generation, batch)
+                {
+                    // Indices can shift when failed decodes drop out of the
+                    // grid; a pending single-click must not copy a different
+                    // file than the one that was under the cursor.
+                    let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                    state.pending_click = None;
+                    state.hover = -1;
+                    state.thumbs = thumbs;
+                    relayout(state);
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
         crate::share::WM_SHARE_COMPLETE => {
             let Some(completion) = crate::share::take_completion(lparam.0 as u64, hwnd.0 as isize)
             else {
@@ -2352,6 +2548,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_NCDESTROY => {
             crate::share::discard_window(hwnd.0 as isize);
+            THUMB_COMPLETIONS.unbind(hwnd.0 as isize);
             let _ = KillTimer(hwnd, STATUS_TIMER_ID);
             let _ = KillTimer(hwnd, CLICK_TIMER_ID);
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
@@ -2367,17 +2564,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-/// Reload the entry list and thumbnails into an already-open window.
+/// Reload the entry list into an already-open window. Placeholders go on
+/// screen immediately; PNG decode stays on the worker (SBS-1054).
 unsafe fn reload(hwnd: HWND) {
     let Some(state) = state_of(hwnd) else { return };
     let _ = KillTimer(hwnd, CLICK_TIMER_ID);
     state.pending_click = None;
     let entries = list();
-    state.thumbs = build_thumbs(&entries, state.cell_w, state.cell_img_h);
+    let cell_w = state.cell_w;
+    let cell_img_h = state.cell_img_h;
+    state.thumb_generation = state.thumb_generation.wrapping_add(1);
+    let generation = state.thumb_generation;
+    state.thumbs = placeholders(&entries);
     state.scroll_y = 0;
     state.hover = -1;
     relayout(state);
     let _ = InvalidateRect(hwnd, None, false);
+    start_thumb_build(hwnd, generation, entries, cell_w, cell_img_h);
 }
 
 /// Open (or focus and refresh) the history browser. Non-modal; shares the
@@ -2406,7 +2609,12 @@ pub fn open() -> Result<()> {
         let cell_h = sc(CELL_H);
         let margin = sc(MARGIN);
         let gap = sc(GAP);
-        let thumbs = build_thumbs(&entries, cell_w, cell_img_h);
+        // Labels and layout only. `build_thumbs` used to run here on this
+        // thread — up to 150 scroll PNGs of IDAT inflate — before
+        // ShowWindow, which froze PrtScn/tray (SBS-1054). Video editor
+        // shows one `probe_opening` frame and fills the rest on a worker;
+        // History has entry metadata, so the equivalent is empty cells.
+        let thumbs = placeholders(&entries);
         let (cells, content_h) = grid_layout(thumbs.len(), cw, cell_w, cell_h, margin, gap);
 
         let monitor = MonitorFromPoint(cursor, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
@@ -2432,6 +2640,7 @@ pub fn open() -> Result<()> {
             status: None,
             pending_click: None,
             pending_share: None,
+            thumb_generation: 0,
         });
 
         let hinstance = GetModuleHandleW(None).context("get app module for history")?;
@@ -2491,6 +2700,7 @@ pub fn open() -> Result<()> {
         let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         let _ = SetForegroundWindow(hwnd);
         eprintln!("history: opened with {} entries", entries.len());
+        start_thumb_build(hwnd, 0, entries, cell_w, cell_img_h);
         Ok(())
     }
 }
