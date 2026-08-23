@@ -71,9 +71,8 @@ everywhere).
 
 - The installer is per-user (no UAC) and code-signed; certification's
   automated install test runs the silent switches above.
-- `AppPublisher` in the installer currently says "SouthForge AI" (template
-  leftover). Fix to "Southbound Software" in `installer/matteshot.iss` with the
-  next release; harmless for certification but worth aligning.
+- `AppPublisher` in the installer is "Southbound Software", matching the
+  privacy policy and `HKCU\Software\Southbound Software\Matteshot`.
 - winget submission for the same binary:
   <https://github.com/microsoft/winget-pkgs/pull/413210> — package id
   `SouthboundSoftware.Matteshot`.

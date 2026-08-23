@@ -28,7 +28,7 @@ SignedUninstaller=yes
 AppId={{8B1F3C52-9D14-4A6E-B7E0-52A32C1D9F41}
 AppName=Matteshot
 AppVersion={#AppVersion}
-AppPublisher=SouthForge AI
+AppPublisher=Southbound Software
 AppPublisherURL=https://matteshot.app
 AppSupportURL=https://matteshot.app
 DefaultDirName={localappdata}\Programs\Matteshot
@@ -51,10 +51,10 @@ UninstallDisplayIcon={app}\matteshot.exe
 ; worse than an unsigned one with a full record.
 VersionInfoVersion={#NumericVersion}
 VersionInfoProductVersion={#NumericVersion}
-VersionInfoCompany=SouthForge AI
+VersionInfoCompany=Southbound Software
 VersionInfoProductName=Matteshot
 VersionInfoDescription=Matteshot Setup
-VersionInfoCopyright=Copyright (C) 2026 SouthForge AI
+VersionInfoCopyright=Copyright (C) 2026 Southbound Software
 ; Built as MatteshotSetup-<version>.exe, but published and downloaded under the
 ; stable name, which is the one worth claiming here.
 VersionInfoOriginalFileName=MatteshotSetup.exe
