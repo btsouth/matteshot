@@ -75,13 +75,19 @@ Any failure leaves the running app untouched and the tray menu still offers the 
 
 ## Settings (tray menu)
 
-Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows (a denied or missing Startup folder on enable, or a locked or read-only shortcut on disable, shows an error and leaves the checkbox matching the shortcut on disk), PrtScn capture toggle, GIF toggle, automatic updates toggle, keep the editor open after Copy, recording audio Off/System/Mic, plus **Copy diagnostics** (a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path) and **Deactivate this PC** for licensed installs.
+Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows (a denied or missing Startup folder on enable, or a locked or read-only shortcut on disable, shows an error and leaves the checkbox matching the shortcut on disk), PrtScn capture toggle, GIF toggle, automatic updates toggle, keep the editor open after Copy, recording audio Off/System/Mic, plus **Copy diagnostics** (a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path), **Clear History titles** (strips stored window titles from the History index and leaves capture files alone), and **Deactivate this PC** for licensed installs.
 
 The Settings window clamps to the active monitor work area and scrolls, so Update, privacy, diagnostics, and license controls stay reachable at 100-200% even on 1366x768. Tab/arrows move focus and scroll the focused control into view; mouse wheel and Page Up/Down scroll the rest of the way.
 
-Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. The tray menu is capture (and the active-window and delayed-capture variants), open captures/videos folders, History, license, and Settings — Deactivate and Copy diagnostics live in the Settings window.
+Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. The tray menu is capture (and the active-window and delayed-capture variants), open captures/videos folders, History, license, and Settings — Deactivate, Copy diagnostics, and Clear History titles live in the Settings window.
 
 On first run, a compact native welcome surface explains the PrtScn-to-paste loop, the no-card 14-day trial, and opens the real capture flow in one click. It follows Windows light and dark app mode, stays non-modal so capture hotkeys remain responsive, and never appears again after it has been shown. If that window fails to open, a tray balloon explains PrtScn and the tray menu, and first-run is marked done so it does not retry.
+
+## History privacy
+
+History is a local index at `%APPDATA%\matteshot\history.json`. Each entry stores the save path, time, size, matte name, and — by default — the captured window's title (or a region-size label), sanitized and capped at 200 characters. Titles stay on this PC; diagnostics and telemetry do not send them.
+
+Opening History drops entries whose files are gone and writes that pruned list back to disk, so a capture deleted in Explorer does not leave its title behind. **Clear History titles…** in Settings removes stored titles without deleting screenshots or videos. Per-item Delete is what removes a file. Uninstall asks before deleting `history.json` (plus leftover `history.json.tmp` and quarantined copies); it does not delete captures. The default is still the full window title, not the app name only.
 
 ## CLI / test rig
 
