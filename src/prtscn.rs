@@ -242,23 +242,119 @@ fn uninstall_hook() {
     KEY_DOWN.store(false, Ordering::SeqCst);
 }
 
-/// Missing value defaults to enabled on current Win11 builds.
-pub fn snipping_owns_prtscn() -> bool {
+/// What HKCU actually holds. Missing is not the same as `1`: Win11 treats
+/// absent as enabled, but writing `1` when we never saw a value is how
+/// release used to turn Snipping on for people who had it off (SBS-1050).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredBinding {
+    Absent,
+    Dword(u32),
+}
+
+/// A registry mutation, or the decision to leave HKCU alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingWrite {
+    Leave,
+    Dword(u32),
+    Delete,
+}
+
+/// Snapshot the first stored value we replace. A later write (take, then a
+/// retry) must still restore that original, not the intermediate `0`.
+fn remember_on_change(
+    remembered: Option<StoredBinding>,
+    current: StoredBinding,
+    next: u32,
+) -> (Option<StoredBinding>, BindingWrite) {
+    let next_stored = StoredBinding::Dword(next);
+    if current == next_stored {
+        return (remembered, BindingWrite::Leave);
+    }
+    (remembered.or(Some(current)), BindingWrite::Dword(next))
+}
+
+fn restore_write(remembered: Option<StoredBinding>) -> BindingWrite {
+    match remembered {
+        None => BindingWrite::Leave,
+        Some(StoredBinding::Absent) => BindingWrite::Delete,
+        Some(StoredBinding::Dword(value)) => BindingWrite::Dword(value),
+    }
+}
+
+fn prior_binding() -> &'static Mutex<Option<StoredBinding>> {
+    static PRIOR: OnceLock<Mutex<Option<StoredBinding>>> = OnceLock::new();
+    PRIOR.get_or_init(|| Mutex::new(None))
+}
+
+fn peek_prior() -> Option<StoredBinding> {
+    prior_binding().lock().ok().and_then(|guard| *guard)
+}
+
+fn take_prior() -> Option<StoredBinding> {
+    prior_binding()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+}
+
+fn set_prior(next: Option<StoredBinding>) {
+    if let Ok(mut guard) = prior_binding().lock() {
+        *guard = next;
+    }
+}
+
+fn read_stored_binding() -> StoredBinding {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(KEYBOARD_KEY, KEY_READ)
         .and_then(|k| k.get_value::<u32, _>(VALUE))
-        .map(|v| v != 0)
-        .unwrap_or(true)
+        .map(StoredBinding::Dword)
+        .unwrap_or(StoredBinding::Absent)
+}
+
+fn write_stored_binding(write: BindingWrite) -> Result<()> {
+    match write {
+        BindingWrite::Leave => Ok(()),
+        BindingWrite::Dword(value) => {
+            RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey_with_flags(KEYBOARD_KEY, KEY_SET_VALUE)
+                .context("open HKCU Control Panel\\Keyboard")?
+                .set_value(VALUE, &value)
+                .context("write PrintScreenKeyForSnippingEnabled")?;
+            broadcast_setting_change();
+            Ok(())
+        }
+        BindingWrite::Delete => {
+            if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey_with_flags(KEYBOARD_KEY, KEY_SET_VALUE)
+            {
+                let _ = key.delete_value(VALUE);
+            }
+            broadcast_setting_change();
+            Ok(())
+        }
+    }
+}
+
+/// Missing value defaults to enabled on current Win11 builds.
+pub fn snipping_owns_prtscn() -> bool {
+    match read_stored_binding() {
+        StoredBinding::Absent => true,
+        StoredBinding::Dword(value) => value != 0,
+    }
 }
 
 pub fn set_snipping_binding(enabled: bool) -> Result<()> {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(KEYBOARD_KEY, KEY_SET_VALUE)
-        .context("open HKCU Control Panel\\Keyboard")?
-        .set_value(VALUE, &(enabled as u32))
-        .context("write PrintScreenKeyForSnippingEnabled")?;
-    broadcast_setting_change();
+    let current = read_stored_binding();
+    let (next_prior, write) = remember_on_change(peek_prior(), current, enabled as u32);
+    write_stored_binding(write)?;
+    if write != BindingWrite::Leave {
+        set_prior(next_prior);
+    }
     Ok(())
+}
+
+fn restore_snipping_binding() {
+    let _ = write_stored_binding(restore_write(take_prior()));
 }
 
 /// Nudge the shell without ever waiting on a slow desktop process.
@@ -303,14 +399,14 @@ pub fn take(id: i32) -> bool {
     try_register(id)
 }
 
-/// Explicit release: let go of the key and restore the Snipping binding.
+/// Explicit release: let go of the key and put HKCU back only if we flipped it.
 pub fn release(id: i32) {
     uninstall_hook();
     unsafe {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey(None, id);
     }
     FALLBACK_REGISTERED.store(false, Ordering::SeqCst);
-    let _ = set_snipping_binding(true);
+    restore_snipping_binding();
 }
 
 /// Try to own PrtScn under the given hotkey id. `interactive` controls
@@ -344,7 +440,10 @@ pub fn acquire(id: i32, interactive: bool) -> Acquire {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_fire, REPEAT_WINDOW_MS};
+    use super::{
+        remember_on_change, restore_write, should_fire, BindingWrite, StoredBinding,
+        REPEAT_WINDOW_MS,
+    };
 
     #[test]
     fn holding_the_key_still_only_captures_once() {
@@ -374,5 +473,76 @@ mod tests {
         // count and even a fast press-release-press fires both times.
         let ticks_since_boot = 900_000u64;
         assert!(should_fire(ticks_since_boot.saturating_sub(0)));
+    }
+
+    /// Pins SBS-1050: the LL hook is the primary owner and usually never
+    /// writes HKCU. Release used to force `1`, which turned Snipping on for
+    /// anyone who had it off (or left the value absent).
+    #[test]
+    fn release_leaves_hkcu_alone_when_we_never_wrote_it() {
+        assert_eq!(restore_write(None), BindingWrite::Leave);
+    }
+
+    /// Pins SBS-1050: a fallback takeover that replaced an explicit `1`
+    /// must put that `1` back, not invent a different enabled encoding.
+    #[test]
+    fn release_restores_the_prior_dword_we_replaced() {
+        let (remembered, write) = remember_on_change(None, StoredBinding::Dword(1), 0);
+        assert_eq!(write, BindingWrite::Dword(0));
+        assert_eq!(remembered, Some(StoredBinding::Dword(1)));
+        assert_eq!(restore_write(remembered), BindingWrite::Dword(1));
+    }
+
+    /// Pins SBS-1050: missing defaults to enabled, but it is still missing.
+    /// Restoring by writing `1` would create a value we never saw.
+    #[test]
+    fn release_deletes_the_value_when_it_was_absent() {
+        let (remembered, write) = remember_on_change(None, StoredBinding::Absent, 0);
+        assert_eq!(write, BindingWrite::Dword(0));
+        assert_eq!(remembered, Some(StoredBinding::Absent));
+        assert_eq!(restore_write(remembered), BindingWrite::Delete);
+    }
+
+    /// Pins SBS-1050: writing the dword that is already there is not a
+    /// change, so release must not later "restore" by writing anything.
+    #[test]
+    fn writing_the_same_dword_does_not_count_as_a_change() {
+        let (remembered, write) = remember_on_change(None, StoredBinding::Dword(0), 0);
+        assert_eq!(write, BindingWrite::Leave);
+        assert_eq!(remembered, None);
+        assert_eq!(restore_write(remembered), BindingWrite::Leave);
+    }
+
+    /// Pins SBS-1050: take can write more than once. Release still restores
+    /// the original, not the last intermediate value.
+    #[test]
+    fn a_later_write_still_restores_the_original_prior() {
+        let (first, write) = remember_on_change(None, StoredBinding::Dword(1), 0);
+        assert_eq!(write, BindingWrite::Dword(0));
+        let (second, write) = remember_on_change(first, StoredBinding::Dword(0), 0);
+        assert_eq!(write, BindingWrite::Leave);
+        let (third, write) = remember_on_change(second, StoredBinding::Dword(0), 1);
+        assert_eq!(write, BindingWrite::Dword(1));
+        assert_eq!(third, Some(StoredBinding::Dword(1)));
+        assert_eq!(restore_write(third), BindingWrite::Dword(1));
+    }
+
+    /// Pins SBS-1050: the only time release writes `1` is when that was the
+    /// prior dword. The old path wrote `1` for every other case too.
+    #[test]
+    fn release_does_not_force_snipping_on() {
+        assert_ne!(restore_write(None), BindingWrite::Dword(1));
+        assert_ne!(
+            restore_write(Some(StoredBinding::Dword(0))),
+            BindingWrite::Dword(1)
+        );
+        assert_ne!(
+            restore_write(Some(StoredBinding::Absent)),
+            BindingWrite::Dword(1)
+        );
+        assert_eq!(
+            restore_write(Some(StoredBinding::Dword(0))),
+            BindingWrite::Dword(0)
+        );
     }
 }

@@ -1310,11 +1310,11 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             let enabled = !state.cfg.capture_prtscn;
             if update_config(hwnd, state, |cfg| cfg.capture_prtscn = enabled) {
                 prtscn::set_preferred(state.cfg.capture_prtscn);
-            }
-            if state.cfg.capture_prtscn {
-                let _ = prtscn::take(HOTKEY_ID_PRTSCN);
-            } else {
-                prtscn::release(HOTKEY_ID_PRTSCN);
+                if state.cfg.capture_prtscn {
+                    let _ = prtscn::take(HOTKEY_ID_PRTSCN);
+                } else {
+                    prtscn::release(HOTKEY_ID_PRTSCN);
+                }
             }
         }
         Ctrl::CaptureHotkey => {
