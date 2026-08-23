@@ -47,6 +47,27 @@ pub fn share_start(can_share: bool) -> ShareStart {
     }
 }
 
+/// Recdone already refuses a second Share with `if !state.sharing`.
+/// History and tweak pass `pending_share.is_some()` for the same signal
+/// (SBS-1075). A status string is not this check: History clears it on a
+/// timer, and recdone's other handlers overwrite it while an upload runs.
+pub fn share_idle(in_flight: bool) -> bool {
+    !in_flight
+}
+
+/// Claim this window's share slot if idle. `start` — typically
+/// `share_in_background` — runs only when nothing is already pending, so a
+/// second click cannot spawn another ≤300 MB upload or overwrite the id
+/// `accept_completion` will match. Recdone already does this with
+/// `if !state.sharing` (SBS-1075).
+pub fn begin_if_idle(pending: &mut Option<u64>, start: impl FnOnce() -> u64) -> bool {
+    if !share_idle(pending.is_some()) {
+        return false;
+    }
+    *pending = Some(start());
+    true
+}
+
 const SHARE_HOST: &str = "share.matteshot.app";
 const SHARE_PATH: &str = "/v1/share";
 // Matches the worker's own MAX_UPLOAD_BYTES; caught here too so a failure
@@ -693,6 +714,76 @@ mod tests {
         );
         assert!(accept_completion(&mut pending, 2));
         assert_eq!(pending, None);
+    }
+
+    /// The old History/tweak Share path: always spawn, overwrite
+    /// `pending_share`. That is SBS-1075 — `accept_completion` then drops
+    /// the first result while a second uncancellable upload keeps running.
+    fn overwrite_pending_share(pending: &mut Option<u64>, start: impl FnOnce() -> u64) -> bool {
+        *pending = Some(start());
+        true
+    }
+
+    #[test]
+    fn a_second_share_does_not_spawn_or_overwrite_pending() {
+        let mut pending = None;
+        let mut started = Vec::new();
+        assert!(share_idle(pending.is_some()), "a fresh window must be idle");
+        assert!(begin_if_idle(&mut pending, || {
+            started.push(1);
+            1
+        }));
+        assert_eq!(pending, Some(1));
+        assert!(!share_idle(pending.is_some()), "recdone's sharing flag");
+        assert!(
+            !begin_if_idle(&mut pending, || {
+                started.push(2);
+                2
+            }),
+            "History/tweak used to spawn here"
+        );
+        assert_eq!(
+            pending,
+            Some(1),
+            "a second click overwrote pending_share"
+        );
+        assert_eq!(started, [1], "a second click started another upload");
+        // accept_completion still only drops a stale UI result — that is
+        // not the cancel path, and must not be treated as one.
+        assert!(!accept_completion(&mut pending, 2));
+        assert_eq!(pending, Some(1));
+        assert!(accept_completion(&mut pending, 1));
+        assert_eq!(pending, None);
+        assert!(share_idle(pending.is_some()));
+        assert!(begin_if_idle(&mut pending, || {
+            started.push(3);
+            3
+        }));
+        assert_eq!(pending, Some(3));
+        assert_eq!(started, [1, 3]);
+    }
+
+    /// Pins the bug this helper replaces: the old always-overwrite path
+    /// would fail `a_second_share_does_not_spawn_or_overwrite_pending`.
+    #[test]
+    fn overwriting_pending_share_is_the_sbs_1075_bug() {
+        let mut pending = None;
+        let mut started = Vec::new();
+        assert!(overwrite_pending_share(&mut pending, || {
+            started.push(1);
+            1
+        }));
+        assert!(overwrite_pending_share(&mut pending, || {
+            started.push(2);
+            2
+        }));
+        assert_eq!(pending, Some(2), "the second click overwrote the first id");
+        assert_eq!(started, [1, 2], "two uploads were in flight");
+        assert!(
+            !accept_completion(&mut pending, 1),
+            "the first completion is now a stale UI result"
+        );
+        assert_eq!(pending, Some(2));
     }
 
     #[test]

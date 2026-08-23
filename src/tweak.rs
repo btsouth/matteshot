@@ -550,7 +550,9 @@ struct State {
     /// Copy keeps the tab open, so the confirmation replaces the old cue of
     /// the tab closing.
     copy_hint: Option<(String, std::time::Instant)>,
-    /// Correlates asynchronous Share completions with the latest click.
+    /// In-flight Share request. A second click must not overwrite this
+    /// or spawn another upload; `accept_completion` only drops a stale
+    /// UI result (SBS-1075).
     pending_share: Option<u64>,
     /// Cached at open: Share is a paid-license action (SBS-906).
     can_share: bool,
@@ -2143,7 +2145,18 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Ctl::CustomSizeCancel => chip(hdc, *r, "Cancel", state, false, hot),
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
             Ctl::Save => chip(hdc, *r, "Save", state, false, hot),
-            Ctl::Share => chip(hdc, *r, "Share", state, false, hot),
+            Ctl::Share => chip(
+                hdc,
+                *r,
+                if state.pending_share.is_some() {
+                    "Sharing\u{2026}"
+                } else {
+                    "Share"
+                },
+                state,
+                false,
+                hot,
+            ),
             Ctl::Crop => {
                 // Says what it will do rather than what it is called: with a
                 // crop already applied, the button is how you get back to the
@@ -2992,15 +3005,25 @@ unsafe fn share_current(hwnd: HWND, state: &mut State) {
         let _ = InvalidateRect(hwnd, None, false);
         return;
     }
+    // Recdone already refuses a second Share with `if !state.sharing`.
+    // A second click here used to save again and spawn another ≤300 MB
+    // upload; `accept_completion` only dropped the stale UI result (SBS-1075).
+    if !share_upload_idle(state.pending_share) {
+        return;
+    }
     commit_editing(state);
     let img = final_image(state);
     let cfg = Config::load();
     let style_name = state.doc().styles[state.doc().sel].name;
     match output::save_png(&img, style_name, &cfg.save_dir(), Some(&state.doc().title)) {
         Ok(path) => {
+            if !start_share_upload(&mut state.pending_share, || {
+                crate::share::share_in_background(hwnd, path)
+            }) {
+                return;
+            }
             state.copy_hint = Some(("Sharing\u{2026}".into(), std::time::Instant::now()));
             let _ = InvalidateRect(hwnd, None, false);
-            state.pending_share = Some(crate::share::share_in_background(hwnd, path));
         }
         Err(error) => show_output_error(
             hwnd,
@@ -3009,6 +3032,16 @@ unsafe fn share_current(hwnd: HWND, state: &mut State) {
             true,
         ),
     }
+}
+
+/// Tweak Share after the license check, before the save. Recdone already
+/// applies this to `state.sharing` (SBS-1075).
+fn share_upload_idle(pending: Option<u64>) -> bool {
+    crate::share::share_idle(pending.is_some())
+}
+
+fn start_share_upload(pending: &mut Option<u64>, start: impl FnOnce() -> u64) -> bool {
+    crate::share::begin_if_idle(pending, start)
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -4717,8 +4750,9 @@ mod tests {
         active_after_close, ann_bounds, annotation_tool_index, apply_custom_size_input,
         apply_text_input, custom_size_axis, custom_size_bounds, custom_size_initial,
         custom_size_result, custom_size_value, final_size, freehand_length, join_words,
-        layout_controls, nearest_word, persist_and_copy_with,
-        output_max_edge_after_custom_size_cancel, output_size_summary, preview_draw_geometry,
+        layout_controls, nearest_word, persist_and_copy_with, share_upload_idle,
+        start_share_upload, output_max_edge_after_custom_size_cancel, output_size_summary,
+        preview_draw_geometry,
         corner_index, crop_contains, crop_drag_for, crop_from_points, deliver_ocr, move_crop,
         preview_sources, preview_target_edge, redacted, render_final, resize_crop, tab_for_digit,
         tool_after_pick, Crop, CropDrag, History, OcrCompletion, TextSelect, HISTORY_LIMIT,
@@ -4744,6 +4778,36 @@ mod tests {
             let available_height = preview_box.bottom - preview_box.top;
             assert!(full.3 == available_width || full.4 == available_height);
         }
+    }
+
+    /// SBS-1075: a second Share while one is pending must not save-and-upload
+    /// again. Recdone already refuses with `if !state.sharing`.
+    #[test]
+    fn tweak_share_refuses_a_second_in_flight_request() {
+        let mut pending_share = None;
+        let mut saved = 0u32;
+        let mut uploads = 0u64;
+        let click = |pending: &mut Option<u64>| {
+            if !share_upload_idle(*pending) {
+                return false;
+            }
+            saved += 1;
+            start_share_upload(pending, || {
+                uploads += 1;
+                uploads
+            })
+        };
+        assert!(click(&mut pending_share));
+        assert!(!click(&mut pending_share));
+        assert_eq!(saved, 1, "a second tweak Share saved another PNG");
+        assert_eq!(uploads, 1, "a second tweak Share started another upload");
+        assert_eq!(pending_share, Some(1));
+        assert!(!crate::share::accept_completion(&mut pending_share, 2));
+        assert_eq!(pending_share, Some(1));
+        assert!(crate::share::accept_completion(&mut pending_share, 1));
+        assert!(click(&mut pending_share));
+        assert_eq!(saved, 2);
+        assert_eq!(uploads, 2);
     }
 
     #[test]

@@ -1637,6 +1637,29 @@ fn max_scroll(content_h: i32, viewport_h: i32) -> i32 {
 mod layout_tests {
     use super::*;
 
+    /// SBS-1075: a second Share while one is pending must not start another
+    /// upload or overwrite the id `accept_completion` will match.
+    #[test]
+    fn history_share_refuses_a_second_in_flight_request() {
+        let mut pending_share = None;
+        let mut uploads = 0u64;
+        let click = |pending: &mut Option<u64>| {
+            start_share_upload(pending, || {
+                uploads += 1;
+                uploads
+            })
+        };
+        assert!(click(&mut pending_share));
+        assert!(!click(&mut pending_share));
+        assert_eq!(uploads, 1, "a second History Share started another upload");
+        assert_eq!(pending_share, Some(1));
+        assert!(!crate::share::accept_completion(&mut pending_share, 2));
+        assert_eq!(pending_share, Some(1));
+        assert!(crate::share::accept_completion(&mut pending_share, 1));
+        assert!(click(&mut pending_share));
+        assert_eq!(uploads, 2);
+    }
+
     /// SBS-906: History must not offer Share to a trial (or any unpaid) user.
     #[test]
     fn history_omits_share_without_a_paid_license() {
@@ -2034,7 +2057,9 @@ struct State {
     /// it first — otherwise every double-click would also copy, once for
     /// each of a double-click's two WM_LBUTTONUP events.
     pending_click: Option<usize>,
-    /// Only the latest Share click may update the browser or clipboard.
+    /// In-flight Share request. A second click must not overwrite this
+    /// or spawn another upload; `accept_completion` only drops a stale
+    /// UI result (SBS-1075).
     pending_share: Option<u64>,
     /// Bumped on each open/reload so a late worker cannot replace a newer grid.
     thumb_generation: u64,
@@ -2289,14 +2314,25 @@ unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
     if !require_owned_history_path(hwnd, &entry.path) {
         return;
     }
-    if let Some(state) = state_of(hwnd) {
-        state.status = Some(("Sharing\u{2026}".to_string(), std::time::Instant::now()));
-        let _ = InvalidateRect(hwnd, None, false);
+    let Some(state) = state_of(hwnd) else {
+        return;
+    };
+    // Recdone already refuses a second Share with `if !state.sharing`.
+    // Overwriting `pending_share` here used to start another uncancellable
+    // upload; `accept_completion` only dropped the stale UI result (SBS-1075).
+    if !start_share_upload(&mut state.pending_share, || {
+        crate::share::share_in_background(hwnd, entry.path.clone())
+    }) {
+        return;
     }
-    let request_id = crate::share::share_in_background(hwnd, entry.path.clone());
-    if let Some(state) = state_of(hwnd) {
-        state.pending_share = Some(request_id);
-    }
+    state.status = Some(("Sharing\u{2026}".to_string(), std::time::Instant::now()));
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+/// History Share after license + path checks. Same idle rule recdone
+/// applies to `state.sharing` (SBS-1075).
+fn start_share_upload(pending: &mut Option<u64>, start: impl FnOnce() -> u64) -> bool {
+    crate::share::begin_if_idle(pending, start)
 }
 
 unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
