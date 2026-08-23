@@ -38,14 +38,16 @@ pub fn trusted_release_keys() -> &'static [ReleaseKey] {
 
 #[cfg(test)]
 pub fn trusted_release_keys() -> &'static [ReleaseKey] {
+    // test.1 first so installer tests can sign with the well-known seed.
+    // 2026.1 is PROD_RELEASE_KEYS[0] so this list cannot keep a stale pubkey.
     static KEYS: &[ReleaseKey] = &[
         ReleaseKey {
             id: "test.1",
             public_key_base64: "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
         },
         ReleaseKey {
-            id: "2026.1",
-            public_key_base64: "JludjKQ0arQ6IRN5dQqncMzc8IoLeFFXFoI8oDelfqo=",
+            id: PROD_RELEASE_KEYS[0].id,
+            public_key_base64: PROD_RELEASE_KEYS[0].public_key_base64,
         },
     ];
     KEYS
@@ -557,19 +559,110 @@ mod tests {
         );
     }
 
-    /// Pins SBS-747: the build's trusted list includes the production key.
+    /// Pins SBS-1046: PROD_RELEASE_KEYS holds the production pubkey bytes.
+    /// trusted_release_keys() and the Python signer must carry the same 2026.1
+    /// material; a drifted copy fails CI.
     #[test]
     fn production_key_2026_1_is_trusted() {
-        assert_eq!(PROD_RELEASE_KEYS[0].id, "2026.1");
+        const PINNED_ID: &str = "2026.1";
+        const PINNED_B64: &str = "JludjKQ0arQ6IRN5dQqncMzc8IoLeFFXFoI8oDelfqo=";
+        // Raw Ed25519 public key for 2026.1. Decode of PINNED_B64; both sides
+        // are pinned so a base64-only edit of PROD_RELEASE_KEYS still fails.
+        const PINNED_BYTES: [u8; 32] = [
+            0x26, 0x5b, 0x9d, 0x8c, 0xa4, 0x34, 0x6a, 0xb4, 0x3a, 0x21, 0x13, 0x79, 0x75, 0x0a,
+            0xa7, 0x70, 0xcc, 0xdc, 0xf0, 0x8a, 0x0b, 0x78, 0x51, 0x57, 0x16, 0x82, 0x3c, 0xa0,
+            0x37, 0xa5, 0x7e, 0xaa,
+        ];
+
+        let prod = &PROD_RELEASE_KEYS[0];
+        assert_eq!(prod.id, PINNED_ID);
+        assert_eq!(prod.public_key_base64, PINNED_B64);
+        let prod_bytes: [u8; 32] = STANDARD
+            .decode(prod.public_key_base64)
+            .expect("PROD_RELEASE_KEYS pubkey must be standard base64")
+            .try_into()
+            .expect("PROD_RELEASE_KEYS pubkey must be 32 bytes");
+        assert_eq!(prod_bytes, PINNED_BYTES);
+
         assert!(
-            trusted_release_keys().iter().any(|key| key.id == "2026.1"
-                && key.public_key_base64 == "JludjKQ0arQ6IRN5dQqncMzc8IoLeFFXFoI8oDelfqo="),
+            trusted_release_keys().iter().any(|key| {
+                key.id == prod.id && key.public_key_base64 == prod.public_key_base64
+            }),
             "{:?}",
             trusted_release_keys()
                 .iter()
-                .map(|k| k.id)
+                .map(|k| (k.id, k.public_key_base64))
                 .collect::<Vec<_>>()
         );
+
+        let python_keys =
+            python_embedded_public_keys(include_str!("../scripts/sign-release-manifest.py"));
+        for key in PROD_RELEASE_KEYS {
+            let python_b64 = python_keys
+                .iter()
+                .find(|(id, _)| *id == key.id)
+                .map(|(_, b64)| *b64);
+            assert_eq!(
+                python_b64,
+                Some(key.public_key_base64),
+                "Python EMBEDDED_PUBLIC_KEYS drifted from PROD_RELEASE_KEYS for {}",
+                key.id
+            );
+        }
+        assert_eq!(
+            python_keys
+                .iter()
+                .find(|(id, _)| *id == PINNED_ID)
+                .map(|(_, b64)| *b64),
+            Some(PINNED_B64)
+        );
+        assert_eq!(
+            python_keys
+                .iter()
+                .find(|(id, _)| *id == TEST_RELEASE_KEY_ID)
+                .map(|(_, b64)| *b64),
+            Some("0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=")
+        );
+    }
+
+    fn python_embedded_public_keys(source: &str) -> Vec<(&str, &str)> {
+        let name = source
+            .find("EMBEDDED_PUBLIC_KEYS")
+            .expect("sign-release-manifest.py must define EMBEDDED_PUBLIC_KEYS");
+        let after_name = &source[name + "EMBEDDED_PUBLIC_KEYS".len()..];
+        let open = after_name
+            .find('{')
+            .expect("EMBEDDED_PUBLIC_KEYS must be a dict");
+        let body = &after_name[open + 1..];
+        let close = body
+            .find('}')
+            .expect("EMBEDDED_PUBLIC_KEYS must be a closed dict");
+        let mut keys = Vec::new();
+        for piece in body[..close].split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let (id, value) = piece.split_once(':').unwrap_or_else(|| {
+                panic!("EMBEDDED_PUBLIC_KEYS entry must be key: value: {piece}")
+            });
+            keys.push((
+                unquote_python_string(id.trim()),
+                unquote_python_string(value.trim()),
+            ));
+        }
+        assert!(
+            !keys.is_empty(),
+            "EMBEDDED_PUBLIC_KEYS must list at least the production key"
+        );
+        keys
+    }
+
+    fn unquote_python_string(value: &str) -> &str {
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("expected a quoted Python string, got {value:?}"))
     }
 
     fn is_windows_apps(path: &std::path::Path) -> bool {

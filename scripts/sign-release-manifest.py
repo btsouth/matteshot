@@ -46,7 +46,8 @@ PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
 SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 # Same strings compiled into src/release_manifest.rs. A seed that does not
-# produce the 2026.1 key must not publish.
+# produce the 2026.1 key must not publish. production_key_2026_1_is_trusted
+# fails CI if this dict drifts from PROD_RELEASE_KEYS (SBS-1046).
 EMBEDDED_PUBLIC_KEYS = {
     "2026.1": "JludjKQ0arQ6IRN5dQqncMzc8IoLeFFXFoI8oDelfqo=",
     "test.1": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
