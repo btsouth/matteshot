@@ -612,8 +612,7 @@ mod tests {
                     let exe = exe
                         .lines()
                         .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .next_back()
+                        .rfind(|line| !line.is_empty())
                         .unwrap_or("");
                     let exe = std::path::PathBuf::from(exe);
                     if exe.is_file() && !is_windows_apps(&exe) {
