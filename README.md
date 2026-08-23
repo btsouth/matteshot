@@ -87,7 +87,7 @@ On first run, a compact native welcome surface explains the PrtScn-to-paste loop
 
 History is a local index at `%APPDATA%\matteshot\history.json`. Each entry stores the save path, time, size, matte name, and — by default — the captured window's title (or a region-size label), sanitized and capped at 200 characters. Titles stay on this PC; diagnostics and telemetry do not send them.
 
-Opening History drops entries whose files are gone and writes that pruned list back to disk, so a capture deleted in Explorer does not leave its title behind. **Clear History titles…** in Settings removes stored titles without deleting screenshots or videos. Per-item Delete is what removes a file. Uninstall asks before deleting `history.json` (plus leftover `history.json.tmp` and quarantined copies); it does not delete captures. The default is still the full window title, not the app name only.
+Opening History drops entries whose files are confirmed gone — a deleted file whose folder is still reachable — and writes that pruned list back to disk, so a capture deleted in Explorer does not leave its title behind. An ejected USB or offline share stays in the index until the volume is back and the file is actually missing. **Clear History titles…** in Settings removes stored titles without deleting screenshots or videos. Per-item Delete is what removes a file. Uninstall asks before deleting `history.json` (plus leftover `history.json.tmp` and quarantined copies); it does not delete captures. The default is still the full window title, not the app name only.
 
 ## CLI / test rig
 
