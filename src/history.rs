@@ -11,9 +11,10 @@
 //! confirmed gone (deleted while a parent is still reachable, or a path
 //! that exists and is not a file) and rewrites that pruned list (SBS-765).
 //! NotFound on an ejected USB or offline share is not that proof (SBS-1038);
-//! a transient metadata error also keeps the row. Clear titles strips
-//! `source` without deleting captures. Uninstall may offer to delete the
-//! index; it never deletes the files it pointed at.
+//! a transient metadata error also keeps the row. Delete of that same
+//! offline NotFound fails and leaves the index row (SBS-1062). Clear titles
+//! strips `source` without deleting captures. Uninstall may offer to delete
+//! the index; it never deletes the files it pointed at.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -380,7 +381,55 @@ fn parent_is_under_any_root(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
     })
 }
 
+/// File NotFound whose ancestors are also NotFound (or otherwise unreadable):
+/// ejected USB / offline share, not a confirmed delete.
+fn capture_is_offline_not_found(path: &Path) -> bool {
+    matches!(
+        std::fs::metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) && !missing_capture_is_confirmed_gone(path)
+}
+
+fn refuse_offline_delete(path: &Path) -> Result<()> {
+    crate::diagnostics::log(&format!(
+        "history delete skipped because the volume is offline: {}",
+        history_event_name(path)
+    ));
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "volume offline",
+    ))
+    .context("delete capture: volume offline")
+}
+
+enum CanonicalRecheck {
+    Unchanged,
+    Changed,
+    Offline,
+}
+
+/// Third canonicalize after `stable_canonical` succeeded. A volume that
+/// vanished in that window reports the same NotFound chain as SBS-1038;
+/// treating it as "path changed" would persist-drop the row.
+fn path_canonical_recheck(path: &Path, expected: &Path) -> CanonicalRecheck {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) if canonical.as_path() == expected => CanonicalRecheck::Unchanged,
+        Ok(_) => CanonicalRecheck::Changed,
+        Err(_) if capture_is_offline_not_found(path) => CanonicalRecheck::Offline,
+        Err(_) => CanonicalRecheck::Changed,
+    }
+}
+
 fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
+    remove_at_with(index, path, roots, path_canonical_recheck)
+}
+
+fn remove_at_with(
+    index: &Path,
+    path: &Path,
+    roots: &[PathBuf],
+    recheck: impl Fn(&Path, &Path) -> CanonicalRecheck,
+) -> Result<()> {
     // Load first: a Delete that cannot update the index must not unlink the file.
     let mut log = load_for_mutation(index)?;
     let unlink = if is_symlink(path) && parent_is_under_any_root(path, roots) {
@@ -392,22 +441,41 @@ fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
         }
     };
     if let Some(target) = unlink {
-        if !is_symlink(path) && !path_still_matches_canonical(path, &target) {
-            crate::diagnostics::log(&format!(
-                "history delete skipped because the path changed: {}",
-                history_event_name(path)
-            ));
+        let skip_unlink = if is_symlink(path) {
+            false
         } else {
+            match recheck(path, &target) {
+                CanonicalRecheck::Unchanged => false,
+                CanonicalRecheck::Changed => {
+                    crate::diagnostics::log(&format!(
+                        "history delete skipped because the path changed: {}",
+                        history_event_name(path)
+                    ));
+                    true
+                }
+                CanonicalRecheck::Offline => return refuse_offline_delete(path),
+            }
+        };
+        if !skip_unlink {
             match std::fs::remove_file(&target) {
                 Ok(()) => {}
                 // Already gone (deleted outside the app, or a repeat click racing
                 // its own first Delete): the index is just stale, so finish
                 // dropping the entry instead of reporting a failure the user has no
-                // way to act on.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                // way to act on. NotFound on an ejected or offline volume is not
+                // that proof (SBS-1038 / SBS-1062).
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if capture_is_offline_not_found(path) {
+                        return refuse_offline_delete(path);
+                    }
+                }
                 Err(error) => return Err(error).context("delete capture"),
             }
         }
+    } else if capture_is_offline_not_found(path) {
+        // Canonicalize failed with the same NotFound an ejected USB reports.
+        // That is not "unowned" and not a confirmed delete (SBS-1062).
+        return refuse_offline_delete(path);
     } else {
         // History is an index, not a file manager: a stale or hand-edited
         // entry must not unlink a file outside the save/video folders.
@@ -420,12 +488,10 @@ fn remove_at(index: &Path, path: &Path, roots: &[PathBuf]) -> Result<()> {
     save_unlocked_at(index, &log)
 }
 
-fn path_still_matches_canonical(path: &Path, expected: &Path) -> bool {
-    std::fs::canonicalize(path).ok().as_deref() == Some(expected)
-}
-
 /// Delete the file and drop it from history. Unlike `record`, errors surface:
 /// a Delete click that silently failed would look like it had worked.
+/// Offline NotFound is that failure: the volume is gone, so the row stays
+/// (SBS-1062), same keep as opening History (SBS-1038).
 pub fn remove(path: &Path) -> Result<()> {
     let _guard = crate::state_lock::lock(HISTORY_MUTEX).ok();
     let config = crate::config::Config::try_load().context("config could not be loaded")?;
@@ -1009,16 +1075,97 @@ mod persistence_tests {
     }
 
     #[test]
-    fn path_still_matches_canonical_is_false_after_the_file_moves() {
+    fn path_canonical_recheck_reports_a_moved_file_as_changed() {
         let dir = temp_dir("canonical-moved");
         std::fs::create_dir_all(&dir).unwrap();
         let original = capture(&dir, "a.png");
         let canonical = std::fs::canonicalize(&original).unwrap();
-        assert!(path_still_matches_canonical(&original, &canonical));
+        assert!(matches!(
+            path_canonical_recheck(&original, &canonical),
+            CanonicalRecheck::Unchanged
+        ));
         let moved = dir.join("b.png");
         std::fs::rename(&original, &moved).unwrap();
-        assert!(!path_still_matches_canonical(&original, &canonical));
+        assert!(matches!(
+            path_canonical_recheck(&original, &canonical),
+            CanonicalRecheck::Changed
+        ));
         assert!(moved.is_file());
+    }
+
+    #[test]
+    fn path_canonical_recheck_treats_a_deleted_file_as_changed() {
+        let dir = temp_dir("canonical-deleted");
+        std::fs::create_dir_all(&dir).unwrap();
+        let deleted = capture(&dir, "gone.png");
+        let canonical = std::fs::canonicalize(&deleted).unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        assert!(matches!(
+            path_canonical_recheck(&deleted, &canonical),
+            CanonicalRecheck::Changed
+        ));
+    }
+
+    #[test]
+    fn path_canonical_recheck_is_offline_when_the_volume_is_gone() {
+        let Some(offline) = offline_not_found_capture("usb.png") else {
+            eprintln!("skipping: no unused drive letter reported NotFound");
+            return;
+        };
+        let expected = PathBuf::from(r"C:\matteshot-canonical-recheck.png");
+        assert!(
+            matches!(
+                path_canonical_recheck(&offline, &expected),
+                CanonicalRecheck::Offline
+            ),
+            "a vanished volume is not a changed path: {offline:?}"
+        );
+    }
+
+    #[test]
+    fn remove_at_keeps_the_row_when_recheck_reports_offline() {
+        let dir = temp_dir("remove-recheck-offline");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let shot = capture(&save, "a.png");
+        let index = dir.join("history.json");
+        write_log(&index, vec![entry_with_source(&shot, "USB title")]);
+
+        assert!(
+            remove_at_with(&index, &shot, std::slice::from_ref(&save), |_, _| {
+                CanonicalRecheck::Offline
+            })
+            .is_err(),
+            "offline recheck must not look like a successful Delete"
+        );
+        assert!(shot.is_file(), "the capture must stay on disk");
+        let on_disk = load_for_mutation(&index).unwrap();
+        assert_eq!(on_disk.entries.len(), 1, "offline recheck must not persist-prune");
+        assert_eq!(on_disk.entries[0].path, shot);
+        assert_eq!(on_disk.entries[0].source.as_deref(), Some("USB title"));
+    }
+
+    #[test]
+    fn remove_at_still_drops_when_recheck_reports_changed() {
+        let dir = temp_dir("remove-recheck-changed");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let shot = capture(&save, "a.png");
+        let index = dir.join("history.json");
+        write_log(&index, vec![entry_at(&shot)]);
+
+        assert!(remove_at_with(&index, &shot, std::slice::from_ref(&save), |_, _| {
+            CanonicalRecheck::Changed
+        })
+        .is_ok());
+        assert!(
+            shot.is_file(),
+            "a changed path must not unlink the file that is now there"
+        );
+        assert!(
+            load_for_mutation(&index).unwrap().entries.is_empty(),
+            "a changed path still drops the stale index row"
+        );
     }
 
     #[test]
@@ -1404,6 +1551,95 @@ mod persistence_tests {
         assert!(disk_paths.contains(&kept.as_path()));
         assert!(!disk_paths.contains(&gone.as_path()));
         assert!(on_disk.entries.iter().all(|entry| entry.source.is_none()));
+        assert!(kept.is_file());
+    }
+
+    /// SBS-1062: Delete used to treat canonicalize-failed NotFound the same
+    /// as a stale unowned row and persist-drop it. Offline is not that.
+    #[test]
+    fn remove_at_keeps_an_offline_volume_and_drops_a_deleted_file() {
+        let Some(offline) = offline_not_found_capture("usb.png") else {
+            eprintln!("skipping: no unused drive letter reported NotFound");
+            return;
+        };
+        let dir = temp_dir("remove-offline");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let kept = capture(&save, "kept.png");
+        let gone = capture(&save, "gone.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&offline, "USB Confidential.docx"),
+                entry_with_source(&kept, "Local.docx"),
+                entry_with_source(&gone, "Deleted subject"),
+            ],
+        );
+        std::fs::remove_file(&gone).unwrap();
+
+        assert!(
+            remove_at(&index, &offline, std::slice::from_ref(&save)).is_err(),
+            "offline NotFound must not look like a successful Delete"
+        );
+        let on_disk = load_for_mutation(&index).unwrap();
+        let disk_paths: Vec<_> = on_disk.entries.iter().map(|e| e.path.as_path()).collect();
+        assert!(
+            disk_paths.contains(&offline.as_path()),
+            "ejected/offline NotFound must not persist as a prune"
+        );
+        assert_eq!(
+            on_disk
+                .entries
+                .iter()
+                .find(|e| e.path == offline)
+                .and_then(|e| e.source.as_deref()),
+            Some("USB Confidential.docx")
+        );
+        assert!(disk_paths.contains(&kept.as_path()));
+        assert!(
+            disk_paths.contains(&gone.as_path()),
+            "Delete of USB must not rewrite other rows"
+        );
+        assert!(kept.is_file());
+
+        assert!(remove_at(&index, &gone, std::slice::from_ref(&save)).is_ok());
+        let on_disk = load_for_mutation(&index).unwrap();
+        let disk_paths: Vec<_> = on_disk.entries.iter().map(|e| e.path.as_path()).collect();
+        assert!(
+            !disk_paths.contains(&gone.as_path()),
+            "a real delete must still persist-prune"
+        );
+        assert!(disk_paths.contains(&offline.as_path()));
+        assert!(disk_paths.contains(&kept.as_path()));
+        assert!(kept.is_file());
+    }
+
+    #[test]
+    fn remove_at_still_drops_a_locally_deleted_file() {
+        let dir = temp_dir("remove-gone-local");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save).unwrap();
+        let gone = capture(&save, "gone.png");
+        let kept = capture(&save, "kept.png");
+        let index = dir.join("history.json");
+        write_log(
+            &index,
+            vec![
+                entry_with_source(&gone, "Deleted subject"),
+                entry_with_source(&kept, "Local.docx"),
+            ],
+        );
+        std::fs::remove_file(&gone).unwrap();
+
+        assert!(remove_at(&index, &gone, std::slice::from_ref(&save)).is_ok());
+        let on_disk = load_for_mutation(&index).unwrap();
+        let disk_paths: Vec<_> = on_disk.entries.iter().map(|e| e.path.as_path()).collect();
+        assert!(
+            !disk_paths.contains(&gone.as_path()),
+            "a deleted file whose folder is still there is gone"
+        );
+        assert!(disk_paths.contains(&kept.as_path()));
         assert!(kept.is_file());
     }
 

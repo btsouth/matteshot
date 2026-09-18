@@ -111,6 +111,7 @@ fn request_graceful_shutdown() -> Result<()> {
     // so the editor is deliberately closed after the capture surfaces.
     close_all("matteshot_recui", "the recorder")?;
     close_all("matteshot_scrollpill", "scroll capture")?;
+    close_all("matteshot_delaypill", "delayed capture")?;
     close_all("matteshot_overlay", "the capture overlay")?;
     close_all("matteshot_picker", "the picker")?;
     close_all("matteshot_tweak", "the image editor")?;
@@ -118,6 +119,7 @@ fn request_graceful_shutdown() -> Result<()> {
     close_all("matteshot_settings", "settings")?;
     close_all("matteshot_activation", "activation")?;
     close_all("matteshot_welcome", "welcome")?;
+    close_all("matteshot_history", "History")?;
     close_all("matteshot_pin", "a pinned capture")?;
     // SBS-893: supervise_late_finalize has no window. Closing the tray next
     // would exit the resident mid-Finalize; the next start would then delete
@@ -786,6 +788,11 @@ fn run_app() -> Result<()> {
         return Ok(());
     };
     let result = run_resident();
+    // --quit posts WM_CLOSE and the loop returns Ok. release() must still
+    // run: it puts HKCU back only if we flipped it (SBS-1050). Uninstall
+    // used to follow --quit with --restore-printscreen, which wrote 1 in
+    // a new process and undid a prior-off (SBS-1072).
+    disable_capture_hotkeys(true);
     if let Err(error) = &result {
         // Reported here, not in main: the resident mutex is still held, so
         // nothing races into the slot while the dialog is up, and the tray
@@ -793,7 +800,6 @@ fn run_app() -> Result<()> {
         // out of run_resident, so the dialog's message pump has no freed
         // state to reach. Hand the capture hooks back first — "start
         // Matteshot again" has to be able to take them.
-        disable_capture_hotkeys(true);
         report_resident_failure(error, RESIDENT_READY.load(Ordering::Relaxed));
     }
     result
@@ -2047,6 +2053,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("--restore-printscreen") => {
+            // Explicit user undo: write 1. Must not run from uninstall after
+            // --quit — that is a new process with no prior, so this force-
+            // enables Snipping for anyone who had it off (SBS-1072).
             prtscn::set_snipping_binding(true)?;
             eprintln!("PrtScn re-bound to Snipping Tool.");
             Ok(())
@@ -2087,6 +2096,7 @@ fn main() -> Result<()> {
                 }
             })?;
             let bytes = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+            // run-probes.ps1 matches this line, so keep the wording stable.
             eprintln!(
                 "verified signed release + Authenticode: {} ({bytes} bytes)",
                 staged.display()

@@ -305,9 +305,10 @@ pub fn find_own_by_class(class_name: &str) -> Option<HWND> {
 /// Every Matteshot surface that can hold work the user would lose. The
 /// shutdown path closes these in order; the updater refuses to restart while
 /// any of them is on screen.
-pub const SURFACE_CLASSES: [&str; 10] = [
+pub const SURFACE_CLASSES: [&str; 12] = [
     "matteshot_recui",
     "matteshot_scrollpill",
+    "matteshot_delaypill",
     "matteshot_overlay",
     "matteshot_picker",
     "matteshot_tweak",
@@ -315,6 +316,7 @@ pub const SURFACE_CLASSES: [&str; 10] = [
     "matteshot_settings",
     "matteshot_activation",
     "matteshot_welcome",
+    "matteshot_history",
     "matteshot_pin",
 ];
 
@@ -374,6 +376,80 @@ mod tests {
             assert!(
                 !any_surface_open(),
                 "dropping the guard did not return the idle check to false"
+            );
+        }
+    }
+
+    /// History and the delay pill are user-facing surfaces. Leaving them out
+    /// of `SURFACE_CLASSES` made auto-update treat an open History window or a
+    /// live countdown as idle, and `--quit` skipped them (SBS-1065).
+    #[test]
+    fn history_and_delay_are_idle_and_quit_surfaces() {
+        assert!(
+            SURFACE_CLASSES.contains(&"matteshot_history"),
+            "History is invisible to auto-update idle and --quit"
+        );
+        assert!(
+            SURFACE_CLASSES.contains(&"matteshot_delaypill"),
+            "Delay pill is invisible to auto-update idle and --quit"
+        );
+    }
+
+    /// A newly registered Matteshot tool window that is not the resident tray
+    /// must appear in `SURFACE_CLASSES`, or idle and `--quit` cannot see it.
+    /// The tray is excluded: it is always present, so listing it would make
+    /// auto-update wait forever.
+    #[test]
+    fn every_registered_surface_except_the_tray_is_in_surface_classes() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut registered = std::collections::BTreeSet::new();
+        let marker = "lpszClassName: w!(\"";
+        for entry in std::fs::read_dir(&src).expect("read src") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for (index, _) in text.match_indices(marker) {
+                let rest = &text[index + marker.len()..];
+                let Some(end) = rest.find('"') else {
+                    continue;
+                };
+                let name = &rest[..end];
+                if name.starts_with("matteshot_") {
+                    registered.insert(name.to_owned());
+                }
+            }
+        }
+        registered.remove("matteshot_tray");
+        let listed: std::collections::BTreeSet<_> =
+            SURFACE_CLASSES.iter().map(|class| (*class).to_owned()).collect();
+        let missing: Vec<_> = registered.difference(&listed).collect();
+        assert!(
+            missing.is_empty(),
+            "these window classes are registered but missing from SURFACE_CLASSES, \
+             so auto-update idle and --quit cannot see them: {missing:?}"
+        );
+    }
+
+    /// `--quit` walks its own close list. A class in `SURFACE_CLASSES` that is
+    /// missing there is still invisible to graceful shutdown.
+    #[test]
+    fn quit_closes_every_idle_surface() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let start = source
+            .find("fn request_graceful_shutdown()")
+            .expect("request_graceful_shutdown");
+        // Nested helpers also start with `fn `, so the next top-level item is
+        // the bound. `enum Source` is the first item after this function.
+        let shutdown = source[start..]
+            .split("\nenum Source")
+            .next()
+            .expect("shutdown ends before enum Source");
+        for class in SURFACE_CLASSES {
+            assert!(
+                shutdown.contains(&format!("close_all(\"{class}\"")),
+                "{class} is in SURFACE_CLASSES but --quit never closes it"
             );
         }
     }

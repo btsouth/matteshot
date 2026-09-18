@@ -70,9 +70,9 @@ pub fn begin_if_idle(pending: &mut Option<u64>, start: impl FnOnce() -> u64) -> 
 
 const SHARE_HOST: &str = "share.matteshot.app";
 const SHARE_PATH: &str = "/v1/share";
-// Matches the worker's own MAX_UPLOAD_BYTES; caught here too so a failure
-// reads as "too large" immediately instead of after minutes of upload.
-const MAX_UPLOAD_BYTES: u64 = 300 * 1024 * 1024;
+// Matches the worker and Cloudflare Free plan's request-body limit; caught
+// here too so a failure reads as "too large" before any upload starts.
+const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Posted to whichever window started a share once `share_in_background`'s
 /// worker thread finishes. `lparam` is an opaque token from
