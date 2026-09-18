@@ -483,11 +483,11 @@ jobs:
           $v = '${{ needs.build.outputs.version }}'
           $p = '${{ steps.checksums.outputs.path }}'
           # Versioned objects never change, so they can be cached forever.
-          # The stable names DO change every release, and an installer cached
-          # at the edge alongside a fresh checksum is a hash mismatch that
-          # breaks auto-update for everyone until the cache expires.
+          # The stable names DO change every release. Do not store them in
+          # shared or browser caches, where a stale installer beside a fresh
+          # checksum would break auto-update until the cache expires.
           $immutable = "public, max-age=31536000, immutable"
-          $mutable = "public, max-age=60, must-revalidate"
+          $mutable = "no-store"
           npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe" `
             --file $p --content-type application/octet-stream --cache-control $immutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -560,7 +560,7 @@ jobs:
             if ($ok) {
               Write-Host "Purged the stable installer and checksum from the edge."
             } else {
-              Write-Warning "Cache purge was refused. CLOUDFLARE_CACHE_PURGE_API_TOKEN needs Zone > Cache Purge on zone $env:CLOUDFLARE_ZONE_ID. Uploads set a 60s TTL, so the stable URL still corrects itself shortly; this only removes the wait."
+              Write-Warning "Cache purge was refused. CLOUDFLARE_CACHE_PURGE_API_TOKEN needs Zone > Cache Purge on zone $env:CLOUDFLARE_ZONE_ID. Stable aliases are no-store, so this only affects copies cached before that policy took effect."
             }
           }
           "purged=$($ok.ToString().ToLower())" >> $env:GITHUB_OUTPUT
@@ -641,7 +641,7 @@ jobs:
             Write-Error "The public stable URL and its checksum never agreed on $expected after a successful purge."
             exit 1
           } else {
-            Write-Warning "The stable download URL is still serving an older installer because the edge could not be purged. Versioned URLs and auto-update are unaffected; the stable URL corrects itself when its TTL expires."
+            Write-Warning "The stable download URL is still serving an older installer because the edge could not be purged. Versioned URLs and auto-update are unaffected; only a copy cached before stable aliases became no-store can remain."
           }
 
       - name: Create the GitHub release
