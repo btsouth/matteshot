@@ -63,7 +63,7 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] 100%, 125%, 150%, and mixed-DPI layouts keep controls visible and captures sharp.
 - [ ] Duplicate launch opens Settings on the resident; quitting releases the PrtScn hook. A prior-off `PrintScreenKeyForSnippingEnabled` stays off.
 - [ ] Tray menu lists capture, active window, delayed capture, open captures/videos folders, History, license, and Settings. Deactivate, Copy diagnostics, and Clear History titles appear only in Settings, and Deactivate frees the license slot with the confirmation and hotkey teardown.
-- [ ] Opening History after deleting a capture in Explorer drops that row; reopening History does not bring the title back. A capture on an ejected USB stays until the drive is back and the file is gone.
+- [ ] Opening History after deleting a capture in Explorer drops that row; reopening History does not bring the title back. A capture on an ejected USB stays until the drive is back and the file is gone. History Delete of that offline row fails and leaves the entry; it does not persist-prune the index.
 - [ ] Settings → Clear History titles… asks first, then strips labels and leaves the screenshot/video files. History Delete is what removes a file.
 - [ ] Uninstall asks before deleting `%APPDATA%\matteshot\history.json`. No leaves it; Yes removes the index (and quarantined copies) and leaves captures.
 - [ ] First run shows the native welcome surface, not a tray balloon. A balloon is only the resident fallback if that window fails to open. `--welcome` opens the same surface; if it cannot, the process exits and no balloon is shown.
