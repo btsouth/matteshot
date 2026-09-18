@@ -94,7 +94,7 @@ Opening History drops entries whose files are confirmed gone — a deleted file 
 ```
 matteshot                    # tray app (normal mode)
 matteshot --take-printscreen # unbind PrtScn from Snipping Tool
-matteshot --restore-printscreen
+matteshot --restore-printscreen # explicit force-on; quit/toggle do not do this
 matteshot --bench <substr>   # timed capture of a window, raw PNG to %TEMP%
 matteshot --overlay-bench [batched|sequential] # headless multi-monitor freeze/layer timing
 matteshot --scroll-test <t>  # scroll-capture a window headlessly (MATTESHOT_SCROLL_DEBUG=1 for per-step diagnostics)
@@ -168,7 +168,7 @@ Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `
 ## Windows landmines (hard-won)
 
 - **DPI**: `PerMonitorV2` at startup or captures come out soft on mixed-DPI setups.
-- **PrtScn**: Win11 routes it to Snipping Tool. On 23H2/24H2 that's `PrintScreenKeyForSnippingEnabled` (HKCU\Control Panel\Keyboard, missing = enabled), but Insider 26220+ can ignore that value and consume the key even after `RegisterHotKey(VK_SNAPSHOT)` reports success. The resident therefore owns PrtScn with a `WH_KEYBOARD_LL` hook and posts the same `WM_HOTKEY` used by every nested picker/editor loop. The hook is removed on toggle, license expiry, or process exit, so Snipping Tool immediately gets the key back. Registry routing remains only as a compatibility fallback.
+- **PrtScn**: Win11 routes it to Snipping Tool. On 23H2/24H2 that's `PrintScreenKeyForSnippingEnabled` (HKCU\Control Panel\Keyboard, missing = enabled), but Insider 26220+ can ignore that value and consume the key even after `RegisterHotKey(VK_SNAPSHOT)` reports success. The resident therefore owns PrtScn with a `WH_KEYBOARD_LL` hook and posts the same `WM_HOTKEY` used by every nested picker/editor loop. The hook is removed on toggle, license expiry, or process exit, so Matteshot stops consuming the key. Registry routing remains only as a compatibility fallback: `release` puts `PrintScreenKeyForSnippingEnabled` back only if we flipped it this run. A prior-off value stays off; missing stays missing. `--restore-printscreen` is the explicit force-on write.
 - **Synthetic PrtScn is untestable** while Snipping routing is on — injected VK_SNAPSHOT never reaches hotkey dispatch.
 - **WGC corner alpha varies by build** — Matteshot applies its own SDF corner mask unconditionally.
 - **`FindWindowW` doesn't match** Matteshot's toolwindow popups even though `EnumWindows` sees them — don't use it in tests.

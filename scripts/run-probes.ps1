@@ -333,7 +333,7 @@ if (-not $Offline) {
     Invoke-Probe -Name 'update manifest' -ProbeArgs @('--update-test') | Out-Null
     Invoke-Probe -Name 'update download + verify' `
         -ProbeArgs @('--update-stage-test', 'https://download.matteshot.app/MatteshotSetup.exe') `
-        -Expect 'verified hash \+ signature' | Out-Null
+        -Expect 'verified signed release \+ Authenticode' | Out-Null
 }
 
 # ----------------------------------------------------------------- report ---

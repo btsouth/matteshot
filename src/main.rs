@@ -111,6 +111,7 @@ fn request_graceful_shutdown() -> Result<()> {
     // so the editor is deliberately closed after the capture surfaces.
     close_all("matteshot_recui", "the recorder")?;
     close_all("matteshot_scrollpill", "scroll capture")?;
+    close_all("matteshot_delaypill", "delayed capture")?;
     close_all("matteshot_overlay", "the capture overlay")?;
     close_all("matteshot_picker", "the picker")?;
     close_all("matteshot_tweak", "the image editor")?;
@@ -118,6 +119,7 @@ fn request_graceful_shutdown() -> Result<()> {
     close_all("matteshot_settings", "settings")?;
     close_all("matteshot_activation", "activation")?;
     close_all("matteshot_welcome", "welcome")?;
+    close_all("matteshot_history", "History")?;
     close_all("matteshot_pin", "a pinned capture")?;
     // SBS-893: supervise_late_finalize has no window. Closing the tray next
     // would exit the resident mid-Finalize; the next start would then delete
@@ -2087,6 +2089,7 @@ fn main() -> Result<()> {
                 }
             })?;
             let bytes = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+            // run-probes.ps1 matches this line, so keep the wording stable.
             eprintln!(
                 "verified signed release + Authenticode: {} ({bytes} bytes)",
                 staged.display()
