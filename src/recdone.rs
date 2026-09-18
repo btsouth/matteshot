@@ -473,6 +473,20 @@ struct State {
     can_share: bool,
 }
 
+/// Recdone Share click. History and tweak now use the same idle rule on
+/// `pending_share` (SBS-1075).
+fn start_share_upload(
+    sharing: &mut bool,
+    pending: &mut Option<u64>,
+    start: impl FnOnce() -> u64,
+) -> bool {
+    if !crate::share::share_idle(*sharing) || !crate::share::begin_if_idle(pending, start) {
+        return false;
+    }
+    *sharing = true;
+    true
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
@@ -4137,14 +4151,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // win. A dedicated flag rather than checking
                             // `status` directly: that string gets overwritten
                             // by unrelated handlers while the upload runs.
-                            if !state.sharing {
-                                state.sharing = true;
+                            // History and tweak now use the same idle rule
+                            // on `pending_share` (SBS-1075).
+                            if start_share_upload(
+                                &mut state.sharing,
+                                &mut state.share_request_id,
+                                || crate::share::share_in_background(hwnd, state.mp4.clone()),
+                            ) {
                                 state.status = Some("Sharing\u{2026}".into());
                                 let _ = InvalidateRect(hwnd, None, false);
-                                state.share_request_id = Some(crate::share::share_in_background(
-                                    hwnd,
-                                    state.mp4.clone(),
-                                ));
                             }
                         }
                         Act::Delete => {
@@ -5255,6 +5270,46 @@ mod tests {
             // layout must remain valid while the window self-repairs.
             assert_layout_is_usable(scale, 320, 180);
         }
+    }
+
+    /// SBS-1075: Recdone already guards Share; this pins that a second
+    /// click neither spawns nor overwrites `share_request_id`.
+    #[test]
+    fn recording_share_refuses_a_second_in_flight_request() {
+        let mut sharing = false;
+        let mut share_request_id = None;
+        let mut uploads = Vec::new();
+        assert!(super::start_share_upload(
+            &mut sharing,
+            &mut share_request_id,
+            || {
+                uploads.push(1);
+                1
+            }
+        ));
+        assert!(sharing);
+        assert!(
+            !super::start_share_upload(&mut sharing, &mut share_request_id, || {
+                uploads.push(2);
+                2
+            }),
+            "a second recording Share started another upload"
+        );
+        assert_eq!(uploads, [1]);
+        assert_eq!(share_request_id, Some(1));
+        assert!(!crate::share::accept_completion(&mut share_request_id, 2));
+        assert_eq!(share_request_id, Some(1));
+        assert!(crate::share::accept_completion(&mut share_request_id, 1));
+        sharing = false;
+        assert!(super::start_share_upload(
+            &mut sharing,
+            &mut share_request_id,
+            || {
+                uploads.push(3);
+                3
+            }
+        ));
+        assert_eq!(uploads, [1, 3]);
     }
 
     #[test]
