@@ -1051,4 +1051,26 @@ mod tests {
             "legacy close must Exec {{sys}}\\taskkill.exe"
         );
     }
+
+    /// Pins SBS-1072: [UninstallRun] must stop through `--quit` and must not
+    /// then launch `--restore-printscreen`. `--quit` already restores the
+    /// prior HKCU binding (SBS-1050). A new process then force-writes
+    /// PrintScreenKeyForSnippingEnabled=1, which turns Snipping on for
+    /// anyone who had it off.
+    #[test]
+    fn uninstall_does_not_force_restore_printscreen() {
+        let source = include_str!("../installer/matteshot.iss");
+        assert!(
+            source.contains("Parameters: \"--quit\""),
+            "uninstall must still stop through --quit"
+        );
+        assert!(
+            !source.contains("Parameters: \"--restore-printscreen\""),
+            "uninstall --restore-printscreen is the SBS-1072 failure mode"
+        );
+        assert!(
+            !source.contains("RunOnceId: \"RestorePrtScn\""),
+            "RestorePrtScn UninstallRun entry is the SBS-1072 failure mode"
+        );
+    }
 }
