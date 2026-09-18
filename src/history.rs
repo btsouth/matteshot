@@ -488,13 +488,6 @@ fn remove_at_with(
     save_unlocked_at(index, &log)
 }
 
-fn path_still_matches_canonical(path: &Path, expected: &Path) -> bool {
-    matches!(
-        path_canonical_recheck(path, expected),
-        CanonicalRecheck::Unchanged
-    )
-}
-
 /// Delete the file and drop it from history. Unlike `record`, errors surface:
 /// a Delete click that silently failed would look like it had worked.
 /// Offline NotFound is that failure: the volume is gone, so the row stays
@@ -1082,15 +1075,17 @@ mod persistence_tests {
     }
 
     #[test]
-    fn path_still_matches_canonical_is_false_after_the_file_moves() {
+    fn path_canonical_recheck_reports_a_moved_file_as_changed() {
         let dir = temp_dir("canonical-moved");
         std::fs::create_dir_all(&dir).unwrap();
         let original = capture(&dir, "a.png");
         let canonical = std::fs::canonicalize(&original).unwrap();
-        assert!(path_still_matches_canonical(&original, &canonical));
+        assert!(matches!(
+            path_canonical_recheck(&original, &canonical),
+            CanonicalRecheck::Unchanged
+        ));
         let moved = dir.join("b.png");
         std::fs::rename(&original, &moved).unwrap();
-        assert!(!path_still_matches_canonical(&original, &canonical));
         assert!(matches!(
             path_canonical_recheck(&original, &canonical),
             CanonicalRecheck::Changed
