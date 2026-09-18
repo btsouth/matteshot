@@ -2087,6 +2087,7 @@ fn main() -> Result<()> {
                 }
             })?;
             let bytes = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+            // run-probes.ps1 matches this line, so keep the wording stable.
             eprintln!(
                 "verified signed release + Authenticode: {} ({bytes} bytes)",
                 staged.display()
