@@ -16,6 +16,9 @@ jobs:
   build:
     name: Build and sign
     runs-on: windows-latest
+    # Forks inherit this file but not the signing identity or the release
+    # environment; skip rather than fail there.
+    if: github.repository == 'btsouth/matteshot'
     environment: release
     timeout-minutes: 30
     permissions:
@@ -26,7 +29,7 @@ jobs:
       installer-name: ${{ steps.installer.outputs.name }}
       hash: ${{ steps.verify.outputs.hash }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history so the ancestry gate below can walk back to main —
           # this same fetch creates origin/main, so the gate needs no later
@@ -58,11 +61,11 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: .\scripts\validate-release-version.ps1 -Tag $env:TAG_NAME
 
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Verify code
         shell: pwsh
@@ -87,7 +90,7 @@ jobs:
           }
 
       - name: Sign in to Azure with GitHub OIDC
-        uses: Azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3
+        uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -95,7 +98,7 @@ jobs:
 
       # Sign the app exe first so the installer packages a signed binary.
       - name: Sign the app binary with Trusted Signing
-        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
@@ -176,7 +179,7 @@ jobs:
           Write-Host "SHA-256: $hash"
 
       - name: Upload unverified release for probing
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-unverified-${{ steps.installer.outputs.version }}
           path: |
@@ -197,14 +200,17 @@ jobs:
     name: Probe the tagged release
     needs: build
     runs-on: windows-latest
+    # Forks inherit this file but not the signing identity or the release
+    # environment; skip rather than fail there.
+    if: github.repository == 'btsouth/matteshot'
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download unverified release
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-unverified-${{ needs.build.outputs.version }}
 
@@ -257,6 +263,9 @@ jobs:
     name: Publish
     needs: [build, probe]
     runs-on: windows-latest
+    # Forks inherit this file but not the signing identity or the release
+    # environment; skip rather than fail there.
+    if: github.repository == 'btsouth/matteshot'
     environment: release
     # Deliberately loose. This job downloads the probed installer, re-verifies
     # it, pushes four objects to R2 through a `npx --yes wrangler` that fetches
@@ -267,7 +276,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # gh release create authenticates through GH_TOKEN env, not git.
           persist-credentials: false
@@ -385,7 +394,7 @@ jobs:
           }
 
       - name: Download probed release
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-unverified-${{ needs.build.outputs.version }}
 

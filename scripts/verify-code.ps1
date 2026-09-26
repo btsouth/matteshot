@@ -46,16 +46,28 @@ function Invoke-CargoStep {
     }
 }
 
-Invoke-CargoStep 'Running all tests' @(
+Invoke-CargoStep 'Checking formatting' @(
+    'fmt', '--all', '--', '--check'
+)
+# Two builds ship from this tree: the default one, and one with the optional
+# `share` feature. Both are tested and linted, because each compiles code the
+# other leaves out.
+Invoke-CargoStep 'Running all tests (default build)' @(
+    'test', '--all-targets'
+)
+Invoke-CargoStep 'Running all tests (all features)' @(
     'test', '--all-targets', '--all-features'
 )
-Invoke-CargoStep 'Running strict Clippy' @(
+Invoke-CargoStep 'Running strict Clippy (default build)' @(
+    'clippy', '--all-targets', '--', '-D', 'warnings'
+)
+Invoke-CargoStep 'Running strict Clippy (all features)' @(
     'clippy', '--all-targets', '--all-features', '--', '-D', 'warnings'
 )
 
 if (-not $SkipReleaseBuild) {
     Invoke-CargoStep 'Building release binary' @('build', '--release')
-    Write-Host 'Code verification passed: RustSec audit, tests, strict Clippy, and release build.'
+    Write-Host 'Code verification passed: RustSec audit, formatting, tests, strict Clippy, and release build.'
 } else {
-    Write-Host 'Code verification passed: RustSec audit, tests, and strict Clippy (release build skipped).'
+    Write-Host 'Code verification passed: RustSec audit, formatting, tests, and strict Clippy (release build skipped).'
 }
