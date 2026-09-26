@@ -1201,6 +1201,9 @@ fn duration_test_report(duration_100ns: i64) -> String {
 }
 
 fn main() -> Result<()> {
+    // Declared first so it drops last: the cached capture devices must be
+    // released before process teardown starts (see capture::CacheGuard).
+    let _capture_cache = capture::CacheGuard;
     unsafe {
         // STA: the folder picker (IFileDialog) requires it; WGC's
         // free-threaded frame pool is unaffected.

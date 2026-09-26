@@ -1,5 +1,6 @@
 //! Single-frame window capture via Windows.Graphics.Capture.
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -31,12 +32,35 @@ use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 thread_local! {
     /// D3D device creation costs tens of ms; cache per thread. All captures
     /// run on the main thread in practice.
-    static DEVICE: std::cell::OnceCell<(ID3D11Device, ID3D11DeviceContext)> =
-        const { std::cell::OnceCell::new() };
+    static DEVICE: RefCell<Option<(ID3D11Device, ID3D11DeviceContext)>> =
+        const { RefCell::new(None) };
     /// The WinRT device wrapper around the cached D3D one. Rebuilding it per
     /// capture cost several milliseconds for no reason.
-    static WINRT_DEVICE: std::cell::OnceCell<IDirect3DDevice> =
-        const { std::cell::OnceCell::new() };
+    static WINRT_DEVICE: RefCell<Option<IDirect3DDevice>> = const { RefCell::new(None) };
+}
+
+/// Releases this thread's cached devices now, while the process is fully
+/// alive, instead of leaving them to thread-local destruction.
+///
+/// Since Rust 1.98 the main thread's thread-locals are destroyed during
+/// process teardown. Releasing the WinRT capture device there faults inside
+/// the already-stopping Windows thread pool, and every Matteshot process that
+/// had captured anything exited with STATUS_INVALID_PARAMETER (0xC000000D)
+/// and a crash report. `main` holds a [`CacheGuard`] so this runs on the way
+/// out. Worker threads still release theirs at an ordinary thread exit.
+pub fn release_thread_cache() {
+    // WinRT wrapper first: it holds a reference to the D3D device.
+    let _ = WINRT_DEVICE.try_with(|cell| cell.borrow_mut().take());
+    let _ = DEVICE.try_with(|cell| cell.borrow_mut().take());
+}
+
+/// Calls [`release_thread_cache`] when dropped. Held for the whole of `main`.
+pub struct CacheGuard;
+
+impl Drop for CacheGuard {
+    fn drop(&mut self) {
+        release_thread_cache();
+    }
 }
 
 /// A staging texture for reading `desc` back on the CPU.
@@ -59,11 +83,11 @@ fn staging_for(device: &ID3D11Device, desc: &D3D11_TEXTURE2D_DESC) -> Result<ID3
 
 fn cached_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     DEVICE.with(|cell| {
-        if cell.get().is_none() {
-            let pair = create_d3d_device()?;
-            let _ = cell.set(pair);
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(create_d3d_device()?);
         }
-        Ok(cell.get().unwrap().clone())
+        Ok(slot.as_ref().expect("filled above").clone())
     })
 }
 
@@ -238,13 +262,14 @@ impl Drop for PendingCapture {
 
 fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice> {
     WINRT_DEVICE.with(|cell| -> Result<IDirect3DDevice> {
-        if cell.get().is_none() {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
             let dxgi: IDXGIDevice = device.cast()?;
             let wrapped: IDirect3DDevice =
                 unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
-            let _ = cell.set(wrapped);
+            *slot = Some(wrapped);
         }
-        Ok(cell.get().unwrap().clone())
+        Ok(slot.as_ref().expect("filled above").clone())
     })
 }
 
@@ -427,4 +452,30 @@ fn capture_item(item: GraphicsCaptureItem) -> Result<RgbaImage> {
     capture_items(vec![item])?
         .pop()
         .context("capture returned no image")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard in `main` relies on this leaving nothing behind for
+    /// thread-local destruction to release during process teardown.
+    #[test]
+    fn releasing_the_thread_cache_empties_both_slots() {
+        // Needs a D3D device. Hosted runners and VMs fall back to WARP; a
+        // machine with neither cannot run this and has nothing cached anyway.
+        let Ok((device, _)) = cached_device() else {
+            return;
+        };
+        let _ = winrt_device(&device);
+        drop(device);
+        release_thread_cache();
+        assert!(DEVICE.with(|cell| cell.borrow().is_none()));
+        assert!(WINRT_DEVICE.with(|cell| cell.borrow().is_none()));
+        // Releasing twice, or with nothing cached, is fine.
+        release_thread_cache();
+        // And the cache refills on the next capture.
+        assert!(cached_device().is_ok());
+        release_thread_cache();
+    }
 }
