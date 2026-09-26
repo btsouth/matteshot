@@ -2,7 +2,7 @@
 
 Notable changes to Matteshot. Releases before 0.21.0 are listed on [GitHub Releases](https://github.com/btsouth/matteshot/releases).
 
-## Unreleased
+## 0.21.0 (2026-09-26)
 
 ### Free and open source
 
@@ -36,3 +36,4 @@ Notable changes to Matteshot. Releases before 0.21.0 are listed on [GitHub Relea
 - CI runs for pull requests from forks on GitHub-hosted runners with no secrets. It checks formatting, tests and lints both the default and the `share` build, enforces a dependency license and source policy with cargo-deny, and tests the share server.
 - The version resource is generated with `embed-resource` in place of the unmaintained `winres`, which also lets the Windows target be type-checked and linted from Linux with `cargo xwin`.
 - GitHub Actions and the share server's dependencies are updated, and Dependabot now watches Cargo, npm and Actions.
+- Rust dependencies are current: `windows` 0.62, `winreg` 0.56, `dirs` 7, `sha2` 0.11, `ed25519-dalek` 3 and `base64` 0.23, plus every compatible update. Config, History and log locations are unchanged.

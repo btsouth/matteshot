@@ -223,4 +223,4 @@ at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Matteshot by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
-The Matteshot name and icon identify the official builds signed by Southbound Software. Forks are welcome under the license; please give them a different name and icon so people can tell them apart.
+The Matteshot name and icon identify the official builds Southbound Software publishes and code-signs (Windows shows the signer as Brandon South). Forks are welcome under the license; please give them a different name and icon so people can tell them apart.
