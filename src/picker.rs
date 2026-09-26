@@ -134,7 +134,7 @@ fn key_action(vk: u16, hover: i32, count: usize, can_share: bool) -> Option<KeyA
         v if v == VK_ESCAPE.0 => Some(KeyAction::Cancel),
         v if v == VK_RETURN.0 => selected.map(KeyAction::Choose),
         0x54 => selected.map(KeyAction::Tweak), // T
-        // S is Share only when a paid license can actually upload (SBS-906).
+        // S is Share only when this build can actually upload.
         0x53 if can_share => selected.map(KeyAction::Share),
         0x50 => Some(KeyAction::Pin),           // P
         0x43 => Some(KeyAction::CopyText),      // C
@@ -295,7 +295,8 @@ struct State {
     /// cancel-on-focus-loss behavior.
     suspended: bool,
     theme: crate::theme::Theme,
-    /// Cached at open: Share is a paid-license action (SBS-906).
+    /// Cached at open: Share is offered only in a build with the `share`
+    /// feature and a configured share server.
     can_share: bool,
     auto_copy: AutoCopyHintSlot,
     painted_hint: AutoCopyHint,
@@ -644,7 +645,7 @@ pub fn pick(
         height: total_h,
         suspended: false,
         theme: crate::theme::current(),
-        can_share: crate::license::can_share(),
+        can_share: crate::share::available(),
         auto_copy,
         painted_hint: AutoCopyHint::Pending,
     });
@@ -729,17 +730,17 @@ mod tests {
         assert_eq!(key_action(VK_ESCAPE.0, 3, 7, true), Some(KeyAction::Cancel));
     }
 
-    /// SBS-906: trial (and any other unpaid state) must not be offered Share.
+    /// Share is offered only when an upload can actually happen.
     #[test]
-    fn picker_does_not_offer_share_without_a_paid_license() {
+    fn picker_does_not_offer_share_when_it_cannot_upload() {
         assert_eq!(key_action(0x53, 3, 7, false), None);
         assert_eq!(key_action(0x54, 3, 7, false), Some(KeyAction::Tweak(3)));
-        let licensed = picker_hint(AutoCopyHint::Succeeded, true);
-        let trial = picker_hint(AutoCopyHint::Succeeded, false);
-        assert!(licensed.contains("S share"), "{licensed}");
-        assert!(!trial.contains("S share"), "{trial}");
-        assert!(trial.contains("T tweak"), "{trial}");
-        assert!(trial.contains("C copy text"), "{trial}");
+        let sharing = picker_hint(AutoCopyHint::Succeeded, true);
+        let default_build = picker_hint(AutoCopyHint::Succeeded, false);
+        assert!(sharing.contains("S share"), "{sharing}");
+        assert!(!default_build.contains("S share"), "{default_build}");
+        assert!(default_build.contains("T tweak"), "{default_build}");
+        assert!(default_build.contains("C copy text"), "{default_build}");
     }
 
     #[test]

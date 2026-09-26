@@ -3,13 +3,10 @@ param(
     [string]$InstallerPath,
 
     [Parameter(Mandatory = $true)]
-    [string]$LicenseKeyPath,
-
-    [Parameter(Mandatory = $true)]
     [string]$WorkDirectory,
 
     # How long the host waits for the guest result.json (SBS-901).
-    # Default 20 minutes covers install + capture + license + uninstall.
+    # Default 20 minutes covers install + offline capture + uninstall.
     [ValidateRange(1, [int]::MaxValue)]
     [int]$TimeoutSeconds = 1200
 )
@@ -25,7 +22,6 @@ try {
 
 $sandbox = (Get-Command "WindowsSandbox.exe" -ErrorAction Stop).Source
 $installer = (Resolve-Path $InstallerPath).Path
-$licenseKey = (Resolve-Path $LicenseKeyPath).Path
 $work = [System.IO.Path]::GetFullPath($WorkDirectory)
 $payload = Join-Path $work "payload"
 $results = Join-Path $work "results"
@@ -33,7 +29,6 @@ $results = Join-Path $work "results"
 New-Item -ItemType Directory -Force $payload, $results | Out-Null
 Clear-SandboxSmokePriorResult -ResultsDirectory $results
 Copy-Item $installer (Join-Path $payload (Split-Path $installer -Leaf))
-Copy-Item $licenseKey (Join-Path $payload "license-key.txt")
 Copy-Item `
     (Join-Path $PSScriptRoot "sandbox-smoke-guest.ps1") `
     (Join-Path $payload "sandbox-smoke-guest.ps1")

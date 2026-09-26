@@ -21,7 +21,7 @@ pub struct Config {
     pub output_max_edge: u32,
     /// First-run onboarding completed (welcome shown, or balloon fallback after welcome failed).
     pub onboarded: bool,
-    /// Whether the resident should own PrtScn while capture is licensed.
+    /// Whether the resident should own PrtScn.
     /// This is the user's preference, not the current Windows routing state.
     pub capture_prtscn: bool,
     /// Also write an animated GIF alongside recordings.
@@ -34,22 +34,10 @@ pub struct Config {
     pub video_dir: Option<PathBuf>,
     /// Install updates in the background instead of only announcing them.
     pub auto_update: bool,
-    /// Whether anonymous usage telemetry may be sent.
-    ///
-    /// `None` means the question has not been answered, and nothing is sent
-    /// while that is true. Consent has to be an actual choice: defaulting to
-    /// on would have the first launch reporting before anyone could decline,
-    /// which is the one thing that cannot be undone afterwards.
-    ///
-    /// Installs that already carry an explicit true or false keep it and are
-    /// not asked again.
-    pub telemetry: Option<bool>,
-    /// The pseudonymous PostHog identity: a random UUID minted on the first
-    /// event after consent. Deliberately not derived from `MachineGuid` or any
-    /// licensing identifier — usage history must not be joinable to a
-    /// customer, and it must not survive a reinstall. Cleared whenever
-    /// telemetry is turned off, so turning it back on starts a fresh history.
-    pub telemetry_id: Option<String>,
+    // Builds up to 0.20.0 also wrote `telemetry` and `telemetry_id`. Usage
+    // telemetry is gone, and serde skips keys it does not know, so those
+    // configs load with every other setting intact and the two keys drop out
+    // the next time the file is saved.
     /// Keep the tweak editor's tab open after Copy so the capture can keep
     /// being refined. Off restores the old close-after-copy behavior.
     pub keep_editor_open: bool,
@@ -63,6 +51,14 @@ pub struct Config {
     /// menu or tooltip can be opened first. See `crate::delay`.
     #[serde(default = "default_capture_delay")]
     pub capture_delay_secs: u32,
+    /// Self-hosted share server, as `https://host[:port]`. Only read by
+    /// builds made with `--features share`; see docs/self-hosting-share.md.
+    /// Absent by default, and never written unless someone sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_server: Option<String>,
+    /// Upload token the share server expects in `Authorization: Bearer`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_token: Option<String>,
 }
 
 fn default_capture_delay() -> u32 {
@@ -87,26 +83,16 @@ impl Default for Config {
             record_fps: crate::record::DEFAULT_FPS,
             video_dir: None,
             auto_update: true,
-            telemetry: None,
-            telemetry_id: None,
             keep_editor_open: true,
             capture_hotkey: default_capture_hotkey(),
             capture_delay_secs: default_capture_delay(),
+            share_server: None,
+            share_token: None,
         }
     }
 }
 
 impl Config {
-    /// Telemetry only runs once someone has said yes. Unanswered is off.
-    pub fn telemetry_enabled(&self) -> bool {
-        self.telemetry == Some(true)
-    }
-
-    /// Whether the consent question still needs asking.
-    pub fn telemetry_unanswered(&self) -> bool {
-        self.telemetry.is_none()
-    }
-
     /// Keep malformed or future config values from reaching capture timing.
     pub fn record_fps(&self) -> u32 {
         crate::record::sanitize_fps(self.record_fps)
@@ -171,7 +157,6 @@ fn fail_closed() -> Config {
     Config {
         auto_update: false,
         capture_prtscn: false,
-        telemetry: None,
         capture_hotkey: crate::hotkey::NONE.to_owned(),
         onboarded: true,
         ..Config::default()
@@ -402,33 +387,25 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The whole point: a fresh install must not report anything before the
-    /// question has been answered.
+    /// 0.20.0 and earlier wrote telemetry keys. Upgrading must keep every
+    /// other setting in that file rather than treating it as unreadable.
     #[test]
-    fn telemetry_is_off_until_the_question_is_answered() {
-        let fresh: Config = serde_json::from_str("{}").expect("empty config");
-        assert!(fresh.telemetry_unanswered(), "a fresh install must be unanswered");
-        assert!(!fresh.telemetry_enabled(), "nothing may be sent before consent");
-    }
-
-    #[test]
-    fn an_existing_answer_is_kept_and_not_re_asked() {
-        for (json, expected) in [
-            (r#"{"telemetry":true}"#, true),
-            (r#"{"telemetry":false}"#, false),
-        ] {
-            let cfg: Config = serde_json::from_str(json).expect(json);
-            assert!(!cfg.telemetry_unanswered(), "{json} was already answered");
-            assert_eq!(cfg.telemetry_enabled(), expected, "for {json}");
-        }
-    }
-
-    #[test]
-    fn declining_is_distinct_from_never_asked() {
-        // Otherwise a decline would put the question back the next time round.
-        let declined = Config { telemetry: Some(false), ..Default::default() };
-        assert!(!declined.telemetry_enabled());
-        assert!(!declined.telemetry_unanswered());
+    fn a_config_with_retired_telemetry_keys_still_loads() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "telemetry": true,
+                "telemetry_id": "8f0c1c1e-8d8a-4a53-9b53-3d9c3f3b7a10",
+                "auto_update": false,
+                "capture_hotkey": "Ctrl+Shift+F9",
+                "capture_delay_secs": 7
+            }"#,
+        )
+        .expect("an upgraded config must parse");
+        assert!(!cfg.auto_update);
+        assert_eq!(cfg.capture_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(cfg.capture_delay_secs, 7);
+        let saved = serde_json::to_string(&cfg).unwrap();
+        assert!(!saved.contains("telemetry"), "retired keys are not written back");
     }
 
     #[test]
@@ -495,7 +472,7 @@ mod tests {
             "auto_update": false,
             "capture_prtscn": false,
             "capture_hotkey": "Ctrl+Shift+F9",
-            "telemetry": false,
+            "keep_editor_open": false,
             "capture_delay_secs": 7
         }"#
     }
@@ -532,8 +509,6 @@ mod tests {
             config.onboarded,
             "a present unreadable file is not first-run and must not open welcome"
         );
-        assert!(config.telemetry_unanswered());
-        assert!(!config.telemetry_enabled());
         let _ = std::fs::remove_file(path);
     }
 
@@ -595,7 +570,7 @@ mod tests {
             load_for_update_from(&path, last_good.as_ref()).expect("seed from last-known-good");
         assert!(!config.auto_update);
         assert_eq!(config.capture_hotkey, "Ctrl+Shift+F9");
-        assert_eq!(config.telemetry, Some(false));
+        assert!(!config.keep_editor_open);
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"{",
@@ -608,7 +583,7 @@ mod tests {
         let saved = load_from(&path).expect("updated last-known-good");
         assert!(!saved.auto_update);
         assert_eq!(saved.capture_hotkey, "Ctrl+Shift+F9");
-        assert_eq!(saved.telemetry, Some(false));
+        assert!(!saved.keep_editor_open);
         assert_eq!(saved.last_style, 3);
         assert_eq!(loaded.capture_delay_secs, 7);
         assert_eq!(saved.capture_delay_secs, 7);
@@ -627,7 +602,7 @@ mod tests {
         assert!(!first.auto_update);
         assert!(!first.capture_prtscn);
         assert_eq!(first.capture_hotkey, "Ctrl+Shift+F9");
-        assert_eq!(first.telemetry, Some(false));
+        assert!(!first.keep_editor_open);
         assert_eq!(first.capture_delay_secs, 7);
 
         write_fixture(&path, "{");
@@ -635,7 +610,7 @@ mod tests {
         assert!(!second.auto_update);
         assert!(!second.capture_prtscn);
         assert_eq!(second.capture_hotkey, "Ctrl+Shift+F9");
-        assert_eq!(second.telemetry, Some(false));
+        assert!(!second.keep_editor_open);
         assert_eq!(second.capture_delay_secs, 7);
 
         let _ = std::fs::remove_file(&path);
@@ -644,7 +619,7 @@ mod tests {
         assert!(!third.auto_update);
         assert!(!third.capture_prtscn);
         assert_eq!(third.capture_hotkey, "Ctrl+Shift+F9");
-        assert_eq!(third.telemetry, Some(false));
+        assert!(!third.keep_editor_open);
         assert_eq!(third.capture_delay_secs, 7);
         let _ = std::fs::remove_dir_all(path);
     }

@@ -55,13 +55,11 @@ enum Ctrl {
     RecordGif,
     FrameRate(u32),
     AutoUpdate,
-    Telemetry,
     KeepEditorOpen,
     Audio(&'static str),
     CaptureHotkey,
     CaptureDelay(u32),
     Diagnostics,
-    Deactivate,
     ClearHistoryTitles,
 }
 
@@ -84,7 +82,6 @@ enum Chrome {
     FrameRateLabel,
     HotkeyLabel,
     DelayLabel,
-    UpdateTerm,
 }
 
 /// Walks down the window handing out rects.
@@ -200,13 +197,6 @@ impl Layout {
     /// `width` stops short of whatever else is on the line. Without it the
     /// label gets the full band, and at a DPI or font where the text runs
     /// wider it would slide under the controls and be overdrawn by them.
-    /// A muted line under the control it explains, aligned with that
-    /// control's label rather than with the margin.
-    fn note(&mut self, chrome: Chrome, indent: i32, height: i32) {
-        let rect = self.band(height);
-        let left = rect.left + self.sc(indent);
-        self.chrome.push((RECT { left, ..rect }, chrome));
-    }
     fn chrome_at(&mut self, top: i32, height: i32, width: i32, chrome: Chrome) {
         self.chrome.push((
             RECT {
@@ -413,17 +403,16 @@ fn fit_settings_window(
 /// right-aligned controls stay inside a work area narrower than 500 logical.
 fn layout_to_work(
     scale: f32,
-    license: &crate::license::Status,
     work: WorkRect,
     preferred_origin: Option<(i32, i32)>,
     nc_w: i32,
     nc_h: i32,
 ) -> (LaidOut, FittedWindow) {
     let designed_cw = (LOGICAL_WIDTH as f32 * scale) as i32;
-    let laid = build_layout(scale, designed_cw, license);
+    let laid = build_layout(scale, designed_cw);
     let fitted = fit_settings_window(designed_cw, laid.height, nc_w, nc_h, work, preferred_origin);
     let laid = if fitted.client_w != designed_cw {
-        build_layout(scale, fitted.client_w, license)
+        build_layout(scale, fitted.client_w)
     } else {
         laid
     };
@@ -451,21 +440,12 @@ fn scroll_rect_into_view(
     y.clamp(0, max_scroll(content_h, viewport_h))
 }
 
-fn control_is_reachable(ctrl: Ctrl, license: &crate::license::Status) -> bool {
-    match ctrl {
-        Ctrl::Deactivate => matches!(license, crate::license::Status::Licensed { .. }),
-        _ => true,
-    }
-}
-
-/// Keyboard/hover index, or -1 when that slot is gone or Deactivate is hidden.
-fn reachable_index(index: i32, controls: &[(RECT, Ctrl)], license: &crate::license::Status) -> i32 {
-    if index < 0 {
-        return -1;
-    }
-    match controls.get(index as usize) {
-        Some((_, ctrl)) if control_is_reachable(*ctrl, license) => index,
-        _ => -1,
+/// Keyboard/hover index, or -1 when a relayout left that slot empty.
+fn reachable_index(index: i32, controls: &[(RECT, Ctrl)]) -> i32 {
+    if index < 0 || index as usize >= controls.len() {
+        -1
+    } else {
+        index
     }
 }
 
@@ -475,35 +455,20 @@ fn key_activates_focus(vk: u32, alt_down: bool) -> bool {
     !alt_down && (vk == VK_RETURN.0 as u32 || vk == VK_SPACE.0 as u32)
 }
 
-fn hit_test_control(
-    controls: &[(RECT, Ctrl)],
-    license: &crate::license::Status,
-    x: i32,
-    y: i32,
-    scroll_y: i32,
-) -> i32 {
+fn hit_test_control(controls: &[(RECT, Ctrl)], x: i32, y: i32, scroll_y: i32) -> i32 {
     let content_y = y + scroll_y;
     controls
         .iter()
-        .position(|(r, c)| {
-            control_is_reachable(*c, license)
-                && x >= r.left
-                && x < r.right
-                && content_y >= r.top
-                && content_y < r.bottom
+        .position(|(r, _)| {
+            x >= r.left && x < r.right && content_y >= r.top && content_y < r.bottom
         })
         .map(|i| i as i32)
         .unwrap_or(-1)
 }
 
-/// Next reachable control, wrapping. `from == -1` starts at the beginning
-/// (or the end when reverse).
-fn next_reachable(
-    controls: &[(RECT, Ctrl)],
-    license: &crate::license::Status,
-    from: i32,
-    reverse: bool,
-) -> i32 {
+/// Next control, wrapping. `from == -1` starts at the beginning (or the end
+/// when reverse).
+fn next_reachable(controls: &[(RECT, Ctrl)], from: i32, reverse: bool) -> i32 {
     let n = controls.len() as i32;
     if n == 0 {
         return -1;
@@ -517,17 +482,11 @@ fn next_reachable(
     } else {
         from
     };
-    for step in 1..=n {
-        let i = if reverse {
-            (start - step).rem_euclid(n)
-        } else {
-            (start + step).rem_euclid(n)
-        };
-        if control_is_reachable(controls[i as usize].1, license) {
-            return i;
-        }
+    if reverse {
+        (start - 1).rem_euclid(n)
+    } else {
+        (start + 1).rem_euclid(n)
     }
-    -1
 }
 
 fn work_area_at(point: POINT) -> WorkRect {
@@ -567,7 +526,6 @@ fn non_client_delta(content_w: i32, content_h: i32, scale: f32) -> (i32, i32) {
 
 struct State {
     cfg: Config,
-    license: crate::license::Status,
     font: HFONT,
     font_small: HFONT,
     controls: Vec<(RECT, Ctrl)>,
@@ -638,7 +596,7 @@ struct LaidOut {
 /// Extracted from `open` so `WM_DPICHANGED` can re-run exactly the same pass
 /// rather than a second copy of it. Returns the controls, the chrome, and the
 /// client height the sequence ended up needing.
-fn build_layout(scale: f32, cw: i32, license: &crate::license::Status) -> LaidOut {
+fn build_layout(scale: f32, cw: i32) -> LaidOut {
     let mut l = Layout::new(scale, cw);
 
     l.gap(20);
@@ -681,7 +639,7 @@ fn build_layout(scale: f32, cw: i32, license: &crate::license::Status) -> LaidOu
     );
 
     // Checkboxes, grouped: app and editor behavior, then recording,
-    // then updates, with privacy last.
+    // then updates.
     l.gap(16);
     l.checkbox(Ctrl::Autostart);
     l.gap(4);
@@ -738,19 +696,10 @@ fn build_layout(scale: f32, cw: i32, license: &crate::license::Status) -> LaidOu
 
     l.gap(4);
     l.checkbox(Ctrl::AutoUpdate);
-    // Said where it is asked about, rather than left for a support email.
-    if license.updates_note().is_some() {
-        l.note(Chrome::UpdateTerm, 28, 18);
-    }
-    l.gap(4);
-    l.checkbox(Ctrl::Telemetry);
 
-    // Support and license actions, above the footer. Deactivate is hidden
-    // for anyone without a license to give up.
+    // Support and privacy actions, above the footer.
     l.gap(6);
-    l.button_pair(Ctrl::Diagnostics, Ctrl::Deactivate, 190, 198);
-    l.gap(4);
-    l.chips(&[Ctrl::ClearHistoryTitles], 220, 0, 0, 30);
+    l.button_pair(Ctrl::Diagnostics, Ctrl::ClearHistoryTitles, 190, 198);
 
     let height = l.finish();
     LaidOut {
@@ -971,11 +920,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
             Chrome::DelayLabel => {
                 draw_text_in(hdc, state.font, state.theme.text, *r, "Capture delay", 0)
             }
-            Chrome::UpdateTerm => {
-                if let Some(note) = state.license.updates_note() {
-                    draw_text_in(hdc, state.font_small, state.theme.muted, *r, &note, 0);
-                }
-            }
             // The paths stop short of the buttons sharing their line.
             Chrome::SavePath | Chrome::VideoPath => {
                 let text = if *chrome == Chrome::SavePath {
@@ -1069,8 +1013,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 );
                 let (label, color) = if !state.cfg.capture_prtscn {
                     ("Off", state.theme.muted)
-                } else if !state.license.can_capture() {
-                    ("Activate to use", state.theme.muted)
                 } else if prtscn::owns_key() {
                     ("Active", state.theme.accent)
                 } else {
@@ -1116,14 +1058,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 "Install updates automatically",
                 state,
                 state.cfg.auto_update,
-                hot,
-            ),
-            Ctrl::Telemetry => draw_checkbox(
-                hdc,
-                *r,
-                "Send anonymous usage stats",
-                state,
-                state.cfg.telemetry_enabled(),
                 hot,
             ),
             Ctrl::KeepEditorOpen => draw_checkbox(
@@ -1180,12 +1114,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 hot,
             ),
             Ctrl::Diagnostics => draw_chip_button(hdc, *r, "Copy diagnostics", state, false, hot),
-            Ctrl::Deactivate => {
-                let licensed = matches!(state.license, crate::license::Status::Licensed { .. });
-                if licensed {
-                    draw_chip_button(hdc, *r, "Deactivate this PC\u{2026}", state, false, hot);
-                }
-            }
             Ctrl::ClearHistoryTitles => {
                 draw_chip_button(hdc, *r, "Clear History titles\u{2026}", state, false, hot)
             }
@@ -1202,9 +1130,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
         bottom: state.height - s(state, 10),
     };
     let footer_text = format!(
-        "Matteshot {}   \u{00b7}   {}",
-        env!("CARGO_PKG_VERSION"),
-        state.license.tray_label()
+        "Matteshot {}   \u{00b7}   Free and open source",
+        env!("CARGO_PKG_VERSION")
     );
     draw_text_in(
         hdc,
@@ -1334,22 +1261,6 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             let enabled = !state.cfg.auto_update;
             update_config(hwnd, state, |cfg| cfg.auto_update = enabled);
         }
-        Ctrl::Telemetry => {
-            // Toggling here answers the question too, so an install that
-            // reaches Settings before the welcome screen is not asked twice.
-            let enabled = !state.cfg.telemetry_enabled();
-            if update_config(hwnd, state, |cfg| {
-                cfg.telemetry = Some(enabled);
-                // Turning telemetry off also forgets the pseudonymous id, so
-                // a later opt-in starts a history that cannot be joined to
-                // the old one. A fresh id is minted on the next event.
-                if !enabled {
-                    cfg.telemetry_id = None;
-                }
-            }) {
-                crate::telemetry::set_enabled(enabled);
-            }
-        }
         Ctrl::KeepEditorOpen => {
             let enabled = !state.cfg.keep_editor_open;
             update_config(hwnd, state, |cfg| cfg.keep_editor_open = enabled);
@@ -1377,30 +1288,6 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
                 );
             }
         },
-        Ctrl::Deactivate => {
-            if !matches!(state.license, crate::license::Status::Licensed { .. }) {
-                return;
-            }
-            // A running resident owns the capture hotkeys, so route through its
-            // loop: it hands PrtScn back to Windows and keeps its own hotkey
-            // state in sync. Standalone --settings mode has no resident, so a
-            // direct deactivation is all there is to do there.
-            let result = if crate::tray::request_deactivate() {
-                Ok(())
-            } else {
-                crate::deactivate_license()
-            };
-            if let Err(error) = result {
-                eprintln!("deactivate failed: {error:#}");
-                let text = format!("Deactivation failed:\n\n{error:#}");
-                let _ = MessageBoxW(
-                    None,
-                    PCWSTR(HSTRING::from(text).as_ptr()),
-                    w!("Matteshot"),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
-        }
         Ctrl::ClearHistoryTitles => {
             // Confirmation is the explicit request. Yes clears titles only;
             // capture files stay unless the user uses History Delete.
@@ -1489,16 +1376,16 @@ unsafe fn apply_fit(hwnd: HWND, state: &mut State, work: WorkRect, origin: Optio
     state.reclamping = true;
     let (nc_w, nc_h) = {
         let designed_cw = (LOGICAL_WIDTH as f32 * state.scale) as i32;
-        let laid = build_layout(state.scale, designed_cw, &state.license);
+        let laid = build_layout(state.scale, designed_cw);
         non_client_delta(designed_cw, laid.height, state.scale)
     };
-    let (laid, fitted) = layout_to_work(state.scale, &state.license, work, origin, nc_w, nc_h);
+    let (laid, fitted) = layout_to_work(state.scale, work, origin, nc_w, nc_h);
     state.controls = laid.controls;
     state.chrome = laid.chrome;
     state.width = fitted.client_w;
     state.height = laid.height;
-    state.hover = reachable_index(state.hover, &state.controls, &state.license);
-    state.focus = reachable_index(state.focus, &state.controls, &state.license);
+    state.hover = reachable_index(state.hover, &state.controls);
+    state.focus = reachable_index(state.focus, &state.controls);
     let _ = SetWindowPos(
         hwnd,
         None,
@@ -1567,18 +1454,13 @@ unsafe fn handle_settings_key(
     let vk = wparam.0 as u32;
     let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
     if vk == VK_TAB.0 as u32 {
-        let next = next_reachable(&state.controls, &state.license, state.focus, shift);
+        let next = next_reachable(&state.controls, state.focus, shift);
         move_focus(state, next);
         let _ = InvalidateRect(hwnd, None, false);
         return LRESULT(0);
     }
     if vk == VK_DOWN.0 as u32 || vk == VK_UP.0 as u32 {
-        let next = next_reachable(
-            &state.controls,
-            &state.license,
-            state.focus,
-            vk == VK_UP.0 as u32,
-        );
+        let next = next_reachable(&state.controls, state.focus, vk == VK_UP.0 as u32);
         move_focus(state, next);
         let _ = InvalidateRect(hwnd, None, false);
         return LRESULT(0);
@@ -1786,7 +1668,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                let hover = hit_test_control(&state.controls, &state.license, x, y, state.scroll_y);
+                let hover = hit_test_control(&state.controls, x, y, state.scroll_y);
                 if hover != state.hover {
                     state.hover = hover;
                     let _ = InvalidateRect(hwnd, None, false);
@@ -1817,7 +1699,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                let i = hit_test_control(&state.controls, &state.license, x, y, state.scroll_y);
+                let i = hit_test_control(&state.controls, x, y, state.scroll_y);
                 if i >= 0 {
                     state.focus = i;
                     let ctrl = state.controls[i as usize].1;
@@ -1895,22 +1777,18 @@ pub fn open() -> Result<()> {
         // to be baked into ~37 literal coordinates in this function and 17
         // more in the paint routine; they are derived from that geometry, so
         // the window is pixel-identical to before the cursor existed.
-        // Read once: the layout needs to know whether there is an update term
-        // to make room for, and the window then keeps the same answer.
-        let license = crate::license::status();
 
         // Same cursor reading that chose the scale. Sampling it twice lets
         // the pointer cross monitors in between, pairing one monitor's scale
         // with another's work area.
         let work = work_area_at(cursor);
-        let probe_h = build_layout(scale, cw, &license).height;
+        let probe_h = build_layout(scale, cw).height;
         let (nc_w, nc_h) = non_client_delta(cw, probe_h, scale);
-        let (laid_out, fitted) = layout_to_work(scale, &license, work, None, nc_w, nc_h);
+        let (laid_out, fitted) = layout_to_work(scale, work, None, nc_w, nc_h);
         let (controls, chrome, ch) = (laid_out.controls, laid_out.chrome, laid_out.height);
 
         let state = Box::new(State {
             cfg: Config::load(),
-            license,
             font,
             font_small,
             controls,
@@ -1986,10 +1864,7 @@ pub fn refresh() {
         let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
         if !hwnd.0.is_null() && IsWindow(hwnd).as_bool() {
             if let Some(state) = state_of(hwnd) {
-                state.license = crate::license::status();
                 state.cfg = Config::load();
-                // Rebuild: a license flip can add or remove the update-term
-                // note, which changes content height, and can hide Deactivate.
                 state.hover = -1;
                 reclamp_to_monitor(hwnd, state);
             }
@@ -2013,7 +1888,7 @@ pub fn is_open() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_layout, chip_focus_ring_visible, control_is_reachable, fit_equal_row,
+        build_layout, chip_focus_ring_visible, fit_equal_row,
         fit_settings_window, hit_test_control, key_activates_focus, layout_to_work, max_scroll,
         next_reachable, reachable_index, scroll_rect_into_view, Ctrl, WorkRect, LOGICAL_WIDTH,
         MIN_VISIBLE_CLIENT,
@@ -2027,12 +1902,11 @@ mod tests {
     /// around it moved.
     #[test]
     fn the_layout_scales_whole_rather_than_in_parts() {
-        let license = crate::license::Status::TrialNotStarted;
-        let base = build_layout(1.0, 500, &license);
+        let base = build_layout(1.0, 500);
 
         for scale in [1.25f32, 1.5, 2.0] {
             let width = (500.0 * scale) as i32;
-            let scaled = build_layout(scale, width, &license);
+            let scaled = build_layout(scale, width);
 
             // Same rows, in the same order: scale must not change what the
             // window contains, only how big it is.
@@ -2077,32 +1951,6 @@ mod tests {
         }
     }
 
-    fn trial() -> crate::license::Status {
-        crate::license::Status::TrialNotStarted
-    }
-
-    fn expired() -> crate::license::Status {
-        crate::license::Status::Expired
-    }
-
-    fn unavailable() -> crate::license::Status {
-        crate::license::Status::Unavailable
-    }
-
-    fn licensed_term() -> crate::license::Status {
-        crate::license::Status::Licensed {
-            customer_email: None,
-            updates_until: Some("2027-07-30T00:00:00.000Z".into()),
-        }
-    }
-
-    fn licensed_no_term() -> crate::license::Status {
-        crate::license::Status::Licensed {
-            customer_email: None,
-            updates_until: None,
-        }
-    }
-
     /// 1366x768 laptop with a ~40px taskbar. 1920x1080 with the same.
     const LAPTOP: WorkRect = WorkRect {
         left: 0,
@@ -2123,100 +1971,66 @@ mod tests {
         ((16.0 * scale) as i32, (39.0 * scale) as i32)
     }
 
-    fn every_license() -> [crate::license::Status; 5] {
-        [
-            trial(),
-            expired(),
-            unavailable(),
-            licensed_no_term(),
-            licensed_term(),
-        ]
-    }
-
     /// SBS-753: the unclamped client already exceeds a 1366x768 work area
     /// at 125%. Without `fit_settings_window`, Update/privacy/diagnostics
     /// sit below the taskbar.
     #[test]
     fn unclamped_content_overflows_a_1366x768_work_area_from_125_percent() {
-        for license in every_license() {
-            for scale in [1.25f32, 1.5, 2.0] {
-                let width = (LOGICAL_WIDTH as f32 * scale) as i32;
-                let laid = build_layout(scale, width, &license);
-                let (_nc_w, nc_h) = non_client(scale);
-                assert!(
-                    laid.height + nc_h > LAPTOP.height(),
-                    "content {} + frame {nc_h} at {scale}x for {license:?} should overflow 728",
-                    laid.height
-                );
-            }
+        for scale in [1.25f32, 1.5, 2.0] {
+            let width = (LOGICAL_WIDTH as f32 * scale) as i32;
+            let laid = build_layout(scale, width);
+            let (_nc_w, nc_h) = non_client(scale);
+            assert!(
+                laid.height + nc_h > LAPTOP.height(),
+                "content {} + frame {nc_h} at {scale}x should overflow 728",
+                laid.height
+            );
         }
     }
 
     /// SBS-753: final outer size stays inside representative work areas at
-    /// 100-200%, including the taller licensed-with-update-term layout.
+    /// 100-200%.
     #[test]
     fn fitted_window_stays_inside_representative_work_areas() {
         for work in [LAPTOP, DESKTOP] {
-            for license in every_license() {
-                for scale in [1.0f32, 1.25, 1.5, 2.0] {
-                    let width = (LOGICAL_WIDTH as f32 * scale) as i32;
-                    let laid = build_layout(scale, width, &license);
-                    let (nc_w, nc_h) = non_client(scale);
-                    let fitted = fit_settings_window(width, laid.height, nc_w, nc_h, work, None);
+            for scale in [1.0f32, 1.25, 1.5, 2.0] {
+                let width = (LOGICAL_WIDTH as f32 * scale) as i32;
+                let laid = build_layout(scale, width);
+                let (nc_w, nc_h) = non_client(scale);
+                let fitted = fit_settings_window(width, laid.height, nc_w, nc_h, work, None);
+                assert!(
+                    fitted.outer_w <= work.width(),
+                    "outer width {} > work {} at {scale}x",
+                    fitted.outer_w,
+                    work.width()
+                );
+                assert!(
+                    fitted.outer_h <= work.height(),
+                    "outer height {} > work {} at {scale}x",
+                    fitted.outer_h,
+                    work.height()
+                );
+                assert!(fitted.x >= work.left && fitted.x + fitted.outer_w <= work.right);
+                assert!(fitted.y >= work.top && fitted.y + fitted.outer_h <= work.bottom);
+                assert!(fitted.viewport_h >= 1);
+                assert_eq!(fitted.scrollable, laid.height > fitted.viewport_h);
+                if laid.height + nc_h > work.height() {
                     assert!(
-                        fitted.outer_w <= work.width(),
-                        "outer width {} > work {} at {scale}x {license:?}",
-                        fitted.outer_w,
-                        work.width()
+                        fitted.scrollable,
+                        "overflow at {scale}x must become scrollable"
                     );
-                    assert!(
-                        fitted.outer_h <= work.height(),
-                        "outer height {} > work {} at {scale}x {license:?}",
-                        fitted.outer_h,
-                        work.height()
-                    );
-                    assert!(fitted.x >= work.left && fitted.x + fitted.outer_w <= work.right);
-                    assert!(fitted.y >= work.top && fitted.y + fitted.outer_h <= work.bottom);
-                    assert!(fitted.viewport_h >= 1);
-                    assert_eq!(fitted.scrollable, laid.height > fitted.viewport_h);
-                    if laid.height + nc_h > work.height() {
-                        assert!(
-                            fitted.scrollable,
-                            "overflow at {scale}x {license:?} must become scrollable"
-                        );
-                    }
                 }
             }
         }
-    }
-
-    /// Licensed-with-term is the tallest Settings layout; trial/expired/
-    /// unavailable share the shorter one (no update note).
-    #[test]
-    fn licensed_update_term_is_the_tallest_layout() {
-        let width = LOGICAL_WIDTH;
-        let trial_h = build_layout(1.0, width, &trial()).height;
-        let expired_h = build_layout(1.0, width, &expired()).height;
-        let unavailable_h = build_layout(1.0, width, &unavailable()).height;
-        let no_term_h = build_layout(1.0, width, &licensed_no_term()).height;
-        let term_h = build_layout(1.0, width, &licensed_term()).height;
-        assert_eq!(trial_h, expired_h);
-        assert_eq!(trial_h, unavailable_h);
-        assert_eq!(trial_h, no_term_h);
-        assert!(
-            term_h > trial_h,
-            "update-term note should add a row: term {term_h} vs trial {trial_h}"
-        );
     }
 
     /// Keyboard navigation can bring the bottom control into a viewport
     /// shorter than the content (the 1366x768 @ 200% case).
     #[test]
     fn keyboard_scroll_reaches_the_bottom_control() {
-        let license = licensed_term();
         let scale = 2.0f32;
         let width = (LOGICAL_WIDTH as f32 * scale) as i32;
-        let laid = build_layout(scale, width, &license);
+        let laid = build_layout(scale, width);
         let (nc_w, nc_h) = non_client(scale);
         let fitted = fit_settings_window(width, laid.height, nc_w, nc_h, LAPTOP, None);
         assert!(fitted.scrollable, "200% on 1366x768 must scroll");
@@ -2225,15 +2039,11 @@ mod tests {
             .controls
             .iter()
             .enumerate()
-            .rev()
-            .find(|(_, (_, c))| control_is_reachable(*c, &license))
-            .expect("settings has reachable controls");
+            .next_back()
+            .expect("settings has controls");
         let (idx, (rect, ctrl)) = last;
         assert!(
-            matches!(
-                *ctrl,
-                Ctrl::Diagnostics | Ctrl::Deactivate | Ctrl::ClearHistoryTitles
-            ),
+            matches!(*ctrl, Ctrl::Diagnostics | Ctrl::ClearHistoryTitles),
             "bottom control should be a footer action, got {ctrl:?}"
         );
         assert!(
@@ -2255,7 +2065,7 @@ mod tests {
         let mut focus = -1;
         let mut seen_last = false;
         for _ in 0..laid.controls.len() + 2 {
-            focus = next_reachable(&laid.controls, &license, focus, false);
+            focus = next_reachable(&laid.controls, focus, false);
             if focus == idx as i32 {
                 seen_last = true;
                 break;
@@ -2265,65 +2075,34 @@ mod tests {
         let _ = idx;
     }
 
+    /// Tab walks every control once per cycle, in layout order, and wraps.
     #[test]
-    fn tab_skips_deactivate_unless_licensed() {
-        let trial_layout = build_layout(1.0, LOGICAL_WIDTH, &trial());
+    fn tab_visits_every_control_once_per_cycle() {
+        let laid = build_layout(1.0, LOGICAL_WIDTH);
+        let n = laid.controls.len() as i32;
         let mut focus = -1;
-        let mut saw_deactivate = false;
-        for _ in 0..trial_layout.controls.len() + 1 {
-            focus = next_reachable(&trial_layout.controls, &trial(), focus, false);
-            if focus >= 0 && matches!(trial_layout.controls[focus as usize].1, Ctrl::Deactivate) {
-                saw_deactivate = true;
-            }
+        for expected in 0..n {
+            focus = next_reachable(&laid.controls, focus, false);
+            assert_eq!(focus, expected);
         }
-        assert!(!saw_deactivate, "trial Tab must not land on Deactivate");
-
-        let licensed = licensed_term();
-        let licensed_layout = build_layout(1.0, LOGICAL_WIDTH, &licensed);
-        focus = -1;
-        saw_deactivate = false;
-        for _ in 0..licensed_layout.controls.len() + 1 {
-            focus = next_reachable(&licensed_layout.controls, &licensed, focus, false);
-            if focus >= 0 && matches!(licensed_layout.controls[focus as usize].1, Ctrl::Deactivate)
-            {
-                saw_deactivate = true;
-            }
-        }
-        assert!(saw_deactivate, "licensed Tab should reach Deactivate");
-
-        let deactivate = trial_layout
-            .controls
-            .iter()
-            .position(|(_, c)| matches!(c, Ctrl::Deactivate))
-            .expect("Deactivate stays in the trial layout") as i32;
-        let next = next_reachable(&trial_layout.controls, &trial(), deactivate, false);
-        assert!(next >= 0);
-        assert!(
-            control_is_reachable(trial_layout.controls[next as usize].1, &trial()),
-            "Tab from hidden Deactivate must land on a reachable control"
-        );
-        assert!(
-            !matches!(trial_layout.controls[next as usize].1, Ctrl::Deactivate),
-            "Tab from hidden Deactivate must not stay on Deactivate"
-        );
+        assert_eq!(next_reachable(&laid.controls, focus, false), 0, "Tab wraps");
+        assert_eq!(next_reachable(&laid.controls, -1, true), n - 1, "Shift+Tab starts at the end");
+        assert_eq!(next_reachable(&laid.controls, 0, true), n - 1, "Shift+Tab wraps");
+        assert_eq!(next_reachable(&[], -1, false), -1);
     }
 
     #[test]
     fn hit_test_uses_scroll_offset() {
-        let license = trial();
-        let laid = build_layout(1.0, LOGICAL_WIDTH, &license);
+        let laid = build_layout(1.0, LOGICAL_WIDTH);
         let (rect, _) = laid.controls[0];
         let x = rect.left + 1;
         let y = 10;
         // Unscrolled, y=10 near the top may miss the first control (it sits
         // below the header). Use the control's own top as the pointer.
         let y_on = 0;
+        assert_eq!(hit_test_control(&laid.controls, x, rect.top + 1, 0), 0);
         assert_eq!(
-            hit_test_control(&laid.controls, &license, x, rect.top + 1, 0),
-            0
-        );
-        assert_eq!(
-            hit_test_control(&laid.controls, &license, x, y_on, rect.top + 1),
+            hit_test_control(&laid.controls, x, y_on, rect.top + 1),
             0,
             "scrolled so the control sits at the top of the viewport"
         );
@@ -2377,15 +2156,14 @@ mod tests {
     /// the laptop taskbar until it is re-fitted (SBS-753).
     #[test]
     fn a_taller_window_becomes_scrollable_on_a_shorter_same_dpi_work_area() {
-        let license = licensed_term();
         let scale = 1.25f32;
         let width = (LOGICAL_WIDTH as f32 * scale) as i32;
-        let laid = build_layout(scale, width, &license);
+        let laid = build_layout(scale, width);
         let (nc_w, nc_h) = non_client(scale);
         let on_desktop = fit_settings_window(width, laid.height, nc_w, nc_h, DESKTOP, None);
         assert!(
             laid.height + nc_h > LAPTOP.height(),
-            "125% licensed layout must overflow a 728px laptop work area"
+            "125% layout must overflow a 728px laptop work area"
         );
         assert!(
             on_desktop.outer_h > LAPTOP.height(),
@@ -2429,33 +2207,15 @@ mod tests {
     }
 
     #[test]
-    fn refresh_clears_focus_when_deactivate_becomes_unreachable() {
-        let licensed = licensed_term();
-        let licensed_layout = build_layout(1.0, LOGICAL_WIDTH, &licensed);
-        let deactivate = licensed_layout
-            .controls
-            .iter()
-            .position(|(_, c)| matches!(c, Ctrl::Deactivate))
-            .expect("licensed layout includes Deactivate") as i32;
+    fn a_relayout_clears_focus_that_no_longer_points_at_a_control() {
+        let laid = build_layout(1.0, LOGICAL_WIDTH);
+        let last = laid.controls.len() as i32 - 1;
+        assert_eq!(reachable_index(last, &laid.controls), last);
+        assert_eq!(reachable_index(-1, &laid.controls), -1);
         assert_eq!(
-            reachable_index(deactivate, &licensed_layout.controls, &licensed),
-            deactivate
-        );
-
-        let trial_layout = build_layout(1.0, LOGICAL_WIDTH, &trial());
-        assert!(matches!(
-            trial_layout.controls[deactivate as usize].1,
-            Ctrl::Deactivate
-        ));
-        assert_eq!(
-            reachable_index(deactivate, &trial_layout.controls, &trial()),
-            -1
-        );
-        assert_eq!(reachable_index(-1, &trial_layout.controls, &trial()), -1);
-        assert_eq!(
-            reachable_index(99, &trial_layout.controls, &trial()),
+            reachable_index(last + 1, &laid.controls),
             -1,
-            "out-of-range focus also clears"
+            "out-of-range focus clears"
         );
     }
 
@@ -2464,7 +2224,6 @@ mod tests {
     /// the window so hit-testing still finds it, including the right edge.
     #[test]
     fn a_narrow_work_area_keeps_controls_hit_testable() {
-        let license = licensed_term();
         let scale = 2.0f32;
         let (nc_w, nc_h) = non_client(scale);
         let designed_cw = (LOGICAL_WIDTH as f32 * scale) as i32;
@@ -2476,7 +2235,7 @@ mod tests {
             bottom: 728,
         };
         assert!(work.width() < desired_outer_w);
-        let (laid, fitted) = layout_to_work(scale, &license, work, None, nc_w, nc_h);
+        let (laid, fitted) = layout_to_work(scale, work, None, nc_w, nc_h);
         assert!(fitted.outer_w <= work.width());
         assert!(fitted.client_w < designed_cw);
         assert_eq!(fitted.client_w, (fitted.outer_w - nc_w).max(1));
@@ -2492,17 +2251,14 @@ mod tests {
                 rect.right > rect.left,
                 "{ctrl:?} must have a positive width"
             );
-            if !control_is_reachable(*ctrl, &license) {
-                continue;
-            }
             let y = rect.top + 1;
             assert_eq!(
-                hit_test_control(&laid.controls, &license, rect.left + 1, y, 0),
+                hit_test_control(&laid.controls, rect.left + 1, y, 0),
                 i as i32,
                 "{ctrl:?} left edge must remain hit-testable"
             );
             assert_eq!(
-                hit_test_control(&laid.controls, &license, rect.right - 1, y, 0),
+                hit_test_control(&laid.controls, rect.right - 1, y, 0),
                 i as i32,
                 "{ctrl:?} right edge must remain hit-testable"
             );
@@ -2511,7 +2267,7 @@ mod tests {
 
     #[test]
     fn designed_width_does_not_shrink_chip_rows() {
-        let laid = build_layout(1.0, LOGICAL_WIDTH, &licensed_term());
+        let laid = build_layout(1.0, LOGICAL_WIDTH);
         let custom = laid
             .controls
             .iter()
@@ -2519,13 +2275,13 @@ mod tests {
             .expect("screenshot-size row");
         assert_eq!(custom.0.left, 24 + 3 * 110);
         assert_eq!(custom.0.right, 24 + 3 * 110 + 102);
-        let deactivate = laid
+        let clear = laid
             .controls
             .iter()
-            .find(|(_, c)| matches!(c, Ctrl::Deactivate))
+            .find(|(_, c)| matches!(c, Ctrl::ClearHistoryTitles))
             .expect("footer pair");
-        assert_eq!(deactivate.0.left, 24 + 198);
-        assert_eq!(deactivate.0.right, 24 + 198 + 190);
+        assert_eq!(clear.0.left, 24 + 198);
+        assert_eq!(clear.0.right, 24 + 198 + 190);
     }
 
     #[test]

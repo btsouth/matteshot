@@ -554,7 +554,8 @@ struct State {
     /// or spawn another upload; `accept_completion` only drops a stale
     /// UI result (SBS-1075).
     pending_share: Option<u64>,
-    /// Cached at open: Share is a paid-license action (SBS-906).
+    /// Cached at open: Share is offered only in a build with the `share`
+    /// feature and a configured share server.
     can_share: bool,
     /// The crop drag in flight. Lives on the window rather than the document
     /// because, like the slider drags, it belongs to the mouse rather than to
@@ -2999,7 +3000,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
 /// capture" the way saving is.
 unsafe fn share_current(hwnd: HWND, state: &mut State) {
     if let crate::share::ShareStart::Unavailable(reason) =
-        crate::share::share_start(crate::license::can_share())
+        crate::share::share_start()
     {
         state.copy_hint = Some((reason.into(), std::time::Instant::now()));
         let _ = InvalidateRect(hwnd, None, false);
@@ -3034,7 +3035,7 @@ unsafe fn share_current(hwnd: HWND, state: &mut State) {
     }
 }
 
-/// Tweak Share after the license check, before the save. Recdone already
+/// Tweak Share after the availability check, before the save. Recdone already
 /// applies this to `state.sharing` (SBS-1075).
 fn share_upload_idle(pending: Option<u64>) -> bool {
     crate::share::share_idle(pending.is_some())
@@ -4658,7 +4659,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         custom_size_edit: None,
         copy_hint: None,
         pending_share: None,
-        can_share: crate::license::can_share(),
+        can_share: crate::share::available(),
         crop_drag: None,
         crop_click_owed: false,
         font: unsafe { make_font(-sc(14), 400) },

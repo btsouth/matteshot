@@ -469,7 +469,8 @@ struct State {
     sharing: bool,
     /// Guards against a completion posted to a destroyed/reused HWND.
     share_request_id: Option<u64>,
-    /// Cached at open: Share is a paid-license action (SBS-906).
+    /// Cached at open: Share is offered only in a build with the `share`
+    /// feature and a configured share server.
     can_share: bool,
 }
 
@@ -4139,7 +4140,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // buttons agree the "real" artifact is.
                         Act::Share => {
                             if let crate::share::ShareStart::Unavailable(reason) =
-                                crate::share::share_start(crate::license::can_share())
+                                crate::share::share_start()
                             {
                                 state.status = Some(reason.into());
                                 let _ = InvalidateRect(hwnd, None, false);
@@ -4872,7 +4873,7 @@ pub fn show(
         summary.push_str("   \u{00b7}   + GIF");
     }
 
-    let initial = layout(scale, cw, ch, styles.len(), crate::license::can_share());
+    let initial = layout(scale, cw, ch, styles.len(), crate::share::available());
     // The frame the opening probe already decoded; re-decoding it here cost
     // another seek for the same picture.
     let preview_raw = scrub_previews.first().cloned();
@@ -4962,7 +4963,7 @@ pub fn show(
         scrub_generation: 0,
         sharing: false,
         share_request_id: None,
-        can_share: crate::license::can_share(),
+        can_share: crate::share::available(),
     });
     recompose_preview(&mut state);
     let state = Box::into_raw(state);
@@ -5336,14 +5337,14 @@ mod tests {
     }
 
     #[test]
-    fn share_is_hidden_without_a_paid_license() {
+    fn share_is_hidden_when_it_cannot_upload() {
         let window = layout(1.0, 1280, 720, 7, false);
         assert!(
             window
                 .controls
                 .iter()
                 .all(|(_, act, _)| *act != super::Act::Share),
-            "trial and unlicensed editors must not show Share"
+            "an editor that cannot upload must not show Share"
         );
     }
 

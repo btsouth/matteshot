@@ -305,7 +305,7 @@ pub fn find_own_by_class(class_name: &str) -> Option<HWND> {
 /// Every Matteshot surface that can hold work the user would lose. The
 /// shutdown path closes these in order; the updater refuses to restart while
 /// any of them is on screen.
-pub const SURFACE_CLASSES: [&str; 12] = [
+pub const SURFACE_CLASSES: [&str; 11] = [
     "matteshot_recui",
     "matteshot_scrollpill",
     "matteshot_delaypill",
@@ -314,7 +314,6 @@ pub const SURFACE_CLASSES: [&str; 12] = [
     "matteshot_tweak",
     "matteshot_recdone",
     "matteshot_settings",
-    "matteshot_activation",
     "matteshot_welcome",
     "matteshot_history",
     "matteshot_pin",
@@ -395,33 +394,64 @@ mod tests {
         );
     }
 
-    /// A newly registered Matteshot tool window that is not the resident tray
-    /// must appear in `SURFACE_CLASSES`, or idle and `--quit` cannot see it.
-    /// The tray is excluded: it is always present, so listing it would make
-    /// auto-update wait forever.
+    /// A newly registered Matteshot window must appear in `SURFACE_CLASSES`,
+    /// or idle and `--quit` cannot see it. Registrations are found both inline
+    /// (`lpszClassName: w!("...")`) and through a class constant
+    /// (`lpszClassName: CLASS` with `const CLASS: PCWSTR = w!("...")`).
+    ///
+    /// Two exclusions, both deliberate:
+    /// - the tray, which is always present, so listing it would make
+    ///   auto-update wait forever;
+    /// - the output-size prompt, a modal owned by Settings. It cannot exist
+    ///   without Settings open, Settings is listed, and closing Settings
+    ///   takes the prompt with it.
     #[test]
     fn every_registered_surface_except_the_tray_is_in_surface_classes() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut registered = std::collections::BTreeSet::new();
-        let marker = "lpszClassName: w!(\"";
-        for entry in std::fs::read_dir(&src).expect("read src") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read source");
-            for (index, _) in text.match_indices(marker) {
-                let rest = &text[index + marker.len()..];
-                let Some(end) = rest.find('"') else {
+        let quoted = |text: &str| -> Option<String> {
+            let start = text.find("w!(\"")? + 4;
+            let end = text[start..].find('"')?;
+            Some(text[start..start + end].to_owned())
+        };
+        let mut files = vec![src.clone()];
+        while let Some(dir) = files.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    files.push(path);
                     continue;
-                };
-                let name = &rest[..end];
-                if name.starts_with("matteshot_") {
-                    registered.insert(name.to_owned());
+                }
+                if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source");
+                for line in text.lines().map(str::trim) {
+                    let Some(value) = line.strip_prefix("lpszClassName: ") else {
+                        continue;
+                    };
+                    if value.starts_with("w!(") {
+                        registered.extend(quoted(value));
+                        continue;
+                    }
+                    // A constant: resolve it in the same file.
+                    let ident = value.trim_end_matches(',');
+                    let definition = format!("const {ident}: PCWSTR = ");
+                    let name = text
+                        .lines()
+                        .find_map(|line| line.trim().strip_prefix(definition.as_str()))
+                        .and_then(quoted)
+                        .unwrap_or_else(|| panic!("{}: cannot resolve {ident}", path.display()));
+                    registered.insert(name);
                 }
             }
         }
+        assert!(
+            registered.contains("MatteshotOutputSizePrompt"),
+            "the scan must see class-constant registrations"
+        );
         registered.remove("matteshot_tray");
+        registered.remove("MatteshotOutputSizePrompt");
         let listed: std::collections::BTreeSet<_> =
             SURFACE_CLASSES.iter().map(|class| (*class).to_owned()).collect();
         let missing: Vec<_> = registered.difference(&listed).collect();

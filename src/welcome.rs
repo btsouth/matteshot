@@ -37,7 +37,6 @@ static ACTION: AtomicU8 = AtomicU8::new(0);
 
 const PRIMARY: i32 = 1;
 const SETTINGS: i32 = 2;
-const CONSENT: i32 = 3;
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,16 +59,6 @@ struct State {
     font_body: HFONT,
     font_step: HFONT,
     font_small: HFONT,
-    /// Hit and hover area for the whole consent row, box and label together,
-    /// so the label is clickable rather than only the 18px box.
-    consent: RECT,
-    /// What the checkbox currently shows. Nothing is written until the user
-    /// leaves this screen, so closing it without choosing means no consent.
-    consent_checked: bool,
-    /// Only ask when the question is unanswered. Showing an unticked box to
-    /// someone who already said yes would quietly revoke their consent when
-    /// they pressed a button.
-    consent_needed: bool,
 }
 
 impl State {
@@ -83,11 +72,6 @@ impl State {
             tracking_mouse: false,
             primary: RECT::default(),
             settings: RECT::default(),
-            consent: RECT::default(),
-            // Ticked where opt-out is lawful, empty where consent must be
-            // asked for. See crate::telemetry::consent_default_checked.
-            consent_checked: crate::telemetry::consent_default_checked(),
-            consent_needed: crate::config::Config::load().telemetry_unanswered(),
             font_brand: HFONT::default(),
             font_title: HFONT::default(),
             font_body: HFONT::default(),
@@ -111,23 +95,15 @@ impl State {
         self.height = height;
         self.primary = RECT {
             left: sc(318),
-            top: sc(412),
+            top: sc(360),
             right: sc(606),
-            bottom: sc(456),
+            bottom: sc(404),
         };
         self.settings = RECT {
             left: sc(206),
-            top: sc(412),
-            right: sc(306),
-            bottom: sc(456),
-        };
-        // Above the buttons, so the choice is read before either is pressed
-        // rather than discovered afterwards.
-        self.consent = RECT {
-            left: sc(34),
             top: sc(360),
-            right: sc(606),
-            bottom: sc(392),
+            right: sc(306),
+            bottom: sc(404),
         };
         // Create first, then swap: deleting the old handles up front leaves
         // the window with no font at all if a creation fails, and a window
@@ -436,7 +412,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         "Your selected matte is already copied and ready to paste.",
     );
 
-    let trial = RECT {
+    let note = RECT {
         left: sc(state, 32),
         top: sc(state, 282),
         right: sc(state, 608),
@@ -444,16 +420,16 @@ unsafe fn paint(hdc: HDC, state: &State) {
     };
     rounded_panel(
         hdc,
-        trial,
+        note,
         state.theme.panel,
         state.theme.chip_line,
         sc(state, 12),
     );
     let dot = RECT {
-        left: trial.left + sc(state, 16),
-        top: trial.top + sc(state, 21),
-        right: trial.left + sc(state, 28),
-        bottom: trial.top + sc(state, 33),
+        left: note.left + sc(state, 16),
+        top: note.top + sc(state, 21),
+        right: note.left + sc(state, 28),
+        bottom: note.top + sc(state, 33),
     };
     rounded_panel(
         hdc,
@@ -467,12 +443,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
         state.font_step,
         state.theme.text,
         RECT {
-            left: trial.left + sc(state, 40),
-            top: trial.top + sc(state, 5),
-            right: trial.right - sc(state, 14),
-            bottom: trial.top + sc(state, 30),
+            left: note.left + sc(state, 40),
+            top: note.top + sc(state, 5),
+            right: note.right - sc(state, 14),
+            bottom: note.top + sc(state, 30),
         },
-        "14 days free. No card required.",
+        "Free and open source.",
         DT_LEFT | DT_SINGLELINE | DT_VCENTER,
     );
     text(
@@ -480,12 +456,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
         state.font_small,
         state.theme.muted,
         RECT {
-            left: trial.left + sc(state, 40),
-            top: trial.top + sc(state, 26),
-            right: trial.right - sc(state, 14),
-            bottom: trial.bottom - sc(state, 4),
+            left: note.left + sc(state, 40),
+            top: note.top + sc(state, 26),
+            right: note.right - sc(state, 14),
+            bottom: note.bottom - sc(state, 4),
         },
-        "Your trial starts with your first completed capture.",
+        "No account and no usage tracking. Your captures stay on this PC.",
         DT_LEFT | DT_SINGLELINE | DT_VCENTER,
     );
 
@@ -495,56 +471,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
         state.theme.faint,
         RECT {
             left: sc(state, 32),
-            top: sc(state, 412),
+            top: sc(state, 360),
             right: sc(state, 194),
-            bottom: sc(state, 456),
+            bottom: sc(state, 404),
         },
         "Ready in your tray.",
         DT_LEFT | DT_SINGLELINE | DT_VCENTER,
     );
-    // Consent row. Unticked, and deliberately not styled as a call to
-    // action: a pre-ticked box is not consent, and a box people tick by
-    // reflex is not much better.
-    if state.consent_needed {
-        let box_side = sc(state, 18);
-        let box_rect = RECT {
-            left: state.consent.left,
-            top: state.consent.top + sc(state, 6),
-            right: state.consent.left + box_side,
-            bottom: state.consent.top + sc(state, 6) + box_side,
-        };
-        let checked = state.consent_checked;
-        rounded_panel(
-            hdc,
-            box_rect,
-            if checked { state.theme.accent } else { state.theme.panel },
-            if state.hover == CONSENT { state.theme.accent } else { state.theme.chip_line },
-            sc(state, 4),
-        );
-        if checked {
-            text(
-                hdc,
-                state.font_small,
-                state.theme.accent_text,
-                box_rect,
-                "\u{2713}",
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-            );
-        }
-        text(
-            hdc,
-            state.font_small,
-            state.theme.muted,
-            RECT {
-                left: state.consent.left + box_side + sc(state, 10),
-                top: state.consent.top,
-                right: state.consent.right,
-                bottom: state.consent.bottom,
-            },
-            "Share anonymous usage stats. No screenshots, text, file names or paths.",
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-        );
-    }
     button(
         hdc,
         state,
@@ -563,32 +496,6 @@ unsafe fn paint(hdc: HDC, state: &State) {
     );
 }
 
-/// Write the answer the user is leaving with.
-///
-/// Only called when they act on this screen. Closing it with Escape or the X
-/// leaves the setting unanswered, so nothing is sent and the question can be
-/// asked again rather than silently defaulting to yes.
-fn record_consent(state: &State) {
-    if !state.consent_needed {
-        return;
-    }
-    let allowed = state.consent_checked;
-    // Re-checked inside the update, which holds the config lock. This window
-    // is non-modal, so Settings can answer the question while it sits open,
-    // and pressing a button here must not overwrite that real answer with the
-    // default this screen happened to open with.
-    let settled = crate::config::Config::update(|cfg| {
-        if cfg.telemetry.is_none() {
-            cfg.telemetry = Some(allowed);
-        }
-    });
-    match settled {
-        Ok(settled) => crate::telemetry::set_enabled(settled.telemetry_enabled()),
-        Err(error) => crate::diagnostics::log(&format!(
-            "telemetry consent could not be saved: {error:#}"
-        )),
-    }
-}
 unsafe fn activate(hwnd: HWND, action: u8) {
     ACTION.store(action, Ordering::SeqCst);
     let _ = DestroyWindow(hwnd);
@@ -629,7 +536,7 @@ unsafe extern "system" fn wndproc(
             if let Some(state) = state(hwnd) {
                 let scale = crate::dpi::scale_from_message(wparam);
                 let sc = |value: i32| (value as f32 * scale) as i32;
-                state.apply_scale(scale, sc(640), sc(476));
+                state.apply_scale(scale, sc(640), sc(424));
                 crate::dpi::apply_suggested_bounds(hwnd, lparam);
                 let _ = InvalidateRect(hwnd, None, true);
             }
@@ -654,8 +561,6 @@ unsafe extern "system" fn wndproc(
                     PRIMARY
                 } else if contains(state.settings, x, y) {
                     SETTINGS
-                } else if state.consent_needed && contains(state.consent, x, y) {
-                    CONSENT
                 } else {
                     0
                 };
@@ -678,14 +583,9 @@ unsafe extern "system" fn wndproc(
             if let Some(state) = state(hwnd) {
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                if state.consent_needed && contains(state.consent, x, y) {
-                    state.consent_checked = !state.consent_checked;
-                    let _ = InvalidateRect(hwnd, None, false);
-                } else if contains(state.primary, x, y) {
-                    record_consent(state);
+                if contains(state.primary, x, y) {
                     activate(hwnd, PRIMARY as u8);
                 } else if contains(state.settings, x, y) {
-                    record_consent(state);
                     activate(hwnd, SETTINGS as u8);
                 }
             }
@@ -693,9 +593,6 @@ unsafe extern "system" fn wndproc(
         }
         WM_KEYDOWN => {
             if wparam.0 as u16 == VK_RETURN.0 {
-                if let Some(state) = state(hwnd) {
-                    record_consent(state);
-                }
                 activate(hwnd, PRIMARY as u8);
             } else if wparam.0 as u16 == VK_ESCAPE.0 {
                 let _ = DestroyWindow(hwnd);
@@ -743,7 +640,7 @@ fn open(mark_seen: bool) -> Result<()> {
         let _ = GetCursorPos(&mut cursor);
         let scale = crate::dpi::scale_for_point(cursor);
         let sc = |value: i32| (value as f32 * scale) as i32;
-        let (client_width, client_height) = (sc(640), sc(476));
+        let (client_width, client_height) = (sc(640), sc(424));
         let state = Box::new(State::new(scale, client_width, client_height));
         let leaked = Box::into_raw(state);
 

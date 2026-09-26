@@ -390,16 +390,20 @@ fn capture_is_offline_not_found(path: &Path) -> bool {
     ) && !missing_capture_is_confirmed_gone(path)
 }
 
+/// The same refusal covers an ejected drive and a path that never existed on
+/// this machine (a hand-edited row, a drive letter that is not there): both
+/// have no readable ancestor, and neither proves the file is gone. The message
+/// says what is known rather than guessing which one it is.
 fn refuse_offline_delete(path: &Path) -> Result<()> {
     crate::diagnostics::log(&format!(
-        "history delete skipped because the volume is offline: {}",
+        "history delete skipped because the drive or folder is unavailable: {}",
         history_event_name(path)
     ));
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "volume offline",
+        "drive or folder unavailable",
     ))
-    .context("delete capture: volume offline")
+    .context("delete capture: the drive or folder holding it is not available (disconnected, offline, or no longer on this PC)")
 }
 
 enum CanonicalRecheck {
@@ -1902,21 +1906,21 @@ mod layout_tests {
         assert_eq!(uploads, [1, 3]);
     }
 
-    /// SBS-906: History must not offer Share to a trial (or any unpaid) user.
+    /// History offers Share only when an upload can actually happen.
     #[test]
-    fn history_omits_share_without_a_paid_license() {
-        let licensed: Vec<_> = history_menu_items(true)
+    fn history_omits_share_when_it_cannot_upload() {
+        let sharing: Vec<_> = history_menu_items(true)
             .into_iter()
             .map(|(_, label)| label)
             .collect();
-        let trial: Vec<_> = history_menu_items(false)
+        let default_build: Vec<_> = history_menu_items(false)
             .into_iter()
             .map(|(_, label)| label)
             .collect();
-        assert!(licensed.contains(&"Share link"));
-        assert!(!trial.contains(&"Share link"));
+        assert!(sharing.contains(&"Share link"));
+        assert!(!default_build.contains(&"Share link"));
         assert_eq!(
-            trial,
+            default_build,
             ["Copy", "Open in editor", "Show in folder", "Delete\u{2026}"]
         );
         assert_eq!(
@@ -2545,7 +2549,7 @@ unsafe fn reveal_entry(hwnd: HWND, entry: &Entry) {
 
 unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
     if let crate::share::ShareStart::Unavailable(reason) =
-        crate::share::share_start(crate::license::can_share())
+        crate::share::share_start()
     {
         if let Some(state) = state_of(hwnd) {
             state.status = Some((reason.to_string(), std::time::Instant::now()));
@@ -2571,7 +2575,7 @@ unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
     let _ = InvalidateRect(hwnd, None, false);
 }
 
-/// History Share after license + path checks. Same idle rule recdone
+/// History Share after availability and path checks. Same idle rule recdone
 /// applies to `state.sharing` (SBS-1075).
 fn start_share_upload(pending: &mut Option<u64>, start: impl FnOnce() -> u64) -> bool {
     crate::share::begin_if_idle(pending, start)
@@ -2613,8 +2617,8 @@ unsafe fn warn(hwnd: HWND, prefix: &str, error: &dyn std::fmt::Display) {
     let _ = MessageBoxW(hwnd, PCWSTR(message.as_ptr()), w!("Matteshot"), MB_OK | MB_ICONWARNING);
 }
 
-/// History context-menu rows. Share is omitted unless a paid license can
-/// actually upload (SBS-906). Command ids stay stable so Delete is always 5.
+/// History context-menu rows. Share is omitted unless this build can
+/// actually upload. Command ids stay stable so Delete is always 5.
 fn history_menu_items(can_share: bool) -> Vec<(usize, &'static str)> {
     let mut items = vec![
         (1, "Copy"),
@@ -2634,7 +2638,7 @@ fn history_menu_items(can_share: bool) -> Vec<(usize, &'static str)> {
 unsafe fn context_menu(hwnd: HWND, entry: Entry) {
     crate::theme::enable_dark_menus();
     let Ok(menu) = CreatePopupMenu() else { return };
-    for (id, label) in history_menu_items(crate::license::can_share()) {
+    for (id, label) in history_menu_items(crate::share::available()) {
         let text = HSTRING::from(label);
         let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(text.as_ptr()));
     }

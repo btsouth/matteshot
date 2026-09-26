@@ -39,54 +39,42 @@ function Invoke-Matteshot(
     return ""
 }
 
-function Remove-TestActivation {
-    $licenseStatePath = Join-Path $env:APPDATA "matteshot\license.json"
-    if (-not (Test-Path $licenseStatePath)) {
-        return $false
-    }
+# State a paid or trial install of 0.20.0 or earlier leaves behind. The free
+# build must ignore all of it and must not delete any of it.
+$settingsDir = Join-Path $env:APPDATA "matteshot"
+$legacyLicense = Join-Path $settingsDir "license.json"
+$config = Join-Path $settingsDir "config.json"
+$legacyRegistry = "HKCU:\Software\Southbound Software\Matteshot"
 
-    $licenseState = Get-Content -Raw $licenseStatePath | ConvertFrom-Json
-    # Current builds store the refresh token as a DPAPI current-user blob;
-    # the plaintext field only exists in pre-migration state. The sandbox
-    # user is the one who activated, so it can unprotect its own blob.
-    $storedToken = $licenseState.license.refresh_token
-    if (-not $storedToken -and $licenseState.license.refresh_token_protected) {
-        Add-Type -AssemblyName System.Security
-        $protectedBytes = [Convert]::FromBase64String($licenseState.license.refresh_token_protected)
-        $tokenBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-            $protectedBytes,
-            $null,
-            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-        )
-        $storedToken = [Text.Encoding]::UTF8.GetString($tokenBytes)
-    }
-    if (-not $storedToken -or -not $licenseState.license.certificate) {
-        return $false
-    }
+function Initialize-LegacyState {
+    New-Item -ItemType Directory -Force $settingsDir | Out-Null
+    # A trial that ended 30 days ago: every capture path used to refuse here.
+    $started = [DateTimeOffset]::UtcNow.AddDays(-44).ToUnixTimeSeconds()
+    @{ trial_started_at = $started; last_seen_at = $started } |
+        ConvertTo-Json | Set-Content -Encoding UTF8 $legacyLicense
+    New-Item -Force $legacyRegistry | Out-Null
+    Set-ItemProperty $legacyRegistry -Name "TrialStartedAt" -Value ([string]$started)
+    # A config written by 0.20.0, including the retired telemetry keys.
+    @{
+        onboarded = $true
+        auto_update = $false
+        telemetry = $true
+        telemetry_id = "8f0c1c1e-8d8a-4a53-9b53-3d9c3f3b7a10"
+        capture_delay_secs = 7
+    } | ConvertTo-Json | Set-Content -Encoding UTF8 $config
+}
 
-    $certificateBody = $licenseState.license.certificate.Replace("-", "+").Replace("_", "/")
-    switch ($certificateBody.Length % 4) {
-        2 { $certificateBody += "==" }
-        3 { $certificateBody += "=" }
+function Assert-UserStateKept([string]$When) {
+    if (-not (Test-Path $legacyLicense)) {
+        throw "The old license.json was deleted $When."
     }
-    $certificateJson = [Text.Encoding]::UTF8.GetString(
-        [Convert]::FromBase64String($certificateBody)
-    )
-    $certificate = $certificateJson | ConvertFrom-Json
-    $deactivationBody = @{
-        refresh_token = $storedToken
-        device_id = $certificate.device_id
-    } | ConvertTo-Json
-    $deactivation = Invoke-RestMethod `
-        -Method Post `
-        -Uri "https://license.matteshot.app/v1/license/deactivate" `
-        -ContentType "application/json" `
-        -Body $deactivationBody
-    if (-not $deactivation.deactivated) {
-        throw "License service did not release the sandbox activation."
+    if (-not (Test-Path $config)) {
+        throw "config.json was deleted $When."
     }
-    Remove-Item $licenseStatePath -Force
-    return $true
+    $settings = Get-Content -Raw $config | ConvertFrom-Json
+    if ($settings.capture_delay_secs -ne 7 -or $settings.auto_update -ne $false) {
+        throw "Existing settings were not kept $When."
+    }
 }
 
 $passed = $false
@@ -106,6 +94,9 @@ try {
     if ($installerSigner -cne "Brandon South") {
         throw "Unexpected installer signer."
     }
+
+    Write-Step "Seeding state left by a paid-era install"
+    Initialize-LegacyState
 
     Write-Step "Installing Matteshot silently"
     $install = Start-Process `
@@ -148,11 +139,15 @@ try {
         throw "Unexpected uninstaller signer."
     }
 
-    Write-Step "Checking untouched trial state"
-    $initialStatus = Invoke-Matteshot @("--license-status") "license-before"
-    if ($initialStatus -notmatch "14-day trial ready") {
-        throw "Unexpected initial license state: $initialStatus"
-    }
+    Write-Step "Cutting Matteshot off from the network"
+    # Nothing in capture, editing or the resident may need a connection. The
+    # sandbox keeps its own networking so the install above and the signature
+    # checks behave as they do for a real user; only matteshot.exe is blocked.
+    New-NetFirewallRule `
+        -DisplayName "Matteshot smoke offline" `
+        -Direction Outbound `
+        -Program $app `
+        -Action Block | Out-Null
 
     Write-Step "Launching an isolated test window for capture"
     Start-Process "cmd.exe" -ArgumentList "/k title Matteshot-Smoke" | Out-Null
@@ -175,63 +170,21 @@ try {
         throw "Capture output is missing or empty."
     }
 
-    Write-Step "Checking that the first capture started the trial"
-    $trialStatus = Invoke-Matteshot @("--license-status") "license-trial"
-    if ($trialStatus -notmatch "^Trial: 14 days left") {
-        throw "Unexpected trial state after capture: $trialStatus"
-    }
-
-    $licenseKey = Join-Path $payload "license-key.txt"
-    if (-not (Test-Path $licenseKey)) {
-        throw "Test license key is missing from the sandbox payload."
-    }
-
-    Write-Step "Activating the test license"
-    $activationInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $activationInfo.FileName = $app
-    $activationInfo.Arguments = "--activate-stdin"
-    $activationInfo.UseShellExecute = $false
-    $activationInfo.CreateNoWindow = $true
-    $activationInfo.RedirectStandardInput = $true
-    $activationInfo.RedirectStandardOutput = $true
-    $activationInfo.RedirectStandardError = $true
-    $activationProcess = New-Object System.Diagnostics.Process
-    $activationProcess.StartInfo = $activationInfo
-    $activationProcess.Start() | Out-Null
-    $activationProcess.StandardInput.Write((Get-Content -Raw $licenseKey))
-    $activationProcess.StandardInput.Close()
-    $activationStatus = $activationProcess.StandardError.ReadToEnd().Trim()
-    $activationProcess.StandardOutput.ReadToEnd() | Out-Null
-    $activationProcess.WaitForExit()
-    $activationExitCode = $activationProcess.ExitCode
-    if ($activationExitCode -ne 0) {
-        throw "license-activate failed with exit code ${activationExitCode}: $activationStatus"
-    }
-    if ($activationStatus -notmatch "^Licensed") {
-        throw "Activation did not produce a licensed state."
-    }
-    $licensedStatus = Invoke-Matteshot @("--license-status") "license-licensed"
-    if ($licensedStatus -notmatch "^Licensed") {
-        throw "License did not survive a new process."
-    }
-
-    Write-Step "Restarting the resident app"
+    Write-Step "Starting the resident app offline"
+    # A silent install relaunches the resident itself, before the firewall
+    # rule existed. A second launch would only hand off to that copy and exit,
+    # so stop it and start one that has never had a connection.
+    Get-Process -Name "matteshot" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
     $resident = Start-Process $app -PassThru
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 5
     $resident.Refresh()
     if ($resident.HasExited -or -not $resident.Responding) {
-        throw "Resident app did not remain responsive."
+        throw "Resident app did not remain responsive offline."
     }
     Stop-Process -Id $resident.Id -Force
-
-    Write-Step "Releasing the sandbox activation"
-    if (-not (Remove-TestActivation)) {
-        throw "Activated license state was not stored."
-    }
-    $deactivatedStatus = Invoke-Matteshot @("--license-status") "license-deactivated"
-    if ($deactivatedStatus -notmatch "^Trial ended") {
-        throw "Paid activation was not released cleanly."
-    }
+    Assert-UserStateKept "while running"
 
     Write-Step "Uninstalling Matteshot"
     if (-not (Test-Path $uninstaller)) {
@@ -257,6 +210,7 @@ try {
     if ($runKey) {
         throw "Autostart registry value remains after uninstall."
     }
+    Assert-UserStateKept "by uninstall"
 
     $passed = $true
     Write-Step "PASS"
@@ -268,14 +222,7 @@ catch {
 finally {
     Get-Process -Name "matteshot" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
-    try {
-        if (Remove-TestActivation) {
-            Write-Step "Released a remaining sandbox activation during cleanup"
-        }
-    }
-    catch {
-        Write-Step "Cleanup warning: sandbox activation could not be released"
-    }
+    Remove-NetFirewallRule -DisplayName "Matteshot smoke offline" -ErrorAction SilentlyContinue
     if ((Test-Path $app) -and (Test-Path $uninstaller)) {
         Start-Process `
             -FilePath $uninstaller `
