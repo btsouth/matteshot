@@ -2,6 +2,8 @@
 
 **Every screenshot, a matte shot.**
 
+![A VS Code window captured with Matteshot and framed in the Aurora matte](docs/images/hero.png)
+
 Press PrtScn → the screen freezes → click a window or drag a region → six finished mattes appear → click one → premium PNG on your clipboard. No editor in the flow; choosing between finished results replaces tweaking one.
 
 The name is literal: a [matte shot](https://en.wikipedia.org/wiki/Matte_(filmmaking)) composites a subject over a painted background — exactly what this app does to your windows. The backgrounds are mattes; you pick one.
@@ -25,6 +27,8 @@ Matteshot sends nothing about you or your captures anywhere. It has no telemetry
 Share is not in the default build. If you build with `--features share` and point it at your own server, uploads go to that server only. See [docs/self-hosting-share.md](docs/self-hosting-share.md).
 
 ## The flow
+
+![PrtScn freezes the screen, a click picks the window, and the picker offers seven mattes of it](docs/images/flow.gif)
 
 1. **PrtScn** (or left-click the tray icon): freeze-frame overlay across **all monitors** — dimmed frozen screens, hover highlights whole windows (taskbar included), drag selects a region (cross-monitor works), clicking bare desktop grabs that monitor. Toolbar: **Window / Region / Screen / ● Record / ↓ Scroll / ✕** (keys W/R/F/V/S). Esc cancels. **Shell flyouts are capturable**: the notification center, Quick Settings, Task View, Start and Search all land in the freeze and are offered as one-click targets, which nothing else on Windows manages — see the landmine note on z-bands for why.
 2. **Pick a matte**: contact strip of auto-styled variants. Click / 1–7 / arrows+Enter chooses, **T** opens the tweak editor, **S** shares a link when Share is built in and a server is configured (hidden otherwise), **P** pins the raw capture, **C** copies its text via OCR, **PrtScn re-snips** (the strip itself is snippable), Esc cancels. Last-used matte preselected.
