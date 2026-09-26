@@ -89,6 +89,29 @@ jobs:
         shell: pwsh
         run: .\scripts\verify-code.ps1
 
+      # The probes skip capture on hosted runners because nothing is on screen
+      # by default, which is how a build that captured fine and then crashed on
+      # exit got as far as a signed 0.21.0 candidate (#136). Put a window up
+      # and hold the capture path and the exit code to account.
+      - name: Capture a window with the release build
+        shell: pwsh
+        run: |
+          Start-Process cmd.exe -ArgumentList '/k title Matteshot-Probe && dir %SystemRoot%'
+          Start-Sleep -Seconds 3
+          $log = Join-Path $env:RUNNER_TEMP 'bench.log'
+          $p = Start-Process 'target\release\matteshot.exe' `
+            -ArgumentList '--bench', 'Matteshot-Probe' `
+            -RedirectStandardError $log -NoNewWindow -Wait -PassThru
+          Get-Content $log
+          if ($p.ExitCode -ne 0) {
+            Write-Error ("--bench exited with 0x{0:X8}" -f $p.ExitCode)
+            exit 1
+          }
+          if (-not (Select-String -Path $log -Pattern 'bench 3:' -Quiet)) {
+            Write-Error 'The capture did not complete three rounds.'
+            exit 1
+          }
+
   policy:
     name: Format and dependency policy
     # Platform independent, so it runs on Linux: formatting, and cargo-deny's
