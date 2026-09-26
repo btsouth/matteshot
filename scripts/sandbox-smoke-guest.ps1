@@ -99,11 +99,14 @@ try {
     Initialize-LegacyState
 
     Write-Step "Installing Matteshot silently"
+    # Not -Wait: Windows PowerShell's -Wait follows the whole process tree,
+    # and a silent install relaunches the resident on purpose, so it would
+    # wait on a tray app that never exits. The installer itself is what ends.
     $install = Start-Process `
         -FilePath $installer.FullName `
         -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS="!autostart"' `
-        -PassThru `
-        -Wait
+        -PassThru
+    $install.WaitForExit()
     if ($install.ExitCode -ne 0) {
         throw "Installer exited with code $($install.ExitCode)."
     }
