@@ -26,7 +26,7 @@ semver = "1"
 rayon = "1"
 
 [dependencies.windows]
-version = "0.58"
+version = "0.62"
 features = [
     "Foundation",
     "Foundation_Collections",
