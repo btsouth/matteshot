@@ -497,22 +497,22 @@ jobs:
           # checksum would break auto-update until the cache expires.
           $immutable = "public, max-age=31536000, immutable"
           $mutable = "no-store"
-          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe" `
+          npx --yes wrangler@4.141.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe" `
             --file $p --content-type application/octet-stream --cache-control $immutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup.exe" `
+          npx --yes wrangler@4.141.0 r2 object put "matteshot-downloads/MatteshotSetup.exe" `
             --file $p --content-type application/octet-stream --cache-control $mutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe.sha256" `
+          npx --yes wrangler@4.141.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe.sha256" `
             --file '${{ steps.checksums.outputs.versioned }}' --content-type text/plain --cache-control $immutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup.exe.sha256" `
+          npx --yes wrangler@4.141.0 r2 object put "matteshot-downloads/MatteshotSetup.exe.sha256" `
             --file '${{ steps.checksums.outputs.stable }}' --content-type text/plain --cache-control $mutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe.release.json" `
+          npx --yes wrangler@4.141.0 r2 object put "matteshot-downloads/MatteshotSetup-$v.exe.release.json" `
             --file '${{ steps.signed.outputs.versioned }}' --content-type application/json --cache-control $immutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx --yes wrangler@4.123.0 r2 object put "matteshot-downloads/MatteshotSetup.exe.release.json" `
+          npx --yes wrangler@4.141.0 r2 object put "matteshot-downloads/MatteshotSetup.exe.release.json" `
             --file '${{ steps.signed.outputs.stable }}' --content-type application/json --cache-control $mutable --remote
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
