@@ -132,7 +132,12 @@ fn read_from(path: &Path) -> anyhow::Result<DiskConfig> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(DiskConfig::Missing),
         Err(error) => return Err(error.into()),
     };
-    Ok(DiskConfig::Present(serde_json::from_str(&body)?))
+    // Hand edits are expected (the share settings exist only in this file),
+    // and Windows PowerShell's `Set-Content -Encoding UTF8` and some editors
+    // write a byte-order mark. serde_json rejects one, and an unreadable
+    // config fails closed with PrtScn off, so a BOM must not count as damage.
+    let body = body.strip_prefix('\u{feff}').unwrap_or(&body);
+    Ok(DiskConfig::Present(serde_json::from_str(body)?))
 }
 
 fn load_from(path: &Path) -> anyhow::Result<Config> {
@@ -386,6 +391,22 @@ mod tests {
             "a failed update must not quarantine the only copy"
         );
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A config saved with a UTF-8 byte-order mark is still the user's
+    /// config, not a corrupt one that turns PrtScn off.
+    #[test]
+    fn a_config_with_a_byte_order_mark_still_loads() {
+        let path = temporary_path("bom");
+        std::fs::write(
+            &path,
+            "\u{feff}{\"capture_delay_secs\": 7, \"auto_update\": false}",
+        )
+        .unwrap();
+        let config = load_from(&path).expect("a BOM is not damage");
+        assert_eq!(config.capture_delay_secs, 7);
+        assert!(!config.auto_update);
         let _ = std::fs::remove_file(path);
     }
 
