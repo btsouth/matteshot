@@ -43,7 +43,11 @@ pub fn run(hwnd: HWND, title: &str) -> Result<()> {
     );
 
     let before = capture::capture_window(hwnd).context("before capture")?;
-    eprintln!("spike[{title}]: before capture {}x{}", before.width(), before.height());
+    eprintln!(
+        "spike[{title}]: before capture {}x{}",
+        before.width(),
+        before.height()
+    );
 
     // Ask for double DPI with a doubled suggested rect anchored in place.
     let target_dpi = dpi_before * 2;
@@ -58,7 +62,10 @@ pub fn run(hwnd: HWND, title: &str) -> Result<()> {
 
     let mut mid_rect = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut mid_rect)? };
-    let (mw, mh) = (mid_rect.right - mid_rect.left, mid_rect.bottom - mid_rect.top);
+    let (mw, mh) = (
+        mid_rect.right - mid_rect.left,
+        mid_rect.bottom - mid_rect.top,
+    );
     let after = capture::capture_window(hwnd).context("after capture")?;
     eprintln!(
         "spike[{title}]: after DPICHANGED({target_dpi}) window {mw}x{mh}, capture {}x{}",
@@ -88,7 +95,11 @@ pub fn run(hwnd: HWND, title: &str) -> Result<()> {
     let p2 = dir.join(format!("{safe}-after.png"));
     before.save(&p1)?;
     after.save(&p2)?;
-    eprintln!("spike[{title}]: saved {} and {}", p1.display(), p2.display());
+    eprintln!(
+        "spike[{title}]: saved {} and {}",
+        p1.display(),
+        p2.display()
+    );
 
     let verdict = if after.width() >= before.width() * 2 - 8 {
         "window doubled — check whether content is genuinely 2x-rendered or just relaid-out"

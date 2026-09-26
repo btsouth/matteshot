@@ -380,10 +380,19 @@ mod tests {
             let p = from_system_colors(colors);
             let selected = (p.accent, p.accent_text);
             let idle = (p.panel, p.muted);
-            assert_ne!(selected, idle, "HC {name} selected overlay chip reads as idle");
-            assert_ne!(selected.0, idle.0, "HC {name} selected fill matches the panel");
+            assert_ne!(
+                selected, idle,
+                "HC {name} selected overlay chip reads as idle"
+            );
+            assert_ne!(
+                selected.0, idle.0,
+                "HC {name} selected fill matches the panel"
+            );
             let ratio = contrast_ratio(p.accent_text, p.accent);
-            assert!(ratio >= NORMAL_TEXT_MIN, "HC {name} accent_text on accent is {ratio:.2}:1");
+            assert!(
+                ratio >= NORMAL_TEXT_MIN,
+                "HC {name} accent_text on accent is {ratio:.2}:1"
+            );
         }
     }
 

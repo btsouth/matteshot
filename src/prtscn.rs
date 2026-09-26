@@ -17,9 +17,7 @@ use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, HOT_KEY_MODIFIERS, VK_SNAPSHOT,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, HOT_KEY_MODIFIERS, VK_SNAPSHOT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, MessageBoxW, PeekMessageW, PostMessageW, PostThreadMessageW,
     SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HWND_BROADCAST, IDYES, KBDLLHOOKSTRUCT,
@@ -199,8 +197,7 @@ fn install_hook(id: i32) -> bool {
             let module = GetModuleHandleW(None)
                 .map(|module| HINSTANCE(module.0))
                 .unwrap_or_default();
-            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0)
-            else {
+            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) else {
                 let _ = ready_tx.send(None);
                 return;
             };
@@ -228,12 +225,7 @@ fn uninstall_hook() {
     if let Ok(mut runtime) = hook_runtime().lock() {
         if let Some(runtime) = runtime.take() {
             unsafe {
-                let _ = PostThreadMessageW(
-                    runtime.thread_id,
-                    WM_QUIT,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ = PostThreadMessageW(runtime.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
             }
             let _ = runtime.thread.join();
         }

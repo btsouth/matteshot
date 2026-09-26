@@ -1024,9 +1024,7 @@ fn dispose_in_process_validation_failure(
                     "recording could not be checked this time; the file is still in your videos folder and will be recovered the next time Matteshot starts",
                 )
             } else {
-                error.context(
-                    "recording could not be checked this time; the file was not found",
-                )
+                error.context("recording could not be checked this time; the file was not found")
             }
         }
     }
@@ -1292,7 +1290,11 @@ mod tests {
     fn sixty_fps_configures_encoder_rate_bitrate_and_keyframes() {
         assert_eq!(
             video_encoding(1920, 1080, 60),
-            VideoEncoding { fps: 60, bitrate: 14_929_920, keyframe_spacing: 60 }
+            VideoEncoding {
+                fps: 60,
+                bitrate: 14_929_920,
+                keyframe_spacing: 60
+            }
         );
     }
 
@@ -1371,7 +1373,10 @@ mod tests {
         );
 
         assert_eq!(outcome, LateFinalize::Published);
-        assert!(destination.exists(), "the late recording never reached its destination");
+        assert!(
+            destination.exists(),
+            "the late recording never reached its destination"
+        );
         assert!(!partial.exists());
         assert!(crate::trim::validate_video(&destination).is_ok());
         std::fs::remove_file(destination).unwrap();
@@ -1612,7 +1617,10 @@ mod tests {
         let second = LateFinalizeGuard::acquire();
         assert!(late_finalize_outstanding());
         drop(first);
-        assert!(late_finalize_outstanding(), "dropping one of two guards went idle");
+        assert!(
+            late_finalize_outstanding(),
+            "dropping one of two guards went idle"
+        );
         drop(second);
         assert!(!late_finalize_outstanding());
     }
@@ -1763,8 +1771,14 @@ mod tests {
         let bytes = std::fs::read(&whole).unwrap();
         let cut = dir.join("cut.gif");
         std::fs::write(&cut, &bytes[..bytes.len() * 2 / 3]).unwrap();
-        assert!(image::open(&cut).is_ok(), "the weakness this guards is gone");
-        assert!(validate_gif(&cut).is_err(), "a truncated gif must not validate");
+        assert!(
+            image::open(&cut).is_ok(),
+            "the weakness this guards is gone"
+        );
+        assert!(
+            validate_gif(&cut).is_err(),
+            "a truncated gif must not validate"
+        );
 
         std::fs::remove_file(whole).unwrap();
         std::fs::remove_file(cut).unwrap();
@@ -1818,7 +1832,11 @@ mod tests {
         buf
     }
 
-    fn watch_over(frames: u32, dark_rows: usize, chrome: impl Fn(u32) -> u8) -> ProtectedRegionWatch {
+    fn watch_over(
+        frames: u32,
+        dark_rows: usize,
+        chrome: impl Fn(u32) -> u8,
+    ) -> ProtectedRegionWatch {
         let mut watch = ProtectedRegionWatch::default();
         for frame in 0..frames {
             watch.observe(&player_frame(dark_rows, chrome(frame)));

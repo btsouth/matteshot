@@ -21,13 +21,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
-    GetWindowLongPtrW, IsWindow, LoadCursorW, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE, WNDCLASSW,
-    WS_CAPTION, WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongPtrW, IsWindow,
+    LoadCursorW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
+    SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use crate::config::Config;
@@ -658,7 +658,12 @@ fn open(mark_seen: bool) -> Result<()> {
         let style: WINDOW_STYLE = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_APPWINDOW;
         let bounds = crate::dpi::outer_bounds(
-            RECT { left: 0, top: 0, right: client_width, bottom: client_height },
+            RECT {
+                left: 0,
+                top: 0,
+                right: client_width,
+                bottom: client_height,
+            },
             style,
             ex_style,
             scale,

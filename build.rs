@@ -23,7 +23,10 @@ fn main() {
     // that id (regenerate the file with `matteshot --icon assets`).
     let icon = manifest_dir.join("assets").join("matteshot.ico");
     let icon_line = if icon.exists() {
-        format!("1 ICON \"{}\"\n", icon.display().to_string().replace('\\', "\\\\"))
+        format!(
+            "1 ICON \"{}\"\n",
+            icon.display().to_string().replace('\\', "\\\\")
+        )
     } else {
         String::new()
     };

@@ -15,17 +15,17 @@ use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, InvalidateRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HFONT, MONITORINFO, PAINTSTRUCT, TRANSPARENT,
+    GetMonitorInfoW, InvalidateRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HFONT, MONITORINFO,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW,
-    PeekMessageW, RegisterClassW, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    CREATESTRUCTW, GWLP_USERDATA, MSG, PM_REMOVE, WDA_EXCLUDEFROMCAPTURE, WM_ERASEBKGND,
-    WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    PeekMessageW, RegisterClassW, SetWindowDisplayAffinity, SetWindowLongPtrW, CREATESTRUCTW,
+    GWLP_USERDATA, MSG, PM_REMOVE, WDA_EXCLUDEFROMCAPTURE, WM_ERASEBKGND, WM_NCCREATE, WM_PAINT,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// Delays the Settings row offers. Three is enough to open a menu, ten covers
@@ -70,13 +70,27 @@ unsafe extern "system" fn pill_proc(
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 let bg = CreateSolidBrush(p.theme.panel);
-                FillRect(hdc, &RECT { left: 0, top: 0, right: p.w, bottom: p.h }, bg);
+                FillRect(
+                    hdc,
+                    &RECT {
+                        left: 0,
+                        top: 0,
+                        right: p.w,
+                        bottom: p.h,
+                    },
+                    bg,
+                );
                 let _ = DeleteObject(bg);
                 SetBkMode(hdc, TRANSPARENT);
                 SelectObject(hdc, p.font);
                 SetTextColor(hdc, p.theme.text);
                 let mut t = p.text.clone();
-                let mut r = RECT { left: 0, top: 0, right: p.w, bottom: p.h };
+                let mut r = RECT {
+                    left: 0,
+                    top: 0,
+                    right: p.w,
+                    bottom: p.h,
+                };
                 DrawTextW(hdc, &mut t, &mut r, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 let _ = EndPaint(hwnd, &ps);
             }

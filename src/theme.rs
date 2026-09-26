@@ -111,11 +111,13 @@ fn menu_theme_procs() -> Option<&'static MenuThemeProcs> {
                     unsafe extern "system" fn() -> isize,
                     extern "system" fn(i32) -> i32,
                 >(set),
-                flush_menu_themes: GetProcAddress(lib, PCSTR(136 as *const u8)).map(|flush| {
-                    std::mem::transmute::<unsafe extern "system" fn() -> isize, extern "system" fn()>(
-                        flush,
-                    )
-                }),
+                flush_menu_themes:
+                    GetProcAddress(lib, PCSTR(136 as *const u8)).map(|flush| {
+                        std::mem::transmute::<
+                            unsafe extern "system" fn() -> isize,
+                            extern "system" fn(),
+                        >(flush)
+                    }),
             })
         })
         .as_ref()
@@ -248,9 +250,18 @@ mod tests {
         // An override must force, not allow: AllowDark on a light session
         // still draws light menus under a DARK window palette.
         assert_eq!(preferred_menu_mode(Some("dark"), true), APP_MODE_FORCE_DARK);
-        assert_eq!(preferred_menu_mode(Some("dark"), false), APP_MODE_FORCE_DARK);
-        assert_eq!(preferred_menu_mode(Some("light"), true), APP_MODE_FORCE_LIGHT);
-        assert_eq!(preferred_menu_mode(Some("light"), false), APP_MODE_FORCE_LIGHT);
+        assert_eq!(
+            preferred_menu_mode(Some("dark"), false),
+            APP_MODE_FORCE_DARK
+        );
+        assert_eq!(
+            preferred_menu_mode(Some("light"), true),
+            APP_MODE_FORCE_LIGHT
+        );
+        assert_eq!(
+            preferred_menu_mode(Some("light"), false),
+            APP_MODE_FORCE_LIGHT
+        );
         // An unknown override value is not a third mode.
         assert_eq!(preferred_menu_mode(Some("hc"), true), APP_MODE_DEFAULT);
         assert_eq!(preferred_menu_mode(Some("hc"), false), APP_MODE_ALLOW_DARK);

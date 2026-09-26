@@ -17,7 +17,10 @@ pub const PAD_SLIDER_MAX: f32 = 0.18;
 fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
     // Signed distance to a rounded rectangle centered in [0,w]x[0,h].
     let (cx, cy) = (w / 2.0, h / 2.0);
-    let (qx, qy) = ((x - cx).abs() - (cx - radius), (y - cy).abs() - (cy - radius));
+    let (qx, qy) = (
+        (x - cx).abs() - (cx - radius),
+        (y - cy).abs() - (cy - radius),
+    );
     let dist = if qx > 0.0 && qy > 0.0 {
         (qx * qx + qy * qy).sqrt() - radius
     } else {
@@ -124,12 +127,23 @@ pub struct ComposeOpts {
 
 impl Default for ComposeOpts {
     fn default() -> Self {
-        ComposeOpts { metric_scale: 1.0, pad_factor: DEFAULT_PAD_FACTOR, aspect: None }
+        ComposeOpts {
+            metric_scale: 1.0,
+            pad_factor: DEFAULT_PAD_FACTOR,
+            aspect: None,
+        }
     }
 }
 
 pub fn compose_scaled(window: &RgbaImage, style: &Style, metric_scale: f32) -> RgbaImage {
-    compose_with(window, style, &ComposeOpts { metric_scale, ..Default::default() })
+    compose_with(
+        window,
+        style,
+        &ComposeOpts {
+            metric_scale,
+            ..Default::default()
+        },
+    )
 }
 
 /// Small captures are supersampled so a 400px window does not look mushy.
@@ -341,7 +355,11 @@ pub fn plan_framed_export(
 
     for _ in 0..16 {
         let metric = cw as f32 / content_w as f32;
-        let opts = ComposeOpts { metric_scale: metric, pad_factor, aspect };
+        let opts = ComposeOpts {
+            metric_scale: metric,
+            pad_factor,
+            aspect,
+        };
         let (aw, ah) = framed_size(cw, ch, &opts, framed);
         let pixels = aw as u64 * ah as u64;
         let over_edge = max_edge > 0 && aw.max(ah) > max_edge;
@@ -363,12 +381,20 @@ pub fn plan_framed_export(
             factor = factor.min((max_pixels as f64 / pixels as f64).sqrt());
         }
         let next = (cw as f64 * factor).round().max(1.0) as u32;
-        cw = if next >= cw { cw.saturating_sub(1).max(1) } else { next };
+        cw = if next >= cw {
+            cw.saturating_sub(1).max(1)
+        } else {
+            next
+        };
         (cw, ch) = content_with_aspect(content_w, content_h, cw);
     }
 
     let metric = cw as f32 / content_w as f32;
-    let opts = ComposeOpts { metric_scale: metric, pad_factor, aspect };
+    let opts = ComposeOpts {
+        metric_scale: metric,
+        pad_factor,
+        aspect,
+    };
     let (aw, ah) = framed_size(cw, ch, &opts, framed);
     FramePlan {
         content_w: cw,
@@ -406,7 +432,9 @@ pub fn compose_base(w: usize, h: usize, style: &Style, opts: &ComposeOpts) -> Rg
     let max_dim = w.max(h) as f32;
 
     let Layout { pad_x, pad_y, pad } = layout(w, h, opts);
-    let corner = (max_dim * 0.012).clamp(10.0 * metric_scale, 28.0 * metric_scale).max(2.0);
+    let corner = (max_dim * 0.012)
+        .clamp(10.0 * metric_scale, 28.0 * metric_scale)
+        .max(2.0);
     let shadow_blur = (pad as f32 * 0.38).min(120.0 * metric_scale) as usize;
     let shadow_offset_y = (pad as f32 * 0.16) as usize;
     let shadow_strength = 0.42;
@@ -476,7 +504,9 @@ pub fn blend_content(canvas: &mut RgbaImage, window: &RgbaImage, opts: &ComposeO
     let (w, h) = (window.width() as usize, window.height() as usize);
     let max_dim = w.max(h) as f32;
     let Layout { pad_x, pad_y, .. } = layout(w, h, opts);
-    let corner = (max_dim * 0.012).clamp(10.0 * metric_scale, 28.0 * metric_scale).max(2.0);
+    let corner = (max_dim * 0.012)
+        .clamp(10.0 * metric_scale, 28.0 * metric_scale)
+        .max(2.0);
 
     let canvas_w = canvas.width() as usize;
     let src = window.as_raw();
@@ -533,7 +563,9 @@ pub fn blend_bgra_content(
     let metric_scale = opts.metric_scale;
     let max_dim = w.max(h) as f32;
     let Layout { pad_x, pad_y, .. } = layout(w, h, opts);
-    let corner = (max_dim * 0.012).clamp(10.0 * metric_scale, 28.0 * metric_scale).max(2.0);
+    let corner = (max_dim * 0.012)
+        .clamp(10.0 * metric_scale, 28.0 * metric_scale)
+        .max(2.0);
     let canvas_w = canvas.width() as usize;
     canvas
         .as_mut()
@@ -638,7 +670,10 @@ mod tests {
 
     #[test]
     fn tight_padding_reaches_desktop_edges_without_losing_the_safety_floor() {
-        let opts = ComposeOpts { pad_factor: PAD_SLIDER_MIN, ..Default::default() };
+        let opts = ComposeOpts {
+            pad_factor: PAD_SLIDER_MIN,
+            ..Default::default()
+        };
         let desktop = layout(2560, 1440, &opts);
         let small = layout(800, 450, &opts);
 
@@ -694,15 +729,7 @@ mod tests {
 
         // Auto aspect + Original keeps the tall page. The budget is for the
         // forced-aspect explosion, not for scroll captures in general.
-        let auto = plan_framed_export(
-            1920,
-            19_000,
-            DEFAULT_PAD_FACTOR,
-            None,
-            true,
-            1,
-            0,
-        );
+        let auto = plan_framed_export(1920, 19_000, DEFAULT_PAD_FACTOR, None, true, 1, 0);
         assert_eq!((auto.content_w, auto.content_h), (1920, 19_000));
         assert!(auto.canvas_h >= 19_000);
         assert!(auto.canvas_w < 4_000);
@@ -710,15 +737,7 @@ mod tests {
 
     #[test]
     fn email_cap_shrinks_a_tall_auto_aspect_before_compose() {
-        let email = plan_framed_export(
-            1920,
-            19_000,
-            DEFAULT_PAD_FACTOR,
-            None,
-            true,
-            1,
-            1600,
-        );
+        let email = plan_framed_export(1920, 19_000, DEFAULT_PAD_FACTOR, None, true, 1, 1600);
         assert!(
             email.canvas_w.max(email.canvas_h) <= 1600,
             "Email Auto planned {email:?}"

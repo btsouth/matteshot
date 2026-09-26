@@ -68,7 +68,12 @@ pub struct Crop {
 const MIN_CROP: f32 = 0.02;
 
 impl Crop {
-    pub const FULL: Crop = Crop { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
+    pub const FULL: Crop = Crop {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
 
     /// Corners in the order `resized` counts them: top-left, top-right,
     /// bottom-right, bottom-left.
@@ -282,17 +287,11 @@ pub fn render_preview_at(
     }
 }
 
-fn preview_metric_scale(
-    preview_content_size: (u32, u32),
-    source_content_size: (u32, u32),
-) -> f32 {
+fn preview_metric_scale(preview_content_size: (u32, u32), source_content_size: (u32, u32)) -> f32 {
     let source_scale = metric_scale(source_content_size);
     let preview_scale = (preview_content_size.0.max(1) as f32
         / source_content_size.0.max(1) as f32)
-        .min(
-            preview_content_size.1.max(1) as f32
-                / source_content_size.1.max(1) as f32,
-        );
+        .min(preview_content_size.1.max(1) as f32 / source_content_size.1.max(1) as f32);
     source_scale * preview_scale
 }
 
@@ -352,18 +351,22 @@ pub fn bounds(item: &Item, frame: Frame) -> (f32, f32, f32, f32) {
             from.0.max(to.0),
             from.1.max(to.1),
         ),
-        Shape::Freehand { points } => points.iter().fold(
-            (1.0, 1.0, 0.0, 0.0),
-            |(x0, y0, x1, y1), point| {
-                (x0.min(point.0), y0.min(point.1), x1.max(point.0), y1.max(point.1))
-            },
-        ),
+        Shape::Freehand { points } => {
+            points
+                .iter()
+                .fold((1.0, 1.0, 0.0, 0.0), |(x0, y0, x1, y1), point| {
+                    (
+                        x0.min(point.0),
+                        y0.min(point.1),
+                        x1.max(point.0),
+                        y1.max(point.1),
+                    )
+                })
+        }
         Shape::Rect { a, b }
         | Shape::Ellipse { a, b }
         | Shape::Highlight { a, b }
-        | Shape::Blur { a, b } => {
-            (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
-        }
+        | Shape::Blur { a, b } => (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)),
         Shape::Counter { pos, .. } => {
             let radius = (14.0 * metric_scale(content_size) * item.size).max(9.0);
             let (rx, ry) = frame.to_normalized(radius, radius);
@@ -375,13 +378,10 @@ pub fn bounds(item: &Item, frame: Frame) -> (f32, f32, f32, f32) {
             )
         }
         Shape::Text { pos, text } => {
-            let (width, height) = crate::annotate::caption_text_size(
-                text,
-                item.size,
-                metric_scale(content_size),
-            )
-            .map(|(width, height)| frame.to_normalized(width as f32, height as f32))
-            .unwrap_or((0.04, 0.035 * item.size));
+            let (width, height) =
+                crate::annotate::caption_text_size(text, item.size, metric_scale(content_size))
+                    .map(|(width, height)| frame.to_normalized(width as f32, height as f32))
+                    .unwrap_or((0.04, 0.035 * item.size));
             (
                 pos.0.max(0.0),
                 pos.1.max(0.0),
@@ -483,17 +483,13 @@ pub fn translate(item: &mut Item, dx: f32, dy: f32, frame: Frame) {
 
 pub fn handles(item: &Item) -> Option<[(ShapeHandle, (f32, f32)); 2]> {
     match &item.shape {
-        Shape::Arrow { from, to } | Shape::Line { from, to } => Some([
-            (ShapeHandle::First, *from),
-            (ShapeHandle::Second, *to),
-        ]),
+        Shape::Arrow { from, to } | Shape::Line { from, to } => {
+            Some([(ShapeHandle::First, *from), (ShapeHandle::Second, *to)])
+        }
         Shape::Rect { a, b }
         | Shape::Ellipse { a, b }
         | Shape::Highlight { a, b }
-        | Shape::Blur { a, b } => Some([
-            (ShapeHandle::First, *a),
-            (ShapeHandle::Second, *b),
-        ]),
+        | Shape::Blur { a, b } => Some([(ShapeHandle::First, *a), (ShapeHandle::Second, *b)]),
         Shape::Freehand { .. } | Shape::Counter { .. } | Shape::Text { .. } => None,
     }
 }
@@ -546,7 +542,10 @@ mod tests {
     /// The whole recording at `content` pixels — what every caller passed
     /// before cropping existed, and the baseline these tests compare against.
     fn whole(content: (u32, u32)) -> Frame {
-        Frame { crop: Crop::FULL, content }
+        Frame {
+            crop: Crop::FULL,
+            content,
+        }
     }
 
     fn arrow() -> Item {
@@ -591,8 +590,16 @@ mod tests {
         // annotation placed after a crop is drawn somewhere else entirely —
         // with a crop starting at x=0.5, a click in the centre came back at
         // the left edge.
-        let crop = Crop { x: 0.5, y: 0.25, w: 0.5, h: 0.5 };
-        let frame = Frame { crop, content: (960, 540) };
+        let crop = Crop {
+            x: 0.5,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
+        let frame = Frame {
+            crop,
+            content: (960, 540),
+        };
 
         for (across, down) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0), (0.25, 0.75)] {
             // What the editor stores for a click at that fraction of the
@@ -613,7 +620,10 @@ mod tests {
         }
 
         // And with no crop the two are the plain identity they always were.
-        let whole = Frame { crop: Crop::FULL, content: (960, 540) };
+        let whole = Frame {
+            crop: Crop::FULL,
+            content: (960, 540),
+        };
         let drawn = whole.to_pixels((0.25, 0.75));
         assert!((drawn.0 - 240.0).abs() < 0.01 && (drawn.1 - 405.0).abs() < 0.01);
     }
@@ -653,7 +663,13 @@ mod tests {
         // is the size the export encodes. Half of 321 rounds to 161, which
         // must come back as 160 rather than the editor promising a pixel the
         // encoder was never going to keep.
-        let (x, y, w, h) = Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(321, 241);
+        let (x, y, w, h) = Crop {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        }
+        .pixel_rect(321, 241);
         assert_eq!((x, y), (0, 0));
         assert_eq!((w, h), (160, 120));
         assert_eq!((w % 2, h % 2), (0, 0));
@@ -662,22 +678,60 @@ mod tests {
         // Two out of one is not just wrong: it asks `f32::clamp` for a floor
         // above its ceiling, which panics.
         for limit in [0u32, 1, 2, 3] {
-            let (x, y, w, h) =
-                Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(limit, limit);
+            let (x, y, w, h) = Crop {
+                x: 0.0,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5,
+            }
+            .pixel_rect(limit, limit);
             assert!(
                 x + w <= limit && y + h <= limit,
                 "a {limit}px source gave {w}x{h} at {x},{y}"
             );
         }
         // Two pixels is the first size that can satisfy the even minimum.
-        assert_eq!(Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(1, 1), (0, 0, 1, 1));
-        assert_eq!(Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 }.pixel_rect(2, 2), (0, 0, 2, 2));
+        assert_eq!(
+            Crop {
+                x: 0.0,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5
+            }
+            .pixel_rect(1, 1),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(
+            Crop {
+                x: 0.0,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5
+            }
+            .pixel_rect(2, 2),
+            (0, 0, 2, 2)
+        );
 
         // Never hanging off an edge, however the floats round.
-        let (x, y, w, h) = Crop { x: 0.9, y: 0.9, w: 0.2, h: 0.2 }.pixel_rect(641, 481);
-        assert!(x + w <= 641 && y + h <= 481, "crop {x},{y} {w}x{h} left the frame");
+        let (x, y, w, h) = Crop {
+            x: 0.9,
+            y: 0.9,
+            w: 0.2,
+            h: 0.2,
+        }
+        .pixel_rect(641, 481);
+        assert!(
+            x + w <= 641 && y + h <= 481,
+            "crop {x},{y} {w}x{h} left the frame"
+        );
         // And always something encodable.
-        let (_, _, w, h) = Crop { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }.pixel_rect(320, 240);
+        let (_, _, w, h) = Crop {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        }
+        .pixel_rect(320, 240);
         assert!(w >= 2 && h >= 2);
     }
 
@@ -686,7 +740,12 @@ mod tests {
         // Dragged up and to the left, and past the edges.
         assert_eq!(
             Crop::from_points((0.9, 0.7), (-0.5, -0.3)),
-            Crop { x: 0.0, y: 0.0, w: 0.9, h: 0.7 }
+            Crop {
+                x: 0.0,
+                y: 0.0,
+                w: 0.9,
+                h: 0.7
+            }
         );
         let corner = Crop::from_points((0.6, 0.4), (9.0, 9.0));
         assert!((corner.x - 0.6).abs() < 1e-6 && (corner.w - 0.4).abs() < 1e-6);
@@ -701,7 +760,12 @@ mod tests {
 
     #[test]
     fn dragging_a_crop_into_an_edge_stops_it_instead_of_resizing_it() {
-        let crop = Crop { x: 0.1, y: 0.1, w: 0.4, h: 0.3 };
+        let crop = Crop {
+            x: 0.1,
+            y: 0.1,
+            w: 0.4,
+            h: 0.3,
+        };
         let moved = crop.moved(0.05, -0.04);
         assert!((moved.x - 0.15).abs() < 1e-6 && (moved.y - 0.06).abs() < 1e-6);
         assert_eq!((moved.w, moved.h), (crop.w, crop.h));
@@ -715,7 +779,12 @@ mod tests {
 
     #[test]
     fn resizing_a_crop_pins_the_opposite_corner_and_survives_crossing_it() {
-        let crop = Crop { x: 0.1, y: 0.1, w: 0.4, h: 0.3 };
+        let crop = Crop {
+            x: 0.1,
+            y: 0.1,
+            w: 0.4,
+            h: 0.3,
+        };
         // Corner 0 is the top-left; (0.5, 0.4) stays put while it is dragged.
         let (resized, held) = crop.resized(0, (0.2, 0.25));
         assert!((resized.x - 0.2).abs() < 1e-6 && (resized.y - 0.25).abs() < 1e-6);
@@ -750,7 +819,12 @@ mod tests {
     fn a_crop_reframes_source_coordinates_onto_the_drawn_content() {
         // The middle quarter of the recording, drawn at its own pixel size.
         let frame = Frame {
-            crop: Crop { x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
+            crop: Crop {
+                x: 0.25,
+                y: 0.25,
+                w: 0.5,
+                h: 0.5,
+            },
             content: (960, 540),
         };
         assert_ne!(frame.crop, Crop::FULL);
@@ -779,7 +853,10 @@ mod tests {
         // quarter it must still cross the middle of the drawn frame, not sit
         // where the uncropped coordinates would have put it.
         let item = Item {
-            shape: Shape::Rect { a: (0.45, 0.45), b: (0.55, 0.55) },
+            shape: Shape::Rect {
+                a: (0.45, 0.45),
+                b: (0.55, 0.55),
+            },
             start: 0,
             end: 20,
             color: 0,
@@ -793,7 +870,15 @@ mod tests {
             std::slice::from_ref(&item),
             10,
             None,
-            Frame { crop: Crop { x: 0.25, y: 0.25, w: 0.5, h: 0.5 }, content: (200, 200) },
+            Frame {
+                crop: Crop {
+                    x: 0.25,
+                    y: 0.25,
+                    w: 0.5,
+                    h: 0.5,
+                },
+                content: (200, 200),
+            },
             (0.0, 0.0),
         );
 
@@ -808,7 +893,10 @@ mod tests {
             painted.iter().map(|(x, _)| *x).min().unwrap(),
             painted.iter().map(|(x, _)| *x).max().unwrap(),
         );
-        assert!(min_x >= 70 && max_x <= 130, "drawn at {min_x}..{max_x}, expected ~80..120");
+        assert!(
+            min_x >= 70 && max_x <= 130,
+            "drawn at {min_x}..{max_x}, expected ~80..120"
+        );
     }
 
     #[test]
@@ -900,10 +988,7 @@ mod tests {
         let Shape::Freehand { points } = item.shape else {
             panic!("expected freehand path");
         };
-        for (actual, expected) in points
-            .iter()
-            .zip([(0.3, 0.5), (0.5, 0.7), (0.7, 0.5)])
-        {
+        for (actual, expected) in points.iter().zip([(0.3, 0.5), (0.5, 0.7), (0.7, 0.5)]) {
             assert!((actual.0 - expected.0).abs() < 1e-6);
             assert!((actual.1 - expected.1).abs() < 1e-6);
         }
@@ -994,13 +1079,18 @@ mod tests {
             caption_box_opacity: 0.68,
         };
         let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 255]));
-        render_at(&mut image, &[item], 10, None, whole((100, 100)), (50.0, 50.0));
+        render_at(
+            &mut image,
+            &[item],
+            10,
+            None,
+            whole((100, 100)),
+            (50.0, 50.0),
+        );
 
-        assert!(image
-            .enumerate_pixels()
-            .any(|(x, y, pixel)| {
-                (50..150).contains(&x) && (50..150).contains(&y) && pixel[0] > 0
-            }));
+        assert!(image.enumerate_pixels().any(|(x, y, pixel)| {
+            (50..150).contains(&x) && (50..150).contains(&y) && pixel[0] > 0
+        }));
         assert!(image
             .enumerate_pixels()
             .filter(|(x, y, _)| *x < 45 || *x >= 155 || *y < 45 || *y >= 155)
@@ -1068,7 +1158,14 @@ mod tests {
         );
         let mut shadow_item = item;
         shadow_item.caption_style = CaptionStyle::Shadow;
-        render_at(&mut shadow, &[shadow_item], 10, None, whole((400, 200)), (0.0, 0.0));
+        render_at(
+            &mut shadow,
+            &[shadow_item],
+            10,
+            None,
+            whole((400, 200)),
+            (0.0, 0.0),
+        );
 
         // The box extends left of the text origin; shadow-only text does not.
         assert!(boxed.get_pixel(94, 52)[0] < shadow.get_pixel(94, 52)[0]);
@@ -1090,12 +1187,9 @@ mod tests {
             caption_box_opacity: 0.68,
         };
         let (x0, y0, x1, y1) = bounds(&item, whole(content_size));
-        let (text_w, text_h) = crate::annotate::caption_text_size(
-            "BATTLE",
-            item.size,
-            metric_scale(content_size),
-        )
-        .expect("caption metrics");
+        let (text_w, text_h) =
+            crate::annotate::caption_text_size("BATTLE", item.size, metric_scale(content_size))
+                .expect("caption metrics");
         assert!(((x1 - x0) * content_size.0 as f32 - text_w as f32).abs() < 1.0);
         assert!(((y1 - y0) * content_size.1 as f32 - text_h as f32).abs() < 1.0);
     }

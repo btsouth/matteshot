@@ -11,24 +11,23 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, HALFTONE, InvalidateRect, RoundRect, SelectObject, SetBkMode,
-    SetStretchBltMode, SetTextColor, StretchDIBits, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, PAINTSTRUCT,
-    PS_SOLID, SRCCOPY, TRANSPARENT,
+    GetMonitorInfoW, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetStretchBltMode,
+    SetTextColor, StretchDIBits, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HALFTONE, HDC, HFONT, HMONITOR, MONITORINFO,
+    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow,
-    GetWindowLongPtrW, IsWindow, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW,
-    SetForegroundWindow,
-    SetWindowLongPtrW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    IDC_ARROW, MB_ICONERROR, MB_ICONWARNING, MB_OK, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_SYSMENU, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, LoadCursorW,
+    MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONWARNING,
+    MB_OK, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 use rayon::prelude::*;
@@ -37,8 +36,6 @@ use crate::compose::{self, ComposeOpts};
 use crate::config::Config;
 use crate::output;
 use crate::style::Style;
-
-
 
 const ASPECTS: [(&str, Option<f32>); 6] = [
     ("Auto", None),
@@ -82,7 +79,9 @@ enum Ctl {
     Share,
 }
 
-const TOOLS: [&str; 9] = ["Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen"];
+const TOOLS: [&str; 9] = [
+    "Arrow", "Line", "Box", "Oval", "Mark", "Text", "Blur", "Step", "Pen",
+];
 const SIZES: [f32; 3] = [0.7, 1.0, 1.4];
 const STEP_TOOL: usize = 7;
 const PEN_TOOL: usize = 8;
@@ -109,7 +108,12 @@ const MIN_CROP: u32 = 16;
 
 impl Crop {
     fn full(width: u32, height: u32) -> Self {
-        Crop { x: 0, y: 0, w: width.max(1), h: height.max(1) }
+        Crop {
+            x: 0,
+            y: 0,
+            w: width.max(1),
+            h: height.max(1),
+        }
     }
 
     fn is_full(&self, width: u32, height: u32) -> bool {
@@ -172,13 +176,7 @@ fn corner_index(point: (f32, f32), opposite: (f32, f32)) -> u8 {
 /// Returns the new crop and which corner is now being held: dragging a corner
 /// past its opposite flips it into the one it crossed to, and without that the
 /// next mouse move would pin the wrong point and the rectangle would stick.
-fn resize_crop(
-    crop: Crop,
-    corner: u8,
-    point: (f32, f32),
-    width: u32,
-    height: u32,
-) -> (Crop, u8) {
+fn resize_crop(crop: Crop, corner: u8, point: (f32, f32), width: u32, height: u32) -> (Crop, u8) {
     let opposite = crop.corners()[((corner as usize) + 2) % 4];
     (
         crop_from_points(opposite, point, width, height),
@@ -414,7 +412,11 @@ impl History {
         counter_next: u32,
         crop: Option<Crop>,
     ) {
-        self.steps.push(Snapshot { anns: anns.to_vec(), counter_next, crop });
+        self.steps.push(Snapshot {
+            anns: anns.to_vec(),
+            counter_next,
+            crop,
+        });
         if self.steps.len() > HISTORY_LIMIT {
             self.steps.remove(0);
         }
@@ -776,7 +778,8 @@ fn cancel_crop(state: &mut State) {
 fn text_context(state: &State) -> bool {
     state.doc().editing.is_some()
         || state.tool == Some(5)
-        || state.doc()
+        || state
+            .doc()
             .selected
             .and_then(|index| state.doc().anns.get(index))
             .is_some_and(|ann| matches!(ann.shape, crate::annotate::Shape::Text { .. }))
@@ -1061,7 +1064,12 @@ fn freehand_bounds(points: &[(f32, f32)]) -> (f32, f32, f32, f32) {
     points.iter().copied().skip(1).fold(
         (first.0, first.1, first.0, first.1),
         |(x0, y0, x1, y1), point| {
-            (x0.min(point.0), y0.min(point.1), x1.max(point.0), y1.max(point.1))
+            (
+                x0.min(point.0),
+                y0.min(point.1),
+                x1.max(point.0),
+                y1.max(point.1),
+            )
         },
     )
 }
@@ -1239,8 +1247,7 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
     state.doc_mut().moving = None;
     // A fresh generation per request: a worker still running for an earlier
     // arm of this mode — or for another tab — must not satisfy this one.
-    static NEXT_OCR_GENERATION: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(1);
+    static NEXT_OCR_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let generation = NEXT_OCR_GENERATION.fetch_add(1, Ordering::Relaxed);
     let doc_id = state.doc().id;
     state.doc_mut().text_select = Some(TextSelect {
@@ -1307,7 +1314,16 @@ unsafe fn wash_all(hdc: HDC, color: COLORREF, rects: &[(RECT, u8)]) {
     let bmp = CreateCompatibleBitmap(hdc, 1, 1);
     let old = SelectObject(mem, bmp);
     let brush = CreateSolidBrush(color);
-    FillRect(mem, &RECT { left: 0, top: 0, right: 1, bottom: 1 }, brush);
+    FillRect(
+        mem,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        },
+        brush,
+    );
     for (r, alpha) in rects {
         let (w, h) = (r.right - r.left, r.bottom - r.top);
         if w <= 0 || h <= 0 {
@@ -1348,7 +1364,11 @@ fn rebuild_preview(state: &mut State) {
     let source = source.clone();
     let opts = opts_of(state, metric);
     let plain = compose::is_plain(&state.doc().styles[state.doc().sel]);
-    let caret = if state.caret_on { state.doc_mut().editing } else { None };
+    let caret = if state.caret_on {
+        state.doc_mut().editing
+    } else {
+        None
+    };
     let mut img;
     let (off_x, off_y);
     if plain {
@@ -1558,11 +1578,18 @@ fn output_size_summary(max_edge: u32, dimensions: (u32, u32)) -> String {
 }
 
 fn custom_size_axis(dimensions: (u32, u32)) -> &'static str {
-    if dimensions.0 >= dimensions.1 { "width" } else { "height" }
+    if dimensions.0 >= dimensions.1 {
+        "width"
+    } else {
+        "height"
+    }
 }
 
 fn custom_size_bounds(dimensions: (u32, u32)) -> (u32, u32) {
-    let maximum = dimensions.0.max(dimensions.1).min(output::OUTPUT_CUSTOM_MAX);
+    let maximum = dimensions
+        .0
+        .max(dimensions.1)
+        .min(output::OUTPUT_CUSTOM_MAX);
     (output::OUTPUT_CUSTOM_MIN.min(maximum), maximum)
 }
 
@@ -1593,8 +1620,20 @@ fn custom_size_result(input: &str, dimensions: (u32, u32)) -> Option<(u32, u32)>
 }
 
 unsafe fn chip(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot: bool) {
-    let fill = CreateSolidBrush(if active { state.theme.accent } else { state.theme.chip });
-    let pen = CreatePen(PS_SOLID, 1, if active { state.theme.accent } else { state.theme.chip_line });
+    let fill = CreateSolidBrush(if active {
+        state.theme.accent
+    } else {
+        state.theme.chip
+    });
+    let pen = CreatePen(
+        PS_SOLID,
+        1,
+        if active {
+            state.theme.accent
+        } else {
+            state.theme.chip_line
+        },
+    );
     let ob = SelectObject(hdc, fill);
     let op = SelectObject(hdc, pen);
     let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, 10, 10);
@@ -1622,7 +1661,12 @@ unsafe fn label(hdc: HDC, state: &State, x: i32, y: i32, text: &str) {
     SelectObject(hdc, state.font_small);
     SetTextColor(hdc, state.theme.muted);
     let mut t = wide(text);
-    let mut rc = RECT { left: x, top: y, right: x + 1400, bottom: y + 22 };
+    let mut rc = RECT {
+        left: x,
+        top: y,
+        right: x + 1400,
+        bottom: y + 22,
+    };
     DrawTextW(hdc, &mut t, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 }
 
@@ -1634,10 +1678,7 @@ unsafe fn clipped_label(hdc: HDC, state: &State, mut r: RECT, text: &str) {
         hdc,
         &mut t,
         &mut r,
-        DT_LEFT
-            | DT_SINGLELINE
-            | DT_VCENTER
-            | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
     );
 }
 
@@ -1674,7 +1715,12 @@ unsafe fn custom_size_field(hdc: HDC, r: RECT, state: &State, _hot: bool) {
         right: r.right - pad,
         bottom: r.bottom,
     };
-    DrawTextW(hdc, &mut value, &mut value_rect, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    DrawTextW(
+        hdc,
+        &mut value,
+        &mut value_rect,
+        DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+    );
 }
 
 unsafe fn paint_slider(hdc: HDC, state: &State, rect: RECT, t: f32, active: bool) {
@@ -1682,16 +1728,30 @@ unsafe fn paint_slider(hdc: HDC, state: &State, rect: RECT, t: f32, active: bool
     let track = CreateSolidBrush(state.theme.track);
     FillRect(
         hdc,
-        &RECT { left: rect.left, top: cy - 2, right: rect.right, bottom: cy + 2 },
+        &RECT {
+            left: rect.left,
+            top: cy - 2,
+            right: rect.right,
+            bottom: cy + 2,
+        },
         track,
     );
     let _ = DeleteObject(track);
     let tx = rect.left + ((rect.right - rect.left) as f32 * t.clamp(0.0, 1.0)) as i32;
-    let color = if active { state.theme.accent } else { state.theme.chip_line };
+    let color = if active {
+        state.theme.accent
+    } else {
+        state.theme.chip_line
+    };
     let fill = CreateSolidBrush(color);
     FillRect(
         hdc,
-        &RECT { left: rect.left, top: cy - 2, right: tx, bottom: cy + 2 },
+        &RECT {
+            left: rect.left,
+            top: cy - 2,
+            right: tx,
+            bottom: cy + 2,
+        },
         fill,
     );
     let pen = CreatePen(PS_SOLID, 1, color);
@@ -1718,15 +1778,31 @@ unsafe fn paint_tabs(hdc: HDC, state: &State) {
     let sc = |v: i32| (v as f32 * state.scale) as i32;
     for (index, tab) in tab_rects(state).iter().enumerate() {
         let active = index == state.active;
-        let fill = CreateSolidBrush(if active { state.theme.panel } else { state.theme.bg });
+        let fill = CreateSolidBrush(if active {
+            state.theme.panel
+        } else {
+            state.theme.bg
+        });
         let pen = CreatePen(
             PS_SOLID,
             1,
-            if active { state.theme.accent } else { state.theme.chip_line },
+            if active {
+                state.theme.accent
+            } else {
+                state.theme.chip_line
+            },
         );
         let ob = SelectObject(hdc, fill);
         let op = SelectObject(hdc, pen);
-        let _ = RoundRect(hdc, tab.rect.left, tab.rect.top, tab.rect.right, tab.rect.bottom, 8, 8);
+        let _ = RoundRect(
+            hdc,
+            tab.rect.left,
+            tab.rect.top,
+            tab.rect.right,
+            tab.rect.bottom,
+            8,
+            8,
+        );
         SelectObject(hdc, ob);
         SelectObject(hdc, op);
         let _ = DeleteObject(fill);
@@ -1735,7 +1811,11 @@ unsafe fn paint_tabs(hdc: HDC, state: &State) {
         SelectObject(hdc, state.font_small);
         SetTextColor(
             hdc,
-            if active { state.theme.text } else { state.theme.muted },
+            if active {
+                state.theme.text
+            } else {
+                state.theme.muted
+            },
         );
         let mut label = wide(
             state
@@ -1754,10 +1834,7 @@ unsafe fn paint_tabs(hdc: HDC, state: &State) {
             hdc,
             &mut label,
             &mut text_rect,
-            DT_LEFT
-                | DT_SINGLELINE
-                | DT_VCENTER
-                | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
         );
         // Close affordance. Only worth drawing when closing a tab is not the
         // same as closing the window.
@@ -1777,7 +1854,16 @@ unsafe fn paint_tabs(hdc: HDC, state: &State) {
 
 unsafe fn paint(hdc: HDC, state: &State) {
     let bg = CreateSolidBrush(state.theme.bg);
-    FillRect(hdc, &RECT { left: 0, top: 0, right: state.width, bottom: state.height }, bg);
+    FillRect(
+        hdc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: state.width,
+            bottom: state.height,
+        },
+        bg,
+    );
     let _ = DeleteObject(bg);
     SetBkMode(hdc, TRANSPARENT);
     paint_tabs(hdc, state);
@@ -1825,7 +1911,10 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let (kx0, ky0) = raw_to_screen(state, (pending.x as f32, pending.y as f32));
         let (kx1, ky1) = raw_to_screen(
             state,
-            ((pending.x + pending.w) as f32, (pending.y + pending.h) as f32),
+            (
+                (pending.x + pending.w) as f32,
+                (pending.y + pending.h) as f32,
+            ),
         );
         let (fx0, fy0) = raw_to_screen(state, (0.0, 0.0));
         let (raw_w, raw_h) = state.doc().raw.dimensions();
@@ -1834,10 +1923,42 @@ unsafe fn paint(hdc: HDC, state: &State) {
             hdc,
             state.theme.bg,
             &[
-                (RECT { left: fx0, top: fy0, right: fx1, bottom: ky0 }, 170),
-                (RECT { left: fx0, top: ky1, right: fx1, bottom: fy1 }, 170),
-                (RECT { left: fx0, top: ky0, right: kx0, bottom: ky1 }, 170),
-                (RECT { left: kx1, top: ky0, right: fx1, bottom: ky1 }, 170),
+                (
+                    RECT {
+                        left: fx0,
+                        top: fy0,
+                        right: fx1,
+                        bottom: ky0,
+                    },
+                    170,
+                ),
+                (
+                    RECT {
+                        left: fx0,
+                        top: ky1,
+                        right: fx1,
+                        bottom: fy1,
+                    },
+                    170,
+                ),
+                (
+                    RECT {
+                        left: fx0,
+                        top: ky0,
+                        right: kx0,
+                        bottom: ky1,
+                    },
+                    170,
+                ),
+                (
+                    RECT {
+                        left: kx1,
+                        top: ky0,
+                        right: fx1,
+                        bottom: ky1,
+                    },
+                    170,
+                ),
             ],
         );
         let pen = CreatePen(PS_SOLID, 1, state.theme.accent);
@@ -1889,14 +2010,24 @@ unsafe fn paint(hdc: HDC, state: &State) {
             if !solid && state.doc().selected == Some(i) {
                 continue;
             }
-            let Some(ann) = state.doc().anns.get(i) else { continue };
+            let Some(ann) = state.doc().anns.get(i) else {
+                continue;
+            };
             let (x0, y0, x1, y1) = ann_bounds(ann);
             let (sx0, sy0) = raw_to_screen(state, (x0, y0));
             let (sx1, sy1) = raw_to_screen(state, (x1, y1));
             let pen = CreatePen(
-                if solid { PS_SOLID } else { windows::Win32::Graphics::Gdi::PS_DOT },
+                if solid {
+                    PS_SOLID
+                } else {
+                    windows::Win32::Graphics::Gdi::PS_DOT
+                },
                 1,
-                if solid { state.theme.accent } else { state.theme.muted },
+                if solid {
+                    state.theme.accent
+                } else {
+                    state.theme.muted
+                },
             );
             let op = SelectObject(hdc, pen);
             let ob = SelectObject(
@@ -1905,13 +2036,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     windows::Win32::Graphics::Gdi::HOLLOW_BRUSH,
                 ),
             );
-            let _ = windows::Win32::Graphics::Gdi::Rectangle(
-                hdc,
-                sx0 - 6,
-                sy0 - 6,
-                sx1 + 6,
-                sy1 + 6,
-            );
+            let _ =
+                windows::Win32::Graphics::Gdi::Rectangle(hdc, sx0 - 6, sy0 - 6, sx1 + 6, sy1 + 6);
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
             let _ = DeleteObject(pen);
@@ -1975,7 +2101,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 let (sx1, sy1) = raw_to_screen(state, (x1, y1));
                 let picked = range.is_some_and(|(a, b)| index >= a && index <= b);
                 (
-                    RECT { left: sx0 - 1, top: sy0 - 1, right: sx1 + 1, bottom: sy1 + 1 },
+                    RECT {
+                        left: sx0 - 1,
+                        top: sy0 - 1,
+                        right: sx1 + 1,
+                        bottom: sy1 + 1,
+                    },
                     if picked { 96 } else { 26 },
                 )
             })
@@ -2010,7 +2141,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
     } else if state.doc().crop_edit.is_some() {
         Some("drag to frame   \u{00b7}   pull a corner to resize   \u{00b7}   drag inside to move   \u{00b7}   Del uncrops   \u{00b7}   Enter applies   \u{00b7}   Esc cancels")
     } else if state.tool == Some(PEN_TOOL) {
-        Some("drag on the preview to draw   \u{00b7}   Pen stays active   \u{00b7}   P or Esc exits")
+        Some(
+            "drag on the preview to draw   \u{00b7}   Pen stays active   \u{00b7}   P or Esc exits",
+        )
     } else if state.tool == Some(STEP_TOOL) {
         Some("click the preview to place the next step   \u{00b7}   Step stays active   \u{00b7}   Esc exits")
     } else if state.tool == Some(5) {
@@ -2034,15 +2167,39 @@ unsafe fn paint(hdc: HDC, state: &State) {
 
     // Section labels.
     let lh = (20.0 * state.scale) as i32;
-    if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::Matte(0))) {
+    if let Some((r, _)) = state
+        .controls
+        .iter()
+        .find(|(_, c)| matches!(c, Ctl::Matte(0)))
+    {
         label(hdc, state, r.left, r.top - lh, "MATTE");
     }
-    label(hdc, state, state.slider_rect.left, state.slider_rect.top - lh, "PADDING");
-    if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::Aspect(0))) {
+    label(
+        hdc,
+        state,
+        state.slider_rect.left,
+        state.slider_rect.top - lh,
+        "PADDING",
+    );
+    if let Some((r, _)) = state
+        .controls
+        .iter()
+        .find(|(_, c)| matches!(c, Ctl::Aspect(0)))
+    {
         label(hdc, state, r.left, r.top - lh, "ASPECT");
     }
-    if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::Tool(0))) {
-        label(hdc, state, r.left, r.top - lh, "ANNOTATE  (drag on the preview)");
+    if let Some((r, _)) = state
+        .controls
+        .iter()
+        .find(|(_, c)| matches!(c, Ctl::Tool(0)))
+    {
+        label(
+            hdc,
+            state,
+            r.left,
+            r.top - lh,
+            "ANNOTATE  (drag on the preview)",
+        );
     }
     if text_context(state) {
         label(
@@ -2074,27 +2231,51 @@ unsafe fn paint(hdc: HDC, state: &State) {
         clipped_label(
             hdc,
             state,
-            RECT { left: r.left, top: r.top - lh * 2, right: r.right, bottom: r.top - lh },
+            RECT {
+                left: r.left,
+                top: r.top - lh * 2,
+                right: r.right,
+                bottom: r.top - lh,
+            },
             "CUSTOM OUTPUT SIZE",
         );
         clipped_label(
             hdc,
             state,
-            RECT { left: r.left, top: r.top - lh, right: r.right, bottom: r.top },
+            RECT {
+                left: r.left,
+                top: r.top - lh,
+                right: r.right,
+                bottom: r.top,
+            },
             &detail,
         );
-    } else if let Some((r, _)) = state.controls.iter().find(|(_, c)| matches!(c, Ctl::OutputSize(_))) {
+    } else if let Some((r, _)) = state
+        .controls
+        .iter()
+        .find(|(_, c)| matches!(c, Ctl::OutputSize(_)))
+    {
         clipped_label(
             hdc,
             state,
-            RECT { left: r.left, top: r.top - lh * 2, right: r.left + (216.0 * state.scale) as i32, bottom: r.top - lh },
+            RECT {
+                left: r.left,
+                top: r.top - lh * 2,
+                right: r.left + (216.0 * state.scale) as i32,
+                bottom: r.top - lh,
+            },
             "OUTPUT SIZE",
         );
         let (width, height) = final_dimensions(state);
         clipped_label(
             hdc,
             state,
-            RECT { left: r.left, top: r.top - lh, right: r.left + (216.0 * state.scale) as i32, bottom: r.top },
+            RECT {
+                left: r.left,
+                top: r.top - lh,
+                right: r.left + (216.0 * state.scale) as i32,
+                bottom: r.top,
+            },
             &output_size_summary(state.doc().output_max_edge, (width, height)),
         );
     }
@@ -2106,10 +2287,22 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
         let hot = i as i32 == state.hover;
         match c {
-            Ctl::Matte(n) => chip(hdc, *r, state.doc().styles[*n].name, state, state.doc().sel == *n, hot),
-            Ctl::Aspect(n) => {
-                chip(hdc, *r, ASPECTS[*n].0, state, state.doc().aspect_idx == *n, hot)
-            }
+            Ctl::Matte(n) => chip(
+                hdc,
+                *r,
+                state.doc().styles[*n].name,
+                state,
+                state.doc().sel == *n,
+                hot,
+            ),
+            Ctl::Aspect(n) => chip(
+                hdc,
+                *r,
+                ASPECTS[*n].0,
+                state,
+                state.doc().aspect_idx == *n,
+                hot,
+            ),
             Ctl::OutputSize(max_edge) => chip(
                 hdc,
                 *r,
@@ -2128,20 +2321,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 let custom_label = if custom {
                     format!("{}px", state.doc().output_max_edge)
                 } else {
-                    format!("Set {}\u{2026}", custom_size_axis(composed_dimensions(state)))
+                    format!(
+                        "Set {}\u{2026}",
+                        custom_size_axis(composed_dimensions(state))
+                    )
                 };
-                chip(
-                    hdc,
-                    *r,
-                    &custom_label,
-                    state,
-                    custom,
-                    hot,
-                )
+                chip(hdc, *r, &custom_label, state, custom, hot)
             }
-            Ctl::CustomSizeField => {
-                custom_size_field(hdc, *r, state, hot)
-            }
+            Ctl::CustomSizeField => custom_size_field(hdc, *r, state, hot),
             Ctl::CustomSizeDone => chip(hdc, *r, "Done", state, true, hot),
             Ctl::CustomSizeCancel => chip(hdc, *r, "Cancel", state, false, hot),
             Ctl::Copy => chip(hdc, *r, "Copy", state, true, hot),
@@ -2173,12 +2360,17 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     }
                     (None, committed) => committed,
                 };
-                let label = if showing.is_some() { "Crop \u{00b7} adjust" } else { "Crop" };
+                let label = if showing.is_some() {
+                    "Crop \u{00b7} adjust"
+                } else {
+                    "Crop"
+                };
                 chip(hdc, *r, label, state, state.tool == Some(CROP_TOOL), hot)
             }
             Ctl::Tool(n) => {
                 let property_tool = if state.tool.is_none() {
-                    state.doc()
+                    state
+                        .doc()
                         .selected
                         .and_then(|index| state.doc().anns.get(index))
                         .map(|ann| annotation_tool_index(&ann.shape))
@@ -2219,7 +2411,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 let ring = CreatePen(
                     PS_SOLID,
                     2,
-                    if state.color_idx == *n { state.theme.accent } else { state.theme.chip_line },
+                    if state.color_idx == *n {
+                        state.theme.accent
+                    } else {
+                        state.theme.chip_line
+                    },
                 );
                 let ob = SelectObject(hdc, fill);
                 let op = SelectObject(hdc, ring);
@@ -2268,7 +2464,10 @@ unsafe fn paint(hdc: HDC, state: &State) {
             state,
             state.caption_opacity_slider.left - (52.0 * state.scale) as i32,
             state.caption_opacity_slider.top,
-            &format!("Box {}%", (state.caption_box_opacity * 100.0).round() as i32),
+            &format!(
+                "Box {}%",
+                (state.caption_box_opacity * 100.0).round() as i32
+            ),
         );
         paint_slider(
             hdc,
@@ -2283,13 +2482,31 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let sr = state.slider_rect;
     let cy = (sr.top + sr.bottom) / 2;
     let track = CreateSolidBrush(state.theme.track);
-    FillRect(hdc, &RECT { left: sr.left, top: cy - 2, right: sr.right, bottom: cy + 2 }, track);
+    FillRect(
+        hdc,
+        &RECT {
+            left: sr.left,
+            top: cy - 2,
+            right: sr.right,
+            bottom: cy + 2,
+        },
+        track,
+    );
     let _ = DeleteObject(track);
     let t = (state.doc().pad_factor - compose::PAD_SLIDER_MIN)
         / (compose::PAD_SLIDER_MAX - compose::PAD_SLIDER_MIN);
     let tx = sr.left + ((sr.right - sr.left) as f32 * t) as i32;
     let filled = CreateSolidBrush(state.theme.accent);
-    FillRect(hdc, &RECT { left: sr.left, top: cy - 2, right: tx, bottom: cy + 2 }, filled);
+    FillRect(
+        hdc,
+        &RECT {
+            left: sr.left,
+            top: cy - 2,
+            right: tx,
+            bottom: cy + 2,
+        },
+        filled,
+    );
     let thumb_pen = CreatePen(PS_SOLID, 1, state.theme.accent);
     let ob = SelectObject(hdc, filled);
     let op = SelectObject(hdc, thumb_pen);
@@ -2304,8 +2521,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
 unsafe fn slider_update(hwnd: HWND, state: &mut State, x: i32) {
     let sr = state.slider_rect;
     let t = ((x - sr.left) as f32 / (sr.right - sr.left).max(1) as f32).clamp(0.0, 1.0);
-    let padding = compose::PAD_SLIDER_MIN
-        + t * (compose::PAD_SLIDER_MAX - compose::PAD_SLIDER_MIN);
+    let padding = compose::PAD_SLIDER_MIN + t * (compose::PAD_SLIDER_MAX - compose::PAD_SLIDER_MIN);
     if padding == state.doc_mut().pad_factor {
         return;
     }
@@ -2338,7 +2554,12 @@ unsafe fn show_output_error(hwnd: HWND, summary: &str, error: &Error, save_faile
         hwnd,
         PCWSTR(message.as_ptr()),
         w!("Matteshot"),
-        MB_OK | if save_failed { MB_ICONERROR } else { MB_ICONWARNING },
+        MB_OK
+            | if save_failed {
+                MB_ICONERROR
+            } else {
+                MB_ICONWARNING
+            },
     );
 }
 
@@ -2504,7 +2725,11 @@ fn begin_custom_size(state: &mut State) {
 }
 
 fn preview_custom_size(state: &mut State) {
-    let Some(input) = state.custom_size_edit.as_ref().map(|edit| edit.input.clone()) else {
+    let Some(input) = state
+        .custom_size_edit
+        .as_ref()
+        .map(|edit| edit.input.clone())
+    else {
         return;
     };
     if let Some(value) = custom_size_value(&input, composed_dimensions(state)) {
@@ -2512,10 +2737,7 @@ fn preview_custom_size(state: &mut State) {
     }
 }
 
-fn output_max_edge_after_custom_size_cancel(
-    edit: Option<&CustomSizeEdit>,
-    current: u32,
-) -> u32 {
+fn output_max_edge_after_custom_size_cancel(edit: Option<&CustomSizeEdit>, current: u32) -> u32 {
     edit.map_or(current, |edit| edit.original_max_edge)
 }
 
@@ -2529,7 +2751,11 @@ fn cancel_custom_size(state: &mut State) {
 }
 
 fn commit_custom_size(state: &mut State) -> bool {
-    let Some(input) = state.custom_size_edit.as_ref().map(|edit| edit.input.clone()) else {
+    let Some(input) = state
+        .custom_size_edit
+        .as_ref()
+        .map(|edit| edit.input.clone())
+    else {
         return false;
     };
     let dimensions = composed_dimensions(state);
@@ -2570,13 +2796,7 @@ fn crop_contains(crop: Crop, p: (f32, f32)) -> bool {
 /// instead of moving: there is nowhere for it to move to, and "drag a box
 /// round the part you want" is the whole gesture on a crop you have not
 /// narrowed yet.
-fn crop_drag_for(
-    crop: Crop,
-    p: (f32, f32),
-    tolerance: f32,
-    width: u32,
-    height: u32,
-) -> CropDrag {
+fn crop_drag_for(crop: Crop, p: (f32, f32), tolerance: f32, width: u32, height: u32) -> CropDrag {
     if let Some(corner) = crop_corner_at(crop, p, tolerance) {
         CropDrag::Corner(corner)
     } else if crop_contains(crop, p) && !crop.is_full(width, height) {
@@ -2606,7 +2826,10 @@ fn hit_ann(state: &State, p: (f32, f32)) -> Option<usize> {
                 .any(|segment| dist_seg(p, segment[0], segment[1]) <= tol),
             crate::annotate::Shape::Ellipse { a, b } => {
                 let (cx, cy) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
-                let (rx, ry) = (((a.0 - b.0) / 2.0).abs().max(1.0), ((a.1 - b.1) / 2.0).abs().max(1.0));
+                let (rx, ry) = (
+                    ((a.0 - b.0) / 2.0).abs().max(1.0),
+                    ((a.1 - b.1) / 2.0).abs().max(1.0),
+                );
                 let v = (((p.0 - cx) / rx).powi(2) + ((p.1 - cy) / ry).powi(2)).sqrt();
                 ((v - 1.0) * rx.min(ry)).abs() <= tol
             }
@@ -2635,10 +2858,7 @@ fn hit_ann(state: &State, p: (f32, f32)) -> Option<usize> {
             }
             crate::annotate::Shape::Text { .. } => {
                 let (x0, y0, x1, y1) = ann_bounds(ann);
-                p.0 >= x0 - tol
-                    && p.0 <= x1 + tol
-                    && p.1 >= y0 - tol
-                    && p.1 <= y1 + tol
+                p.0 >= x0 - tol && p.0 <= x1 + tol && p.1 >= y0 - tol && p.1 <= y1 + tol
             }
         };
         if hit {
@@ -2652,8 +2872,7 @@ fn hit_ann(state: &State, p: (f32, f32)) -> Option<usize> {
 /// for both cursor feedback and grabbing).
 fn grab_probe(ann: &crate::annotate::Annotation, p: (f32, f32), tol: f32) -> Grab {
     match &ann.shape {
-        crate::annotate::Shape::Arrow { from, to }
-        | crate::annotate::Shape::Line { from, to } => {
+        crate::annotate::Shape::Arrow { from, to } | crate::annotate::Shape::Line { from, to } => {
             let d0 = ((p.0 - from.0).powi(2) + (p.1 - from.1).powi(2)).sqrt();
             let d1 = ((p.0 - to.0).powi(2) + (p.1 - to.1).powi(2)).sqrt();
             if d1 <= tol * 1.5 {
@@ -2680,9 +2899,7 @@ fn grab_probe(ann: &crate::annotate::Annotation, p: (f32, f32), tol: f32) -> Gra
         }
         crate::annotate::Shape::Text { .. }
         | crate::annotate::Shape::Counter { .. }
-        | crate::annotate::Shape::Freehand { .. } => {
-            Grab::Whole
-        }
+        | crate::annotate::Shape::Freehand { .. } => Grab::Whole,
     }
 }
 
@@ -2999,9 +3216,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
 /// closer in spirit to Copy, since sharing is not "finished with this
 /// capture" the way saving is.
 unsafe fn share_current(hwnd: HWND, state: &mut State) {
-    if let crate::share::ShareStart::Unavailable(reason) =
-        crate::share::share_start()
-    {
+    if let crate::share::ShareStart::Unavailable(reason) = crate::share::share_start() {
         state.copy_hint = Some((reason.into(), std::time::Instant::now()));
         let _ = InvalidateRect(hwnd, None, false);
         return;
@@ -3075,7 +3290,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if state.doc_mut().text_select.as_ref().is_some_and(|s| s.dragging) {
+                if state
+                    .doc_mut()
+                    .text_select
+                    .as_ref()
+                    .is_some_and(|s| s.dragging)
+                {
                     let focus = to_raw(state, x, y).and_then(|p| {
                         nearest_word(&state.doc_mut().text_select.as_ref()?.words, p)
                     });
@@ -3138,7 +3358,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                 } else if state.doc_mut().drawing {
-                    if let (Some(p), Some(ann)) = (to_raw(state, x, y), state.doc_mut().anns.last_mut()) {
+                    if let (Some(p), Some(ann)) =
+                        (to_raw(state, x, y), state.doc_mut().anns.last_mut())
+                    {
                         match &mut ann.shape {
                             crate::annotate::Shape::Arrow { to, .. }
                             | crate::annotate::Shape::Line { to, .. } => *to = p,
@@ -3173,7 +3395,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         })
                         .map(|i| i as i32)
                         .unwrap_or(-1);
-                    let hover_ann = if state.tool.is_none() && state.doc_mut().text_select.is_none() {
+                    let hover_ann = if state.tool.is_none() && state.doc_mut().text_select.is_none()
+                    {
                         to_raw(state, x, y).and_then(|p| hit_ann(state, p))
                     } else {
                         None
@@ -3267,9 +3490,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let inside_inline_editor = state.controls.iter().any(|(rect, control)| {
                         matches!(
                             control,
-                            Ctl::CustomSizeField
-                                | Ctl::CustomSizeDone
-                                | Ctl::CustomSizeCancel
+                            Ctl::CustomSizeField | Ctl::CustomSizeDone | Ctl::CustomSizeCancel
                         ) && in_rect(rect, x, y)
                     });
                     if !inside_inline_editor {
@@ -3374,7 +3595,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if let (Some(tool), Some(p)) =
                     // Crop is in the palette but draws nothing; without this it
                     // would fall through to the catch-all and place a caption.
-                    (state.tool.filter(|tool| *tool != CROP_TOOL), to_raw(state, x, y))
+                    (
+                        state.tool.filter(|tool| *tool != CROP_TOOL),
+                        to_raw(state, x, y),
+                    )
                 {
                     commit_editing(state);
                     let color = state.color_idx;
@@ -3428,7 +3652,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Text: click places, then type.
                         state.doc_mut().push_history();
                         state.doc_mut().anns.push(crate::annotate::Annotation {
-                            shape: Shape::Text { pos: p, text: String::new() },
+                            shape: Shape::Text {
+                                pos: p,
+                                text: String::new(),
+                            },
                             color: 3,
                             size: caption_size,
                             text_style: caption_style,
@@ -3473,7 +3700,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             if let Some(state) = state_of(hwnd) {
-                if state.doc_mut().text_select.as_ref().is_some_and(|s| s.dragging) {
+                if state
+                    .doc_mut()
+                    .text_select
+                    .as_ref()
+                    .is_some_and(|s| s.dragging)
+                {
                     if let Some(select) = state.doc_mut().text_select.as_mut() {
                         select.dragging = false;
                     }
@@ -3546,9 +3778,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
-                if let Some(i) = state.controls.iter().position(|(r, control)| {
-                    control_visible(state, *control) && in_rect(r, x, y)
-                }) {
+                if let Some(i) = state
+                    .controls
+                    .iter()
+                    .position(|(r, control)| control_visible(state, *control) && in_rect(r, x, y))
+                {
                     let ctl = state.controls[i].1;
                     activate(hwnd, state, ctl);
                 }
@@ -3626,7 +3860,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.caret_on = true;
                 if state.custom_size_edit.is_some() {
                     let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
-                    let action = apply_custom_size_input(state.custom_size_edit.as_mut().unwrap(), ch);
+                    let action =
+                        apply_custom_size_input(state.custom_size_edit.as_mut().unwrap(), ch);
                     if action == CustomInput::Commit {
                         commit_custom_size(state);
                     } else if action == CustomInput::Changed {
@@ -3639,7 +3874,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if let Some(i) = state.doc_mut().editing {
                     let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
-                    let action = state.doc_mut()
+                    let action = state
+                        .doc_mut()
                         .anns
                         .get_mut(i)
                         .and_then(|ann| match &mut ann.shape {
@@ -3693,7 +3929,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return LRESULT(0);
                     }
                     if ctrl_down && key == b'A' as u16 {
-                        let last = state.doc_mut()
+                        let last = state
+                            .doc_mut()
                             .text_select
                             .as_ref()
                             .map(|select| select.words.len())
@@ -3800,9 +4037,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Ctrl+1..8 pick a tab directly, Ctrl+9 the last one,
                     // matching every browser.
                     if (b'1' as u16..=b'9' as u16).contains(&key) {
-                        if let Some(target) =
-                            tab_for_digit((key - b'1' as u16) as usize, count)
-                        {
+                        if let Some(target) = tab_for_digit((key - b'1' as u16) as usize, count) {
                             activate_tab(hwnd, state, target);
                         }
                         return LRESULT(0);
@@ -3871,15 +4106,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                     // Tool shortcuts (A/R/T/B/P) and colors (1-4).
-                    0x41 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(0)), // Arrow
-                    0x52 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(2)), // Rectangle
-                    0x54 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(5)), // Text
-                    0x42 if state.doc_mut().editing.is_none() => activate(hwnd, state, Ctl::Tool(6)), // Blur
-                    0x50 if state.doc_mut().editing.is_none() => activate(
-                        hwnd,
-                        state,
-                        Ctl::Tool(PEN_TOOL),
-                    ), // Pen
+                    0x41 if state.doc_mut().editing.is_none() => {
+                        activate(hwnd, state, Ctl::Tool(0))
+                    } // Arrow
+                    0x52 if state.doc_mut().editing.is_none() => {
+                        activate(hwnd, state, Ctl::Tool(2))
+                    } // Rectangle
+                    0x54 if state.doc_mut().editing.is_none() => {
+                        activate(hwnd, state, Ctl::Tool(5))
+                    } // Text
+                    0x42 if state.doc_mut().editing.is_none() => {
+                        activate(hwnd, state, Ctl::Tool(6))
+                    } // Blur
+                    0x50 if state.doc_mut().editing.is_none() => {
+                        activate(hwnd, state, Ctl::Tool(PEN_TOOL))
+                    } // Pen
                     v @ 0x31..=0x34 if state.doc_mut().editing.is_none() => {
                         activate(hwnd, state, Ctl::Color((v - 0x31) as usize))
                     }
@@ -3962,8 +4203,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if (lparam.0 & 0xFFFF) as u32 == 1 {
                 if let Some(state) = state_of(hwnd) {
                     use windows::Win32::UI::WindowsAndMessaging::{
-                        GetCursorPos, LoadCursorW as LC, SetCursor, IDC_ARROW as ARROW,
-                        IDC_CROSS,
+                        GetCursorPos, LoadCursorW as LC, SetCursor, IDC_ARROW as ARROW, IDC_CROSS,
                     };
                     let mut pt = windows::Win32::Foundation::POINT::default();
                     let _ = GetCursorPos(&mut pt);
@@ -4009,7 +4249,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         windows::Win32::UI::WindowsAndMessaging::WM_SIZE => {
             if let Some(state) = state_of(hwnd) {
-                let (w, h) = ((lparam.0 & 0xFFFF) as i32, ((lparam.0 >> 16) & 0xFFFF) as i32);
+                let (w, h) = (
+                    (lparam.0 & 0xFFFF) as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i32,
+                );
                 if w > 0 && h > 0 {
                     state.width = w;
                     state.height = h;
@@ -4160,8 +4403,7 @@ fn column_clears_actions(layout: &WindowLayout, scale: f32) -> bool {
 fn layout_controls(scale: f32, cw: i32, ch: i32, n_styles: usize) -> WindowLayout {
     for matte_columns in [2, 3] {
         for step in 0..=10 {
-            let layout =
-                layout_column(scale, cw, ch, n_styles, matte_columns, step as f32 / 10.0);
+            let layout = layout_column(scale, cw, ch, n_styles, matte_columns, step as f32 / 10.0);
             if column_clears_actions(&layout, scale) {
                 return layout;
             }
@@ -4213,17 +4455,31 @@ fn layout_column(
     let col_x = cw - sc(250);
     // The tab strip is always present, even with one capture open, so adding
     // a second one never reflows everything underneath it.
-    let tab_strip = RECT { left: 0, top: 0, right: cw, bottom: sc(34) };
+    let tab_strip = RECT {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: sc(34),
+    };
     let top = tab_strip.bottom + sc(10);
     // Bottom strip reserved for the contextual hint line.
-    let preview_box = RECT { left: m, top, right: col_x - sc(16), bottom: ch - margin_v - sc(18) };
+    let preview_box = RECT {
+        left: m,
+        top,
+        right: col_x - sc(16),
+        bottom: ch - margin_v - sc(18),
+    };
     let mut controls = Vec::new();
     let mut y = top + head;
     // Matte chips fill the column at whatever width they are given, and a
     // final row with fewer chips than the rest is centred rather than left
     // hanging on the left edge.
     let columns = matte_columns.max(1);
-    let (matte_w, matte_pitch) = if columns >= 3 { (sc(66), sc(74)) } else { (sc(104), sc(112)) };
+    let (matte_w, matte_pitch) = if columns >= 3 {
+        (sc(66), sc(74))
+    } else {
+        (sc(104), sc(112))
+    };
     let matte_rows = (n_styles as i32 + columns - 1) / columns;
     let last_row_count = match n_styles as i32 % columns {
         0 => columns,
@@ -4232,7 +4488,11 @@ fn layout_column(
     for i in 0..n_styles {
         let line = i as i32 / columns;
         let colm = i as i32 % columns;
-        let count = if line == matte_rows - 1 { last_row_count } else { columns };
+        let count = if line == matte_rows - 1 {
+            last_row_count
+        } else {
+            columns
+        };
         let indent = (sc(216) - ((count - 1) * matte_pitch + matte_w)) / 2;
         let x = col_x + if count == columns { 0 } else { indent } + colm * matte_pitch;
         controls.push((
@@ -4246,7 +4506,12 @@ fn layout_column(
         ));
     }
     y += matte_rows * row + gap_matte;
-    let slider_rect = RECT { left: col_x, top: y, right: col_x + sc(216), bottom: y + sc(22) };
+    let slider_rect = RECT {
+        left: col_x,
+        top: y,
+        right: col_x + sc(216),
+        bottom: y + sc(22),
+    };
     controls.push((slider_rect, Ctl::Slider));
     y += gap_slider;
     for i in 0..ASPECTS.len() {
@@ -4271,7 +4536,12 @@ fn layout_column(
     // short, because a slightly tighter group beats a group that does not fit.
     let crop_y = y + row * 2 + vs(10, 0);
     controls.push((
-        RECT { left: col_x, top: crop_y, right: col_x + sc(216), bottom: crop_y + chip_h },
+        RECT {
+            left: col_x,
+            top: crop_y,
+            right: col_x + sc(216),
+            bottom: crop_y + chip_h,
+        },
         Ctl::Crop,
     ));
     // Annotation tools.
@@ -4294,7 +4564,12 @@ fn layout_column(
     for i in 0..crate::annotate::COLORS.len() {
         let x = col_x + i as i32 * sc(34);
         controls.push((
-            RECT { left: x, top: colors_y, right: x + sc(26), bottom: colors_y + sc(26) },
+            RECT {
+                left: x,
+                top: colors_y,
+                right: x + sc(26),
+                bottom: colors_y + sc(26),
+            },
             Ctl::Color(i),
         ));
     }
@@ -4309,14 +4584,24 @@ fn layout_column(
         Ctl::Undo,
     ));
     controls.push((
-        RECT { left: col_x + sc(148), top: uc_y, right: col_x + sc(216), bottom: uc_y + sc(26) },
+        RECT {
+            left: col_x + sc(148),
+            top: uc_y,
+            right: col_x + sc(216),
+            bottom: uc_y + sc(26),
+        },
         Ctl::Clear,
     ));
     // Size chips (S/M/L) on the row under the colors.
     for (i, _) in SIZES.iter().enumerate() {
         let x = col_x + i as i32 * sc(46);
         controls.push((
-            RECT { left: x, top: uc_y, right: x + sc(40), bottom: uc_y + sc(26) },
+            RECT {
+                left: x,
+                top: uc_y,
+                right: x + sc(40),
+                bottom: uc_y + sc(26),
+            },
             Ctl::Size(i),
         ));
     }
@@ -4403,19 +4688,39 @@ fn layout_column(
         Ctl::CustomSizeCancel,
     ));
     controls.push((
-        RECT { left: col_x, top: by - sc(38), right: col_x + sc(216), bottom: by - sc(8) },
+        RECT {
+            left: col_x,
+            top: by - sc(38),
+            right: col_x + sc(216),
+            bottom: by - sc(8),
+        },
         Ctl::Ocr,
     ));
     controls.push((
-        RECT { left: col_x, top: by, right: col_x + sc(64), bottom: by + sc(30) },
+        RECT {
+            left: col_x,
+            top: by,
+            right: col_x + sc(64),
+            bottom: by + sc(30),
+        },
         Ctl::Copy,
     ));
     controls.push((
-        RECT { left: col_x + sc(72), top: by, right: col_x + sc(136), bottom: by + sc(30) },
+        RECT {
+            left: col_x + sc(72),
+            top: by,
+            right: col_x + sc(136),
+            bottom: by + sc(30),
+        },
         Ctl::Save,
     ));
     controls.push((
-        RECT { left: col_x + sc(144), top: by, right: col_x + sc(208), bottom: by + sc(30) },
+        RECT {
+            left: col_x + sc(144),
+            top: by,
+            right: col_x + sc(208),
+            bottom: by + sc(30),
+        },
         Ctl::Share,
     ));
     WindowLayout {
@@ -4431,12 +4736,7 @@ fn layout_column(
 
 /// Build the per-capture half of the editor: preview sources and the starting
 /// matte choices.
-fn build_document(
-    raw: RgbaImage,
-    styles: Vec<Style>,
-    initial: usize,
-    title: String,
-) -> Document {
+fn build_document(raw: RgbaImage, styles: Vec<Style>, initial: usize, title: String) -> Document {
     // Provisional preview source. The pane's real size is not known until the
     // window has been created and sized, and `ensure_preview_source` grows
     // this to match before the first paint. Opening at a modest size keeps
@@ -4681,9 +4981,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
 
         let hinstance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
-            style: CS_HREDRAW
-                | CS_VREDRAW
-                | windows::Win32::UI::WindowsAndMessaging::CS_DBLCLKS,
+            style: CS_HREDRAW | CS_VREDRAW | windows::Win32::UI::WindowsAndMessaging::CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -4702,7 +5000,12 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
             | windows::Win32::UI::WindowsAndMessaging::WS_MAXIMIZEBOX
             | windows::Win32::UI::WindowsAndMessaging::WS_MINIMIZEBOX;
         let outer = crate::dpi::outer_bounds(
-            RECT { left: 0, top: 0, right: cw, bottom: ch },
+            RECT {
+                left: 0,
+                top: 0,
+                right: cw,
+                bottom: ch,
+            },
             style,
             windows::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW,
             dpi_scale,
@@ -4749,16 +5052,15 @@ mod tests {
 
     use super::{
         active_after_close, ann_bounds, annotation_tool_index, apply_custom_size_input,
-        apply_text_input, custom_size_axis, custom_size_bounds, custom_size_initial,
-        custom_size_result, custom_size_value, final_size, freehand_length, join_words,
-        layout_controls, nearest_word, persist_and_copy_with, share_upload_idle,
-        start_share_upload, output_max_edge_after_custom_size_cancel, output_size_summary,
-        preview_draw_geometry,
-        corner_index, crop_contains, crop_drag_for, crop_from_points, deliver_ocr, move_crop,
-        preview_sources, preview_target_edge, redacted, render_final, resize_crop, tab_for_digit,
-        tool_after_pick, Crop, CropDrag, History, OcrCompletion, TextSelect, HISTORY_LIMIT,
-        translate_ann, Ctl, CustomInput, CustomSizeEdit, FinishError, TextInput, ASPECTS,
-        CROP_TOOL, MIN_CROP, TOOLS,
+        apply_text_input, corner_index, crop_contains, crop_drag_for, crop_from_points,
+        custom_size_axis, custom_size_bounds, custom_size_initial, custom_size_result,
+        custom_size_value, deliver_ocr, final_size, freehand_length, join_words, layout_controls,
+        move_crop, nearest_word, output_max_edge_after_custom_size_cancel, output_size_summary,
+        persist_and_copy_with, preview_draw_geometry, preview_sources, preview_target_edge,
+        redacted, render_final, resize_crop, share_upload_idle, start_share_upload, tab_for_digit,
+        tool_after_pick, translate_ann, Crop, CropDrag, Ctl, CustomInput, CustomSizeEdit,
+        FinishError, History, OcrCompletion, TextInput, TextSelect, ASPECTS, CROP_TOOL,
+        HISTORY_LIMIT, MIN_CROP, TOOLS,
     };
     use image::{Rgba, RgbaImage};
     use windows::Win32::Foundation::RECT;
@@ -4766,13 +5068,26 @@ mod tests {
     #[test]
     fn preview_fills_the_workspace_and_padding_drag_quality_does_not_shrink_it() {
         for preview_box in [
-            RECT { left: 0, top: 0, right: 1200, bottom: 800 },
-            RECT { left: 50, top: 25, right: 750, bottom: 525 },
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1200,
+                bottom: 800,
+            },
+            RECT {
+                left: 50,
+                top: 25,
+                right: 750,
+                bottom: 525,
+            },
         ] {
             let full = preview_draw_geometry(preview_box, 960, 600, 1.0);
             let draft = preview_draw_geometry(preview_box, 480, 300, 2.0);
 
-            assert_eq!((draft.0, draft.1, draft.3, draft.4), (full.0, full.1, full.3, full.4));
+            assert_eq!(
+                (draft.0, draft.1, draft.3, draft.4),
+                (full.0, full.1, full.3, full.4)
+            );
             assert!((draft.2 - full.2 * 2.0).abs() < f32::EPSILON);
 
             let available_width = preview_box.right - preview_box.left;
@@ -4792,10 +5107,13 @@ mod tests {
         if first_idle {
             saved.push(1);
         }
-        assert!(first_idle && start_share_upload(&mut pending_share, || {
-            uploads.push(1);
-            1
-        }));
+        assert!(
+            first_idle
+                && start_share_upload(&mut pending_share, || {
+                    uploads.push(1);
+                    1
+                })
+        );
         let second_idle = share_upload_idle(pending_share);
         if second_idle {
             saved.push(2);
@@ -4896,14 +5214,21 @@ mod tests {
     use crate::annotate::{Annotation, Shape, TextStyle};
 
     fn word(text: &str, line: usize, rect: (f32, f32, f32, f32)) -> crate::ocr::Word {
-        crate::ocr::Word { text: text.into(), rect, line }
+        crate::ocr::Word {
+            text: text.into(),
+            rect,
+            line,
+        }
     }
 
     #[test]
     fn undo_restores_the_state_from_before_each_edit() {
         let mut history = History::default();
         let one = vec![blur((0.0, 0.0), (10.0, 10.0))];
-        let two = vec![blur((0.0, 0.0), (10.0, 10.0)), blur((5.0, 5.0), (20.0, 20.0))];
+        let two = vec![
+            blur((0.0, 0.0), (10.0, 10.0)),
+            blur((5.0, 5.0), (20.0, 20.0)),
+        ];
 
         history.push(&[], 1, None);
         history.push(&one, 1, None);
@@ -4980,17 +5305,13 @@ mod tests {
         // Past 1366x768 the captions above the output block lose their room,
         // which is cosmetic. Buttons landing on top of each other would not
         // be, so that is the line that has to hold all the way down.
-        for (screen_w, screen_h, scale) in
-            [(1280, 720, 1.0), (1920, 1080, 1.5), (1024, 768, 1.0)]
-        {
+        for (screen_w, screen_h, scale) in [(1280, 720, 1.0), (1920, 1080, 1.5), (1024, 768, 1.0)] {
             let (cw, ch) = client_for_screen(screen_w, screen_h, scale);
             let layout = layout_controls(scale, cw, ch, 7);
             let action_top = layout
                 .controls
                 .iter()
-                .filter(|(_, control)| {
-                    matches!(control, Ctl::OutputSize(_) | Ctl::CustomSize)
-                })
+                .filter(|(_, control)| matches!(control, Ctl::OutputSize(_) | Ctl::CustomSize))
                 .map(|(rect, _)| rect.top)
                 .min()
                 .expect("the output-size row exists");
@@ -5006,9 +5327,12 @@ mod tests {
         // Narrowing the matte grid buys a row back on a small display, but the
         // chips have to hold names like "Adaptive". Anything with room keeps
         // the two-abreast grid, so this is never paid for by an ordinary user.
-        for (screen_w, screen_h, scale) in
-            [(1920, 1080, 1.0), (1920, 1080, 1.25), (2560, 1440, 1.0), (1600, 900, 1.0)]
-        {
+        for (screen_w, screen_h, scale) in [
+            (1920, 1080, 1.0),
+            (1920, 1080, 1.25),
+            (2560, 1440, 1.0),
+            (1600, 900, 1.0),
+        ] {
             let (cw, ch) = client_for_screen(screen_w, screen_h, scale);
             let layout = layout_controls(scale, cw, ch, 7);
             let widest = layout
@@ -5052,7 +5376,10 @@ mod tests {
             .max()
             .unwrap();
 
-        assert!(matte.top >= tight.tab_strip.bottom + line, "MATTE label has no line");
+        assert!(
+            matte.top >= tight.tab_strip.bottom + line,
+            "MATTE label has no line"
+        );
         assert!(
             tight.padding_slider.top >= last_matte + line,
             "PADDING label runs into the matte chips"
@@ -5063,7 +5390,10 @@ mod tests {
         );
         // Crop sits between them and is what ANNOTATE has to clear.
         let crop = first(|c| matches!(c, Ctl::Crop));
-        assert!(tool.top >= crop.bottom + line, "ANNOTATE label runs into the crop button");
+        assert!(
+            tool.top >= crop.bottom + line,
+            "ANNOTATE label runs into the crop button"
+        );
     }
 
     #[test]
@@ -5092,18 +5422,14 @@ mod tests {
             let column_bottom = layout
                 .controls
                 .iter()
-                .filter(|(_, control)| {
-                    matches!(control, Ctl::Size(_) | Ctl::Color(_) | Ctl::Clear)
-                })
+                .filter(|(_, control)| matches!(control, Ctl::Size(_) | Ctl::Color(_) | Ctl::Clear))
                 .map(|(rect, _)| rect.bottom)
                 .max()
                 .expect("the palette rows exist");
             let action_top = layout
                 .controls
                 .iter()
-                .filter(|(_, control)| {
-                    matches!(control, Ctl::OutputSize(_) | Ctl::CustomSize)
-                })
+                .filter(|(_, control)| matches!(control, Ctl::OutputSize(_) | Ctl::CustomSize))
                 .map(|(rect, _)| rect.top)
                 .min()
                 .expect("the output-size row exists");
@@ -5122,10 +5448,26 @@ mod tests {
     fn a_swept_crop_normalizes_and_stays_inside_the_capture() {
         // Dragged up and to the left, and off the edge of the capture.
         let crop = crop_from_points((900.0, 700.0), (-50.0, -30.0), 1000, 800);
-        assert_eq!(crop, Crop { x: 0, y: 0, w: 900, h: 700 });
+        assert_eq!(
+            crop,
+            Crop {
+                x: 0,
+                y: 0,
+                w: 900,
+                h: 700
+            }
+        );
 
         let crop = crop_from_points((600.0, 400.0), (2000.0, 2000.0), 1000, 800);
-        assert_eq!(crop, Crop { x: 600, y: 400, w: 400, h: 400 });
+        assert_eq!(
+            crop,
+            Crop {
+                x: 600,
+                y: 400,
+                w: 400,
+                h: 400
+            }
+        );
 
         // A flick rather than a drag gives a small crop, not an empty one, and
         // is nudged back inside rather than hanging off the far edge.
@@ -5136,34 +5478,92 @@ mod tests {
 
     #[test]
     fn dragging_a_crop_into_an_edge_stops_it_instead_of_resizing_it() {
-        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        let crop = Crop {
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 300,
+        };
         let moved = move_crop(crop, 50.0, -40.0, 1000, 800);
-        assert_eq!(moved, Crop { x: 150, y: 60, w: 400, h: 300 });
+        assert_eq!(
+            moved,
+            Crop {
+                x: 150,
+                y: 60,
+                w: 400,
+                h: 300
+            }
+        );
 
         // Pushed hard into the bottom-right: it parks against the edge with
         // its size intact.
         let pinned = move_crop(crop, 9000.0, 9000.0, 1000, 800);
-        assert_eq!(pinned, Crop { x: 600, y: 500, w: 400, h: 300 });
+        assert_eq!(
+            pinned,
+            Crop {
+                x: 600,
+                y: 500,
+                w: 400,
+                h: 300
+            }
+        );
         let pinned = move_crop(crop, -9000.0, -9000.0, 1000, 800);
-        assert_eq!(pinned, Crop { x: 0, y: 0, w: 400, h: 300 });
+        assert_eq!(
+            pinned,
+            Crop {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 300
+            }
+        );
     }
 
     #[test]
     fn resizing_a_crop_pins_the_opposite_corner_and_survives_crossing_it() {
-        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        let crop = Crop {
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 300,
+        };
         // Corner 0 is the top-left; the bottom-right at (500, 400) must not
         // move while it is dragged.
         let (resized, held) = resize_crop(crop, 0, (200.0, 250.0), 1000, 800);
-        assert_eq!(resized, Crop { x: 200, y: 250, w: 300, h: 150 });
+        assert_eq!(
+            resized,
+            Crop {
+                x: 200,
+                y: 250,
+                w: 300,
+                h: 150
+            }
+        );
         assert_eq!(held, 0);
 
         // Dragged past the pinned corner, the grabbed handle becomes the
         // bottom-right one, so the next move still pins (500, 400).
         let (crossed, held) = resize_crop(crop, 0, (700.0, 600.0), 1000, 800);
-        assert_eq!(crossed, Crop { x: 500, y: 400, w: 200, h: 200 });
+        assert_eq!(
+            crossed,
+            Crop {
+                x: 500,
+                y: 400,
+                w: 200,
+                h: 200
+            }
+        );
         assert_eq!(held, 2);
         let (again, _) = resize_crop(crossed, held, (800.0, 700.0), 1000, 800);
-        assert_eq!(again, Crop { x: 500, y: 400, w: 300, h: 300 });
+        assert_eq!(
+            again,
+            Crop {
+                x: 500,
+                y: 400,
+                w: 300,
+                h: 300
+            }
+        );
 
         assert_eq!(corner_index((0.0, 0.0), (10.0, 10.0)), 0);
         assert_eq!(corner_index((20.0, 0.0), (10.0, 10.0)), 1);
@@ -5173,7 +5573,12 @@ mod tests {
 
     #[test]
     fn a_press_on_the_crop_picks_the_handle_before_the_interior() {
-        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        let crop = Crop {
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 300,
+        };
         // Right on the bottom-right corner, which is also inside the rect: the
         // handle has to win or a full-frame crop could never be resized.
         assert!(crop_contains(crop, (500.0, 400.0)));
@@ -5207,7 +5612,12 @@ mod tests {
             crop_drag_for(full, (2.0, 3.0), 8.0, 1000, 800),
             CropDrag::Corner(0)
         ));
-        let narrowed = Crop { x: 0, y: 0, w: 999, h: 800 };
+        let narrowed = Crop {
+            x: 0,
+            y: 0,
+            w: 999,
+            h: 800,
+        };
         assert!(matches!(
             crop_drag_for(narrowed, (400.0, 300.0), 8.0, 1000, 800),
             CropDrag::Move(_)
@@ -5222,9 +5632,13 @@ mod tests {
         for y in 0..300 {
             raw.put_pixel(250, y, Rgba([0, 255, 0, 255]));
         }
-        let crop = Crop { x: 200, y: 100, w: 120, h: 90 };
-        let content =
-            image::imageops::crop_imm(&raw, crop.x, crop.y, crop.w, crop.h).to_image();
+        let crop = Crop {
+            x: 200,
+            y: 100,
+            w: 120,
+            h: 90,
+        };
+        let content = image::imageops::crop_imm(&raw, crop.x, crop.y, crop.w, crop.h).to_image();
         let plain = crate::style::Style {
             name: "Plain",
             backdrop: crate::style::Backdrop::Plain,
@@ -5409,7 +5823,15 @@ mod tests {
             2,
             crate::output::OUTPUT_ORIGINAL,
         );
-        let shown = final_size(400, 225, true, 0.14, None, 2, crate::output::OUTPUT_ORIGINAL);
+        let shown = final_size(
+            400,
+            225,
+            true,
+            0.14,
+            None,
+            2,
+            crate::output::OUTPUT_ORIGINAL,
+        );
         assert_eq!(shown, (800, 450));
         assert_eq!(shown, copy.dimensions());
     }
@@ -5417,14 +5839,25 @@ mod tests {
     #[test]
     fn confirming_custom_size_from_plain_original_keeps_the_supersampled_export() {
         let raw = RgbaImage::from_pixel(400, 225, Rgba([24, 32, 48, 255]));
-        let shown = final_size(400, 225, true, 0.14, None, 2, crate::output::OUTPUT_ORIGINAL);
+        let shown = final_size(
+            400,
+            225,
+            true,
+            0.14,
+            None,
+            2,
+            crate::output::OUTPUT_ORIGINAL,
+        );
         let scale = crate::compose::export_super_scale(400, 225, 2);
         let composed = (400 * scale, 225 * scale);
         assert_eq!(shown, (800, 450));
         assert_eq!(composed, shown);
         let committed = custom_size_initial(0, composed, shown);
         assert_eq!(committed, 800);
-        assert_eq!(custom_size_value(&committed.to_string(), composed), Some(800));
+        assert_eq!(
+            custom_size_value(&committed.to_string(), composed),
+            Some(800)
+        );
         let confirmed = render_final(
             &raw,
             &[],
@@ -5477,26 +5910,72 @@ mod tests {
         // outside the picture: the helpers clamp, so the rectangle tracks up to
         // the edge instead of freezing where the cursor crossed it.
         let far_below_right = crop_from_points((400.0, 300.0), (99_999.0, 99_999.0), 1000, 800);
-        assert_eq!(far_below_right, Crop { x: 400, y: 300, w: 600, h: 500 });
+        assert_eq!(
+            far_below_right,
+            Crop {
+                x: 400,
+                y: 300,
+                w: 600,
+                h: 500
+            }
+        );
 
         let far_above_left = crop_from_points((400.0, 300.0), (-99_999.0, -99_999.0), 1000, 800);
-        assert_eq!(far_above_left, Crop { x: 0, y: 0, w: 400, h: 300 });
+        assert_eq!(
+            far_above_left,
+            Crop {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 300
+            }
+        );
 
         // Same for the two drags that adjust an existing frame.
-        let crop = Crop { x: 100, y: 100, w: 400, h: 300 };
+        let crop = Crop {
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 300,
+        };
         let (resized, _) = resize_crop(crop, 0, (-5_000.0, -5_000.0), 1000, 800);
-        assert_eq!(resized, Crop { x: 0, y: 0, w: 500, h: 400 });
+        assert_eq!(
+            resized,
+            Crop {
+                x: 0,
+                y: 0,
+                w: 500,
+                h: 400
+            }
+        );
         assert_eq!(
             move_crop(crop, 50_000.0, 50_000.0, 1000, 800),
-            Crop { x: 600, y: 500, w: 400, h: 300 }
+            Crop {
+                x: 600,
+                y: 500,
+                w: 400,
+                h: 300
+            }
         );
     }
 
     #[test]
     fn a_crop_covering_everything_reads_as_no_crop() {
         assert!(Crop::full(1000, 800).is_full(1000, 800));
-        assert!(!Crop { x: 0, y: 0, w: 999, h: 800 }.is_full(1000, 800));
-        assert!(!Crop { x: 1, y: 0, w: 999, h: 800 }.is_full(1000, 800));
+        assert!(!Crop {
+            x: 0,
+            y: 0,
+            w: 999,
+            h: 800
+        }
+        .is_full(1000, 800));
+        assert!(!Crop {
+            x: 1,
+            y: 0,
+            w: 999,
+            h: 800
+        }
+        .is_full(1000, 800));
     }
 
     #[test]
@@ -5507,9 +5986,17 @@ mod tests {
         assert_eq!(CROP_TOOL, TOOLS.len());
         assert!(TOOLS.get(CROP_TOOL).is_none());
         for shape in [
-            Shape::Arrow { from: (0.0, 0.0), to: (1.0, 1.0) },
-            Shape::Text { pos: (0.0, 0.0), text: String::new() },
-            Shape::Freehand { points: vec![(0.0, 0.0)] },
+            Shape::Arrow {
+                from: (0.0, 0.0),
+                to: (1.0, 1.0),
+            },
+            Shape::Text {
+                pos: (0.0, 0.0),
+                text: String::new(),
+            },
+            Shape::Freehand {
+                points: vec![(0.0, 0.0)],
+            },
         ] {
             assert!(annotation_tool_index(&shape) < CROP_TOOL);
         }
@@ -5532,8 +6019,14 @@ mod tests {
 
         // Between the aspect presets and the annotation grid — the group that
         // decides the shape of the picture, not the marks on it.
-        assert!(crop.top >= last_aspect.bottom, "crop must follow the aspect presets");
-        assert!(crop.bottom <= first_tool.top, "crop must precede the annotation tools");
+        assert!(
+            crop.top >= last_aspect.bottom,
+            "crop must follow the aspect presets"
+        );
+        assert!(
+            crop.bottom <= first_tool.top,
+            "crop must precede the annotation tools"
+        );
         // Full column width, so it reads as its own mode rather than a tenth
         // chip stranded on a row of three.
         assert_eq!(crop.left, rect(Ctl::Aspect(0)).left);
@@ -5608,7 +6101,10 @@ mod tests {
 
         // Other annotation kinds never hide text.
         let boxed = [Annotation {
-            shape: Shape::Rect { a: (90.0, 90.0), b: (210.0, 130.0) },
+            shape: Shape::Rect {
+                a: (90.0, 90.0),
+                b: (210.0, 130.0),
+            },
             ..blur((0.0, 0.0), (0.0, 0.0))
         }];
         assert!(!redacted(&boxed, &covered));
@@ -5642,7 +6138,10 @@ mod tests {
         let mut a = pending_select(1);
         let mut b = pending_select(2);
 
-        assert!(deliver_ocr([(1, &mut a), (2, &mut b)], ocr_ok(2, 2, "b-word")));
+        assert!(deliver_ocr(
+            [(1, &mut a), (2, &mut b)],
+            ocr_ok(2, 2, "b-word")
+        ));
         let b_select = b.as_ref().unwrap();
         assert!(!b_select.pending);
         assert_eq!(b_select.words[0].text, "b-word");
@@ -5650,7 +6149,10 @@ mod tests {
         assert!(a.as_ref().unwrap().pending);
         assert!(a.as_ref().unwrap().words.is_empty());
 
-        assert!(deliver_ocr([(1, &mut a), (2, &mut b)], ocr_ok(1, 1, "a-word")));
+        assert!(deliver_ocr(
+            [(1, &mut a), (2, &mut b)],
+            ocr_ok(1, 1, "a-word")
+        ));
         assert_eq!(a.as_ref().unwrap().words[0].text, "a-word");
         assert_eq!(b.as_ref().unwrap().words[0].text, "b-word");
     }
@@ -5750,10 +6252,19 @@ mod tests {
         assert_eq!(edit.input, "1920");
         assert!(!edit.replace_on_type);
         assert!(!edit.invalid);
-        assert_eq!(apply_custom_size_input(&mut edit, '\u{8}'), CustomInput::Changed);
+        assert_eq!(
+            apply_custom_size_input(&mut edit, '\u{8}'),
+            CustomInput::Changed
+        );
         assert_eq!(edit.input, "192");
-        assert_eq!(apply_custom_size_input(&mut edit, 'x'), CustomInput::Ignored);
-        assert_eq!(apply_custom_size_input(&mut edit, '\r'), CustomInput::Commit);
+        assert_eq!(
+            apply_custom_size_input(&mut edit, 'x'),
+            CustomInput::Ignored
+        );
+        assert_eq!(
+            apply_custom_size_input(&mut edit, '\r'),
+            CustomInput::Commit
+        );
     }
 
     #[test]
@@ -5775,43 +6286,77 @@ mod tests {
     #[test]
     fn every_annotation_shape_opens_the_matching_property_tool() {
         assert_eq!(
-            annotation_tool_index(&Shape::Arrow { from: (0.0, 0.0), to: (1.0, 1.0) }),
+            annotation_tool_index(&Shape::Arrow {
+                from: (0.0, 0.0),
+                to: (1.0, 1.0)
+            }),
             0
         );
         assert_eq!(
-            annotation_tool_index(&Shape::Line { from: (0.0, 0.0), to: (1.0, 1.0) }),
+            annotation_tool_index(&Shape::Line {
+                from: (0.0, 0.0),
+                to: (1.0, 1.0)
+            }),
             1
         );
         assert_eq!(
-            annotation_tool_index(&Shape::Rect { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            annotation_tool_index(&Shape::Rect {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
             2
         );
         assert_eq!(
-            annotation_tool_index(&Shape::Ellipse { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            annotation_tool_index(&Shape::Ellipse {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
             3
         );
         assert_eq!(
-            annotation_tool_index(&Shape::Highlight { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            annotation_tool_index(&Shape::Highlight {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
             4
         );
         assert_eq!(
-            annotation_tool_index(&Shape::Text { pos: (0.0, 0.0), text: String::new() }),
+            annotation_tool_index(&Shape::Text {
+                pos: (0.0, 0.0),
+                text: String::new()
+            }),
             5
         );
         assert_eq!(
-            annotation_tool_index(&Shape::Blur { a: (0.0, 0.0), b: (1.0, 1.0) }),
+            annotation_tool_index(&Shape::Blur {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
             6
         );
-        assert_eq!(annotation_tool_index(&Shape::Counter { pos: (0.0, 0.0), n: 1 }), 7);
         assert_eq!(
-            annotation_tool_index(&Shape::Freehand { points: vec![(0.0, 0.0), (1.0, 1.0)] }),
+            annotation_tool_index(&Shape::Counter {
+                pos: (0.0, 0.0),
+                n: 1
+            }),
+            7
+        );
+        assert_eq!(
+            annotation_tool_index(&Shape::Freehand {
+                points: vec![(0.0, 0.0), (1.0, 1.0)]
+            }),
             8
         );
     }
 
     #[test]
     fn the_preview_source_matches_the_pane_and_never_upscales() {
-        let pane = |w: i32, h: i32| RECT { left: 0, top: 0, right: w, bottom: h };
+        let pane = |w: i32, h: i32| RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
 
         // The pane drives it, so a large monitor gets a sharp preview instead
         // of a stretched one. This is the case that was visibly soft: a 2862px
@@ -5965,9 +6510,27 @@ mod tests {
             .collect();
         assert_eq!(aspects.len(), ASPECTS.len());
         assert_eq!(tools.len(), TOOLS.len());
-        assert_eq!(aspects.iter().filter(|(rect, _)| rect.top == aspects[0].0.top).count(), 3);
-        assert_eq!(tools.iter().filter(|(rect, _)| rect.top == tools[0].0.top).count(), 3);
-        assert_eq!(tools.iter().filter(|(rect, _)| rect.top == tools[8].0.top).count(), 3);
+        assert_eq!(
+            aspects
+                .iter()
+                .filter(|(rect, _)| rect.top == aspects[0].0.top)
+                .count(),
+            3
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|(rect, _)| rect.top == tools[0].0.top)
+                .count(),
+            3
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|(rect, _)| rect.top == tools[8].0.top)
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -6021,4 +6584,3 @@ mod tests {
         }
     }
 }
-

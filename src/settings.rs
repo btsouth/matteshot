@@ -32,8 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SIZE, WM_SYSKEYDOWN, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU,
-    WS_VISIBLE,
+    WM_SIZE, WM_SYSKEYDOWN, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -459,9 +459,7 @@ fn hit_test_control(controls: &[(RECT, Ctrl)], x: i32, y: i32, scroll_y: i32) ->
     let content_y = y + scroll_y;
     controls
         .iter()
-        .position(|(r, _)| {
-            x >= r.left && x < r.right && content_y >= r.top && content_y < r.bottom
-        })
+        .position(|(r, _)| x >= r.left && x < r.right && content_y >= r.top && content_y < r.bottom)
         .map(|i| i as i32)
         .unwrap_or(-1)
 }
@@ -1888,10 +1886,9 @@ pub fn is_open() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_layout, chip_focus_ring_visible, fit_equal_row,
-        fit_settings_window, hit_test_control, key_activates_focus, layout_to_work, max_scroll,
-        next_reachable, reachable_index, scroll_rect_into_view, Ctrl, WorkRect, LOGICAL_WIDTH,
-        MIN_VISIBLE_CLIENT,
+        build_layout, chip_focus_ring_visible, fit_equal_row, fit_settings_window,
+        hit_test_control, key_activates_focus, layout_to_work, max_scroll, next_reachable,
+        reachable_index, scroll_rect_into_view, Ctrl, WorkRect, LOGICAL_WIDTH, MIN_VISIBLE_CLIENT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_SPACE};
 
@@ -2086,8 +2083,16 @@ mod tests {
             assert_eq!(focus, expected);
         }
         assert_eq!(next_reachable(&laid.controls, focus, false), 0, "Tab wraps");
-        assert_eq!(next_reachable(&laid.controls, -1, true), n - 1, "Shift+Tab starts at the end");
-        assert_eq!(next_reachable(&laid.controls, 0, true), n - 1, "Shift+Tab wraps");
+        assert_eq!(
+            next_reachable(&laid.controls, -1, true),
+            n - 1,
+            "Shift+Tab starts at the end"
+        );
+        assert_eq!(
+            next_reachable(&laid.controls, 0, true),
+            n - 1,
+            "Shift+Tab wraps"
+        );
         assert_eq!(next_reachable(&[], -1, false), -1);
     }
 

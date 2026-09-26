@@ -258,7 +258,10 @@ mod tests {
         assert_eq!(target_from(&config(None, None)), None);
         assert_eq!(target_from(&config(Some("https://s.example"), None)), None);
         assert_eq!(target_from(&config(None, Some("secret"))), None);
-        assert_eq!(target_from(&config(Some("https://s.example"), Some("  "))), None);
+        assert_eq!(
+            target_from(&config(Some("https://s.example"), Some("  "))),
+            None
+        );
         assert_eq!(
             target_from(&config(Some("https://s.example"), Some("line\nbreak"))),
             None
@@ -321,11 +324,7 @@ mod tests {
             }),
             "History/tweak used to spawn here"
         );
-        assert_eq!(
-            pending,
-            Some(1),
-            "a second click overwrote pending_share"
-        );
+        assert_eq!(pending, Some(1), "a second click overwrote pending_share");
         assert_eq!(started, [1], "a second click started another upload");
         // accept_completion still only drops a stale UI result — that is
         // not the cancel path, and must not be treated as one.

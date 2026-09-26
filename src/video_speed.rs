@@ -50,7 +50,11 @@ impl TimeMap {
             previous_end = range.end;
         }
 
-        Ok(Self { start, end, ranges: clipped })
+        Ok(Self {
+            start,
+            end,
+            ranges: clipped,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -180,11 +184,6 @@ mod tests {
             ],
         )
         .is_err());
-        assert!(TimeMap::new(
-            0,
-            10 * SECOND,
-            &[SpeedRange::new(SECOND, 2 * SECOND, 3)],
-        )
-        .is_err());
+        assert!(TimeMap::new(0, 10 * SECOND, &[SpeedRange::new(SECOND, 2 * SECOND, 3)],).is_err());
     }
 }

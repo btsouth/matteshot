@@ -11,7 +11,7 @@ use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ScreenToClient, SetBkMode, SelectObject,
+    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ScreenToClient, SelectObject, SetBkMode,
     SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
     FF_DONTCARE, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT, TRANSPARENT,
 };
@@ -46,7 +46,10 @@ impl Target {
         }
         Self::Window(
             hwnd,
-            POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 },
+            POINT {
+                x: (r.left + r.right) / 2,
+                y: (r.top + r.bottom) / 2,
+            },
         )
     }
 }
@@ -155,10 +158,22 @@ const STOP_B: i32 = 34;
 fn pill_origin(work: RECT, w: i32, h: i32, gap: i32, anchor: POINT) -> POINT {
     let cx = work.left + (work.right - work.left - w) / 2;
     let candidates = [
-        POINT { x: cx, y: work.top + gap },
-        POINT { x: cx, y: work.bottom - gap - h },
-        POINT { x: work.left + gap, y: work.top + gap },
-        POINT { x: work.right - gap - w, y: work.top + gap },
+        POINT {
+            x: cx,
+            y: work.top + gap,
+        },
+        POINT {
+            x: cx,
+            y: work.bottom - gap - h,
+        },
+        POINT {
+            x: work.left + gap,
+            y: work.top + gap,
+        },
+        POINT {
+            x: work.right - gap - w,
+            y: work.top + gap,
+        },
     ];
     let home = candidates[0];
     candidates
@@ -255,7 +270,16 @@ unsafe extern "system" fn pill_proc(
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 let bg = CreateSolidBrush(p.theme.panel);
-                FillRect(hdc, &RECT { left: 0, top: 0, right: p.w, bottom: p.h }, bg);
+                FillRect(
+                    hdc,
+                    &RECT {
+                        left: 0,
+                        top: 0,
+                        right: p.w,
+                        bottom: p.h,
+                    },
+                    bg,
+                );
                 let _ = DeleteObject(bg);
                 SetBkMode(hdc, TRANSPARENT);
 
@@ -274,17 +298,38 @@ unsafe extern "system" fn pill_proc(
                 let fill = CreateSolidBrush(if hot { p.theme.accent } else { p.theme.chip });
                 FillRect(hdc, &p.stop_rect, fill);
                 let _ = DeleteObject(fill);
-                SetTextColor(hdc, if hot { p.theme.accent_text } else { p.theme.text });
+                SetTextColor(
+                    hdc,
+                    if hot {
+                        p.theme.accent_text
+                    } else {
+                        p.theme.text
+                    },
+                );
                 let mut stop = wide("Stop");
                 let mut sr = p.stop_rect;
-                DrawTextW(hdc, &mut stop, &mut sr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                DrawTextW(
+                    hdc,
+                    &mut stop,
+                    &mut sr,
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
 
                 SelectObject(hdc, p.font_small);
                 SetTextColor(hdc, p.theme.faint);
                 let mut hint = p.hint.clone();
-                let mut hr =
-                    RECT { left: 0, top: p.stop_rect.bottom, right: p.w, bottom: p.h };
-                DrawTextW(hdc, &mut hint, &mut hr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                let mut hr = RECT {
+                    left: 0,
+                    top: p.stop_rect.bottom,
+                    right: p.w,
+                    bottom: p.h,
+                };
+                DrawTextW(
+                    hdc,
+                    &mut hint,
+                    &mut hr,
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
 
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -548,7 +593,10 @@ fn grab(target: Target) -> Result<RgbaImage> {
                 (r.left - mi.rcMonitor.left).max(0) as u32,
                 (r.top - mi.rcMonitor.top).max(0) as u32,
             );
-            let (w, h) = ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32);
+            let (w, h) = (
+                (r.right - r.left).max(1) as u32,
+                (r.bottom - r.top).max(1) as u32,
+            );
             Ok(image::imageops::crop_imm(
                 &full,
                 x.min(full.width().saturating_sub(1)),
@@ -578,8 +626,14 @@ fn clamp_anchor(anchor: POINT, rect: RECT) -> POINT {
 fn edge_anchor(rect: RECT, current: POINT) -> POINT {
     let width = (rect.right - rect.left).max(1);
     let inset = (width / 32).clamp(24, 64);
-    let right = POINT { x: rect.right - inset, y: current.y };
-    let left = POINT { x: rect.left + inset, y: current.y };
+    let right = POINT {
+        x: rect.right - inset,
+        y: current.y,
+    };
+    let left = POINT {
+        x: rect.left + inset,
+        y: current.y,
+    };
     let candidate = if (current.x - right.x).abs() > (current.x - left.x).abs() {
         right
     } else {
@@ -655,12 +709,7 @@ fn paint_scrollbar_track(image: &mut RgbaImage, track: &[Rgba<u8>]) {
     }
 }
 
-fn paint_final_scrollbar(
-    canvas: &mut RgbaImage,
-    frame: &RgbaImage,
-    width: u32,
-    view_top: u32,
-) {
+fn paint_final_scrollbar(canvas: &mut RgbaImage, frame: &RgbaImage, width: u32, view_top: u32) {
     let width = width.min(canvas.width()).min(frame.width());
     let available = frame.height().saturating_sub(view_top);
     let height = available.min(canvas.height());
@@ -673,7 +722,11 @@ fn paint_final_scrollbar(
     let frame_y = frame.height() - height;
     for y in 0..height {
         for x in 0..width {
-            canvas.put_pixel(canvas_x + x, canvas_y + y, *frame.get_pixel(frame_x + x, frame_y + y));
+            canvas.put_pixel(
+                canvas_x + x,
+                canvas_y + y,
+                *frame.get_pixel(frame_x + x, frame_y + y),
+            );
         }
     }
 }
@@ -789,7 +842,12 @@ fn motion(
     let idle = viewport_diff(prev, next, view_top, view_bottom);
     let (shift, score, ceiling) =
         measure_shift(prev, next, frame_height / 2, view_top, view_bottom);
-    Motion { idle, shift, score, ceiling }
+    Motion {
+        idle,
+        shift,
+        score,
+        ceiling,
+    }
 }
 
 fn stitchable(m: Motion, last_shift: Option<u32>) -> bool {
@@ -1127,8 +1185,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
             }
             chrome = Some((t, b));
             if scrollbar_width > 0 {
-                scrollbar_track_colors =
-                    Some(scrollbar_track(&first, scrollbar_width, t, fh - b));
+                scrollbar_track_colors = Some(scrollbar_track(&first, scrollbar_width, t, fh - b));
             }
             // Drop the footer from the frame already on the canvas.
             if b > 0 {
@@ -1214,7 +1271,11 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
         steps,
         canvas.width(),
         canvas.height(),
-        if stopped { " (stopped by the user)" } else { "" }
+        if stopped {
+            " (stopped by the user)"
+        } else {
+            ""
+        }
     );
     Ok(canvas)
 }
@@ -1251,7 +1312,11 @@ mod tests {
         let measured = motion(&previous, &next, 160, 0, 160);
 
         assert_eq!(measured.shift, 18);
-        assert!(measured.score < 0.01, "unexpected match score: {}", measured.score);
+        assert!(
+            measured.score < 0.01,
+            "unexpected match score: {}",
+            measured.score
+        );
         assert!(measured.score < measured.idle * 0.5);
         assert!(stitchable(measured, None));
     }
@@ -1261,10 +1326,18 @@ mod tests {
         let frame = row_markers(96, 160);
         assert!(!stitchable(motion(&frame, &frame, 160, 0, 160), None));
 
-        let weak = Motion { idle: 20.0, shift: 16, score: 12.0, ceiling: 80 };
+        let weak = Motion {
+            idle: 20.0,
+            shift: 16,
+            score: 12.0,
+            ceiling: 80,
+        };
         assert!(!stitchable(weak, None));
 
-        let consistent = Motion { score: 10.0, ..weak };
+        let consistent = Motion {
+            score: 10.0,
+            ..weak
+        };
         assert!(stitchable(consistent, Some(16)));
     }
 
@@ -1291,16 +1364,28 @@ mod tests {
         assert!(Outcome::Stopped.into_error().is_none());
         assert!(Outcome::Limit(SafetyLimit::Steps).into_error().is_some());
         assert!(Outcome::Limit(SafetyLimit::Height).into_error().is_some());
-        assert!(Outcome::Failed(anyhow::anyhow!("boom")).into_error().is_some());
+        assert!(Outcome::Failed(anyhow::anyhow!("boom"))
+            .into_error()
+            .is_some());
     }
 
     #[test]
     fn the_pill_never_parks_on_the_point_the_wheel_is_sent_to() {
-        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
         let (w, h, gap) = (300, 58, 40);
         let covers = |o: POINT, p: POINT| {
             in_rect(
-                &RECT { left: o.x, top: o.y, right: o.x + w, bottom: o.y + h },
+                &RECT {
+                    left: o.x,
+                    top: o.y,
+                    right: o.x + w,
+                    bottom: o.y + h,
+                },
                 p,
             )
         };
@@ -1311,7 +1396,10 @@ mod tests {
         // Everywhere else it stays where it has always been.
         assert_eq!(
             pill_origin(work, w, h, gap, POINT { x: 400, y: 700 }),
-            POINT { x: (1920 - w) / 2, y: gap }
+            POINT {
+                x: (1920 - w) / 2,
+                y: gap
+            }
         );
         // The whole row is cleared, not just the point. The anchor only ever
         // moves horizontally, so a placement that dodges the initial x but
@@ -1369,22 +1457,52 @@ mod tests {
 
     #[test]
     fn scroll_anchor_stays_at_the_users_point() {
-        let rect = RECT { left: 100, top: 200, right: 500, bottom: 700 };
-        assert_eq!(clamp_anchor(POINT { x: 240, y: 360 }, rect), POINT { x: 240, y: 360 });
+        let rect = RECT {
+            left: 100,
+            top: 200,
+            right: 500,
+            bottom: 700,
+        };
+        assert_eq!(
+            clamp_anchor(POINT { x: 240, y: 360 }, rect),
+            POINT { x: 240, y: 360 }
+        );
     }
 
     #[test]
     fn scroll_anchor_is_kept_inside_the_capture_target() {
-        let rect = RECT { left: 100, top: 200, right: 500, bottom: 700 };
-        assert_eq!(clamp_anchor(POINT { x: 900, y: 900 }, rect), POINT { x: 499, y: 699 });
-        assert_eq!(clamp_anchor(POINT { x: 20, y: 40 }, rect), POINT { x: 100, y: 200 });
+        let rect = RECT {
+            left: 100,
+            top: 200,
+            right: 500,
+            bottom: 700,
+        };
+        assert_eq!(
+            clamp_anchor(POINT { x: 900, y: 900 }, rect),
+            POINT { x: 499, y: 699 }
+        );
+        assert_eq!(
+            clamp_anchor(POINT { x: 20, y: 40 }, rect),
+            POINT { x: 100, y: 200 }
+        );
     }
 
     #[test]
     fn recovery_moves_to_the_far_window_edge() {
-        let rect = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
-        assert_eq!(edge_anchor(rect, POINT { x: 600, y: 700 }), POINT { x: 1860, y: 700 });
-        assert_eq!(edge_anchor(rect, POINT { x: 1500, y: 700 }), POINT { x: 60, y: 700 });
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert_eq!(
+            edge_anchor(rect, POINT { x: 600, y: 700 }),
+            POINT { x: 1860, y: 700 }
+        );
+        assert_eq!(
+            edge_anchor(rect, POINT { x: 1500, y: 700 }),
+            POINT { x: 60, y: 700 }
+        );
     }
 
     #[test]
@@ -1430,7 +1548,10 @@ mod tests {
         assert_eq!(canvas.width(), 8);
         assert_eq!(*canvas.get_pixel(7, 9), Rgba([10, 10, 10, 255]));
         for y in 0..6 {
-            assert_eq!(*canvas.get_pixel(7, 10 + y), Rgba([102 + y as u8, 0, 0, 255]));
+            assert_eq!(
+                *canvas.get_pixel(7, 10 + y),
+                Rgba([102 + y as u8, 0, 0, 255])
+            );
         }
     }
 }

@@ -57,7 +57,11 @@ fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
         return (0.0, 0.0, l);
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if max == r {
         60.0 * (((g - b) / d) % 6.0)
     } else if max == g {
@@ -126,9 +130,24 @@ pub fn variants(img: &RgbaImage) -> Vec<Style> {
             backdrop: Backdrop::Aurora {
                 base: hsl(h, 0.35, 0.15),
                 blobs: vec![
-                    Blob { cx: 0.12, cy: 0.15, r: 0.60, color: hsl(h + 40.0, 0.65, 0.46) },
-                    Blob { cx: 0.88, cy: 0.22, r: 0.52, color: hsl(h - 55.0, 0.60, 0.40) },
-                    Blob { cx: 0.50, cy: 0.98, r: 0.55, color: hsl(h + 165.0, 0.36, 0.26) },
+                    Blob {
+                        cx: 0.12,
+                        cy: 0.15,
+                        r: 0.60,
+                        color: hsl(h + 40.0, 0.65, 0.46),
+                    },
+                    Blob {
+                        cx: 0.88,
+                        cy: 0.22,
+                        r: 0.52,
+                        color: hsl(h - 55.0, 0.60, 0.40),
+                    },
+                    Blob {
+                        cx: 0.50,
+                        cy: 0.98,
+                        r: 0.55,
+                        color: hsl(h + 165.0, 0.36, 0.26),
+                    },
                 ],
             },
         },
@@ -153,7 +172,10 @@ pub fn variants(img: &RgbaImage) -> Vec<Style> {
                 c2: hsl(h + 200.0, 0.68, 0.34),
             },
         },
-        Style { name: "None", backdrop: Backdrop::Plain },
+        Style {
+            name: "None",
+            backdrop: Backdrop::Plain,
+        },
     ]
 }
 
@@ -185,11 +207,20 @@ mod tests {
     #[test]
     fn hsl_produces_the_expected_primary_colors() {
         let Rgb(r, g, b) = hsl(0.0, 1.0, 0.5);
-        assert!(approx(r, 1.0, 0.01) && approx(g, 0.0, 0.01) && approx(b, 0.0, 0.01), "red");
+        assert!(
+            approx(r, 1.0, 0.01) && approx(g, 0.0, 0.01) && approx(b, 0.0, 0.01),
+            "red"
+        );
         let Rgb(r, g, b) = hsl(120.0, 1.0, 0.5);
-        assert!(approx(r, 0.0, 0.01) && approx(g, 1.0, 0.01) && approx(b, 0.0, 0.01), "green");
+        assert!(
+            approx(r, 0.0, 0.01) && approx(g, 1.0, 0.01) && approx(b, 0.0, 0.01),
+            "green"
+        );
         let Rgb(r, g, b) = hsl(240.0, 1.0, 0.5);
-        assert!(approx(r, 0.0, 0.01) && approx(g, 0.0, 0.01) && approx(b, 1.0, 0.01), "blue");
+        assert!(
+            approx(r, 0.0, 0.01) && approx(g, 0.0, 0.01) && approx(b, 1.0, 0.01),
+            "blue"
+        );
     }
 
     #[test]
@@ -243,13 +274,19 @@ mod tests {
     fn variants_always_returns_the_same_seven_named_styles_in_order() {
         let img = RgbaImage::from_pixel(20, 20, image::Rgba([10, 200, 90, 255]));
         let names: Vec<&str> = variants(&img).iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["Adaptive", "Deep", "Aurora", "Slate", "Paper", "Pop", "None"]);
+        assert_eq!(
+            names,
+            vec!["Adaptive", "Deep", "Aurora", "Slate", "Paper", "Pop", "None"]
+        );
     }
 
     #[test]
     fn the_none_style_is_a_plain_backdrop() {
         let img = RgbaImage::from_pixel(20, 20, image::Rgba([10, 200, 90, 255]));
-        assert!(matches!(variants(&img).last().unwrap().backdrop, Backdrop::Plain));
+        assert!(matches!(
+            variants(&img).last().unwrap().backdrop,
+            Backdrop::Plain
+        ));
     }
 
     #[test]
@@ -263,7 +300,16 @@ mod tests {
                     assert_eq!((a2.0, a2.1, a2.2), (b2.0, b2.1, b2.2), "{}", sa.name);
                 }
                 (Backdrop::Plain, Backdrop::Plain) => {}
-                (Backdrop::Aurora { base: ab, blobs: abl }, Backdrop::Aurora { base: bb, blobs: bbl }) => {
+                (
+                    Backdrop::Aurora {
+                        base: ab,
+                        blobs: abl,
+                    },
+                    Backdrop::Aurora {
+                        base: bb,
+                        blobs: bbl,
+                    },
+                ) => {
                     assert_eq!((ab.0, ab.1, ab.2), (bb.0, bb.1, bb.2), "{}", sa.name);
                     assert_eq!(abl.len(), bbl.len(), "{}", sa.name);
                     for (ba, bb) in abl.iter().zip(bbl) {

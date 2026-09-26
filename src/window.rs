@@ -234,7 +234,10 @@ pub fn find_by_title(substr: &str) -> Option<HWND> {
     };
     unsafe {
         // EnumWindows returns an error when the callback stops it early; ignore.
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut state as *mut FindState as isize));
+        let _ = EnumWindows(
+            Some(enum_proc),
+            LPARAM(&mut state as *mut FindState as isize),
+        );
     }
     state.found
 }
@@ -345,14 +348,29 @@ mod tests {
 
     #[test]
     fn monitor_bounds_reject_crossing_regions() {
-        let monitor = RECT { left: -1920, top: 0, right: 0, bottom: 1080 };
+        let monitor = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
         assert!(rect_contains(
             monitor,
-            RECT { left: -1900, top: 20, right: -20, bottom: 1060 }
+            RECT {
+                left: -1900,
+                top: 20,
+                right: -20,
+                bottom: 1060
+            }
         ));
         assert!(!rect_contains(
             monitor,
-            RECT { left: -100, top: 20, right: 100, bottom: 500 }
+            RECT {
+                left: -100,
+                top: 20,
+                right: 100,
+                bottom: 500
+            }
         ));
     }
 
@@ -452,8 +470,10 @@ mod tests {
         );
         registered.remove("matteshot_tray");
         registered.remove("MatteshotOutputSizePrompt");
-        let listed: std::collections::BTreeSet<_> =
-            SURFACE_CLASSES.iter().map(|class| (*class).to_owned()).collect();
+        let listed: std::collections::BTreeSet<_> = SURFACE_CLASSES
+            .iter()
+            .map(|class| (*class).to_owned())
+            .collect();
         let missing: Vec<_> = registered.difference(&listed).collect();
         assert!(
             missing.is_empty(),

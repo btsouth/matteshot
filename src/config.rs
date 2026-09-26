@@ -238,7 +238,9 @@ fn load_for_update_unlocked() -> anyhow::Result<Config> {
 }
 
 fn save_unlocked(config: &Config) -> anyhow::Result<()> {
-    let Some(path) = config_path() else { return Ok(()) };
+    let Some(path) = config_path() else {
+        return Ok(());
+    };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -405,7 +407,10 @@ mod tests {
         assert_eq!(cfg.capture_hotkey, "Ctrl+Shift+F9");
         assert_eq!(cfg.capture_delay_secs, 7);
         let saved = serde_json::to_string(&cfg).unwrap();
-        assert!(!saved.contains("telemetry"), "retired keys are not written back");
+        assert!(
+            !saved.contains("telemetry"),
+            "retired keys are not written back"
+        );
     }
 
     #[test]
@@ -425,7 +430,10 @@ mod tests {
             ..Default::default()
         };
         // A typo should not silently remove the feature.
-        assert_eq!(cfg.capture_hotkey(), crate::hotkey::parse(crate::hotkey::DEFAULT));
+        assert_eq!(
+            cfg.capture_hotkey(),
+            crate::hotkey::parse(crate::hotkey::DEFAULT)
+        );
     }
 
     #[test]

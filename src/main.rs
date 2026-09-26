@@ -1,49 +1,49 @@
 #![windows_subsystem = "windows"]
 
 mod annotate;
+mod audio;
 mod autostart_toggle;
 mod capture;
-mod compose;
 mod completion;
+mod compose;
 mod config;
 mod delay;
 mod diagnostics;
 mod dpi;
 mod history;
-mod thumb_decode;
 mod hotkey;
 mod icon;
 mod installer;
-mod release_manifest;
 mod number_prompt;
 mod ocr;
-mod pin;
-mod audio;
-mod recdone;
-mod record;
-mod recui;
-mod scroll;
-mod state_lock;
-mod trim;
+#[cfg(test)]
+mod onboarding_docs;
 mod output;
 mod overlay;
 mod picker;
+mod pin;
 mod prtscn;
+mod recdone;
+mod record;
+mod recui;
+mod release_manifest;
+mod scroll;
 mod settings;
 mod share;
 mod spike;
+mod state_lock;
 mod style;
 mod theme;
 mod theme_contrast;
+mod thumb_decode;
 mod tray;
+mod trim;
 mod tweak;
 mod update;
 mod video_edit;
 mod video_speed;
 mod welcome;
 mod window;
-#[cfg(test)]
-mod onboarding_docs;
 
 use anyhow::{bail, Context, Result};
 use image::RgbaImage;
@@ -79,11 +79,7 @@ fn request_graceful_shutdown() -> Result<()> {
         close_all_within(class_name, label, std::time::Duration::from_secs(30))
     }
 
-    fn close_all_within(
-        class_name: &str,
-        label: &str,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
+    fn close_all_within(class_name: &str, label: &str, timeout: std::time::Duration) -> Result<()> {
         loop {
             let hwnd = match crate::window::find_by_class(class_name) {
                 Some(hwnd) => hwnd,
@@ -127,11 +123,7 @@ fn request_graceful_shutdown() -> Result<()> {
     if !record::wait_until_late_finalize_idle(record::LATE_FINALIZE_BOUND) {
         bail!("the recorder is still busy; finish or cancel the current operation and try again");
     }
-    close_all_within(
-        "matteshot_tray",
-        "Matteshot",
-        record::QUIT_TRAY_WAIT,
-    )?;
+    close_all_within("matteshot_tray", "Matteshot", record::QUIT_TRAY_WAIT)?;
     Ok(())
 }
 
@@ -254,7 +246,10 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         canceled: bool,
         path: Option<std::path::PathBuf>,
     }
-    let auto = std::sync::Arc::new(std::sync::Mutex::new(AutoCopy { canceled: false, path: None }));
+    let auto = std::sync::Arc::new(std::sync::Mutex::new(AutoCopy {
+        canceled: false,
+        path: None,
+    }));
     let auto_copy_hint = picker::AutoCopyHintSlot::new();
     let preselect = cfg.last_style.min(styles.len().saturating_sub(1));
     let mut auto_worker = None;
@@ -381,7 +376,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 cfg.output_max_edge,
             );
             let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
-            let path = output::save_png(&styled, styles[i].name, &cfg.save_dir(), Some(&capture_title))?;
+            let path = output::save_png(
+                &styled,
+                styles[i].name,
+                &cfg.save_dir(),
+                Some(&capture_title),
+            )?;
             let url = share::share_file(&path).context("could not share this capture")?;
             output::open_url(&url);
             // The share itself already succeeded and the link is already
@@ -451,7 +451,11 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     if chosen == preselect {
         if let Some(path) = &auto_path {
             let _ = Config::update(|cfg| cfg.last_style = chosen);
-            eprintln!("done [{}] (auto-copy reused): {}", styles[chosen].name, path.display());
+            eprintln!(
+                "done [{}] (auto-copy reused): {}",
+                styles[chosen].name,
+                path.display()
+            );
             return Ok(());
         }
     }
@@ -465,7 +469,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         cfg.output_max_edge,
     );
     let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
-    let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir(), Some(&capture_title))?;
+    let path = output::save_png(
+        &styled,
+        styles[chosen].name,
+        &cfg.save_dir(),
+        Some(&capture_title),
+    )?;
     output::to_clipboard(&styled, Some(&path)).context("clipboard failed")?;
     // A different pick supersedes the auto-copied file.
     if let Some(old) = auto_path {
@@ -527,9 +536,7 @@ fn shoot_overlay_from(start_delayed: bool) -> Result<()> {
 
 /// Act on what the overlay returned. Delay never reaches here: the loop
 /// above consumes it.
-fn dispatch_selection(
-    selection: Option<(overlay::Selection, HMONITOR)>,
-) -> Result<()> {
+fn dispatch_selection(selection: Option<(overlay::Selection, HMONITOR)>) -> Result<()> {
     match selection {
         Some((overlay::Selection::Window { hwnd, frozen }, mon)) => note_failure(
             "capture",
@@ -545,18 +552,14 @@ fn dispatch_selection(
         Some((overlay::Selection::Region(img), mon)) => {
             note_failure("capture", shoot(Source::Image(img), mon, None))
         }
-        Some((overlay::Selection::RecordWindow(hwnd), _)) => {
-            note_failure(
-                "record",
-                record::session(record::Target::window(hwnd), Config::load().record_gif),
-            )
-        }
-        Some((overlay::Selection::RecordRegion(r, mon), _)) => {
-            note_failure(
-                "record",
-                record::session(record::Target::region(r, mon), Config::load().record_gif),
-            )
-        }
+        Some((overlay::Selection::RecordWindow(hwnd), _)) => note_failure(
+            "record",
+            record::session(record::Target::window(hwnd), Config::load().record_gif),
+        ),
+        Some((overlay::Selection::RecordRegion(r, mon), _)) => note_failure(
+            "record",
+            record::session(record::Target::region(r, mon), Config::load().record_gif),
+        ),
         Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
             let img = note_failure("scroll", scroll::capture(scroll::Target::Window(h, anchor)))?;
             note_failure("capture", shoot(Source::Image(img), mon, None))
@@ -785,7 +788,11 @@ fn run_resident() -> Result<()> {
     });
     eprintln!(
         "matteshot: ready — PrtScn {} | Ctrl+Alt+S = active window",
-        if prtscn_ours { "= capture overlay" } else { "not held (see tray menu)" }
+        if prtscn_ours {
+            "= capture overlay"
+        } else {
+            "not held (see tray menu)"
+        }
     );
     diagnostics::log("resident ready");
     RESIDENT_READY.store(true, Ordering::Relaxed);
@@ -838,10 +845,7 @@ fn run_resident() -> Result<()> {
             // another exiting instance briefly owned PrtScn during startup,
             // recover automatically instead of believing a failed one-shot
             // registration succeeded forever.
-            if prtscn::preferred()
-                && !prtscn::owns_key()
-                && prtscn::take(HOTKEY_ID_PRTSCN)
-            {
+            if prtscn::preferred() && !prtscn::owns_key() && prtscn::take(HOTKEY_ID_PRTSCN) {
                 settings::refresh();
             }
 
@@ -978,12 +982,30 @@ fn preview_bench(long_edge: u32) -> Result<()> {
     // A working set on the heavy side of typical: shapes cost per pixel they
     // cover, so under-annotating would flatter the larger sizes.
     let annotations: Vec<annotate::Annotation> = vec![
-        annotate::Shape::Rect { a: (120.0, 140.0), b: (900.0, 700.0) },
-        annotate::Shape::Arrow { from: (200.0, 900.0), to: (1200.0, 1300.0) },
-        annotate::Shape::Ellipse { a: (1300.0, 200.0), b: (2000.0, 800.0) },
-        annotate::Shape::Highlight { a: (300.0, 1400.0), b: (1800.0, 1500.0) },
-        annotate::Shape::Text { pos: (400.0, 300.0), text: "Annotation".into() },
-        annotate::Shape::Counter { pos: (1000.0, 1000.0), n: 3 },
+        annotate::Shape::Rect {
+            a: (120.0, 140.0),
+            b: (900.0, 700.0),
+        },
+        annotate::Shape::Arrow {
+            from: (200.0, 900.0),
+            to: (1200.0, 1300.0),
+        },
+        annotate::Shape::Ellipse {
+            a: (1300.0, 200.0),
+            b: (2000.0, 800.0),
+        },
+        annotate::Shape::Highlight {
+            a: (300.0, 1400.0),
+            b: (1800.0, 1500.0),
+        },
+        annotate::Shape::Text {
+            pos: (400.0, 300.0),
+            text: "Annotation".into(),
+        },
+        annotate::Shape::Counter {
+            pos: (1000.0, 1000.0),
+            n: 3,
+        },
     ]
     .into_iter()
     .map(|shape| annotate::Annotation {
@@ -1016,7 +1038,10 @@ fn preview_bench(long_edge: u32) -> Result<()> {
     const CACHED_BUDGET_MS: f64 = 40.0;
     const COLD_BUDGET_MS: f64 = 200.0;
 
-    eprintln!("preview bench: source {long_edge}x{height}, {} annotations", annotations.len());
+    eprintln!(
+        "preview bench: source {long_edge}x{height}, {} annotations",
+        annotations.len()
+    );
     eprintln!(
         "{:>6}  {:>11}  {:>7}  {:>7}  {:>7}",
         "cap", "preview", "source", "cold", "cached"
@@ -2026,9 +2051,17 @@ fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
 /// failed before it was usable versus one that was running and stopped.
 fn resident_failure_wording(was_running: bool) -> (&'static str, &'static str, &'static str) {
     if was_running {
-        ("resident stopped", "resident", "Matteshot stopped unexpectedly")
+        (
+            "resident stopped",
+            "resident",
+            "Matteshot stopped unexpectedly",
+        )
     } else {
-        ("resident startup failed", "startup", "Matteshot could not start")
+        (
+            "resident startup failed",
+            "startup",
+            "Matteshot could not start",
+        )
     }
 }
 
@@ -2048,7 +2081,12 @@ fn startup_failure_message(error: &anyhow::Error) -> String {
         "Windows refused Matteshot's start-up lock. Sign out and back in, then start Matteshot again."
     } else if has(&["create tray window", "notify icon", "shell_notifyicon"]) {
         "Windows did not let Matteshot create its tray icon. Restart Windows Explorer, or sign out and back in, then start Matteshot again."
-    } else if has(&["application data", "app data", "data directory", "create directory"]) {
+    } else if has(&[
+        "application data",
+        "app data",
+        "data directory",
+        "create directory",
+    ]) {
         "Matteshot could not use its application data folder. Check that your AppData folder is writable, then start Matteshot again."
     } else if has(&["access is denied", "access denied", "permission"]) {
         "Windows denied Matteshot something it needs. Start Matteshot again; if that fails, try once as administrator to see the cause."
@@ -2162,7 +2200,10 @@ mod startup_failure_tests {
         }
         // The default still tells the user what to do.
         let unknown = startup_failure_message(&anyhow::anyhow!("something odd"));
-        assert!(unknown.contains("github.com/btsouth/matteshot/issues"), "{unknown}");
+        assert!(
+            unknown.contains("github.com/btsouth/matteshot/issues"),
+            "{unknown}"
+        );
     }
 
     #[test]
@@ -2181,7 +2222,10 @@ mod startup_failure_tests {
         assert!(!text.contains("AppData folder"), "{text}");
 
         // A module-handle failure is not a tray-icon failure.
-        let module = injected("resolve module handle", "The specified module could not be found.");
+        let module = injected(
+            "resolve module handle",
+            "The specified module could not be found.",
+        );
         let text = startup_failure_message(&module);
         assert!(!text.contains("tray icon"), "{text}");
     }
@@ -2212,12 +2256,27 @@ mod startup_failure_tests {
 
     #[test]
     fn path_scrubbing_leaves_ordinary_text_alone() {
-        assert_eq!(without_paths("create resident mutex: Access is denied."), "create resident mutex: Access is denied.");
+        assert_eq!(
+            without_paths("create resident mutex: Access is denied."),
+            "create resident mutex: Access is denied."
+        );
         assert_eq!(without_paths("ratio 3:4 stays"), "ratio 3:4 stays");
-        assert_eq!(without_paths("(0x80070005) at 12:30"), "(0x80070005) at 12:30");
-        assert_eq!(without_paths("saved to D:\\Captures\\shot.png, then failed"), "saved to <path>, then failed");
-        assert_eq!(without_paths("share \\\\nas\\media\\clip.mp4 locked"), "share <path> locked");
-        assert_eq!(without_paths("unicode ünïcode C:/x/y end"), "unicode ünïcode <path> end");
+        assert_eq!(
+            without_paths("(0x80070005) at 12:30"),
+            "(0x80070005) at 12:30"
+        );
+        assert_eq!(
+            without_paths("saved to D:\\Captures\\shot.png, then failed"),
+            "saved to <path>, then failed"
+        );
+        assert_eq!(
+            without_paths("share \\\\nas\\media\\clip.mp4 locked"),
+            "share <path> locked"
+        );
+        assert_eq!(
+            without_paths("unicode ünïcode C:/x/y end"),
+            "unicode ünïcode <path> end"
+        );
     }
 
     #[test]

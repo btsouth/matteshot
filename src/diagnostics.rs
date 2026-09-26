@@ -65,7 +65,13 @@ pub fn failure_kind(error: &anyhow::Error) -> &'static str {
 
     if has(&["cancel", "aborted"]) {
         "cancelled"
-    } else if has(&["access is denied", "access denied", "permission", "privilege", "0x80070005"]) {
+    } else if has(&[
+        "access is denied",
+        "access denied",
+        "permission",
+        "privilege",
+        "0x80070005",
+    ]) {
         "access_denied"
     } else if has(&["signature", "checksum", "sha-256", "sha256", "not trusted"]) {
         "verification"
@@ -75,9 +81,24 @@ pub fn failure_kind(error: &anyhow::Error) -> &'static str {
         "network"
     } else if has(&["clipboard"]) {
         "clipboard"
-    } else if has(&["media foundation", "encoder", "aac", "h.264", "mfstartup", "no video stream"]) {
+    } else if has(&[
+        "media foundation",
+        "encoder",
+        "aac",
+        "h.264",
+        "mfstartup",
+        "no video stream",
+    ]) {
         "encoder"
-    } else if has(&["graphics capture", "wgc", "dwm", "d3d", "direct3d", "adapter", "surface"]) {
+    } else if has(&[
+        "graphics capture",
+        "wgc",
+        "dwm",
+        "d3d",
+        "direct3d",
+        "adapter",
+        "surface",
+    ]) {
         "capture_unavailable"
     // Before the disk bucket: "no such file or directory" contains both "file"
     // and "directory", so checking disk first would swallow every not-found
@@ -91,7 +112,16 @@ pub fn failure_kind(error: &anyhow::Error) -> &'static str {
         "cannot find",
     ]) {
         "not_found"
-    } else if has(&["disk", "space", "write", "create ", "open ", "file", "directory", "io error"]) {
+    } else if has(&[
+        "disk",
+        "space",
+        "write",
+        "create ",
+        "open ",
+        "file",
+        "directory",
+        "io error",
+    ]) {
         "disk"
     } else {
         "other"

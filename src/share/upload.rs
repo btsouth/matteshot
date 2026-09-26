@@ -16,8 +16,8 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
-    WinHttpSetTimeouts, WinHttpWriteData, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-    WINHTTP_FLAG_SECURE, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WinHttpSetTimeouts, WinHttpWriteData, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
     WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 
@@ -48,7 +48,10 @@ fn sanitize_share_filename(name: &str, content_type: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '_' | '-'))
         .collect();
-    let stem = filtered.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&filtered);
+    let stem = filtered
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(&filtered);
     if stem.chars().any(|c| c.is_ascii_alphanumeric()) {
         return filtered;
     }
@@ -92,7 +95,10 @@ fn validate_share_url(target: &ShareTarget, url: &str) -> Result<()> {
 }
 
 fn share_link_is_canonical(target: &ShareTarget, url: &str) -> bool {
-    if url.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()) {
+    if url
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
         return false;
     }
     let Some(rest) = url.strip_prefix("https://") else {
@@ -536,7 +542,10 @@ mod tests {
             sanitize_share_filename("スクリーンショット.png", "image/png"),
             "capture.png"
         );
-        assert_eq!(sanitize_share_filename("---.png", "image/png"), "capture.png");
+        assert_eq!(
+            sanitize_share_filename("---.png", "image/png"),
+            "capture.png"
+        );
         assert_eq!(sanitize_share_filename(".png", "image/png"), "capture.png");
         assert_eq!(
             sanitize_share_filename("matteshot.png", "image/png"),
@@ -614,7 +623,10 @@ mod tests {
             "https://share.example.com/s/ABCDEFGHJKMN\r\nSet-Cookie:x",
             "https://share.example.com/s/ABCDEFGHJKMN%2F..",
         ] {
-            assert!(validate_share_url(&target, url).is_err(), "accepted {url:?}");
+            assert!(
+                validate_share_url(&target, url).is_err(),
+                "accepted {url:?}"
+            );
         }
         let too_long = format!("https://share.example.com/s/{}", "A".repeat(65));
         assert!(validate_share_url(&target, &too_long).is_err());

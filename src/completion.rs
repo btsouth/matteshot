@@ -308,7 +308,11 @@ mod tests {
         for i in 0..64 {
             let token = mailbox.insert(0x10, i);
             let lp = token as isize;
-            assert_eq!(lp as u64, token, "token {:#x} truncated through isize", token);
+            assert_eq!(
+                lp as u64, token,
+                "token {:#x} truncated through isize",
+                token
+            );
             assert!(token <= isize::MAX as u64);
         }
     }

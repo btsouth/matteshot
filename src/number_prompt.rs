@@ -12,16 +12,14 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-    GetCursorPos, GetWindowTextW, IsWindow, LoadCursorW, MoveWindow, RegisterClassW,
-    SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, ES_NUMBER, GWLP_USERDATA,
-    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW,
-    WINDOW_STYLE, WM_CLOSE, WM_CTLCOLOREDIT, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP,
-    WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_EX_DLGMODALFRAME, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsWindow,
+    LoadCursorW, MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    ES_AUTOHSCROLL, ES_NUMBER, GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, MSG,
+    SWP_NOMOVE, SWP_NOSIZE, SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_CTLCOLOREDIT, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::output::{OUTPUT_CUSTOM_MAX, OUTPUT_CUSTOM_MIN, OUTPUT_EMAIL};
@@ -71,7 +69,15 @@ unsafe fn state(hwnd: HWND) -> Option<&'static mut State> {
     (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State).as_mut()
 }
 
-unsafe fn draw_text(hdc: windows::Win32::Graphics::Gdi::HDC, state: &State, rect: RECT, text: &str, small: bool, color: COLORREF, flags: u32) {
+unsafe fn draw_text(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    state: &State,
+    rect: RECT,
+    text: &str,
+    small: bool,
+    color: COLORREF,
+    flags: u32,
+) {
     SelectObject(hdc, if small { state.font_small } else { state.font });
     SetTextColor(hdc, color);
     let mut value = wide(text);
@@ -88,8 +94,12 @@ unsafe fn commit(hwnd: HWND, state: &mut State) {
     let len = GetWindowTextLengthW(state.edit);
     let mut text = vec![0u16; len as usize + 1];
     GetWindowTextW(state.edit, &mut text);
-    let parsed = String::from_utf16_lossy(&text[..len as usize]).parse::<u32>().ok();
-    if let Some(value) = parsed.filter(|value| (OUTPUT_CUSTOM_MIN..=OUTPUT_CUSTOM_MAX).contains(value)) {
+    let parsed = String::from_utf16_lossy(&text[..len as usize])
+        .parse::<u32>()
+        .ok();
+    if let Some(value) =
+        parsed.filter(|value| (OUTPUT_CUSTOM_MIN..=OUTPUT_CUSTOM_MAX).contains(value))
+    {
         state.result = Some(value);
         let _ = DestroyWindow(hwnd);
     } else {
@@ -172,7 +182,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 draw_text(
                     hdc,
                     state,
-                    RECT { left: margin, top: sc(state, 14), right: client.right - margin, bottom: sc(state, 42) },
+                    RECT {
+                        left: margin,
+                        top: sc(state, 14),
+                        right: client.right - margin,
+                        bottom: sc(state, 42),
+                    },
                     "Custom output size",
                     false,
                     state.theme.text,
@@ -181,7 +196,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 draw_text(
                     hdc,
                     state,
-                    RECT { left: margin, top: sc(state, 46), right: client.right - margin, bottom: sc(state, 68) },
+                    RECT {
+                        left: margin,
+                        top: sc(state, 46),
+                        right: client.right - margin,
+                        bottom: sc(state, 68),
+                    },
                     "Resize the longer side to",
                     true,
                     state.theme.muted,
@@ -195,19 +215,54 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 draw_text(
                     hdc,
                     state,
-                    RECT { left: margin, top: sc(state, 108), right: client.right - margin, bottom: sc(state, 132) },
+                    RECT {
+                        left: margin,
+                        top: sc(state, 108),
+                        right: client.right - margin,
+                        bottom: sc(state, 132),
+                    },
                     helper,
                     true,
-                    if state.invalid { COLORREF(0x005858e8) } else { state.theme.muted },
+                    if state.invalid {
+                        COLORREF(0x005858e8)
+                    } else {
+                        state.theme.muted
+                    },
                     DT_LEFT.0,
                 );
-                let apply = RECT { left: client.right - sc(state, 190), top: sc(state, 145), right: client.right - sc(state, 104), bottom: sc(state, 179) };
-                let cancel = RECT { left: client.right - sc(state, 96), top: sc(state, 145), right: client.right - margin, bottom: sc(state, 179) };
+                let apply = RECT {
+                    left: client.right - sc(state, 190),
+                    top: sc(state, 145),
+                    right: client.right - sc(state, 104),
+                    bottom: sc(state, 179),
+                };
+                let cancel = RECT {
+                    left: client.right - sc(state, 96),
+                    top: sc(state, 145),
+                    right: client.right - margin,
+                    bottom: sc(state, 179),
+                };
                 for (rect, label, accent) in [(apply, "Apply", true), (cancel, "Cancel", false)] {
-                    let brush = CreateSolidBrush(if accent { state.theme.accent } else { state.theme.chip });
+                    let brush = CreateSolidBrush(if accent {
+                        state.theme.accent
+                    } else {
+                        state.theme.chip
+                    });
                     FillRect(hdc, &rect, brush);
                     let _ = DeleteObject(brush);
-                    draw_text(hdc, state, rect, label, true, if accent { state.theme.accent_text } else { state.theme.text }, DT_CENTER.0);
+                    draw_text(
+                        hdc,
+                        state,
+                        rect,
+                        label,
+                        true,
+                        if accent {
+                            state.theme.accent_text
+                        } else {
+                            state.theme.text
+                        },
+                        DT_CENTER.0,
+                    );
                 }
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -222,7 +277,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if y >= sc(state, 145) && y <= sc(state, 179) {
                     if x >= client.right - sc(state, 190) && x <= client.right - sc(state, 104) {
                         commit(hwnd, state);
-                    } else if x >= client.right - sc(state, 96) && x <= client.right - sc(state, 22) {
+                    } else if x >= client.right - sc(state, 96) && x <= client.right - sc(state, 22)
+                    {
                         let _ = DestroyWindow(hwnd);
                     }
                 }
@@ -276,7 +332,12 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
         let style = WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_DLGMODALFRAME;
         let bounds = crate::dpi::outer_bounds(
-            RECT { left: 0, top: 0, right: px(360), bottom: px(196) },
+            RECT {
+                left: 0,
+                top: 0,
+                right: px(360),
+                bottom: px(196),
+            },
             style,
             ex_style,
             scale,
@@ -301,8 +362,10 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
         };
         let mut owner_rect = RECT::default();
         if !owner.0.is_null() && GetWindowRect(owner, &mut owner_rect).is_ok() {
-            x = owner_rect.left + ((owner_rect.right - owner_rect.left) - (bounds.right - bounds.left)) / 2;
-            y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - (bounds.bottom - bounds.top)) / 2;
+            x = owner_rect.left
+                + ((owner_rect.right - owner_rect.left) - (bounds.right - bounds.left)) / 2;
+            y = owner_rect.top
+                + ((owner_rect.bottom - owner_rect.top) - (bounds.bottom - bounds.top)) / 2;
         }
         let hwnd = CreateWindowExW(
             ex_style,
@@ -318,16 +381,17 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
             instance,
             Some((&mut *state as *mut State).cast()),
         )?;
-        let initial = if (OUTPUT_CUSTOM_MIN..=OUTPUT_CUSTOM_MAX).contains(&current) { current } else { OUTPUT_EMAIL };
+        let initial = if (OUTPUT_CUSTOM_MIN..=OUTPUT_CUSTOM_MAX).contains(&current) {
+            current
+        } else {
+            OUTPUT_EMAIL
+        };
         let text = HSTRING::from(initial.to_string());
         state.edit = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             w!("EDIT"),
             PCWSTR(text.as_ptr()),
-            WS_CHILD
-                | WS_VISIBLE
-                | WS_TABSTOP
-                | WINDOW_STYLE((ES_NUMBER | ES_AUTOHSCROLL) as u32),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE((ES_NUMBER | ES_AUTOHSCROLL) as u32),
             px(22),
             px(72),
             px(316),
@@ -340,7 +404,12 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
         if !owner.0.is_null() {
             let _ = EnableWindow(owner, false);
         }
-        SendMessageW(state.edit, windows::Win32::UI::WindowsAndMessaging::WM_SETFONT, WPARAM(state.font.0 as usize), LPARAM(1));
+        SendMessageW(
+            state.edit,
+            windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
+            WPARAM(state.font.0 as usize),
+            LPARAM(1),
+        );
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);

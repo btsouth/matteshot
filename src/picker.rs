@@ -24,9 +24,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, IDC_ARROW, MSG, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MSG, WA_INACTIVE, WM_ACTIVATE, WM_DESTROY, WM_ERASEBKGND,
     WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
@@ -136,14 +135,14 @@ fn key_action(vk: u16, hover: i32, count: usize, can_share: bool) -> Option<KeyA
         0x54 => selected.map(KeyAction::Tweak), // T
         // S is Share only when this build can actually upload.
         0x53 if can_share => selected.map(KeyAction::Share),
-        0x50 => Some(KeyAction::Pin),           // P
-        0x43 => Some(KeyAction::CopyText),      // C
+        0x50 => Some(KeyAction::Pin),      // P
+        0x43 => Some(KeyAction::CopyText), // C
         v if v == VK_LEFT.0 && count > 0 => Some(KeyAction::Hover(
             (hover.max(0) - 1).rem_euclid(count as i32),
         )),
-        v if v == VK_RIGHT.0 && count > 0 => Some(KeyAction::Hover(
-            (hover + 1).rem_euclid(count as i32),
-        )),
+        v if v == VK_RIGHT.0 && count > 0 => {
+            Some(KeyAction::Hover((hover + 1).rem_euclid(count as i32)))
+        }
         v if (0x31..=0x39).contains(&v) => {
             let index = (v - 0x31) as usize;
             (index < count).then_some(KeyAction::Choose(index))
@@ -152,15 +151,9 @@ fn key_action(vk: u16, hover: i32, count: usize, can_share: bool) -> Option<KeyA
     }
 }
 
-fn should_cancel_on_deactivate(
-    action_chosen: bool,
-    suspended: bool,
-    visible_for_ms: u128,
-) -> bool {
+fn should_cancel_on_deactivate(action_chosen: bool, suspended: bool, visible_for_ms: u128) -> bool {
     !action_chosen && !suspended && visible_for_ms > 500
 }
-
-
 
 pub enum PickAction {
     /// Copy + save this variant.
@@ -215,12 +208,22 @@ struct Layout {
 fn layout(aspects: &[f32], work_w: i32, work_h: i32) -> Layout {
     let n = aspects.len() as i32;
     if n == 0 {
-        return Layout { cells: Vec::new(), width: MARGIN * 2, height: MARGIN * 2 };
+        return Layout {
+            cells: Vec::new(),
+            width: MARGIN * 2,
+            height: MARGIN * 2,
+        };
     }
     // Sanitize: a degenerate preview must not poison the whole layout.
     let aspects: Vec<f32> = aspects
         .iter()
-        .map(|a| if a.is_finite() && *a > 0.0 { a.clamp(0.01, 100.0) } else { 1.0 })
+        .map(|a| {
+            if a.is_finite() && *a > 0.0 {
+                a.clamp(0.01, 100.0)
+            } else {
+                1.0
+            }
+        })
         .collect();
     let sum_aspect: f32 = aspects.iter().sum();
     let max_aspect = aspects.iter().cloned().fold(0.01f32, f32::max);
@@ -256,13 +259,21 @@ fn layout(aspects: &[f32], work_w: i32, work_h: i32) -> Layout {
     } else {
         let avail_w = (work_w - MARGIN * 2 - GAP * (n - 1) - 24).max(80) as f32;
         let avail_h = (work_h - chrome_h - LABEL_H).max(4);
-        let thumb_h = THUMB_H.min((avail_w / sum_aspect) as i32).min(avail_h).max(1);
+        let thumb_h = THUMB_H
+            .min((avail_w / sum_aspect) as i32)
+            .min(avail_h)
+            .max(1);
         let mut x = MARGIN;
         let cells = aspects
             .iter()
             .map(|a| {
                 let w = ((a * thumb_h as f32) as i32).max(1);
-                let cell = Cell { x, y: MARGIN, w, h: thumb_h };
+                let cell = Cell {
+                    x,
+                    y: MARGIN,
+                    w,
+                    h: thumb_h,
+                };
                 x += w + GAP;
                 cell
             })
@@ -351,7 +362,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
     let bg = CreateSolidBrush(state.theme.panel);
     FillRect(
         hdc,
-        &RECT { left: 0, top: 0, right: state.width, bottom: state.height },
+        &RECT {
+            left: 0,
+            top: 0,
+            right: state.width,
+            bottom: state.height,
+        },
         bg,
     );
     let _ = DeleteObject(bg);
@@ -391,10 +407,30 @@ unsafe fn paint(hdc: HDC, state: &State) {
             let accent = CreateSolidBrush(state.theme.accent);
             let (x0, y0, x1, y1) = (t.x - 3, t.y - 3, t.x + t.w + 3, t.y + t.h + 3);
             for r in [
-                RECT { left: x0, top: y0, right: x1, bottom: y0 + 2 },
-                RECT { left: x0, top: y1 - 2, right: x1, bottom: y1 },
-                RECT { left: x0, top: y0, right: x0 + 2, bottom: y1 },
-                RECT { left: x1 - 2, top: y0, right: x1, bottom: y1 },
+                RECT {
+                    left: x0,
+                    top: y0,
+                    right: x1,
+                    bottom: y0 + 2,
+                },
+                RECT {
+                    left: x0,
+                    top: y1 - 2,
+                    right: x1,
+                    bottom: y1,
+                },
+                RECT {
+                    left: x0,
+                    top: y0,
+                    right: x0 + 2,
+                    bottom: y1,
+                },
+                RECT {
+                    left: x1 - 2,
+                    top: y0,
+                    right: x1,
+                    bottom: y1,
+                },
             ] {
                 FillRect(hdc, &r, accent);
             }
@@ -402,7 +438,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
 
         SelectObject(hdc, state.font);
-        SetTextColor(hdc, if hovered { state.theme.accent } else { state.theme.text });
+        SetTextColor(
+            hdc,
+            if hovered {
+                state.theme.accent
+            } else {
+                state.theme.text
+            },
+        );
         let mut label_rect = RECT {
             left: t.x,
             top: t.y + t.h + 2,
@@ -597,7 +640,11 @@ pub fn pick(
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    unsafe { GetMonitorInfoW(monitor, &mut mi).ok().context("monitor info")? };
+    unsafe {
+        GetMonitorInfoW(monitor, &mut mi)
+            .ok()
+            .context("monitor info")?
+    };
     let work_w = mi.rcWork.right - mi.rcWork.left;
     let work_h = mi.rcWork.bottom - mi.rcWork.top;
 
@@ -629,8 +676,10 @@ pub fn pick(
     }
     let (total_w, total_h) = (plan.width, plan.height);
 
-    let win_x = (mi.rcWork.left + (work_w - total_w) / 2)
-        .clamp(mi.rcWork.left + 8, (mi.rcWork.right - total_w - 8).max(mi.rcWork.left + 8));
+    let win_x = (mi.rcWork.left + (work_w - total_w) / 2).clamp(
+        mi.rcWork.left + 8,
+        (mi.rcWork.right - total_w - 8).max(mi.rcWork.left + 8),
+    );
     let win_y = (mi.rcWork.top + work_h - total_h - BOTTOM_INSET).max(mi.rcWork.top + 8);
 
     let (font, font_small) = unsafe { (make_font(-14), make_font(-12)) };
@@ -716,13 +765,14 @@ mod tests {
         key_action, layout, picker_hint, should_cancel_on_deactivate, AutoCopyHint,
         AutoCopyHintSlot, KeyAction, COPIED_MARK, THUMB_H,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT};
 
     #[test]
     fn picker_shortcuts_choose_the_visible_variant() {
-        assert_eq!(key_action(VK_RETURN.0, 3, 7, true), Some(KeyAction::Choose(3)));
+        assert_eq!(
+            key_action(VK_RETURN.0, 3, 7, true),
+            Some(KeyAction::Choose(3))
+        );
         assert_eq!(key_action(0x54, 3, 7, true), Some(KeyAction::Tweak(3)));
         assert_eq!(key_action(0x53, 3, 7, true), Some(KeyAction::Share(3)));
         assert_eq!(key_action(0x50, 3, 7, true), Some(KeyAction::Pin));
@@ -746,9 +796,18 @@ mod tests {
     #[test]
     fn picker_arrows_wrap_and_recover_an_unset_hover() {
         assert_eq!(key_action(VK_LEFT.0, 0, 7, true), Some(KeyAction::Hover(6)));
-        assert_eq!(key_action(VK_RIGHT.0, 6, 7, true), Some(KeyAction::Hover(0)));
-        assert_eq!(key_action(VK_RIGHT.0, -1, 7, true), Some(KeyAction::Hover(0)));
-        assert_eq!(key_action(VK_LEFT.0, -1, 7, true), Some(KeyAction::Hover(6)));
+        assert_eq!(
+            key_action(VK_RIGHT.0, 6, 7, true),
+            Some(KeyAction::Hover(0))
+        );
+        assert_eq!(
+            key_action(VK_RIGHT.0, -1, 7, true),
+            Some(KeyAction::Hover(0))
+        );
+        assert_eq!(
+            key_action(VK_LEFT.0, -1, 7, true),
+            Some(KeyAction::Hover(6))
+        );
     }
 
     #[test]
@@ -797,8 +856,8 @@ mod tests {
     #[test]
     fn extreme_aspects_never_overflow_the_work_area() {
         for aspects in [
-            vec![100.0; 7],  // a one-pixel-tall sliver
-            vec![0.01; 7],   // a full-page scroll capture
+            vec![100.0; 7], // a one-pixel-tall sliver
+            vec![0.01; 7],  // a full-page scroll capture
             vec![1.0; 7],
             vec![0.5; 1],
             vec![f32::NAN, f32::INFINITY, 0.0, -3.0],
@@ -869,4 +928,3 @@ mod tests {
         }
     }
 }
-

@@ -8,26 +8,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use windows::core::{w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
-};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS,
 };
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    SHGetKnownFolderPath, ShellLink, Shell_NotifyIconW, FOLDERID_Startup, IShellLinkW,
-    KF_FLAG_DEFAULT, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NOTIFYICONDATAW,
+    FOLDERID_Startup, IShellLinkW, SHGetKnownFolderPath, ShellLink, Shell_NotifyIconW,
+    KF_FLAG_DEFAULT, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DestroyMenu, GetCursorPos, GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, GetCursorPos, GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW, GWLP_USERDATA,
-    HICON, ICONINFO, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, WM_CLOSE, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER,
-    WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    HICON, ICONINFO, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD,
+    WM_CLOSE, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
@@ -88,7 +88,10 @@ fn autostart_link() -> Result<PathBuf> {
     unsafe {
         let raw = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, None)
             .context("locate the Startup folder")?;
-        let path = PathBuf::from(raw.to_string().context("Startup folder path is not UTF-16")?);
+        let path = PathBuf::from(
+            raw.to_string()
+                .context("Startup folder path is not UTF-16")?,
+        );
         CoTaskMemFree(Some(raw.0 as *const c_void));
         Ok(path.join("Matteshot.lnk"))
     }
@@ -159,7 +162,8 @@ pub fn migrate_autostart_from_run_key() {
             return;
         }
     }
-    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
+    if let Ok(key) =
+        RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
     {
         let _ = key.delete_value(RUN_VALUE);
     }
@@ -171,7 +175,9 @@ pub fn migrate_autostart_from_run_key() {
 /// window icon for taskbar-visible windows.
 #[allow(clippy::manual_dangling_ptr)] // Win32 MAKEINTRESOURCE: resource ID encoded as a pointer.
 pub(crate) unsafe fn app_icon() -> HICON {
-    use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+    };
     if let Ok(hinstance) = GetModuleHandleW(None) {
         if let Ok(h) = LoadImageW(
             hinstance,
@@ -205,8 +211,8 @@ unsafe fn make_icon() -> HICON {
     };
     let screen = GetDC(None);
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let color = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0)
-        .expect("icon dib");
+    let color =
+        CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0).expect("icon dib");
     ReleaseDC(None, screen);
     let px = std::slice::from_raw_parts_mut(bits as *mut u8, (S * S * 4) as usize);
 
@@ -278,7 +284,10 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     // being Ctrl+Alt+S the moment the shortcut became configurable.
     let cfg = crate::config::Config::load();
     let active_label: Vec<u16> = match cfg.capture_hotkey() {
-        Some(hotkey) => format!("Capture active window	{}", crate::hotkey::label(Some(hotkey))),
+        Some(hotkey) => format!(
+            "Capture active window	{}",
+            crate::hotkey::label(Some(hotkey))
+        ),
         None => "Capture active window".to_string(),
     }
     .encode_utf16()
@@ -306,9 +315,8 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     if let Some(update) = &state.update {
         // A staged installer plus its hash sidecar means we can re-check
         // before launch. A leftover file alone is not an install (SBS-911).
-        let staged = crate::installer::is_ready_to_launch(&crate::installer::staged_path(
-            &update.version,
-        ));
+        let staged =
+            crate::installer::is_ready_to_launch(&crate::installer::staged_path(&update.version));
         let text = if staged {
             format!("Install update v{} now", update.version)
         } else {
@@ -439,7 +447,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         &if automatic {
                             format!("Version {version} is downloading in the background.")
                         } else {
-                            format!("Version {version} is ready. Right-click Matteshot to download.")
+                            format!(
+                                "Version {version} is ready. Right-click Matteshot to download."
+                            )
                         },
                     );
                 }
@@ -491,9 +501,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // in-memory counter. Wait here so Finalize can publish or park
             // the partial. Silent: a MessageBox would hang the installer
             // on UI. Tray-menu Quit prompts and waits before this.
-            let _ = crate::record::wait_until_late_finalize_idle(
-                crate::record::LATE_FINALIZE_BOUND,
-            );
+            let _ =
+                crate::record::wait_until_late_finalize_idle(crate::record::LATE_FINALIZE_BOUND);
             // SBS-743: after the wait, not before. That wait pumps, so an
             // update completion posted during it is still delivered; a
             // discard first would bump the generation and drop it.
@@ -548,12 +557,18 @@ impl Tray {
                 hIcon: icon,
                 ..Default::default()
             };
-            let tip: Vec<u16> = "Matteshot \u{2014} PrtScn to capture".encode_utf16().collect();
+            let tip: Vec<u16> = "Matteshot \u{2014} PrtScn to capture"
+                .encode_utf16()
+                .collect();
             data.szTip[..tip.len()].copy_from_slice(&tip);
             let _ = Shell_NotifyIconW(NIM_ADD, &data);
             let _ = SetTimer(hwnd, 1, 250, None);
 
-            Ok(Tray { hwnd, state, _icon: icon })
+            Ok(Tray {
+                hwnd,
+                state,
+                _icon: icon,
+            })
         }
     }
 
@@ -643,9 +658,12 @@ mod tests {
             let shell_link: IShellLinkW =
                 CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
             let file: IPersistFile = shell_link.cast().unwrap();
-            file.Load(&HSTRING::from(link.as_os_str()), STGM_READ).unwrap();
+            file.Load(&HSTRING::from(link.as_os_str()), STGM_READ)
+                .unwrap();
             let mut buffer = [0u16; 260];
-            shell_link.GetPath(&mut buffer, std::ptr::null_mut(), 0).unwrap();
+            shell_link
+                .GetPath(&mut buffer, std::ptr::null_mut(), 0)
+                .unwrap();
             String::from_utf16_lossy(&buffer)
                 .trim_end_matches('\0')
                 .to_string()
@@ -682,7 +700,13 @@ mod tests {
         let link = autostart_link().expect("resolve the Startup folder");
         assert_eq!(link.file_name().unwrap(), "Matteshot.lnk");
         let text = link.to_string_lossy().to_lowercase();
-        assert!(text.contains("startup"), "not a Startup folder path: {text}");
-        assert!(!text.contains("programdata"), "resolved machine-wide: {text}");
+        assert!(
+            text.contains("startup"),
+            "not a Startup folder path: {text}"
+        );
+        assert!(
+            !text.contains("programdata"),
+            "resolved machine-wide: {text}"
+        );
     }
 }
