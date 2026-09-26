@@ -2,7 +2,8 @@
 
 Run this after `scripts\verify-code.ps1` and `scripts\run-probes.ps1`. These
 checks deliberately remain human-driven: automating them would write the
-clipboard, move the pointer, inject keys, or steal the foreground from Tyler.
+clipboard, move the pointer, inject keys, or steal the foreground from whoever
+is at the machine.
 
 A failed or ambiguous check blocks release. Record the Windows build, monitor
 layout/DPI, theme, and audio mode with the result.
@@ -62,7 +63,7 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Light/dark changes repaint every open surface, popup, and title bar.
 - [ ] 100%, 125%, 150%, and mixed-DPI layouts keep controls visible and captures sharp.
 - [ ] Duplicate launch opens Settings on the resident; quitting releases the PrtScn hook. A prior-off `PrintScreenKeyForSnippingEnabled` stays off.
-- [ ] Tray menu lists capture, active window, delayed capture, open captures/videos folders, History, license, and Settings. Deactivate, Copy diagnostics, and Clear History titles appear only in Settings, and Deactivate frees the license slot with the confirmation and hotkey teardown.
+- [ ] Tray menu lists capture, active window, delayed capture, open captures/videos folders, History, and Settings. Copy diagnostics and Clear History titles appear only in Settings.
 - [ ] Opening History after deleting a capture in Explorer drops that row; reopening History does not bring the title back. A capture on an ejected USB stays until the drive is back and the file is gone. History Delete of that offline row fails and leaves the entry; it does not persist-prune the index.
 - [ ] Settings → Clear History titles… asks first, then strips labels and leaves the screenshot/video files. History Delete is what removes a file.
 - [ ] Uninstall asks before deleting `%APPDATA%\matteshot\history.json`. No leaves it; Yes removes the index (and quarantined copies) and leaves captures.
@@ -70,45 +71,16 @@ layout/DPI, theme, and audio mode with the result.
 - [ ] Sleep/resume and display connect/disconnect leave the resident responsive.
 - [ ] An available update defers while a capture, recording, editor, or export is active.
 
-## Trial and purchase
+## Free build, offline use, and upgrades
 
-Every machine that has tested Matteshot so far has been licensed, so this path
-has never run end to end. Build with `cargo build --release --features
-debug-license --target-dir target/debug-license`, so the override build never
-replaces the binary a release was cut from, then set
-`MATTESHOT_LICENSE_OVERRIDE` per row. Unset it and confirm `--license-status`
-reports the real state before closing out.
-
-Two things to know before running these:
-
-- **The override has side effects, even though it stores nothing itself.**
-  Everything downstream branches on what `status()` reports, so `expired` sends
-  the background sync down the trial branch and registers a trial record for
-  the device on the server. On a licensed machine that record is already past
-  its 14 days, so it is harmless, but it outlives the test.
-- **Launch without redirecting stderr.** `Start-Process -RedirectStandardError`
-  forces `UseShellExecute=false`, and the activation window then reports
-  `IsWindowVisible=false` and never paints. That is the harness, not a bug, and
-  it looks exactly like a broken window if you are not expecting it. Redirect
-  only for the console-output test flags.
-
-- [ ] `not-started`: capture works and the tray reads "14-day trial ready".
-- [ ] `trial:3`: the tray reads "Trial: 3 days left" and capture is unaffected.
-- [ ] Share follows the real certificate, not the override: on a machine
-      without a paid `license.json`, picker hint has no "S share", History
-      omits "Share link", and tweak/recdone have no Share control. A licensed
-      machine still offers Share even under `trial:3`, because it can actually
-      upload.
-- [ ] `expired`: PrtScn no longer captures and the activation window appears.
-- [ ] Buy from the expired window, and from the tray, opens the pricing card at
-      matteshot.app rather than the top of the page.
-- [ ] Activating a real key from the expired state restores the hotkeys without
-      a restart, and the tray switches to the licensed label.
-- [ ] Unset the override: `--license-status` reports the machine's real state
-      and no forced-state line.
+- [ ] The tray has no license, trial, or purchase entries. Settings has no Deactivate button and no usage-stats checkbox, and its footer reads "Free and open source".
+- [ ] With the network cut (a Windows Firewall outbound block on `matteshot.exe`, or the adapter disabled), the resident starts, PrtScn captures, and every editor, OCR, recording, scrolling capture, History and Settings work. The update check fails quietly and says nothing.
+- [ ] Installing over 0.20.0 on a machine whose trial had ended: capture works straight away, the old settings survive, and `%APPDATA%\matteshot\license.json` is left where it was.
+- [ ] A default build offers no Share: the picker hint has no "S share", History omits "Share link", and the tweak and video editors have no Share control.
+- [ ] A `--features share` build with `share_server` and `share_token` set in config.json offers Share in all four places, the link opens, and a second click while an upload runs is refused.
 
 ## Closeout
 
-- [ ] Restore Tyler's original audio, folders, theme override, and other settings.
+- [ ] Restore the tester's original audio, folders, theme override, and other settings.
 - [ ] Confirm exactly one resident process is running the intended release candidate.
 - [ ] Re-run `scripts\run-probes.ps1` after any fix made during this pass.

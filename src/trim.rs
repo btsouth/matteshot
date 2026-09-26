@@ -15,8 +15,8 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
     MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
-    MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
+    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
 };
 
 pub struct Probe {
@@ -176,11 +176,7 @@ fn open_reader(path: &Path, with_audio: bool) -> Result<(IMFSourceReader, u32, u
                 at.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block)?;
                 at.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * block)?;
                 reader
-                    .SetCurrentMediaType(
-                        MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32,
-                        None,
-                        &at,
-                    )
+                    .SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, None, &at)
                     .context("set 16-bit PCM audio decode type")?;
                 let resolved =
                     reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)?;
@@ -384,8 +380,8 @@ pub fn playback_frames_with_speed(
 ) -> Result<()> {
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).ok() };
     let (reader, w, h, stride, _) = open_reader(path, false)?;
-    let time_map = crate::video_speed::TimeMap::new(start, end, speed_ranges)
-        .map_err(anyhow::Error::msg)?;
+    let time_map =
+        crate::video_speed::TimeMap::new(start, end, speed_ranges).map_err(anyhow::Error::msg)?;
     unsafe {
         let position = PROPVARIANT::from(start.max(0));
         reader
@@ -576,12 +572,7 @@ pub fn probe_editor(
     preview_w: u32,
     preview_h: u32,
 ) -> Result<Probe> {
-    probe_impl(
-        path,
-        strip_w,
-        thumb_h,
-        Some((preview_w, preview_h)),
-    )
+    probe_impl(path, strip_w, thumb_h, Some((preview_w, preview_h)))
 }
 
 /// A finalized MP4 is trusted only after Media Foundation can read its
@@ -729,7 +720,10 @@ fn bgra_to_rgba_into(bytes: &[u8], image: &mut RgbaImage) {
 }
 
 fn rgba_to_bgra_in_place(image: &mut RgbaImage) {
-    image.as_mut().par_chunks_mut(4).for_each(|pixel| pixel.swap(0, 2));
+    image
+        .as_mut()
+        .par_chunks_mut(4)
+        .for_each(|pixel| pixel.swap(0, 2));
 }
 
 /// Re-encode [start, end), optionally framing every video frame with one
@@ -774,16 +768,7 @@ pub fn cut_with_edit_progress(
     progress: impl FnMut(u32),
 ) -> Result<()> {
     let cancel = AtomicBool::new(false);
-    cut_with_edit_progress_cancel(
-        src,
-        dst,
-        start,
-        end,
-        matte,
-        annotations,
-        &cancel,
-        progress,
-    )
+    cut_with_edit_progress_cancel(src, dst, start, end, matte, annotations, &cancel, progress)
 }
 
 /// Convert one decoded PCM sample onto the output timeline. Frames outside
@@ -811,8 +796,7 @@ fn retime_pcm(
     let first = segments.first()?.0;
     let mut output = Vec::new();
     let frame_at = |time: i64| {
-        (((time - timestamp).max(0) as i128 * format.rate as i128
-            + (TICKS_PER_SECOND / 2) as i128)
+        (((time - timestamp).max(0) as i128 * format.rate as i128 + (TICKS_PER_SECOND / 2) as i128)
             / TICKS_PER_SECOND as i128)
             .clamp(0, source_frames as i128) as usize
     };
@@ -918,8 +902,8 @@ pub fn cut_with_speed_edit_progress_cancel(
     let (reader, w, h, stride, source_fps) = open_reader(src, true)?;
     let fps = crate::record::sanitize_fps(source_fps);
     let (video_idx, audio_idx) = stream_indices(&reader);
-    let time_map = crate::video_speed::TimeMap::new(start, end, speed_ranges)
-        .map_err(anyhow::Error::msg)?;
+    let time_map =
+        crate::video_speed::TimeMap::new(start, end, speed_ranges).map_err(anyhow::Error::msg)?;
 
     // Audio format, if the source has a track.
     let audio_fmt = unsafe {
@@ -955,9 +939,7 @@ pub fn cut_with_speed_edit_progress_cancel(
     let downscaled = (cw, ch) != (crop_w, crop_h);
     if downscaled {
         crate::diagnostics::log("export content scaled down to stay encodable");
-        eprintln!(
-            "export: content {crop_w}x{crop_h} -> {cw}x{ch} so the framed result fits H.264"
-        );
+        eprintln!("export: content {crop_w}x{crop_h} -> {cw}x{ch} so the framed result fits H.264");
     }
     let matte_base = matte
         .map(|style| crate::compose::compose_base(cw as usize, ch as usize, style, &matte_opts));
@@ -1135,7 +1117,10 @@ pub fn cut_with_speed_edit_progress_cancel(
                         annotations,
                         ts,
                         None,
-                        crate::video_edit::Frame { crop, content: (cw, ch) },
+                        crate::video_edit::Frame {
+                            crop,
+                            content: (cw, ch),
+                        },
                         annotation_offset,
                     );
                     rgba_to_bgra_in_place(composed);
@@ -1213,9 +1198,8 @@ pub fn cut_with_speed_edit_progress_cancel(
 mod tests {
     use super::{
         bgra_to_rgba, crop_rect, cut_with_speed_edit_progress_cancel, export_pcm, fit_inside,
-        sample_is_before_trim_start,
         open_reader, read_video_frame, retime_pcm, retime_video_sample, rgba_to_bgra,
-        scrub_cache_plan, validate_video,
+        sample_is_before_trim_start, scrub_cache_plan, validate_video,
     };
     use std::sync::atomic::AtomicBool;
 
@@ -1233,13 +1217,18 @@ mod tests {
     /// the export loop compared the sample timestamp to `start` (SBS-751).
     #[test]
     fn ordinary_trim_clips_a_pcm_packet_that_crosses_the_start() {
-        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let format = crate::audio::Format {
+            rate: 100,
+            channels: 1,
+        };
         // 30 frames at 100 Hz from 0.1s -> 0.4s. Trim is [0.2s, 0.5s).
         let source = mono_pcm(1, 30);
         let map = ordinary_map(2_000_000, 5_000_000);
-        let (output, timestamp, duration) =
-            export_pcm(&source, 1_000_000, &format, &map).unwrap();
-        assert_eq!(timestamp, 0, "in-range audio must start at output time zero");
+        let (output, timestamp, duration) = export_pcm(&source, 1_000_000, &format, &map).unwrap();
+        assert_eq!(
+            timestamp, 0,
+            "in-range audio must start at output time zero"
+        );
         assert_eq!(duration, 2_000_000);
         assert_eq!(output, source[10 * 2..], "only frames at/after 0.2s");
     }
@@ -1248,12 +1237,14 @@ mod tests {
     /// written whole when there were no speed sections (SBS-751).
     #[test]
     fn ordinary_trim_clips_a_pcm_packet_that_crosses_the_end() {
-        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let format = crate::audio::Format {
+            rate: 100,
+            channels: 1,
+        };
         // 30 frames at 100 Hz from 0.1s -> 0.4s. Trim is [0, 0.2s).
         let source = mono_pcm(1, 30);
         let map = ordinary_map(0, 2_000_000);
-        let (output, timestamp, duration) =
-            export_pcm(&source, 1_000_000, &format, &map).unwrap();
+        let (output, timestamp, duration) = export_pcm(&source, 1_000_000, &format, &map).unwrap();
         assert_eq!(timestamp, 1_000_000);
         assert_eq!(duration, 1_000_000);
         assert_eq!(output, source[..10 * 2], "must stop at the chosen duration");
@@ -1262,7 +1253,10 @@ mod tests {
     /// Wholly-outside packets are not an empty write; they are absent.
     #[test]
     fn ordinary_trim_drops_pcm_wholly_outside_the_interval() {
-        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let format = crate::audio::Format {
+            rate: 100,
+            channels: 1,
+        };
         let source = mono_pcm(1, 10);
         assert!(
             export_pcm(&source, 0, &format, &ordinary_map(2_000_000, 5_000_000)).is_none(),
@@ -1276,7 +1270,10 @@ mod tests {
 
     #[test]
     fn ordinary_trim_keeps_a_pcm_packet_wholly_inside_the_interval() {
-        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let format = crate::audio::Format {
+            rate: 100,
+            channels: 1,
+        };
         let source = mono_pcm(1, 10);
         let (output, timestamp, duration) =
             export_pcm(&source, 1_000_000, &format, &ordinary_map(0, 5_000_000)).unwrap();
@@ -1289,7 +1286,10 @@ mod tests {
     /// same [start, end) cut so the two paths cannot drift (SBS-751).
     #[test]
     fn ordinary_and_speed_trims_share_start_boundary_semantics() {
-        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let format = crate::audio::Format {
+            rate: 100,
+            channels: 1,
+        };
         let source = mono_pcm(1, 30);
         let ordinary = ordinary_map(2_000_000, 5_000_000);
         // Speed range sits after this packet so it must not change the clip.
@@ -1307,7 +1307,10 @@ mod tests {
 
     #[test]
     fn ordinary_trim_clips_stereo_on_frame_boundaries() {
-        let format = crate::audio::Format { rate: 100, channels: 2 };
+        let format = crate::audio::Format {
+            rate: 100,
+            channels: 2,
+        };
         let mut source = Vec::new();
         for frame in 1i16..=20 {
             source.extend_from_slice(&frame.to_le_bytes());
@@ -1323,7 +1326,10 @@ mod tests {
 
     #[test]
     fn export_pcm_treats_an_unusable_rate_as_unknown_not_silence() {
-        let format = crate::audio::Format { rate: 0, channels: 1 };
+        let format = crate::audio::Format {
+            rate: 0,
+            channels: 1,
+        };
         let source = mono_pcm(1, 10);
         assert!(
             export_pcm(&source, 0, &format, &ordinary_map(0, TICKS_PER_SECOND)).is_none(),
@@ -1378,7 +1384,10 @@ mod tests {
 
     #[test]
     fn sped_audio_becomes_shorter_silence_while_surrounding_pcm_is_preserved() {
-        let format = crate::audio::Format { rate: 100, channels: 1 };
+        let format = crate::audio::Format {
+            rate: 100,
+            channels: 1,
+        };
         let source: Vec<u8> = (1i16..=100).flat_map(i16::to_le_bytes).collect();
         let map = crate::video_speed::TimeMap::new(
             0,
@@ -1404,7 +1413,11 @@ mod tests {
         let map = crate::video_speed::TimeMap::new(
             0,
             6 * SECOND,
-            &[crate::video_speed::SpeedRange::new(2 * SECOND, 4 * SECOND, 2)],
+            &[crate::video_speed::SpeedRange::new(
+                2 * SECOND,
+                4 * SECOND,
+                2,
+            )],
         )
         .unwrap();
 
@@ -1495,8 +1508,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("matteshot-crop-export-{}-{unique}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "matteshot-crop-export-{}-{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.mp4");
         let output = dir.join("output.mp4");
@@ -1548,7 +1563,12 @@ mod tests {
             None,
             &[],
             &[],
-            crate::video_edit::Crop { x: 0.5, y: 0.0, w: 0.5, h: 1.0 },
+            crate::video_edit::Crop {
+                x: 0.5,
+                y: 0.0,
+                w: 0.5,
+                h: 1.0,
+            },
             &AtomicBool::new(false),
             |_| {},
         )
@@ -1578,23 +1598,57 @@ mod tests {
     fn a_normalized_crop_becomes_an_even_source_rect_inside_the_frame() {
         // Even dimensions because H.264 rejects odd ones, and never hanging
         // off an edge however the floats round.
-        assert_eq!(crop_rect(crate::video_edit::Crop::FULL, 1920, 1080), (0, 0, 1920, 1080));
+        assert_eq!(
+            crop_rect(crate::video_edit::Crop::FULL, 1920, 1080),
+            (0, 0, 1920, 1080)
+        );
         // An odd source is left exactly alone. Evening it here would shave a
         // pixel, report itself as a crop, and disagree with the preview, which
         // keeps the frame untouched for FULL.
-        assert_eq!(crop_rect(crate::video_edit::Crop::FULL, 321, 241), (0, 0, 321, 241));
         assert_eq!(
-            crop_rect(crate::video_edit::Crop { x: 0.5, y: 0.0, w: 0.5, h: 1.0 }, 320, 240),
+            crop_rect(crate::video_edit::Crop::FULL, 321, 241),
+            (0, 0, 321, 241)
+        );
+        assert_eq!(
+            crop_rect(
+                crate::video_edit::Crop {
+                    x: 0.5,
+                    y: 0.0,
+                    w: 0.5,
+                    h: 1.0
+                },
+                320,
+                240
+            ),
             (160, 0, 160, 240)
         );
         // An odd span rounds down to even and is nudged back inside.
-        let (x, y, w, h) =
-            crop_rect(crate::video_edit::Crop { x: 0.9, y: 0.9, w: 0.1, h: 0.1 }, 641, 481);
+        let (x, y, w, h) = crop_rect(
+            crate::video_edit::Crop {
+                x: 0.9,
+                y: 0.9,
+                w: 0.1,
+                h: 0.1,
+            },
+            641,
+            481,
+        );
         assert_eq!((w % 2, h % 2), (0, 0), "odd dimensions would be rejected");
-        assert!(x + w <= 641 && y + h <= 481, "crop {x},{y} {w}x{h} hangs off the frame");
+        assert!(
+            x + w <= 641 && y + h <= 481,
+            "crop {x},{y} {w}x{h} hangs off the frame"
+        );
         // A degenerate crop still yields something encodable.
-        let (_, _, w, h) =
-            crop_rect(crate::video_edit::Crop { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, 320, 240);
+        let (_, _, w, h) = crop_rect(
+            crate::video_edit::Crop {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            320,
+            240,
+        );
         assert!(w >= 2 && h >= 2);
     }
 
@@ -1607,15 +1661,23 @@ mod tests {
 
     #[test]
     fn scrub_cache_is_smooth_sharp_and_memory_bounded() {
-        let (count, width, height) =
-            scrub_cache_plan(30 * 10_000_000, (1920, 1036), (1600, 700));
+        let (count, width, height) = scrub_cache_plan(30 * 10_000_000, (1920, 1036), (1600, 700));
         assert_eq!(count, 60);
-        assert!(width >= 700 && height >= 375, "cache frame was {width}x{height}");
+        assert!(
+            width >= 700 && height >= 375,
+            "cache frame was {width}x{height}"
+        );
         assert!((width as f32 / height as f32 - 1920.0 / 1036.0).abs() < 0.01);
         assert!(count as u64 * width as u64 * height as u64 * 4 <= 96 * 1024 * 1024);
 
-        assert_eq!(scrub_cache_plan(2 * 10_000_000, (1280, 720), (900, 600)).0, 24);
-        assert_eq!(scrub_cache_plan(90 * 10_000_000, (1280, 720), (900, 600)).0, 96);
+        assert_eq!(
+            scrub_cache_plan(2 * 10_000_000, (1280, 720), (900, 600)).0,
+            24
+        );
+        assert_eq!(
+            scrub_cache_plan(90 * 10_000_000, (1280, 720), (900, 600)).0,
+            96
+        );
     }
 
     #[test]
@@ -1665,10 +1727,16 @@ mod tests {
         assert_eq!((cw % 2, ch % 2), (0, 0), "encoder needs even dimensions");
 
         // Ordinary sizes must pass through untouched.
-        assert_eq!(content_size_for_encoder(1920, 1080, &opts, true), (1920, 1080));
+        assert_eq!(
+            content_size_for_encoder(1920, 1080, &opts, true),
+            (1920, 1080)
+        );
         assert_eq!(content_size_for_encoder(960, 522, &opts, true), (960, 522));
         // Unframed output is its own size, so only absurd sources shrink.
-        assert_eq!(content_size_for_encoder(3840, 2160, &opts, false), (3840, 2160));
+        assert_eq!(
+            content_size_for_encoder(3840, 2160, &opts, false),
+            (3840, 2160)
+        );
     }
 
     #[test]
@@ -1693,7 +1761,11 @@ mod tests {
             mf(MF_E_INVALIDMEDIATYPE),
             mf(E_FAIL),
         ] {
-            assert_eq!(validation_fault(&error), ValidationFault::Undecodable, "{error:#}");
+            assert_eq!(
+                validation_fault(&error),
+                ValidationFault::Undecodable,
+                "{error:#}"
+            );
         }
 
         // Nothing here says the file is bad; the check simply did not run.
@@ -1704,11 +1776,17 @@ mod tests {
         .context("read video metadata");
         for error in [
             locked,
-            mf(windows::core::HRESULT::from_win32(ERROR_SHARING_VIOLATION.0)),
+            mf(windows::core::HRESULT::from_win32(
+                ERROR_SHARING_VIOLATION.0,
+            )),
             mf(CO_E_NOTINITIALIZED),
             mf(MF_E_TOPO_CODEC_NOT_FOUND),
         ] {
-            assert_eq!(validation_fault(&error), ValidationFault::Unavailable, "{error:#}");
+            assert_eq!(
+                validation_fault(&error),
+                ValidationFault::Unavailable,
+                "{error:#}"
+            );
         }
     }
 

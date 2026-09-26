@@ -21,18 +21,17 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN,
-    VK_RIGHT,
-    VK_SPACE,
+    VK_RIGHT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
-    GetCursorPos, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW, WINDOW_STYLE, WS_CAPTION,
-    WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongPtrW, LoadCursorW,
+    MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
+    IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
+    WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 const WM_EXPORT_PROGRESS: u32 = WM_APP + 20;
@@ -49,7 +48,10 @@ const WM_SCRUB_FRAME: u32 = WM_APP + 26;
 static NEXT_EXPORT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn recording_delete_prompt(mp4: &std::path::Path, gif: Option<&std::path::Path>) -> String {
-    let mp4_name = mp4.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "this recording".into());
+    let mp4_name = mp4
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "this recording".into());
     let names = gif
         .and_then(|path| path.file_name())
         .map(|name| format!("{mp4_name} and {}", name.to_string_lossy()))
@@ -58,7 +60,10 @@ fn recording_delete_prompt(mp4: &std::path::Path, gif: Option<&std::path::Path>)
 }
 
 fn recording_delete_stage_path(path: &std::path::Path) -> PathBuf {
-    let name = path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
     path.with_file_name(format!(
         "{name}.matteshot-delete-{}-{}",
         std::process::id(),
@@ -469,7 +474,8 @@ struct State {
     sharing: bool,
     /// Guards against a completion posted to a destroyed/reused HWND.
     share_request_id: Option<u64>,
-    /// Cached at open: Share is a paid-license action (SBS-906).
+    /// Cached at open: Share is offered only in a build with the `share`
+    /// feature and a configured share server.
     can_share: bool,
 }
 
@@ -495,7 +501,9 @@ fn available_export_path(candidate: PathBuf) -> PathBuf {
     if !candidate.exists() {
         return candidate;
     }
-    let parent = candidate.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let parent = candidate
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
     let stem = candidate
         .file_stem()
         .map(|value| value.to_string_lossy())
@@ -612,11 +620,9 @@ fn layout(scale: f32, cw: i32, ch: i32, style_count: usize, can_share: bool) -> 
     let mut aspect_controls = Vec::new();
     let aspect_start = m + sc(344);
     let aspect_gap = sc(6);
-    let aspect_available = (crop_control.left
-        - sc(12)
-        - aspect_start
-        - aspect_gap * (ASPECTS.len() as i32 - 1))
-        .max(1);
+    let aspect_available =
+        (crop_control.left - sc(12) - aspect_start - aspect_gap * (ASPECTS.len() as i32 - 1))
+            .max(1);
     let aspect_width = (aspect_available / ASPECTS.len() as i32).max(sc(48));
     for index in 0..ASPECTS.len() {
         let left = aspect_start + index as i32 * (aspect_width + aspect_gap);
@@ -866,7 +872,9 @@ fn matte_thumbs(
     if crate::compose::is_plain(style) {
         return raw
             .iter()
-            .map(|(bytes, w, h)| image_thumb(&crop_frame(&thumb_image(bytes, *w, *h), crop, source)))
+            .map(|(bytes, w, h)| {
+                image_thumb(&crop_frame(&thumb_image(bytes, *w, *h), crop, source))
+            })
             .collect();
     }
     let mut bases = std::collections::HashMap::<(u32, u32), RgbaImage>::new();
@@ -874,9 +882,9 @@ fn matte_thumbs(
         .map(|(bytes, w, h)| {
             let image = crop_frame(&thumb_image(bytes, *w, *h), crop, source);
             let (w, h) = (&image.width(), &image.height());
-            let base = bases
-                .entry((*w, *h))
-                .or_insert_with(|| crate::compose::compose_base(*w as usize, *h as usize, style, opts));
+            let base = bases.entry((*w, *h)).or_insert_with(|| {
+                crate::compose::compose_base(*w as usize, *h as usize, style, opts)
+            });
             let mut composed = base.clone();
             crate::compose::blend_content(&mut composed, &image, opts);
             image_thumb(&composed)
@@ -943,11 +951,7 @@ fn editor_style() -> WINDOW_STYLE {
 /// Preview frames and filmstrip thumbnails are both scaled copies of the whole
 /// recording, so a crop normalized to the source applies to either directly,
 /// whatever size it happens to have been decoded at.
-fn crop_frame(
-    image: &RgbaImage,
-    crop: crate::video_edit::Crop,
-    source: (u32, u32),
-) -> RgbaImage {
+fn crop_frame(image: &RgbaImage, crop: crate::video_edit::Crop, source: (u32, u32)) -> RgbaImage {
     if crop == crate::video_edit::Crop::FULL {
         return image.clone();
     }
@@ -1137,7 +1141,10 @@ fn recompose_preview(state: &mut State) {
         &state.annotations,
         annotation_time,
         skip,
-        crate::video_edit::Frame { crop: active_crop(state), content: content_size },
+        crate::video_edit::Frame {
+            crop: active_crop(state),
+            content: content_size,
+        },
         cropped_source_size(state),
         content_offset,
     );
@@ -1160,7 +1167,10 @@ fn recompose_preview(state: &mut State) {
             std::slice::from_ref(&draft),
             annotation_time,
             None,
-            crate::video_edit::Frame { crop: active_crop(state), content: content_size },
+            crate::video_edit::Frame {
+                crop: active_crop(state),
+                content: content_size,
+            },
             cropped_source_size(state),
             content_offset,
         );
@@ -1170,8 +1180,7 @@ fn recompose_preview(state: &mut State) {
 
 fn update_padding(state: &mut State, x: i32) {
     let slider = state.padding_slider;
-    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32)
-        .clamp(0.0, 1.0);
+    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32).clamp(0.0, 1.0);
     state.pad_factor = crate::compose::PAD_SLIDER_MIN
         + t * (crate::compose::PAD_SLIDER_MAX - crate::compose::PAD_SLIDER_MIN);
     recompose_preview(state);
@@ -1379,14 +1388,16 @@ fn update_caption_size(state: &mut State, x: i32) {
     const MIN: f32 = 0.7;
     const MAX: f32 = 3.4;
     let slider = state.caption_size_slider;
-    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32)
-        .clamp(0.0, 1.0);
+    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32).clamp(0.0, 1.0);
     state.caption_size = MIN + t * (MAX - MIN);
     if let Some(index) = state
         .selected
         .filter(|index| *index < state.annotations.len())
     {
-        if matches!(state.annotations[index].shape, crate::video_edit::Shape::Text { .. }) {
+        if matches!(
+            state.annotations[index].shape,
+            crate::video_edit::Shape::Text { .. }
+        ) {
             state.annotations[index].size = state.caption_size;
         }
     }
@@ -1395,8 +1406,7 @@ fn update_caption_size(state: &mut State, x: i32) {
 
 fn update_caption_opacity(state: &mut State, x: i32) {
     let slider = state.caption_opacity_slider;
-    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32)
-        .clamp(0.0, 1.0);
+    let t = ((x - slider.left) as f32 / (slider.right - slider.left).max(1) as f32).clamp(0.0, 1.0);
     // Keep the plate useful at the low end while still offering a light,
     // glassy treatment. Zero opacity is already available via Shadow style.
     state.caption_box_opacity = 0.20 + t * 0.75;
@@ -1593,10 +1603,8 @@ fn preview_down(state: &State, y: f32) -> f32 {
 }
 
 fn preview_point(state: &State, rect: RECT, x: i32, y: i32) -> (f32, f32) {
-    let across =
-        ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0);
-    let down =
-        ((y - rect.top) as f32 / (rect.bottom - rect.top).max(1) as f32).clamp(0.0, 1.0);
+    let across = ((x - rect.left) as f32 / (rect.right - rect.left).max(1) as f32).clamp(0.0, 1.0);
+    let down = ((y - rect.top) as f32 / (rect.bottom - rect.top).max(1) as f32).clamp(0.0, 1.0);
     // What is on screen is the crop, so a fraction of the picture is that
     // fraction *of the crop*. `Crop::FULL` — including the whole time the crop
     // tool is armed — leaves this an identity.
@@ -1635,10 +1643,7 @@ fn hit_annotation(state: &State, point: (f32, f32)) -> Option<usize> {
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, item)| {
-            item.active_at(time)
-                && crate::video_edit::hit(item, point, 0.018, frame)
-        })
+        .find(|(_, item)| item.active_at(time) && crate::video_edit::hit(item, point, 0.018, frame))
         .map(|(index, _)| index)
 }
 
@@ -1648,13 +1653,14 @@ fn hit_annotation_handle(
 ) -> Option<(usize, crate::video_edit::ShapeHandle)> {
     let frame = annotation_frame(state);
     let time = current_annotation_time(state);
-    let index = state.selected.filter(|index| *index < state.annotations.len())?;
+    let index = state
+        .selected
+        .filter(|index| *index < state.annotations.len())?;
     let item = &state.annotations[index];
     if !item.active_at(time) {
         return None;
     }
-    crate::video_edit::hit_handle(item, point, 0.026, frame)
-        .map(|handle| (index, handle))
+    crate::video_edit::hit_handle(item, point, 0.026, frame).map(|handle| (index, handle))
 }
 
 fn contains(rect: RECT, x: i32, y: i32) -> bool {
@@ -1713,11 +1719,7 @@ fn shape_for_tool(tool: Tool, start: (f32, f32)) -> crate::video_edit::Shape {
     }
 }
 
-fn update_draw_shape(
-    shape: &mut crate::video_edit::Shape,
-    start: (f32, f32),
-    point: (f32, f32),
-) {
+fn update_draw_shape(shape: &mut crate::video_edit::Shape, start: (f32, f32), point: (f32, f32)) {
     match shape {
         crate::video_edit::Shape::Arrow { from, to }
         | crate::video_edit::Shape::Line { from, to } => {
@@ -1732,9 +1734,10 @@ fn update_draw_shape(
             *b = point;
         }
         crate::video_edit::Shape::Freehand { points } => {
-            if points.last().is_none_or(|last| {
-                (last.0 - point.0).hypot(last.1 - point.1) >= 0.001
-            }) {
+            if points
+                .last()
+                .is_none_or(|last| (last.0 - point.0).hypot(last.1 - point.1) >= 0.001)
+            {
                 points.push(point);
             }
         }
@@ -1751,15 +1754,11 @@ fn draw_shape_is_degenerate(shape: &crate::video_edit::Shape) -> bool {
         crate::video_edit::Shape::Rect { a, b }
         | crate::video_edit::Shape::Ellipse { a, b }
         | crate::video_edit::Shape::Highlight { a, b }
-        | crate::video_edit::Shape::Blur { a, b } => {
-            (a.0 - b.0).hypot(a.1 - b.1) < 0.008
-        }
+        | crate::video_edit::Shape::Blur { a, b } => (a.0 - b.0).hypot(a.1 - b.1) < 0.008,
         crate::video_edit::Shape::Freehand { points } => {
             points
                 .windows(2)
-                .map(|segment| {
-                    (segment[0].0 - segment[1].0).hypot(segment[0].1 - segment[1].1)
-                })
+                .map(|segment| (segment[0].0 - segment[1].0).hypot(segment[0].1 - segment[1].1))
                 .sum::<f32>()
                 < 0.008
         }
@@ -2094,12 +2093,7 @@ unsafe fn paint_bgra_fit(hdc: HDC, rect: RECT, frame: &(Vec<u8>, u32, u32), stat
 
 /// Translucent fill over the preview. GDI has no alpha on `Rectangle`, so a
 /// 1x1 solid is stretched through `AlphaBlend`.
-unsafe fn wash(
-    hdc: HDC,
-    rect: RECT,
-    color: windows::Win32::Foundation::COLORREF,
-    alpha: u8,
-) {
+unsafe fn wash(hdc: HDC, rect: RECT, color: windows::Win32::Foundation::COLORREF, alpha: u8) {
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     if w <= 0 || h <= 0 {
         return;
@@ -2108,7 +2102,16 @@ unsafe fn wash(
     let bmp = windows::Win32::Graphics::Gdi::CreateCompatibleBitmap(hdc, 1, 1);
     let old = SelectObject(mem, bmp);
     let brush = CreateSolidBrush(color);
-    FillRect(mem, &RECT { left: 0, top: 0, right: 1, bottom: 1 }, brush);
+    FillRect(
+        mem,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        },
+        brush,
+    );
     let _ = windows::Win32::Graphics::Gdi::AlphaBlend(
         hdc,
         rect.left,
@@ -2249,10 +2252,9 @@ unsafe fn paint(hdc: HDC, state: &State) {
         {
             let item = &state.annotations[index];
             if item.active_at(current_annotation_time(state)) {
-                let image_rect = preview_content_rect(state)
-                    .unwrap_or_else(|| preview_image_rect(state, frame));
-                let (x0, y0, x1, y1) =
-                    crate::video_edit::bounds(item, annotation_frame(state));
+                let image_rect =
+                    preview_content_rect(state).unwrap_or_else(|| preview_image_rect(state, frame));
+                let (x0, y0, x1, y1) = crate::video_edit::bounds(item, annotation_frame(state));
                 // `bounds` is in the recording's coordinates, so it has to come
                 // back through the crop — the exact inverse of `preview_point`.
                 // Multiplying it straight into the picture on screen drew the
@@ -2294,13 +2296,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     let radius = s(state, 7);
                     for (_, point) in handles {
                         let (x, y) = (map_x(point.0), map_y(point.1));
-                        let _ = Ellipse(
-                            hdc,
-                            x - radius,
-                            y - radius,
-                            x + radius + 1,
-                            y + radius + 1,
-                        );
+                        let _ =
+                            Ellipse(hdc, x - radius, y - radius, x + radius + 1, y + radius + 1);
                     }
                     SelectObject(hdc, old_brush);
                     SelectObject(hdc, old_pen);
@@ -2386,14 +2383,22 @@ unsafe fn paint(hdc: HDC, state: &State) {
         if caption_controls_active(state) {
             SelectObject(hdc, state.font_small);
             SetTextColor(hdc, state.theme.muted);
-            let mut size_label = wide(&format!("Size {}", (state.caption_size * 24.0).round() as i32));
+            let mut size_label = wide(&format!(
+                "Size {}",
+                (state.caption_size * 24.0).round() as i32
+            ));
             let mut size_rect = RECT {
                 left: tool_panel(state).left + s(state, 12),
                 top: state.caption_size_slider.top,
                 right: state.caption_size_slider.left - s(state, 6),
                 bottom: state.caption_size_slider.bottom,
             };
-            DrawTextW(hdc, &mut size_label, &mut size_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawTextW(
+                hdc,
+                &mut size_label,
+                &mut size_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
             let slider = state.caption_size_slider;
             let cy = (slider.top + slider.bottom) / 2;
             let track = CreateSolidBrush(state.theme.track);
@@ -2523,7 +2528,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 right: state.timing_controls[0].0.left - s(state, 6),
                 bottom: state.timing_controls[0].0.bottom,
             };
-            DrawTextW(hdc, &mut timing_label, &mut timing_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawTextW(
+                hdc,
+                &mut timing_label,
+                &mut timing_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
             let active_timing = selected_timing(state);
             for (rect, choice) in &state.timing_controls {
                 paint_chip(
@@ -2751,7 +2761,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
         );
     }
     for (rect, index) in &state.aspect_controls {
-        paint_chip(hdc, *rect, ASPECTS[*index].0, state.aspect_idx == *index, state);
+        paint_chip(
+            hdc,
+            *rect,
+            ASPECTS[*index].0,
+            state.aspect_idx == *index,
+            state,
+        );
     }
     // Says what it will do rather than what it is called: with a crop applied,
     // this is how you get back to the whole recording.
@@ -2796,10 +2812,30 @@ unsafe fn paint(hdc: HDC, state: &State) {
             let (kx0, ky0) = at(pending.x, pending.y);
             let (kx1, ky1) = at(pending.x + pending.w, pending.y + pending.h);
             for band in [
-                RECT { left: content.left, top: content.top, right: content.right, bottom: ky0 },
-                RECT { left: content.left, top: ky1, right: content.right, bottom: content.bottom },
-                RECT { left: content.left, top: ky0, right: kx0, bottom: ky1 },
-                RECT { left: kx1, top: ky0, right: content.right, bottom: ky1 },
+                RECT {
+                    left: content.left,
+                    top: content.top,
+                    right: content.right,
+                    bottom: ky0,
+                },
+                RECT {
+                    left: content.left,
+                    top: ky1,
+                    right: content.right,
+                    bottom: content.bottom,
+                },
+                RECT {
+                    left: content.left,
+                    top: ky0,
+                    right: kx0,
+                    bottom: ky1,
+                },
+                RECT {
+                    left: kx1,
+                    top: ky0,
+                    right: content.right,
+                    bottom: ky1,
+                },
             ] {
                 if band.right > band.left && band.bottom > band.top {
                     wash(hdc, band, state.theme.bg, 170);
@@ -2961,7 +2997,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
             SelectObject(hdc, state.font_small);
             SetTextColor(
                 hdc,
-                if selected { state.theme.accent_text } else { state.theme.text },
+                if selected {
+                    state.theme.accent_text
+                } else {
+                    state.theme.text
+                },
             );
             let mut text = wide(&format!("{}\u{00d7}", range.rate));
             let mut rect = RECT {
@@ -2970,7 +3010,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 right: right - s(state, 4),
                 bottom: strip.top + s(state, 20),
             };
-            DrawTextW(hdc, &mut text, &mut rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawTextW(
+                hdc,
+                &mut text,
+                &mut rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
         }
 
         // Dim the trimmed-away ends with a 50% wash so frames stay visible.
@@ -3078,7 +3123,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let selected_seconds = whole_secs(state.trim_end - state.trim_start).max(1);
         let duration_tail = speed_time_map(state)
             .filter(|map| !map.is_empty())
-            .map(|map| format!("{selected_seconds}s \u{2192} {}s output", whole_secs(map.output_duration()).max(1)))
+            .map(|map| {
+                format!(
+                    "{selected_seconds}s \u{2192} {}s output",
+                    whole_secs(map.output_duration()).max(1)
+                )
+            })
             .unwrap_or_else(|| format!("{selected_seconds}s selected"));
         let label = format!(
             "{:02}:{:02}.{}     Trim  {:02}:{:02} \u{2013} {:02}:{:02}     {}",
@@ -3098,7 +3148,10 @@ unsafe fn paint(hdc: HDC, state: &State) {
             left: strip.left,
             top: strip.bottom + s(state, 6),
             right: if state.selected_speed.is_some() {
-                state.speed_rate_controls.first().map_or(strip.right, |(rect, _)| rect.left)
+                state
+                    .speed_rate_controls
+                    .first()
+                    .map_or(strip.right, |(rect, _)| rect.left)
                     - s(state, 8)
             } else {
                 state.speed_add_control.left - s(state, 8)
@@ -3107,16 +3160,30 @@ unsafe fn paint(hdc: HDC, state: &State) {
         };
         DrawTextW(hdc, &mut l, &mut lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-        if let Some(index) = state.selected_speed.filter(|index| *index < state.speed_ranges.len()) {
+        if let Some(index) = state
+            .selected_speed
+            .filter(|index| *index < state.speed_ranges.len())
+        {
             let selected_rate = state.speed_ranges[index].rate;
             for (rect, rate) in &state.speed_rate_controls {
-                paint_chip(hdc, *rect, &format!("{rate}\u{00d7}"), *rate == selected_rate, state);
+                paint_chip(
+                    hdc,
+                    *rect,
+                    &format!("{rate}\u{00d7}"),
+                    *rate == selected_rate,
+                    state,
+                );
             }
             paint_chip(hdc, state.speed_remove_control, "Remove", false, state);
         } else {
-            paint_chip(hdc, state.speed_add_control, "+ Speed", state.speed_armed, state);
+            paint_chip(
+                hdc,
+                state.speed_add_control,
+                "+ Speed",
+                state.speed_armed,
+                state,
+            );
         }
-
     }
 
     // A tool that arms and then waits has to say what it is waiting for. Both
@@ -3248,14 +3315,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Ok(()) => {
                             crate::diagnostics::log("video export complete");
                             let name = done.path.file_name().unwrap_or_default().to_string_lossy();
-                            state.status = Some(match crate::output::file_to_clipboard(&done.path) {
-                                Ok(()) => format!("saved {name} · edit on clipboard"),
-                                Err(error) => {
-                                    crate::diagnostics::log("video export clipboard copy failed");
-                                    eprintln!("video export clipboard copy failed: {error:#}");
-                                    format!("saved {name} · clipboard unavailable")
-                                }
-                            });
+                            state.status =
+                                Some(match crate::output::file_to_clipboard(&done.path) {
+                                    Ok(()) => format!("saved {name} · edit on clipboard"),
+                                    Err(error) => {
+                                        crate::diagnostics::log(
+                                            "video export clipboard copy failed",
+                                        );
+                                        eprintln!("video export clipboard copy failed: {error:#}");
+                                        format!("saved {name} · clipboard unavailable")
+                                    }
+                                });
                             state.exported = Some(done.path.clone());
                         }
                         Err(error) if error == "export cancelled" => {
@@ -3679,9 +3749,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
                     }
-                    if caption_controls_active(state)
-                        && contains(state.caption_size_slider, x, y)
-                    {
+                    if caption_controls_active(state) && contains(state.caption_size_slider, x, y) {
                         stop_playback(state);
                         if state.selected.is_some() {
                             push_undo(state);
@@ -3858,7 +3926,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let index = state.annotations.len() - 1;
                             state.selected = Some(index);
                             state.tools_open = false;
-                            state.dragging = Some(Drag::Draw { index, start: point });
+                            state.dragging = Some(Drag::Draw {
+                                index,
+                                start: point,
+                            });
                             windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                             recompose_preview(state);
                         }
@@ -3911,7 +3982,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let grab = s(state, 10);
                     if state.speed_armed {
                         stop_playback(state);
-                        let anchor = timeline_time(state, x).clamp(state.trim_start, state.trim_end);
+                        let anchor =
+                            timeline_time(state, x).clamp(state.trim_start, state.trim_end);
                         push_undo(state);
                         if let Some(index) = add_speed_range(state, anchor) {
                             state.selected_speed = Some(index);
@@ -3921,7 +3993,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
                         } else {
                             state.undo.pop();
-                            state.status = Some("there is no room for another speed section here".into());
+                            state.status =
+                                Some("there is no room for another speed section here".into());
                         }
                         let _ = InvalidateRect(hwnd, None, false);
                         return LRESULT(0);
@@ -4033,10 +4106,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                     if matches!(
                         drag,
-                        Drag::Trim(_)
-                            | Drag::Speed { .. }
-                            | Drag::SpeedNew { .. }
-                            | Drag::Playhead
+                        Drag::Trim(_) | Drag::Speed { .. } | Drag::SpeedNew { .. } | Drag::Playhead
                     ) {
                         // The decoder is already chasing this position, so
                         // releasing no longer blocks on a fresh seek.
@@ -4123,14 +4193,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Act::Play => toggle_playback(hwnd, state),
                         Act::Reveal => crate::output::reveal_in_explorer(&state.mp4),
                         Act::Copy => {
-                            state.status = Some(match crate::output::file_to_clipboard(&state.mp4) {
-                                Ok(()) => "original copied to clipboard".into(),
-                                Err(error) => {
-                                    crate::diagnostics::log("video clipboard copy failed");
-                                    eprintln!("video clipboard copy failed: {error:#}");
-                                    "could not copy original to the clipboard".into()
-                                }
-                            });
+                            state.status =
+                                Some(match crate::output::file_to_clipboard(&state.mp4) {
+                                    Ok(()) => "original copied to clipboard".into(),
+                                    Err(error) => {
+                                        crate::diagnostics::log("video clipboard copy failed");
+                                        eprintln!("video clipboard copy failed: {error:#}");
+                                        "could not copy original to the clipboard".into()
+                                    }
+                                });
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                         // Shares the original recording, same as Copy and Show
@@ -4139,7 +4210,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // buttons agree the "real" artifact is.
                         Act::Share => {
                             if let crate::share::ShareStart::Unavailable(reason) =
-                                crate::share::share_start(crate::license::can_share())
+                                crate::share::share_start()
                             {
                                 state.status = Some(reason.into());
                                 let _ = InvalidateRect(hwnd, None, false);
@@ -4183,14 +4254,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 return LRESULT(0);
                             }
                             stop_playback(state);
-                            if let Err(error) = delete_recording_files(
-                                &state.mp4,
-                                state.gif.as_deref(),
-                            ) {
+                            if let Err(error) =
+                                delete_recording_files(&state.mp4, state.gif.as_deref())
+                            {
                                 crate::diagnostics::log(&format!(
                                     "recording could not be deleted: {error:#}"
                                 ));
-                                state.status = Some("could not delete recording · original kept".into());
+                                state.status =
+                                    Some("could not delete recording · original kept".into());
                                 let _ = InvalidateRect(hwnd, None, false);
                                 return LRESULT(0);
                             }
@@ -4372,16 +4443,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 };
                                 unsafe {
                                     let target = HWND(hwnd_raw as *mut _);
-                                    EXPORT_COMPLETIONS.post_with_at(hwnd_raw, mailbox_generation, done, |token| {
-                                        crate::window::has_class(target, "matteshot_recdone")
-                                            && PostMessageW(
-                                                target,
-                                                WM_EXPORT_DONE,
-                                                WPARAM(0),
-                                                LPARAM(token as isize),
-                                            )
-                                            .is_ok()
-                                    });
+                                    EXPORT_COMPLETIONS.post_with_at(
+                                        hwnd_raw,
+                                        mailbox_generation,
+                                        done,
+                                        |token| {
+                                            crate::window::has_class(target, "matteshot_recdone")
+                                                && PostMessageW(
+                                                    target,
+                                                    WM_EXPORT_DONE,
+                                                    WPARAM(0),
+                                                    LPARAM(token as isize),
+                                                )
+                                                .is_ok()
+                                        },
+                                    );
                                 }
                             });
                         }
@@ -4680,7 +4756,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let s = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
                 let (minimum_w, minimum_h) = minimum_client_size(s);
                 let outer = crate::dpi::outer_bounds(
-                    RECT { left: 0, top: 0, right: minimum_w, bottom: minimum_h },
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: minimum_w,
+                        bottom: minimum_h,
+                    },
                     editor_style(),
                     WS_EX_APPWINDOW,
                     s,
@@ -4798,7 +4879,9 @@ pub fn show(
         crate::output::cleanup_stale_video_partials(parent);
     }
     let mut cursor = POINT::default();
-    unsafe { let _ = GetCursorPos(&mut cursor); }
+    unsafe {
+        let _ = GetCursorPos(&mut cursor);
+    }
     // Opens on the cursor's monitor, so that is the scale its chrome uses.
     let scale = crate::dpi::scale_for_point(cursor);
     let sc = |v: i32| (v as f32 * scale) as i32;
@@ -4813,10 +4896,8 @@ pub fn show(
     }
     let work_w = monitor_info.rcWork.right - monitor_info.rcWork.left;
     let work_h = monitor_info.rcWork.bottom - monitor_info.rcWork.top;
-    let cw = ((work_w as f32 * 0.85) as i32)
-        .clamp(sc(760).min(work_w - sc(40)), work_w - sc(40));
-    let ch = ((work_h as f32 * 0.85) as i32)
-        .clamp(sc(560).min(work_h - sc(40)), work_h - sc(40));
+    let cw = ((work_w as f32 * 0.85) as i32).clamp(sc(760).min(work_w - sc(40)), work_w - sc(40));
+    let ch = ((work_h as f32 * 0.85) as i32).clamp(sc(560).min(work_h - sc(40)), work_h - sc(40));
     let window_x = monitor_info.rcWork.left + (work_w - cw) / 2;
     let window_y = monitor_info.rcWork.top + (work_h - ch) / 2;
 
@@ -4872,7 +4953,7 @@ pub fn show(
         summary.push_str("   \u{00b7}   + GIF");
     }
 
-    let initial = layout(scale, cw, ch, styles.len(), crate::license::can_share());
+    let initial = layout(scale, cw, ch, styles.len(), crate::share::available());
     // The frame the opening probe already decoded; re-decoding it here cost
     // another seek for the same picture.
     let preview_raw = scrub_previews.first().cloned();
@@ -4962,7 +5043,7 @@ pub fn show(
         scrub_generation: 0,
         sharing: false,
         share_request_id: None,
-        can_share: crate::license::can_share(),
+        can_share: crate::share::available(),
     });
     recompose_preview(&mut state);
     let state = Box::into_raw(state);
@@ -5028,14 +5109,15 @@ pub fn show(
                                     mailbox_generation,
                                     (generation, bytes, fw, fh),
                                     |token| {
-                                        posted = crate::window::has_class(hwnd, "matteshot_recdone")
-                                            && PostMessageW(
-                                                hwnd,
-                                                WM_SCRUB_FRAME,
-                                                WPARAM(0),
-                                                LPARAM(token as isize),
-                                            )
-                                            .is_ok();
+                                        posted =
+                                            crate::window::has_class(hwnd, "matteshot_recdone")
+                                                && PostMessageW(
+                                                    hwnd,
+                                                    WM_SCRUB_FRAME,
+                                                    WPARAM(0),
+                                                    LPARAM(token as isize),
+                                                )
+                                                .is_ok();
                                         posted
                                     },
                                 );
@@ -5059,9 +5141,8 @@ pub fn show(
                 std::thread::spawn(move || {
                     let com = CoInitializeEx(None, COINIT_MULTITHREADED);
                     let started = std::time::Instant::now();
-                    let probed = crate::trim::probe_editor(
-                        &source, probe_w, probe_h, preview_w, preview_h,
-                    );
+                    let probed =
+                        crate::trim::probe_editor(&source, probe_w, probe_h, preview_w, preview_h);
                     eprintln!("timing: filmstrip + scrub cache in {:?}", started.elapsed());
                     if com.is_ok() {
                         CoUninitialize();
@@ -5073,13 +5154,8 @@ pub fn show(
                     let hwnd = HWND(target as *mut _);
                     PROBE_COMPLETIONS.post_with_at(target, mailbox_generation, probed, |token| {
                         crate::window::has_class(hwnd, "matteshot_recdone")
-                            && PostMessageW(
-                                hwnd,
-                                WM_PROBE_READY,
-                                WPARAM(0),
-                                LPARAM(token as isize),
-                            )
-                            .is_ok()
+                            && PostMessageW(hwnd, WM_PROBE_READY, WPARAM(0), LPARAM(token as isize))
+                                .is_ok()
                     });
                 });
             }
@@ -5100,7 +5176,12 @@ mod tests {
         // keeps as 160. A preview that rounded for itself would show 161
         // source pixels' worth and promise a sliver the file does not hold.
         let source = (321u32, 241u32);
-        let crop = crate::video_edit::Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 };
+        let crop = crate::video_edit::Crop {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
         let (_, _, kept_w, kept_h) = crop.pixel_rect(source.0, source.1);
         assert_eq!((kept_w, kept_h), (160, 120), "the encoder's rounding");
 
@@ -5210,7 +5291,10 @@ mod tests {
         let window = layout(scale, requested_w, requested_h, 7, true);
         let preview_h = window.preview.bottom - window.preview.top;
         let timeline_h = window.strip.bottom - window.strip.top;
-        assert!(preview_h >= (180.0 * scale) as i32, "preview was {preview_h}px");
+        assert!(
+            preview_h >= (180.0 * scale) as i32,
+            "preview was {preview_h}px"
+        );
         assert!(timeline_h >= (60.0 * scale) as i32);
         assert!(window.preview.left >= 0 && window.preview.right <= width);
         assert!(window.preview.top >= 0 && window.preview.bottom < window.strip.top);
@@ -5225,15 +5309,11 @@ mod tests {
             "matte row ended at {matte_bottom}, settings began at {}",
             window.padding_slider.top
         );
-        assert!(
-            matte_bottom + (6.0 * scale).round() as i32
-                <= window.aspect_controls[0].0.top
-        );
+        assert!(matte_bottom + (6.0 * scale).round() as i32 <= window.aspect_controls[0].0.top);
         assert!(window.padding_slider.bottom < window.strip.top);
-        assert!(window
-            .tool_controls
-            .iter()
-            .all(|(rect, ..)| rect.left >= window.preview.left && rect.right <= window.preview.right));
+        assert!(window.tool_controls.iter().all(
+            |(rect, ..)| rect.left >= window.preview.left && rect.right <= window.preview.right
+        ));
         assert!(window.timing_controls.iter().all(|(rect, _)| {
             rect.top >= window.preview.top && rect.bottom <= window.preview.bottom
         }));
@@ -5241,16 +5321,26 @@ mod tests {
         assert!(window.speed_add_control.top > window.strip.bottom);
         assert!(window.speed_add_control.bottom <= window.controls[0].0.top);
         assert_eq!(
-            window.speed_rate_controls.iter().map(|(_, rate)| *rate).collect::<Vec<_>>(),
+            window
+                .speed_rate_controls
+                .iter()
+                .map(|(_, rate)| *rate)
+                .collect::<Vec<_>>(),
             vec![2, 4, 8, 16]
         );
-        assert!(window.speed_rate_controls.windows(2).all(|pair| pair[0].0.right < pair[1].0.left));
+        assert!(window
+            .speed_rate_controls
+            .windows(2)
+            .all(|pair| pair[0].0.right < pair[1].0.left));
         assert!(window
             .speed_rate_controls
             .last()
             .is_some_and(|(rect, _)| rect.right < window.speed_remove_control.left));
         assert!(window.speed_remove_control.right <= width);
-        assert!(window.controls.iter().all(|(rect, ..)| rect.bottom <= height));
+        assert!(window
+            .controls
+            .iter()
+            .all(|(rect, ..)| rect.bottom <= height));
         assert!(window
             .matte_controls
             .iter()
@@ -5332,18 +5422,21 @@ mod tests {
         assert_eq!(*share_label, "Share");
         assert!(copy_rect.right < share_rect.left, "Share overlaps Copy");
         assert!(share_rect.right < delete_rect.left, "Delete overlaps Share");
-        assert!(share_rect.right <= 1280, "Share runs off the minimum-width window");
+        assert!(
+            share_rect.right <= 1280,
+            "Share runs off the minimum-width window"
+        );
     }
 
     #[test]
-    fn share_is_hidden_without_a_paid_license() {
+    fn share_is_hidden_when_it_cannot_upload() {
         let window = layout(1.0, 1280, 720, 7, false);
         assert!(
             window
                 .controls
                 .iter()
                 .all(|(_, act, _)| *act != super::Act::Share),
-            "trial and unlicensed editors must not show Share"
+            "an editor that cannot upload must not show Share"
         );
     }
 
@@ -5354,7 +5447,10 @@ mod tests {
             assert_eq!(apply_caption_input(&mut text, ch), CaptionInput::Changed);
         }
         assert_eq!(text, "Smooth caption 👍");
-        assert_eq!(apply_caption_input(&mut text, '\u{8}'), CaptionInput::Changed);
+        assert_eq!(
+            apply_caption_input(&mut text, '\u{8}'),
+            CaptionInput::Changed
+        );
         assert_eq!(text, "Smooth caption ");
         assert_eq!(apply_caption_input(&mut text, '\r'), CaptionInput::Commit);
         assert_eq!(apply_caption_input(&mut text, '\n'), CaptionInput::Ignored);
@@ -5401,15 +5497,68 @@ mod tests {
     fn every_annotation_shape_opens_the_matching_property_tool() {
         use crate::video_edit::Shape;
 
-        assert_eq!(super::tool_for_shape(&Shape::Arrow { from: (0.0, 0.0), to: (1.0, 1.0) }), super::Tool::Arrow);
-        assert_eq!(super::tool_for_shape(&Shape::Line { from: (0.0, 0.0), to: (1.0, 1.0) }), super::Tool::Line);
-        assert_eq!(super::tool_for_shape(&Shape::Rect { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Rect);
-        assert_eq!(super::tool_for_shape(&Shape::Ellipse { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Ellipse);
-        assert_eq!(super::tool_for_shape(&Shape::Highlight { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Highlight);
-        assert_eq!(super::tool_for_shape(&Shape::Text { pos: (0.0, 0.0), text: String::new() }), super::Tool::Text);
-        assert_eq!(super::tool_for_shape(&Shape::Blur { a: (0.0, 0.0), b: (1.0, 1.0) }), super::Tool::Blur);
-        assert_eq!(super::tool_for_shape(&Shape::Counter { pos: (0.0, 0.0), n: 1 }), super::Tool::Counter);
-        assert_eq!(super::tool_for_shape(&Shape::Freehand { points: vec![(0.0, 0.0), (1.0, 1.0)] }), super::Tool::Pen);
+        assert_eq!(
+            super::tool_for_shape(&Shape::Arrow {
+                from: (0.0, 0.0),
+                to: (1.0, 1.0)
+            }),
+            super::Tool::Arrow
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Line {
+                from: (0.0, 0.0),
+                to: (1.0, 1.0)
+            }),
+            super::Tool::Line
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Rect {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
+            super::Tool::Rect
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Ellipse {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
+            super::Tool::Ellipse
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Highlight {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
+            super::Tool::Highlight
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Text {
+                pos: (0.0, 0.0),
+                text: String::new()
+            }),
+            super::Tool::Text
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Blur {
+                a: (0.0, 0.0),
+                b: (1.0, 1.0)
+            }),
+            super::Tool::Blur
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Counter {
+                pos: (0.0, 0.0),
+                n: 1
+            }),
+            super::Tool::Counter
+        );
+        assert_eq!(
+            super::tool_for_shape(&Shape::Freehand {
+                points: vec![(0.0, 0.0), (1.0, 1.0)]
+            }),
+            super::Tool::Pen
+        );
     }
 
     #[test]
@@ -5424,7 +5573,9 @@ mod tests {
             assert_eq!(row.len(), 3);
             assert!(row.windows(2).all(|pair| pair[0].0.right < pair[1].0.left));
         }
-        assert!(controls.windows(4).all(|window| window[0].0.bottom < window[3].0.top));
+        assert!(controls
+            .windows(4)
+            .all(|window| window[0].0.bottom < window[3].0.top));
         // Every tool arms until it is put away: a second pick disarms it, and
         // any other pick switches instead of clearing.
         for (tool, _) in VIDEO_TOOLS {

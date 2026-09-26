@@ -21,12 +21,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    SetForegroundWindow, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCAPTION,
-    IDC_ARROW, MSG, WDA_EXCLUDEFROMCAPTURE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT,
-    WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    SetForegroundWindow, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, TranslateMessage,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCAPTION, IDC_ARROW, MSG,
+    WDA_EXCLUDEFROMCAPTURE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::record::{Progress, Target};
@@ -53,14 +52,32 @@ fn wide(s: &str) -> Vec<u16> {
 
 unsafe fn paint(hdc: HDC, state: &UiState) {
     let bg = CreateSolidBrush(state.theme.panel);
-    FillRect(hdc, &RECT { left: 0, top: 0, right: state.width, bottom: state.height }, bg);
+    FillRect(
+        hdc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: state.width,
+            bottom: state.height,
+        },
+        bg,
+    );
     let _ = DeleteObject(bg);
     SetBkMode(hdc, windows::Win32::Graphics::Gdi::TRANSPARENT);
 
     // Red dot.
     let dot = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x004444EF));
     let cy = state.height / 2;
-    FillRect(hdc, &RECT { left: 14, top: cy - 5, right: 24, bottom: cy + 5 }, dot);
+    FillRect(
+        hdc,
+        &RECT {
+            left: 14,
+            top: cy - 5,
+            right: 24,
+            bottom: cy + 5,
+        },
+        dot,
+    );
     let _ = DeleteObject(dot);
 
     let secs = state.progress.started.elapsed().as_secs();
@@ -68,17 +85,30 @@ unsafe fn paint(hdc: HDC, state: &UiState) {
     SelectObject(hdc, state.font);
     SetTextColor(hdc, state.theme.text);
     let mut t = wide(&label);
-    let mut rc = RECT { left: 34, top: 0, right: 104, bottom: state.height };
+    let mut rc = RECT {
+        left: 34,
+        top: 0,
+        right: 104,
+        bottom: state.height,
+    };
     DrawTextW(hdc, &mut t, &mut rc, DT_SINGLELINE | DT_VCENTER);
 
     // Stop button.
-    let fill = CreateSolidBrush(if state.hover { state.theme.accent } else { state.theme.chip });
+    let fill = CreateSolidBrush(if state.hover {
+        state.theme.accent
+    } else {
+        state.theme.chip
+    });
     FillRect(hdc, &state.stop_rect, fill);
     let _ = DeleteObject(fill);
     SelectObject(hdc, state.font_small);
     SetTextColor(
         hdc,
-        if state.hover { state.theme.accent_text } else { state.theme.text },
+        if state.hover {
+            state.theme.accent_text
+        } else {
+            state.theme.text
+        },
     );
     let mut s = wide("Stop");
     let mut sr = state.stop_rect;
@@ -204,7 +234,12 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
         theme,
         font: unsafe { make_font(-16, 600) },
         font_small: unsafe { make_font(-13, 400) },
-        stop_rect: RECT { left: 108, top: 7, right: 166, bottom: ch - 7 },
+        stop_rect: RECT {
+            left: 108,
+            top: 7,
+            right: 166,
+            bottom: ch - 7,
+        },
         hover: false,
         width: cw,
         height: ch,
@@ -224,12 +259,8 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
 
         // Bottom-center of the monitor being recorded.
         let anchor = match target {
-            Target::Window(h) => {
-                MonitorFromWindow(HWND(h as *mut _), MONITOR_DEFAULTTOPRIMARY)
-            }
-            Target::Region(_, m) => {
-                windows::Win32::Graphics::Gdi::HMONITOR(m as *mut _)
-            }
+            Target::Window(h) => MonitorFromWindow(HWND(h as *mut _), MONITOR_DEFAULTTOPRIMARY),
+            Target::Region(_, m) => windows::Win32::Graphics::Gdi::HMONITOR(m as *mut _),
         };
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,

@@ -13,7 +13,6 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, FixedOffset};
 use semver::Version;
 use serde::Deserialize;
 use windows::core::{w, HSTRING, PCWSTR};
@@ -44,10 +43,10 @@ struct VersionManifest {
     version: String,
     url: Option<String>,
     download: Option<String>,
-    released: Option<String>,
-    /// Every build still being served, so a customer whose update term has
-    /// ended can be offered the newest release that term covered rather than
-    /// nothing at all. Absent from older manifests, hence the default.
+    /// Every build still being served. Older builds used it to offer a
+    /// lapsed update term the newest release that term covered; now it is
+    /// just a list to pick the newest valid entry from. Absent from older
+    /// manifests, hence the default.
     #[serde(default)]
     releases: Vec<ManifestRelease>,
 }
@@ -56,7 +55,6 @@ struct VersionManifest {
 struct ManifestRelease {
     version: String,
     download: Option<String>,
-    released: Option<String>,
 }
 
 struct InternetHandle(*mut c_void);
@@ -159,46 +157,16 @@ fn fetch_manifest() -> Result<String> {
     }
 }
 
-/// Whether a release falls inside an update term.
-///
-/// Calendar dates rather than instants: a build put out during the final day
-/// of a term counts, and nobody should lose one to a few hours. A release with
-/// no date, or an unreadable one, counts as covered, because a mistake in our
-/// own manifest must never withhold an update someone paid for.
-fn covered(released: Option<&str>, deadline: Option<DateTime<FixedOffset>>) -> bool {
-    let Some(deadline) = deadline else {
-        return true;
-    };
-    let Some(released) = released.and_then(|text| DateTime::parse_from_rfc3339(text).ok()) else {
-        return true;
-    };
-    released.date_naive() <= deadline.date_naive()
-}
-
-/// The newest release this license is entitled to install, if any.
-///
-/// `entitled_through` is the certificate's `updates_until`; `None` means
-/// unrestricted, which covers the trial and any certificate minted without a
-/// term. A release counts when it came out on or before that date, so the term
-/// bounds *which versions were bought*, not how long they may be installed.
-/// Someone who lapses keeps every build their year paid for, forever, and can
-/// still install one after two years offline. Comparing against today instead
-/// would quietly turn a perpetual license into a subscription.
-fn available_from(
-    body: &str,
-    current: &str,
-    entitled_through: Option<&str>,
-) -> Result<Option<AvailableUpdate>> {
+/// The newest release in the manifest that is newer than `current`, if any.
+fn available_from(body: &str, current: &str) -> Result<Option<AvailableUpdate>> {
     let manifest: VersionManifest = serde_json::from_str(body).context("parse update manifest")?;
     let current = Version::parse(current.trim_start_matches('v')).context("parse app version")?;
-    let deadline = entitled_through.and_then(|text| DateTime::parse_from_rfc3339(text).ok());
 
     let mut candidates = manifest.releases;
     if candidates.is_empty() {
         candidates.push(ManifestRelease {
             version: manifest.version,
             download: manifest.download.or(manifest.url),
-            released: manifest.released,
         });
     }
 
@@ -216,7 +184,7 @@ fn available_from(
         let Ok(version) = Version::parse(release.version.trim_start_matches('v')) else {
             continue;
         };
-        if version <= current || !covered(release.released.as_deref(), deadline) {
+        if version <= current {
             continue;
         }
         let Some(download_url) = release.download else {
@@ -236,30 +204,10 @@ fn available_from(
     }))
 }
 
-/// The update term on the installed license, or `None` when nothing limits it.
-fn entitled_through() -> Option<String> {
-    match crate::license::status() {
-        crate::license::Status::Licensed { updates_until, .. } => updates_until,
-        _ => None,
-    }
-}
-
 pub fn check_once() -> Result<Option<AvailableUpdate>> {
     let body = fetch_manifest()?;
     let current = env!("CARGO_PKG_VERSION");
-    let term = entitled_through();
-    let update = available_from(&body, current, term.as_deref())?;
-    if update.is_none() && term.is_some() {
-        // A lapsed customer sees nothing happen at all, which support cannot
-        // tell apart from a broken update check unless we write it down.
-        if let Ok(Some(newer)) = available_from(&body, current, None) {
-            crate::diagnostics::log(&format!(
-                "{} is available but falls outside this license's update term",
-                newer.version
-            ));
-        }
-    }
-    let Some(update) = update else {
+    let Some(update) = available_from(&body, current)? else {
         return Ok(None);
     };
     // Discovery is unsigned version.json. Authorization is the signed
@@ -413,12 +361,11 @@ pub fn start(hwnd: HWND) {
                                 // (SBS-1044). The tray still offers the
                                 // manual download in the meantime.
                                 //
-                                // Quiet for the user, but not for us: a silent
-                                // update failure strands people on an old build
-                                // with nothing to report, so it is the one failure
-                                // most worth counting.
+                                // Quiet for the user, but not in the log: a
+                                // silent update failure strands people on an
+                                // old build with nothing to report.
                                 crate::diagnostics::log("update could not be applied");
-                                crate::telemetry::report_failure("update", &error);
+                                crate::diagnostics::log_failure("update", &error);
                                 eprintln!("update failed: {error:#}");
                             }
                         }
@@ -507,25 +454,9 @@ mod tests {
         assert!(apply_marks_handled::<()>(&Ok(ApplyOutcome::Installed)));
     }
 
-    /// A manifest listing several served builds, each with a release date.
-    fn history() -> String {
-        r#"{
-          "version": "2.0.0",
-          "url": "https://matteshot.app",
-          "download": "https://download.matteshot.app/MatteshotSetup-2.0.0.exe",
-          "released": "2028-03-01T00:00:00Z",
-          "releases": [
-            {"version":"2.0.0","released":"2028-03-01T00:00:00Z","download":"https://download.matteshot.app/MatteshotSetup-2.0.0.exe"},
-            {"version":"1.5.0","released":"2027-06-01T00:00:00Z","download":"https://download.matteshot.app/MatteshotSetup-1.5.0.exe"},
-            {"version":"1.1.0","released":"2026-11-01T00:00:00Z","download":"https://download.matteshot.app/MatteshotSetup-1.1.0.exe"}
-          ]
-        }"#
-        .to_owned()
-    }
-
     #[test]
     fn newer_version_is_available() {
-        let update = available_from(&manifest("0.9.2", SETUP), "0.9.1", None)
+        let update = available_from(&manifest("0.9.2", SETUP), "0.9.1")
             .unwrap()
             .unwrap();
         assert_eq!(update.version, "0.9.2");
@@ -545,7 +476,7 @@ mod tests {
             ("0.15.0", "0.14.10"),
             ("1.0.10", "1.0.9"),
         ] {
-            let update = available_from(&manifest(offered, SETUP), running, None)
+            let update = available_from(&manifest(offered, SETUP), running)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{offered} should be offered to {running}"));
             assert_eq!(update.version, offered);
@@ -555,7 +486,7 @@ mod tests {
         // later as text must not be mistaken for an upgrade.
         for (offered, running) in [("0.14.9", "0.14.10"), ("1.0.9", "1.0.10")] {
             assert!(
-                available_from(&manifest(offered, SETUP), running, None)
+                available_from(&manifest(offered, SETUP), running)
                     .unwrap()
                     .is_none(),
                 "{offered} must not be offered to {running}"
@@ -565,10 +496,10 @@ mod tests {
 
     #[test]
     fn equal_or_older_version_is_ignored() {
-        assert!(available_from(&manifest("0.9.1", SETUP), "0.9.1", None)
+        assert!(available_from(&manifest("0.9.1", SETUP), "0.9.1")
             .unwrap()
             .is_none());
-        assert!(available_from(&manifest("0.8.9", SETUP), "0.9.1", None)
+        assert!(available_from(&manifest("0.8.9", SETUP), "0.9.1")
             .unwrap()
             .is_none());
     }
@@ -583,7 +514,7 @@ mod tests {
             "http://download.matteshot.app/x.exe",
         ] {
             assert!(
-                available_from(&manifest("1.0.0", bad), "0.9.1", None)
+                available_from(&manifest("1.0.0", bad), "0.9.1")
                     .unwrap()
                     .is_none(),
                 "for {bad}"
@@ -603,7 +534,7 @@ mod tests {
             {"version":"1.3.0","released":"2027-01-01T00:00:00Z","download":"http://d/c.exe"}
           ]
         }"#;
-        let update = available_from(body, "1.0.0", None).unwrap().unwrap();
+        let update = available_from(body, "1.0.0").unwrap().unwrap();
         assert_eq!(update.version, "1.5.0");
         assert_eq!(update.download_url, "https://d/b.exe");
     }
@@ -611,119 +542,26 @@ mod tests {
     #[test]
     fn page_url_is_used_when_download_is_missing() {
         let body = r#"{"version":"1.0.0","url":"https://matteshot.app"}"#;
-        let update = available_from(body, "0.9.1", None).unwrap().unwrap();
+        let update = available_from(body, "0.9.1").unwrap().unwrap();
         assert_eq!(update.download_url, "https://matteshot.app");
     }
 
-    /// The trial has no term, so it is always offered the newest build.
+    /// The newest listed build wins, whatever its `released` date says and
+    /// wherever it sits in the list. 0.20.0 and earlier compared those dates
+    /// against a license's update term; nothing does now.
     #[test]
-    fn no_entitlement_means_no_restriction() {
-        let update = available_from(&history(), "1.0.0", None).unwrap().unwrap();
-        assert_eq!(update.version, "2.0.0");
-    }
-
-    /// The heart of it: a lapsed license is not offered a build released after
-    /// its term, but is still offered the newest one released inside it.
-    #[test]
-    fn a_lapsed_license_still_gets_the_builds_it_paid_for() {
-        let update = available_from(&history(), "1.0.0", Some("2027-08-01T00:00:00Z"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(update.version, "1.5.0");
-        assert!(update.download_url.ends_with("MatteshotSetup-1.5.0.exe"));
-    }
-
-    /// Time passing must not take anything away. The same lapsed license makes
-    /// the same offer whenever it asks, because the comparison is against the
-    /// release date and never against today.
-    #[test]
-    fn an_entitlement_does_not_decay() {
-        // Whatever they are running, the ceiling their term bought is the same
-        // one, and nothing here consults a clock to decide it.
-        for current in ["0.9.0", "1.0.0", "v1.1.0", "1.4.9"] {
-            let update = available_from(&history(), current, Some("2027-08-01T00:00:00Z"))
-                .unwrap()
-                .unwrap();
-            assert_eq!(update.version, "1.5.0", "from {current}");
-        }
-        // And once on that build, there is nothing further owed.
-        assert!(
-            available_from(&history(), "1.5.0", Some("2027-08-01T00:00:00Z"))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// A term that predates every served build offers nothing rather than
-    /// falling back to the newest one.
-    #[test]
-    fn a_term_older_than_every_build_offers_nothing() {
-        assert!(
-            available_from(&history(), "1.0.0", Some("2026-01-01T00:00:00Z"))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// A build put out during the last day of a term belongs to that term.
-    #[test]
-    fn the_final_day_of_a_term_counts() {
-        assert!(covered(
-            Some("2027-08-01T23:59:00Z"),
-            Some(DateTime::parse_from_rfc3339("2027-08-01T00:00:00Z").unwrap())
-        ));
-        assert!(!covered(
-            Some("2027-08-02T00:00:01Z"),
-            Some(DateTime::parse_from_rfc3339("2027-08-01T00:00:00Z").unwrap())
-        ));
-    }
-
-    /// Our own mistake must never withhold an update someone paid for.
-    #[test]
-    fn a_manifest_without_dates_is_not_treated_as_expired() {
-        let update = available_from(
-            &manifest("1.0.0", SETUP),
-            "0.9.1",
-            Some("2020-01-01T00:00:00Z"),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(update.version, "1.0.0");
-        for unusable in [None, Some("not a date"), Some("")] {
-            assert!(
-                covered(
-                    unusable,
-                    Some(DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap())
-                ),
-                "for {unusable:?}"
-            );
-        }
-    }
-
-    /// An unreadable term restricts nothing, for the same reason.
-    #[test]
-    fn an_unreadable_term_restricts_nothing() {
-        let update = available_from(&history(), "1.0.0", Some("whenever"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(update.version, "2.0.0");
-    }
-
-    /// Order in the manifest is not load-bearing.
-    #[test]
-    fn the_newest_covered_build_wins_regardless_of_order() {
+    fn the_newest_listed_build_wins_regardless_of_order_or_dates() {
         let body = r#"{
           "version": "1.1.0",
           "releases": [
             {"version":"1.1.0","released":"2026-11-01T00:00:00Z","download":"https://d/a.exe"},
-            {"version":"1.5.0","released":"2027-06-01T00:00:00Z","download":"https://d/b.exe"},
-            {"version":"1.3.0","released":"2027-01-01T00:00:00Z","download":"https://d/c.exe"}
+            {"version":"1.5.0","released":"2099-06-01T00:00:00Z","download":"https://d/b.exe"},
+            {"version":"1.3.0","released":"not a date","download":"https://d/c.exe"}
           ]
         }"#;
-        let update = available_from(body, "1.0.0", Some("2027-08-01T00:00:00Z"))
-            .unwrap()
-            .unwrap();
+        let update = available_from(body, "1.0.0").unwrap().unwrap();
         assert_eq!(update.version, "1.5.0");
+        assert!(available_from(body, "1.5.0").unwrap().is_none());
     }
 
     /// Pins SBS-743: a forged update LPARAM must not consume a real payload.

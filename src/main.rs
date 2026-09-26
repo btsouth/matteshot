@@ -1,52 +1,49 @@
 #![windows_subsystem = "windows"]
 
 mod annotate;
+mod audio;
 mod autostart_toggle;
 mod capture;
-mod compose;
 mod completion;
+mod compose;
 mod config;
 mod delay;
 mod diagnostics;
 mod dpi;
 mod history;
-mod thumb_decode;
 mod hotkey;
 mod icon;
 mod installer;
-mod release_manifest;
-mod license;
-mod license_ui;
 mod number_prompt;
 mod ocr;
-mod pin;
-mod audio;
-mod recdone;
-mod record;
-mod recui;
-mod scroll;
-mod state_lock;
-mod trim;
+#[cfg(test)]
+mod onboarding_docs;
 mod output;
 mod overlay;
 mod picker;
+mod pin;
 mod prtscn;
+mod recdone;
+mod record;
+mod recui;
+mod release_manifest;
+mod scroll;
 mod settings;
 mod share;
 mod spike;
+mod state_lock;
 mod style;
 mod theme;
 mod theme_contrast;
+mod thumb_decode;
 mod tray;
+mod trim;
 mod tweak;
 mod update;
 mod video_edit;
 mod video_speed;
 mod welcome;
 mod window;
-mod telemetry;
-#[cfg(test)]
-mod onboarding_docs;
 
 use anyhow::{bail, Context, Result};
 use image::RgbaImage;
@@ -59,9 +56,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, IsWindow, MessageBoxW, PostMessageW, IDYES,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    MB_YESNO, MSG, WM_CLOSE, WM_HOTKEY,
+    DispatchMessageW, GetMessageW, IsWindow, MessageBoxW, PostMessageW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MSG, WM_CLOSE, WM_HOTKEY,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,11 +79,7 @@ fn request_graceful_shutdown() -> Result<()> {
         close_all_within(class_name, label, std::time::Duration::from_secs(30))
     }
 
-    fn close_all_within(
-        class_name: &str,
-        label: &str,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
+    fn close_all_within(class_name: &str, label: &str, timeout: std::time::Duration) -> Result<()> {
         loop {
             let hwnd = match crate::window::find_by_class(class_name) {
                 Some(hwnd) => hwnd,
@@ -117,7 +109,6 @@ fn request_graceful_shutdown() -> Result<()> {
     close_all("matteshot_tweak", "the image editor")?;
     close_all("matteshot_recdone", "the video editor")?;
     close_all("matteshot_settings", "settings")?;
-    close_all("matteshot_activation", "activation")?;
     close_all("matteshot_welcome", "welcome")?;
     close_all("matteshot_history", "History")?;
     close_all("matteshot_pin", "a pinned capture")?;
@@ -132,11 +123,7 @@ fn request_graceful_shutdown() -> Result<()> {
     if !record::wait_until_late_finalize_idle(record::LATE_FINALIZE_BOUND) {
         bail!("the recorder is still busy; finish or cancel the current operation and try again");
     }
-    close_all_within(
-        "matteshot_tray",
-        "Matteshot",
-        record::QUIT_TRAY_WAIT,
-    )?;
+    close_all_within("matteshot_tray", "Matteshot", record::QUIT_TRAY_WAIT)?;
     Ok(())
 }
 
@@ -163,14 +150,14 @@ fn pump_until_closed(open: fn() -> bool) {
     }
 }
 
-/// Report a failed operation once, then hand the error back untouched.
+/// Log a failed operation once, then hand the error back untouched.
 ///
 /// Tagging happens at the branch that knows which operation ran, because every
 /// capture path funnels into the same handler by the time the error surfaces,
 /// and "something failed" is the one answer that would not help.
 fn note_failure<T>(operation: &'static str, result: Result<T>) -> Result<T> {
     if let Err(error) = &result {
-        telemetry::report_failure(operation, error);
+        diagnostics::log_failure(operation, error);
     }
     result
 }
@@ -183,16 +170,6 @@ fn error_box(text: &str) {
             w!("Matteshot"),
             MB_OK | MB_ICONERROR,
         );
-    }
-}
-
-fn require_capture_license() -> Result<()> {
-    if license::status().can_capture() {
-        Ok(())
-    } else {
-        bail!(
-            "Your 14-day trial has ended. Open Matteshot and enter a license key from the tray menu."
-        )
     }
 }
 
@@ -259,10 +236,6 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     if capture_title.trim().is_empty() {
         capture_title = format!("Capture {}\u{00d7}{}", raw.width(), raw.height());
     }
-    // A successful window or region capture starts the trial regardless of
-    // which picker action follows. This includes the zero-touch auto-copy
-    // path, Esc (where auto-copy stands), OCR, pinning, and the tweak editor.
-    license::record_successful_capture();
     let styles = style::variants(&raw);
     let names: Vec<&'static str> = styles.iter().map(|s| s.name).collect();
 
@@ -273,7 +246,10 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         canceled: bool,
         path: Option<std::path::PathBuf>,
     }
-    let auto = std::sync::Arc::new(std::sync::Mutex::new(AutoCopy { canceled: false, path: None }));
+    let auto = std::sync::Arc::new(std::sync::Mutex::new(AutoCopy {
+        canceled: false,
+        path: None,
+    }));
     let auto_copy_hint = picker::AutoCopyHintSlot::new();
     let preselect = cfg.last_style.min(styles.len().saturating_sub(1));
     let mut auto_worker = None;
@@ -370,7 +346,6 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             if let Some(p) = cancel_auto() {
                 let _ = std::fs::remove_file(p);
             }
-            telemetry::report("matteshot_ocr_used");
             return ocr::copy_text(&raw);
         }
         PickAction::Tweak(i) => {
@@ -384,13 +359,11 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
             // while it is open is now just another capture: the hotkey reaches
             // the resident's loop as normal instead of tearing down the
             // editor and replaying a reshoot through here.
-            telemetry::report("matteshot_editor_opened");
             return tweak::open(raw, styles, i, monitor, capture_title);
         }
         PickAction::Share(i) => {
-            // The picker already hid S when can_share was false at open.
-            // Do not preflight-bail here: a transient license.json lock would
-            // skip the chosen save and report a capture failure (SBS-906).
+            // The picker only offers S when a share server is configured in
+            // a build that includes Share.
             if let Some(p) = cancel_auto() {
                 let _ = std::fs::remove_file(p);
             }
@@ -403,7 +376,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
                 cfg.output_max_edge,
             );
             let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
-            let path = output::save_png(&styled, styles[i].name, &cfg.save_dir(), Some(&capture_title))?;
+            let path = output::save_png(
+                &styled,
+                styles[i].name,
+                &cfg.save_dir(),
+                Some(&capture_title),
+            )?;
             let url = share::share_file(&path).context("could not share this capture")?;
             output::open_url(&url);
             // The share itself already succeeded and the link is already
@@ -473,7 +451,11 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
     if chosen == preselect {
         if let Some(path) = &auto_path {
             let _ = Config::update(|cfg| cfg.last_style = chosen);
-            eprintln!("done [{}] (auto-copy reused): {}", styles[chosen].name, path.display());
+            eprintln!(
+                "done [{}] (auto-copy reused): {}",
+                styles[chosen].name,
+                path.display()
+            );
             return Ok(());
         }
     }
@@ -487,7 +469,12 @@ fn shoot(source: Source, monitor: HMONITOR, pick_override: Option<usize>) -> Res
         cfg.output_max_edge,
     );
     let styled = output::resize_to_max_edge(&styled, cfg.output_max_edge);
-    let path = output::save_png(&styled, styles[chosen].name, &cfg.save_dir(), Some(&capture_title))?;
+    let path = output::save_png(
+        &styled,
+        styles[chosen].name,
+        &cfg.save_dir(),
+        Some(&capture_title),
+    )?;
     output::to_clipboard(&styled, Some(&path)).context("clipboard failed")?;
     // A different pick supersedes the auto-copied file.
     if let Some(old) = auto_path {
@@ -549,9 +536,7 @@ fn shoot_overlay_from(start_delayed: bool) -> Result<()> {
 
 /// Act on what the overlay returned. Delay never reaches here: the loop
 /// above consumes it.
-fn dispatch_selection(
-    selection: Option<(overlay::Selection, HMONITOR)>,
-) -> Result<()> {
+fn dispatch_selection(selection: Option<(overlay::Selection, HMONITOR)>) -> Result<()> {
     match selection {
         Some((overlay::Selection::Window { hwnd, frozen }, mon)) => note_failure(
             "capture",
@@ -567,31 +552,16 @@ fn dispatch_selection(
         Some((overlay::Selection::Region(img), mon)) => {
             note_failure("capture", shoot(Source::Image(img), mon, None))
         }
-        Some((overlay::Selection::RecordWindow(hwnd), _)) => {
-            let result = note_failure(
-                "record",
-                record::session(record::Target::window(hwnd), Config::load().record_gif),
-            );
-            if result.is_ok() {
-                license::record_successful_capture();
-                telemetry::report("matteshot_record_completed");
-            }
-            result
-        }
-        Some((overlay::Selection::RecordRegion(r, mon), _)) => {
-            let result = note_failure(
-                "record",
-                record::session(record::Target::region(r, mon), Config::load().record_gif),
-            );
-            if result.is_ok() {
-                license::record_successful_capture();
-                telemetry::report("matteshot_record_completed");
-            }
-            result
-        }
+        Some((overlay::Selection::RecordWindow(hwnd), _)) => note_failure(
+            "record",
+            record::session(record::Target::window(hwnd), Config::load().record_gif),
+        ),
+        Some((overlay::Selection::RecordRegion(r, mon), _)) => note_failure(
+            "record",
+            record::session(record::Target::region(r, mon), Config::load().record_gif),
+        ),
         Some((overlay::Selection::ScrollWindow(h, anchor), mon)) => {
             let img = note_failure("scroll", scroll::capture(scroll::Target::Window(h, anchor)))?;
-            telemetry::report("matteshot_scroll_capture");
             note_failure("capture", shoot(Source::Image(img), mon, None))
         }
         Some((overlay::Selection::ScrollRegion(r, m, anchor), mon)) => {
@@ -599,7 +569,6 @@ fn dispatch_selection(
                 "scroll",
                 scroll::capture(scroll::Target::Region(r, m, anchor)),
             )?;
-            telemetry::report("matteshot_scroll_capture");
             note_failure("capture", shoot(Source::Image(img), mon, None))
         }
         // Consumed by the loop in shoot_overlay, so arriving here means that
@@ -687,10 +656,6 @@ fn enable_capture_hotkeys() -> Result<bool> {
         taken = !registered;
         if !registered {
             diagnostics::log("capture shortcut already owned by another app");
-            telemetry::report_failure(
-                "hotkey",
-                &anyhow::anyhow!("register capture shortcut: already in use"),
-            );
         }
     }
     CAPTURE_HOTKEY_TAKEN.store(taken, Ordering::Relaxed);
@@ -712,56 +677,6 @@ fn disable_capture_hotkeys(_restore_windows_prtscn: bool) {
     // wrote PrintScreenKeyForSnippingEnabled=1 even when the LL hook never
     // touched the value, which is SBS-1050.
     prtscn::release(HOTKEY_ID_PRTSCN);
-}
-
-/// Confirm and deactivate this machine's license. Lives here rather than in the
-/// Settings window because disabling capture needs the resident's hotkey
-/// ownership (the Ctrl+Alt+S registration, the PrtScn hook, and handing PrtScn
-/// back to Windows). Called when Settings' Deactivate button is clicked.
-pub(crate) fn deactivate_license() -> Result<()> {
-    let answer = unsafe {
-        MessageBoxW(
-            None,
-            // No device count, and no implied plural: the limit lives on the
-            // license and can be raised per key, and the certificate does not
-            // carry it, so the client cannot know whether there is one slot or
-            // ten. Say what the action does and leave the arithmetic alone.
-            w!("Deactivate Matteshot on this PC? This frees up a device slot."),
-            w!("Matteshot"),
-            MB_YESNO | MB_ICONWARNING,
-        )
-    };
-    if answer == IDYES {
-        license::deactivate()?;
-        settings::refresh();
-        if !license::status().can_capture() {
-            disable_capture_hotkeys(true);
-        }
-    }
-    Ok(())
-}
-
-fn ensure_capture_allowed(hotkeys_active: &mut bool) -> Result<bool> {
-    if license::status().can_capture() {
-        if !*hotkeys_active {
-            let _ = enable_capture_hotkeys()?;
-            *hotkeys_active = true;
-        }
-        return Ok(true);
-    }
-
-    if *hotkeys_active {
-        disable_capture_hotkeys(true);
-        *hotkeys_active = false;
-    }
-    if license_ui::open()? {
-        let _ = enable_capture_hotkeys()?;
-        *hotkeys_active = true;
-        settings::refresh();
-        Ok(true)
-    } else {
-        Ok(false)
-    }
 }
 
 fn run_app() -> Result<()> {
@@ -826,12 +741,10 @@ fn claim_resident_slot() -> Result<Option<state_lock::ProcessMutex>> {
     Ok(guard)
 }
 
-/// Everything after the resident slot is ours: telemetry, hotkeys, the tray,
-/// and the message loop. Owns the `Tray` for its whole lifetime, so an error
+/// Everything after the resident slot is ours: hotkeys, the tray, and the
+/// message loop. Owns the `Tray` for its whole lifetime, so an error
 /// anywhere in here drops it — and its window — before `run_app` reports.
 fn run_resident() -> Result<()> {
-    telemetry::init();
-    telemetry::report("matteshot_launch");
     let config = Config::load();
     let cleaned = output::cleanup_stale_video_partials(&config.video_dir())
         + output::cleanup_stale_png_partials(&config.save_dir());
@@ -840,14 +753,7 @@ fn run_resident() -> Result<()> {
     }
     capture::warmup();
     prtscn::set_preferred(Config::load().capture_prtscn);
-    let initial_license = license::status();
-    let mut hotkeys_active = initial_license.can_capture();
-    let prtscn_ours = if hotkeys_active {
-        enable_capture_hotkeys()?
-    } else {
-        disable_capture_hotkeys(true);
-        false
-    };
+    let prtscn_ours = enable_capture_hotkeys()?;
     diagnostics::log(if prtscn_ours {
         "prtscn acquired at startup"
     } else {
@@ -882,7 +788,11 @@ fn run_resident() -> Result<()> {
     });
     eprintln!(
         "matteshot: ready — PrtScn {} | Ctrl+Alt+S = active window",
-        if prtscn_ours { "= capture overlay" } else { "not held (see tray menu)" }
+        if prtscn_ours {
+            "= capture overlay"
+        } else {
+            "not held (see tray menu)"
+        }
     );
     diagnostics::log("resident ready");
     RESIDENT_READY.store(true, Ordering::Relaxed);
@@ -890,7 +800,7 @@ fn run_resident() -> Result<()> {
     // First run: show the core loop before the app disappears into the tray.
     // This is non-modal, so PrtScn and tray commands remain live.
     let cfg = Config::load();
-    if !cfg.onboarded && initial_license.can_capture() {
+    if !cfg.onboarded {
         if let Err(error) = welcome::open_first_run() {
             diagnostics::log("welcome window failed");
             eprintln!("welcome: {error:#}");
@@ -902,25 +812,15 @@ fn run_resident() -> Result<()> {
         }
     }
     update::start(tray.hwnd);
-    license::start_background_refresh();
-
-    if matches!(initial_license, license::Status::Expired) && license_ui::open()? {
-        let _ = enable_capture_hotkeys()?;
-        hotkeys_active = true;
-    }
 
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_HOTKEY {
-                let result = if ensure_capture_allowed(&mut hotkeys_active)? {
-                    match msg.wParam.0 as i32 {
-                        HOTKEY_ID_PRTSCN => shoot_overlay(),
-                        HOTKEY_ID => shoot_active(),
-                        _ => Ok(()),
-                    }
-                } else {
-                    Ok(())
+                let result = match msg.wParam.0 as i32 {
+                    HOTKEY_ID_PRTSCN => shoot_overlay(),
+                    HOTKEY_ID => shoot_active(),
+                    _ => Ok(()),
                 };
                 if let Err(e) = result {
                     eprintln!("error: {e:#}");
@@ -932,13 +832,7 @@ fn run_resident() -> Result<()> {
 
             if let Some(action) = welcome::take_action() {
                 let result = match action {
-                    welcome::Action::Capture => {
-                        if ensure_capture_allowed(&mut hotkeys_active)? {
-                            shoot_overlay()
-                        } else {
-                            Ok(())
-                        }
-                    }
+                    welcome::Action::Capture => shoot_overlay(),
                     welcome::Action::Settings => settings::open(),
                 };
                 if let Err(error) = result {
@@ -951,47 +845,28 @@ fn run_resident() -> Result<()> {
             // another exiting instance briefly owned PrtScn during startup,
             // recover automatically instead of believing a failed one-shot
             // registration succeeded forever.
-            if hotkeys_active
-                && prtscn::preferred()
-                && !prtscn::owns_key()
-                && prtscn::take(HOTKEY_ID_PRTSCN)
-            {
+            if prtscn::preferred() && !prtscn::owns_key() && prtscn::take(HOTKEY_ID_PRTSCN) {
                 settings::refresh();
             }
 
             if let Some(action) = tray.take_action() {
                 let result = match action {
-                    tray::Action::Capture => {
-                        if ensure_capture_allowed(&mut hotkeys_active)? {
+                    tray::Action::Capture => shoot_overlay(),
+                    // The countdown exists so a menu can be opened during it,
+                    // so the tray popup must be gone before it starts; the
+                    // action is already deferred until the popup dismisses.
+                    tray::Action::CaptureDelayed => {
+                        let seconds = Config::load().capture_delay_secs;
+                        if note_failure("delay", delay::countdown(seconds))? {
                             shoot_overlay()
                         } else {
                             Ok(())
                         }
                     }
-                    // The countdown exists so a menu can be opened during it,
-                    // so the tray popup must be gone before it starts; the
-                    // action is already deferred until the popup dismisses.
-                    tray::Action::CaptureDelayed => {
-                        if ensure_capture_allowed(&mut hotkeys_active)? {
-                            let seconds = Config::load().capture_delay_secs;
-                            if note_failure("delay", delay::countdown(seconds))? {
-                                shoot_overlay()
-                            } else {
-                                Ok(())
-                            }
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    tray::Action::CaptureActive => {
-                        if ensure_capture_allowed(&mut hotkeys_active)? {
-                            tray.active_window()
-                                .context("No active app window to capture")
-                                .and_then(shoot_active_window)
-                        } else {
-                            Ok(())
-                        }
-                    }
+                    tray::Action::CaptureActive => tray
+                        .active_window()
+                        .context("No active app window to capture")
+                        .and_then(shoot_active_window),
                     tray::Action::OpenFolder => {
                         output::open_folder(&Config::load().save_dir());
                         Ok(())
@@ -1040,28 +915,6 @@ fn run_resident() -> Result<()> {
                                     output::open_url(&url);
                                 }
                             }
-                        }
-                        Ok(())
-                    }
-                    tray::Action::Buy => {
-                        output::open_url(license::BUY_URL);
-                        Ok(())
-                    }
-                    tray::Action::Activate => {
-                        if license_ui::open()? && !hotkeys_active {
-                            let _ = enable_capture_hotkeys()?;
-                            hotkeys_active = true;
-                        }
-                        settings::refresh();
-                        Ok(())
-                    }
-                    // Reached from Settings' Deactivate button via the tray
-                    // window; routing here keeps `hotkeys_active` in sync when
-                    // the loop hands the capture hotkeys back.
-                    tray::Action::Deactivate => {
-                        deactivate_license()?;
-                        if !license::status().can_capture() {
-                            hotkeys_active = false;
                         }
                         Ok(())
                     }
@@ -1129,12 +982,30 @@ fn preview_bench(long_edge: u32) -> Result<()> {
     // A working set on the heavy side of typical: shapes cost per pixel they
     // cover, so under-annotating would flatter the larger sizes.
     let annotations: Vec<annotate::Annotation> = vec![
-        annotate::Shape::Rect { a: (120.0, 140.0), b: (900.0, 700.0) },
-        annotate::Shape::Arrow { from: (200.0, 900.0), to: (1200.0, 1300.0) },
-        annotate::Shape::Ellipse { a: (1300.0, 200.0), b: (2000.0, 800.0) },
-        annotate::Shape::Highlight { a: (300.0, 1400.0), b: (1800.0, 1500.0) },
-        annotate::Shape::Text { pos: (400.0, 300.0), text: "Annotation".into() },
-        annotate::Shape::Counter { pos: (1000.0, 1000.0), n: 3 },
+        annotate::Shape::Rect {
+            a: (120.0, 140.0),
+            b: (900.0, 700.0),
+        },
+        annotate::Shape::Arrow {
+            from: (200.0, 900.0),
+            to: (1200.0, 1300.0),
+        },
+        annotate::Shape::Ellipse {
+            a: (1300.0, 200.0),
+            b: (2000.0, 800.0),
+        },
+        annotate::Shape::Highlight {
+            a: (300.0, 1400.0),
+            b: (1800.0, 1500.0),
+        },
+        annotate::Shape::Text {
+            pos: (400.0, 300.0),
+            text: "Annotation".into(),
+        },
+        annotate::Shape::Counter {
+            pos: (1000.0, 1000.0),
+            n: 3,
+        },
     ]
     .into_iter()
     .map(|shape| annotate::Annotation {
@@ -1167,7 +1038,10 @@ fn preview_bench(long_edge: u32) -> Result<()> {
     const CACHED_BUDGET_MS: f64 = 40.0;
     const COLD_BUDGET_MS: f64 = 200.0;
 
-    eprintln!("preview bench: source {long_edge}x{height}, {} annotations", annotations.len());
+    eprintln!(
+        "preview bench: source {long_edge}x{height}, {} annotations",
+        annotations.len()
+    );
     eprintln!(
         "{:>6}  {:>11}  {:>7}  {:>7}  {:>7}",
         "cap", "preview", "source", "cold", "cached"
@@ -1342,7 +1216,6 @@ fn main() -> Result<()> {
         // (or the current foreground window) and exit. `--pick N` skips the
         // picker UI. `--overlay` runs the freeze-frame overlay instead.
         Some("--once") => {
-            require_capture_license()?;
             let mut hwnd = window::foreground();
             let mut pick_override = None;
             let mut use_overlay = false;
@@ -1373,7 +1246,6 @@ fn main() -> Result<()> {
             } else if use_tweak {
                 let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
                 let raw = capture::capture_window(hwnd).context("capture failed")?;
-                license::record_successful_capture();
                 let styles = style::variants(&raw);
                 let title = window::title_of(hwnd);
                 tweak::open(raw, styles, 0, mon, title)?;
@@ -1396,7 +1268,6 @@ fn main() -> Result<()> {
         // Open several captures as tabs in one editor (testing). Each argument
         // is a window title substring.
         Some("--tweak-tabs-test") => {
-            require_capture_license()?;
             let needles: Vec<&String> = args[1..].iter().collect();
             if needles.is_empty() {
                 bail!("--tweak-tabs-test needs one or more window title substrings");
@@ -1406,7 +1277,6 @@ fn main() -> Result<()> {
                     .with_context(|| format!("no visible window matching {needle:?}"))?;
                 let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
                 let raw = capture::capture_window(hwnd).context("capture failed")?;
-                license::record_successful_capture();
                 let styles = style::variants(&raw);
                 let title = window::title_of(hwnd);
                 eprintln!("tab: {title}");
@@ -1417,7 +1287,6 @@ fn main() -> Result<()> {
         }
         // Warm-path capture benchmark: same window three times in-process.
         Some("--bench") => {
-            require_capture_license()?;
             let needle = args.get(1).context("--bench needs a window title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
@@ -1429,7 +1298,6 @@ fn main() -> Result<()> {
                 last = Some(img);
             }
             if let Some(img) = last {
-                license::record_successful_capture();
                 let p = std::env::temp_dir().join("matteshot-bench.png");
                 img.save(&p)?;
                 eprintln!("bench: raw capture saved to {}", p.display());
@@ -1451,7 +1319,6 @@ fn main() -> Result<()> {
         // Headless timing of the multi-monitor freeze and GDI-layer path.
         // `sequential` keeps the old capture order as a local baseline.
         Some("--overlay-bench") => {
-            require_capture_license()?;
             let batched = match args.get(1).map(String::as_str) {
                 None | Some("batched") => true,
                 Some("sequential") => false,
@@ -1468,14 +1335,12 @@ fn main() -> Result<()> {
         // Marketing/site asset generator: capture a window and export every
         // matte style as a PNG into a directory.
         Some("--assets") => {
-            require_capture_license()?;
             let needle = args.get(1).context("--assets <title substr> <outdir>")?;
             let outdir = std::path::PathBuf::from(args.get(2).context("--assets <title substr> <outdir>")?);
             std::fs::create_dir_all(&outdir)?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let raw = capture::capture_window(hwnd).context("capture failed")?;
-            license::record_successful_capture();
             for s in style::variants(&raw) {
                 let img = compose::export(&raw, &s, compose::DEFAULT_PAD_FACTOR, None, 2, 0);
                 let p = outdir.join(format!("matte-{}.png", s.name.to_lowercase()));
@@ -1487,7 +1352,6 @@ fn main() -> Result<()> {
         }
         // Record the primary monitor region for N seconds (testing).
         Some("--record-test") => {
-            require_capture_license()?;
             let secs: u64 = args.get(1).map(|s| s.parse().unwrap_or(4)).unwrap_or(4);
             let mon = unsafe {
                 windows::Win32::Graphics::Gdi::MonitorFromPoint(
@@ -1503,7 +1367,6 @@ fn main() -> Result<()> {
             };
             schedule_recording_stop(secs);
             record::session(record::Target::region(rect, mon), true)?;
-            license::record_successful_capture();
             // Keep pumping briefly so the review window can be inspected.
             let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut msg = MSG::default();
@@ -1531,7 +1394,6 @@ fn main() -> Result<()> {
         // the stop action is timed so resize and editor behavior can be tested
         // without synthesizing Matteshot's global shortcuts.
         Some("--record-window-test") => {
-            require_capture_license()?;
             let needle = args
                 .get(1)
                 .context("--record-window-test <title> [seconds]")?;
@@ -1540,7 +1402,6 @@ fn main() -> Result<()> {
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             schedule_recording_stop(secs);
             record::session(record::Target::window(hwnd), false)?;
-            license::record_successful_capture();
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
             let mut msg = MSG::default();
@@ -1567,12 +1428,10 @@ fn main() -> Result<()> {
         }
         // Scroll-capture a window by title, save raw (testing).
         Some("--scroll-test") => {
-            require_capture_license()?;
             let needle = args.get(1).context("--scroll-test <title>")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let img = scroll::capture(scroll::Target::centered_window(hwnd))?;
-            license::record_successful_capture();
             let p = std::env::temp_dir().join("matteshot-scroll.png");
             img.save(&p)?;
             eprintln!("saved {}x{} -> {}", img.width(), img.height(), p.display());
@@ -1812,12 +1671,10 @@ fn main() -> Result<()> {
         }
         // OCR probe: recognize and print (no clipboard) — testing.
         Some("--ocr") => {
-            require_capture_license()?;
             let needle = args.get(1).context("--ocr needs a title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let img = capture::capture_window(hwnd)?;
-            license::record_successful_capture();
             let text = ocr::recognize(&img)?;
             eprintln!("--- {} chars ---", text.len());
             for line in text.lines().take(12) {
@@ -1832,7 +1689,6 @@ fn main() -> Result<()> {
         // select-text is this engine's real output over the sample capture
         // rather than a mock.
         Some("--ocr-words") => {
-            require_capture_license()?;
             if args.len() > 3 {
                 bail!("--ocr-words <title|png> [out.json]");
             }
@@ -1846,9 +1702,7 @@ fn main() -> Result<()> {
             } else {
                 let hwnd = window::find_by_title(target)
                     .with_context(|| format!("no visible window matching {target:?}"))?;
-                let captured = capture::capture_window(hwnd)?;
-                license::record_successful_capture();
-                captured
+                capture::capture_window(hwnd)?
             };
             let words = ocr::recognize_words(&img)?;
             if let Some(out) = args.get(2) {
@@ -1902,12 +1756,10 @@ fn main() -> Result<()> {
         }
         // Render sample annotations onto a capture and save raw (testing).
         Some("--annotate-demo") => {
-            require_capture_license()?;
             let needle = args.get(1).context("--annotate-demo needs a title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             let mut img = capture::capture_window(hwnd)?;
-            license::record_successful_capture();
             let (w, h) = (img.width() as f32, img.height() as f32);
             let anns = vec![
                 annotate::Annotation {
@@ -2038,12 +1890,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("--spike-dpi") => {
-            require_capture_license()?;
             let needle = args.get(1).context("--spike-dpi needs a window title substring")?;
             let hwnd = window::find_by_title(needle)
                 .with_context(|| format!("no visible window matching {needle:?}"))?;
             spike::run(hwnd, needle)?;
-            license::record_successful_capture();
             Ok(())
         }
         Some("--take-printscreen") => {
@@ -2135,8 +1985,6 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        // Open only the activation window (testing; does not capture or write
-        // to the clipboard).
         // Countdown only, with no capture after it: proves the pill paints,
         // counts, and can be cancelled without writing anything.
         Some("--delay-test") => {
@@ -2154,43 +2002,8 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Some("--license") => {
-            let activated = license_ui::open()?;
-            eprintln!(
-                "license window closed: {}",
-                if activated { "activated" } else { "unchanged" }
-            );
-            Ok(())
-        }
-        Some("--license-status") => {
-            eprintln!("{}", license::status().tray_label());
-            #[cfg(feature = "debug-license")]
-            if let Ok(value) = std::env::var("MATTESHOT_LICENSE_OVERRIDE") {
-                if license::debug_override_active() {
-                    eprintln!("(forced by MATTESHOT_LICENSE_OVERRIDE={value})");
-                } else {
-                    eprintln!(
-                        "(ignoring unrecognized MATTESHOT_LICENSE_OVERRIDE={value}; \
-                         the state above is real)"
-                    );
-                }
-            }
-            Ok(())
-        }
-        // Support-safe activation path: the key is read from redirected stdin
-        // so it never appears in process arguments or diagnostic output.
-        Some("--activate-stdin") => {
-            use std::io::Read;
-            let mut key = String::new();
-            std::io::stdin()
-                .read_to_string(&mut key)
-                .context("read license key from stdin")?;
-            let activated = license::activate(&key)?;
-            eprintln!("{}", activated.tray_label());
-            Ok(())
-        }
         Some(other) => bail!(
-            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --video-speed-test <mp4> | --duration-test <mp4> | --welcome | --delay-test [seconds] | --license | --license-status | --activate-stdin | --take-printscreen | --restore-printscreen | --quit]"
+            "unknown argument {other:?}; usage: matteshot [--once [--window <title-substring>] [--pick <1-7>] [--overlay] | --bench <title> | --overlay-bench [batched|sequential] | --record-window-test <title> [seconds] | --review-test <mp4> | --video-edit-test <mp4> | --video-speed-test <mp4> | --duration-test <mp4> | --welcome | --delay-test [seconds] | --take-printscreen | --restore-printscreen | --quit]"
         ),
         None => run_app(),
     };
@@ -2204,18 +2017,16 @@ fn main() -> Result<()> {
 }
 
 /// Flipped once the tray exists and the resident is usable. `run_app` can
-/// still fail after that (a `?` on the message-loop side of Activate,
-/// Deactivate, or the expired-license window), and that is a running app
-/// stopping, not a startup that never happened — the dialog, the diagnostic
-/// event, and the telemetry kind all say which.
+/// still fail after that (a `?` on the message-loop side), and that is a
+/// running app stopping, not a startup that never happened — the dialog and
+/// the diagnostic event both say which.
 static RESIDENT_READY: AtomicBool = AtomicBool::new(false);
 
 /// The resident is a windows-subsystem process: nothing it prints is ever
 /// seen. When `run_app` fails, the app used to just not be there — no tray
 /// icon, no PrtScn, and nothing to say why. Show one dialog the user can act
-/// on, and leave one diagnostic event and one telemetry failure behind it.
-/// Every other mode (`--once`, probes, `--license`) is a console flow and
-/// keeps stderr.
+/// on, and leave one diagnostic event behind it. Every other mode (`--once`,
+/// the probes) is a console flow and keeps stderr.
 fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
     let message = startup_failure_message(error);
     let (event, operation, title) = resident_failure_wording(was_running);
@@ -2223,7 +2034,7 @@ fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
         "{event}: {}",
         without_paths(&format!("{error:#}"))
     ));
-    telemetry::report_failure(operation, error);
+    diagnostics::log_failure(operation, error);
     let title = HSTRING::from(title);
     let text = HSTRING::from(message.as_str());
     unsafe {
@@ -2236,13 +2047,21 @@ fn report_resident_failure(error: &anyhow::Error, was_running: bool) {
     }
 }
 
-/// (diagnostic event, telemetry operation, dialog title) for a resident that
+/// (diagnostic event, failure operation, dialog title) for a resident that
 /// failed before it was usable versus one that was running and stopped.
 fn resident_failure_wording(was_running: bool) -> (&'static str, &'static str, &'static str) {
     if was_running {
-        ("resident stopped", "resident", "Matteshot stopped unexpectedly")
+        (
+            "resident stopped",
+            "resident",
+            "Matteshot stopped unexpectedly",
+        )
     } else {
-        ("resident startup failed", "startup", "Matteshot could not start")
+        (
+            "resident startup failed",
+            "startup",
+            "Matteshot could not start",
+        )
     }
 }
 
@@ -2256,18 +2075,23 @@ fn startup_failure_message(error: &anyhow::Error) -> String {
     let has = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
     // Exact contexts, not loose words: "create resident mutex" is
     // CreateMutexW itself failing (a second copy takes a different, silent
-    // path), and "create state mutex" is the license lock, which has nothing
+    // path), and "create state mutex" is a state-file lock, which has nothing
     // to do with a stuck copy.
     let advice = if has(&["create resident mutex"]) {
         "Windows refused Matteshot's start-up lock. Sign out and back in, then start Matteshot again."
     } else if has(&["create tray window", "notify icon", "shell_notifyicon"]) {
         "Windows did not let Matteshot create its tray icon. Restart Windows Explorer, or sign out and back in, then start Matteshot again."
-    } else if has(&["application data", "app data", "data directory", "create directory"]) {
+    } else if has(&[
+        "application data",
+        "app data",
+        "data directory",
+        "create directory",
+    ]) {
         "Matteshot could not use its application data folder. Check that your AppData folder is writable, then start Matteshot again."
     } else if has(&["access is denied", "access denied", "permission"]) {
         "Windows denied Matteshot something it needs. Start Matteshot again; if that fails, try once as administrator to see the cause."
     } else {
-        "Start Matteshot again. If this keeps happening, copy this message into an email to support@matteshot.app."
+        "Start Matteshot again. If this keeps happening, report it at github.com/btsouth/matteshot/issues with this message."
     };
     format!("{advice}\n\nDetail: {detail}\n\nThe diagnostics log has more (Settings > Diagnostics, or %LOCALAPPDATA%\\Matteshot\\matteshot.log).")
 }
@@ -2376,12 +2200,15 @@ mod startup_failure_tests {
         }
         // The default still tells the user what to do.
         let unknown = startup_failure_message(&anyhow::anyhow!("something odd"));
-        assert!(unknown.contains("support@matteshot.app"), "{unknown}");
+        assert!(
+            unknown.contains("github.com/btsouth/matteshot/issues"),
+            "{unknown}"
+        );
     }
 
     #[test]
     fn advice_matches_exact_contexts_not_loose_words() {
-        // The license lock is a mutex too, but a stuck copy has nothing to
+        // A state-file lock is a mutex too, but a stuck copy has nothing to
         // do with it: this is an access problem and says so.
         let state_lock = injected("create state mutex", "Access is denied. (0x80070005)");
         let text = startup_failure_message(&state_lock);
@@ -2395,7 +2222,10 @@ mod startup_failure_tests {
         assert!(!text.contains("AppData folder"), "{text}");
 
         // A module-handle failure is not a tray-icon failure.
-        let module = injected("resolve module handle", "The specified module could not be found.");
+        let module = injected(
+            "resolve module handle",
+            "The specified module could not be found.",
+        );
         let text = startup_failure_message(&module);
         assert!(!text.contains("tray icon"), "{text}");
     }
@@ -2426,12 +2256,27 @@ mod startup_failure_tests {
 
     #[test]
     fn path_scrubbing_leaves_ordinary_text_alone() {
-        assert_eq!(without_paths("create resident mutex: Access is denied."), "create resident mutex: Access is denied.");
+        assert_eq!(
+            without_paths("create resident mutex: Access is denied."),
+            "create resident mutex: Access is denied."
+        );
         assert_eq!(without_paths("ratio 3:4 stays"), "ratio 3:4 stays");
-        assert_eq!(without_paths("(0x80070005) at 12:30"), "(0x80070005) at 12:30");
-        assert_eq!(without_paths("saved to D:\\Captures\\shot.png, then failed"), "saved to <path>, then failed");
-        assert_eq!(without_paths("share \\\\nas\\media\\clip.mp4 locked"), "share <path> locked");
-        assert_eq!(without_paths("unicode ünïcode C:/x/y end"), "unicode ünïcode <path> end");
+        assert_eq!(
+            without_paths("(0x80070005) at 12:30"),
+            "(0x80070005) at 12:30"
+        );
+        assert_eq!(
+            without_paths("saved to D:\\Captures\\shot.png, then failed"),
+            "saved to <path>, then failed"
+        );
+        assert_eq!(
+            without_paths("share \\\\nas\\media\\clip.mp4 locked"),
+            "share <path> locked"
+        );
+        assert_eq!(
+            without_paths("unicode ünïcode C:/x/y end"),
+            "unicode ünïcode <path> end"
+        );
     }
 
     #[test]

@@ -32,20 +32,19 @@ use windows::Win32::Graphics::Gdi::{
     InvalidateRect, MonitorFromPoint, MonitorFromWindow, RoundRect, SelectObject, SetBkMode,
     SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
     DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DT_WORDBREAK,
-    FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
-    SRCCOPY, TRANSPARENT,
+    DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, HDC, HFONT, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetCursorPos, GetWindowLongPtrW, IsWindow, KillTimer, LoadCursorW,
-    MessageBoxW, PostMessageW, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TrackPopupMenu, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDYES, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MF_STRING, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
-    WM_APP, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
+    GetCursorPos, GetWindowLongPtrW, IsWindow, KillTimer, LoadCursorW, MessageBoxW, PostMessageW,
+    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TrackPopupMenu, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDYES, MB_ICONWARNING, MB_OK, MB_YESNO, MF_STRING,
+    SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, WM_APP,
+    WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     WS_CAPTION, WS_EX_APPWINDOW, WS_SYSMENU, WS_VISIBLE,
 };
@@ -207,7 +206,13 @@ fn sanitize_source(text: &str) -> String {
                 '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
                 | '\u{FEFF}')
         })
-        .map(|c| if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -254,7 +259,9 @@ fn append_at(index: &Path, entry: Entry) {
     log.entries.push(entry);
     log.entries = trim_entries(log.entries, MAX_ENTRIES, capture_file_present);
     if let Err(error) = save_unlocked_at(index, &log) {
-        crate::diagnostics::log(&format!("capture not indexed, history write failed: {error:#}"));
+        crate::diagnostics::log(&format!(
+            "capture not indexed, history write failed: {error:#}"
+        ));
     }
 }
 
@@ -297,7 +304,12 @@ fn list_at_with(index: &Path, present: impl Fn(&Path) -> bool) -> Vec<Entry> {
     let original_len = log.entries.len();
     let pruned = trim_entries(log.entries, MAX_ENTRIES, present);
     if pruned.len() != original_len {
-        if let Err(error) = save_unlocked_at(index, &Log { entries: pruned.clone() }) {
+        if let Err(error) = save_unlocked_at(
+            index,
+            &Log {
+                entries: pruned.clone(),
+            },
+        ) {
             crate::diagnostics::log(&format!("history prune not persisted: {error:#}"));
         }
     }
@@ -319,7 +331,9 @@ fn path_is_under_root(path: &Path, root: &Path) -> bool {
 }
 
 fn path_is_owned_capture(path: &Path, roots: &[impl AsRef<Path>]) -> bool {
-    roots.iter().any(|root| path_is_under_root(path, root.as_ref()))
+    roots
+        .iter()
+        .any(|root| path_is_under_root(path, root.as_ref()))
 }
 
 enum HistoryPathDisposition {
@@ -335,10 +349,7 @@ fn history_event_name(path: &Path) -> String {
         .unwrap_or_else(|| "unnamed".into())
 }
 
-fn take_owned_history_path_at(
-    path: &Path,
-    roots: &[PathBuf],
-) -> HistoryPathDisposition {
+fn take_owned_history_path_at(path: &Path, roots: &[PathBuf]) -> HistoryPathDisposition {
     if path_is_owned_capture(path, roots) {
         return HistoryPathDisposition::Owned;
     }
@@ -355,7 +366,9 @@ fn take_owned_history_path_at(
 
 fn take_owned_history_path(path: &Path) -> Result<HistoryPathDisposition> {
     let config = crate::config::Config::try_load().inspect_err(|_| {
-        crate::diagnostics::log("history ownership check skipped because config could not be loaded");
+        crate::diagnostics::log(
+            "history ownership check skipped because config could not be loaded",
+        );
     })?;
     let roots = [config.save_dir(), config.video_dir()];
     Ok(take_owned_history_path_at(path, &roots))
@@ -390,16 +403,20 @@ fn capture_is_offline_not_found(path: &Path) -> bool {
     ) && !missing_capture_is_confirmed_gone(path)
 }
 
+/// The same refusal covers an ejected drive and a path that never existed on
+/// this machine (a hand-edited row, a drive letter that is not there): both
+/// have no readable ancestor, and neither proves the file is gone. The message
+/// says what is known rather than guessing which one it is.
 fn refuse_offline_delete(path: &Path) -> Result<()> {
     crate::diagnostics::log(&format!(
-        "history delete skipped because the volume is offline: {}",
+        "history delete skipped because the drive or folder is unavailable: {}",
         history_event_name(path)
     ));
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "volume offline",
+        "drive or folder unavailable",
     ))
-    .context("delete capture: volume offline")
+    .context("delete capture: the drive or folder holding it is not available (disconnected, offline, or no longer on this PC)")
 }
 
 enum CanonicalRecheck {
@@ -523,7 +540,12 @@ fn clear_source_metadata_at(index: &Path) -> Result<usize> {
     let cleared = log
         .entries
         .iter()
-        .filter(|entry| entry.source.as_ref().is_some_and(|source| !source.is_empty()))
+        .filter(|entry| {
+            entry
+                .source
+                .as_ref()
+                .is_some_and(|source| !source.is_empty())
+        })
         .count();
     for entry in &mut log.entries {
         entry.source = None;
@@ -618,7 +640,11 @@ mod persistence_tests {
         let entries = vec![entry("a"), entry("b"), entry("c"), entry("d")];
         let kept = trim_entries(entries, 2, |_| true);
         let paths: Vec<_> = kept.iter().map(|e| e.path.to_str().unwrap()).collect();
-        assert_eq!(paths, vec!["c", "d"], "oldest-first order means the cap trims the front");
+        assert_eq!(
+            paths,
+            vec!["c", "d"],
+            "oldest-first order means the cap trims the front"
+        );
     }
 
     #[test]
@@ -651,7 +677,10 @@ mod persistence_tests {
         assert_eq!(normalize_source(None), None);
         assert_eq!(normalize_source(Some("")), None);
         assert_eq!(normalize_source(Some("   ")), None);
-        assert_eq!(normalize_source(Some("  Notepad  ")), Some("Notepad".to_string()));
+        assert_eq!(
+            normalize_source(Some("  Notepad  ")),
+            Some("Notepad".to_string())
+        );
     }
 
     #[test]
@@ -690,9 +719,9 @@ mod persistence_tests {
         assert_eq!(normalized, "Left Right End");
     }
 
-
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("matteshot-history-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("matteshot-history-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -723,7 +752,11 @@ mod persistence_tests {
         append_at(&index, entry_at(&capture(&dir, "a.png")));
         append_at(&index, entry_at(&capture(&dir, "b.png")));
         let log = load_for_mutation(&index).unwrap();
-        assert_eq!(log.entries.len(), 2, "the second append lost the first entry");
+        assert_eq!(
+            log.entries.len(),
+            2,
+            "the second append lost the first entry"
+        );
     }
 
     #[test]
@@ -738,7 +771,11 @@ mod persistence_tests {
         let quarantined = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .find(|e| e.file_name().to_string_lossy().starts_with("history.json.corrupt-"))
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("history.json.corrupt-")
+            })
             .expect("the corrupt index was quarantined");
         assert_eq!(std::fs::read(quarantined.path()).unwrap(), b"{ not json");
     }
@@ -753,7 +790,10 @@ mod persistence_tests {
         let index = dir.join("history.json");
         std::fs::create_dir_all(&index).unwrap();
         append_at(&index, entry_at(&capture(&dir, "a.png")));
-        assert!(index.is_dir(), "the unreadable index was replaced by a write");
+        assert!(
+            index.is_dir(),
+            "the unreadable index was replaced by a write"
+        );
     }
 
     #[test]
@@ -778,7 +818,11 @@ mod persistence_tests {
         let quarantined = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .find(|e| e.file_name().to_string_lossy().starts_with("history.json.corrupt-"))
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("history.json.corrupt-")
+            })
             .expect("the undecodable index was quarantined");
         assert_eq!(std::fs::read(quarantined.path()).unwrap(), utf16);
     }
@@ -809,8 +853,14 @@ mod persistence_tests {
         let via_dotdot = root.join("..").join("root-evil").join("shot.png");
 
         assert!(path_is_under_root(&inside, &root));
-        assert!(!path_is_under_root(&sibling, &root), "root-evil must not match root");
-        assert!(!path_is_under_root(&via_dotdot, &root), "`..` that lands outside is not owned");
+        assert!(
+            !path_is_under_root(&sibling, &root),
+            "root-evil must not match root"
+        );
+        assert!(
+            !path_is_under_root(&via_dotdot, &root),
+            "`..` that lands outside is not owned"
+        );
         assert!(!path_is_under_root(&inside, &base.join("no-such-root")));
         assert!(!path_is_under_root(&root.join("missing.png"), &root));
     }
@@ -864,7 +914,10 @@ mod persistence_tests {
             matches!(disposition, HistoryPathDisposition::UnownedRefused),
             "an outside path must not surface as owned"
         );
-        assert!(foreign.is_file(), "a file outside the save folder must stay on disk");
+        assert!(
+            foreign.is_file(),
+            "a file outside the save folder must stay on disk"
+        );
         assert_eq!(
             load_for_mutation(&index).unwrap().entries.len(),
             1,
@@ -924,8 +977,14 @@ mod persistence_tests {
         append_at(&index, entry_at(&escaped));
 
         let disposition = take_owned_history_path_at(&escaped, &[save]);
-        assert!(matches!(disposition, HistoryPathDisposition::UnownedRefused));
-        assert!(foreign.is_file(), "a `..` escape must not unlink the foreign file");
+        assert!(matches!(
+            disposition,
+            HistoryPathDisposition::UnownedRefused
+        ));
+        assert!(
+            foreign.is_file(),
+            "a `..` escape must not unlink the foreign file"
+        );
         assert_eq!(
             load_for_mutation(&index).unwrap().entries.len(),
             1,
@@ -941,7 +1000,10 @@ mod persistence_tests {
         let missing = save.join("gone.png");
 
         let disposition = take_owned_history_path_at(&missing, &[save]);
-        assert!(matches!(disposition, HistoryPathDisposition::UnownedRefused));
+        assert!(matches!(
+            disposition,
+            HistoryPathDisposition::UnownedRefused
+        ));
     }
 
     #[test]
@@ -956,7 +1018,10 @@ mod persistence_tests {
         append_at(&index, entry_at(&foreign));
 
         assert!(remove_at(&index, &foreign, &[save]).is_ok());
-        assert!(foreign.is_file(), "a file outside the save folder must stay on disk");
+        assert!(
+            foreign.is_file(),
+            "a file outside the save folder must stay on disk"
+        );
         assert!(
             load_for_mutation(&index).unwrap().entries.is_empty(),
             "the stale index row is dropped even when the file is left alone"
@@ -989,7 +1054,10 @@ mod persistence_tests {
         append_at(&index, entry_at(&rec));
 
         assert!(remove_at(&index, &rec, &[save, video]).is_ok());
-        assert!(!rec.exists(), "recordings under video_dir are an allowed root");
+        assert!(
+            !rec.exists(),
+            "recordings under video_dir are an allowed root"
+        );
         assert!(load_for_mutation(&index).unwrap().entries.is_empty());
     }
 
@@ -1006,7 +1074,10 @@ mod persistence_tests {
         append_at(&index, entry_at(&escaped));
 
         assert!(remove_at(&index, &escaped, &[save]).is_ok());
-        assert!(foreign.is_file(), "a `..` escape must not unlink the foreign file");
+        assert!(
+            foreign.is_file(),
+            "a `..` escape must not unlink the foreign file"
+        );
         assert!(load_for_mutation(&index).unwrap().entries.is_empty());
     }
 
@@ -1031,10 +1102,7 @@ mod persistence_tests {
             !link.exists(),
             "the symlink inside save_dir must be unlinked"
         );
-        assert!(
-            target.is_file(),
-            "the outside target must not be deleted"
-        );
+        assert!(target.is_file(), "the outside target must not be deleted");
         assert!(load_for_mutation(&index).unwrap().entries.is_empty());
     }
 
@@ -1140,7 +1208,11 @@ mod persistence_tests {
         );
         assert!(shot.is_file(), "the capture must stay on disk");
         let on_disk = load_for_mutation(&index).unwrap();
-        assert_eq!(on_disk.entries.len(), 1, "offline recheck must not persist-prune");
+        assert_eq!(
+            on_disk.entries.len(),
+            1,
+            "offline recheck must not persist-prune"
+        );
         assert_eq!(on_disk.entries[0].path, shot);
         assert_eq!(on_disk.entries[0].source.as_deref(), Some("USB title"));
     }
@@ -1154,10 +1226,12 @@ mod persistence_tests {
         let index = dir.join("history.json");
         write_log(&index, vec![entry_at(&shot)]);
 
-        assert!(remove_at_with(&index, &shot, std::slice::from_ref(&save), |_, _| {
-            CanonicalRecheck::Changed
-        })
-        .is_ok());
+        assert!(
+            remove_at_with(&index, &shot, std::slice::from_ref(&save), |_, _| {
+                CanonicalRecheck::Changed
+            })
+            .is_ok()
+        );
         assert!(
             shot.is_file(),
             "a changed path must not unlink the file that is now there"
@@ -1242,9 +1316,16 @@ mod persistence_tests {
         assert_eq!(listed[0].source.as_deref(), Some("Confidential.docx"));
 
         let on_disk = load_for_mutation(&index).unwrap();
-        assert_eq!(on_disk.entries.len(), 1, "the missing file's title stayed on disk");
+        assert_eq!(
+            on_disk.entries.len(),
+            1,
+            "the missing file's title stayed on disk"
+        );
         assert_eq!(on_disk.entries[0].path, kept);
-        assert!(kept.is_file(), "persist-prune must not delete the remaining capture");
+        assert!(
+            kept.is_file(),
+            "persist-prune must not delete the remaining capture"
+        );
     }
 
     #[test]
@@ -1252,7 +1333,10 @@ mod persistence_tests {
         let dir = temp_dir("list-missing-index");
         let index = dir.join("history.json");
         assert!(list_at(&index).is_empty());
-        assert!(!index.exists(), "a first History open must not mint an empty index");
+        assert!(
+            !index.exists(),
+            "a first History open must not mint an empty index"
+        );
     }
 
     #[test]
@@ -1273,7 +1357,10 @@ mod persistence_tests {
         let index = dir.join("history.json");
         std::fs::create_dir_all(&index).unwrap();
         assert!(list_at(&index).is_empty());
-        assert!(index.is_dir(), "a transient/unreadable index must not be replaced");
+        assert!(
+            index.is_dir(),
+            "a transient/unreadable index must not be replaced"
+        );
     }
 
     #[test]
@@ -1311,7 +1398,11 @@ mod persistence_tests {
                 Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
             )
         });
-        assert_eq!(listed.len(), 1, "an unreadable capture must stay in the open list");
+        assert_eq!(
+            listed.len(),
+            1,
+            "an unreadable capture must stay in the open list"
+        );
         assert_eq!(listed[0].path, shot);
         assert_eq!(listed[0].source.as_deref(), Some("Secret subject"));
         assert_eq!(
@@ -1336,7 +1427,11 @@ mod persistence_tests {
         write_log(&index, vec![entry_with_source(&probe, "Secret subject")]);
         let before = std::fs::read(&index).unwrap();
         let listed = list_at(&index);
-        assert_eq!(listed.len(), 1, "an unreadable capture must stay in the open list");
+        assert_eq!(
+            listed.len(),
+            1,
+            "an unreadable capture must stay in the open list"
+        );
         assert_eq!(listed[0].path, probe);
         assert_eq!(listed[0].source.as_deref(), Some("Secret subject"));
         assert_eq!(
@@ -1755,8 +1850,14 @@ mod persistence_tests {
         let targets = history_metadata_files(&dir).unwrap();
         assert!(targets.iter().any(|p| p == &index));
         assert!(targets.iter().any(|p| p == &quarantined));
-        assert!(targets.iter().any(|p| p == &tmp), "a leftover atomic-write temp still holds titles");
-        assert!(!targets.iter().any(|p| p == &shot), "a capture must not be an uninstall target");
+        assert!(
+            targets.iter().any(|p| p == &tmp),
+            "a leftover atomic-write temp still holds titles"
+        );
+        assert!(
+            !targets.iter().any(|p| p == &shot),
+            "a capture must not be an uninstall target"
+        );
         assert!(!targets.iter().any(|p| p == &config));
         assert!(!targets.iter().any(|p| p == &license));
 
@@ -1766,7 +1867,10 @@ mod persistence_tests {
         assert!(!tmp.exists());
         assert!(shot.is_file(), "data-removal must not delete the capture");
         assert!(config.is_file(), "data-removal must not delete config.json");
-        assert!(license.is_file(), "data-removal must not delete license.json");
+        assert!(
+            license.is_file(),
+            "data-removal must not delete license.json"
+        );
     }
 
     #[test]
@@ -1844,7 +1948,11 @@ fn grid_layout(
             }
         })
         .collect();
-    let rows = if count == 0 { 0 } else { (count - 1) / cols + 1 };
+    let rows = if count == 0 {
+        0
+    } else {
+        (count - 1) / cols + 1
+    };
     let content_h = if rows == 0 {
         margin * 2
     } else {
@@ -1902,21 +2010,21 @@ mod layout_tests {
         assert_eq!(uploads, [1, 3]);
     }
 
-    /// SBS-906: History must not offer Share to a trial (or any unpaid) user.
+    /// History offers Share only when an upload can actually happen.
     #[test]
-    fn history_omits_share_without_a_paid_license() {
-        let licensed: Vec<_> = history_menu_items(true)
+    fn history_omits_share_when_it_cannot_upload() {
+        let sharing: Vec<_> = history_menu_items(true)
             .into_iter()
             .map(|(_, label)| label)
             .collect();
-        let trial: Vec<_> = history_menu_items(false)
+        let default_build: Vec<_> = history_menu_items(false)
             .into_iter()
             .map(|(_, label)| label)
             .collect();
-        assert!(licensed.contains(&"Share link"));
-        assert!(!trial.contains(&"Share link"));
+        assert!(sharing.contains(&"Share link"));
+        assert!(!default_build.contains(&"Share link"));
         assert_eq!(
-            trial,
+            default_build,
             ["Copy", "Open in editor", "Show in folder", "Delete\u{2026}"]
         );
         assert_eq!(
@@ -1933,7 +2041,10 @@ mod layout_tests {
         let (wide_cells, _) = grid_layout(12, 900, CELL_W, CELL_H, MARGIN, GAP);
         let (narrow_cells, _) = grid_layout(12, 300, CELL_W, CELL_H, MARGIN, GAP);
         let wide_cols = wide_cells.iter().filter(|c| c.y == wide_cells[0].y).count();
-        let narrow_cols = narrow_cells.iter().filter(|c| c.y == narrow_cells[0].y).count();
+        let narrow_cols = narrow_cells
+            .iter()
+            .filter(|c| c.y == narrow_cells[0].y)
+            .count();
         assert!(wide_cols > narrow_cols);
     }
 
@@ -1959,24 +2070,38 @@ mod layout_tests {
     #[test]
     fn even_a_single_pixel_viewport_still_lays_out_one_column() {
         let (cells, _) = grid_layout(3, 1, CELL_W, CELL_H, MARGIN, GAP);
-        assert_eq!(cells.iter().filter(|c| c.x == MARGIN).count(), 3, "must collapse to one column, not zero");
+        assert_eq!(
+            cells.iter().filter(|c| c.x == MARGIN).count(),
+            3,
+            "must collapse to one column, not zero"
+        );
     }
 
     #[test]
     fn hit_test_accounts_for_scroll_offset() {
         let (cells, _) = grid_layout(4, 860, CELL_W, CELL_H, MARGIN, GAP);
         // Unscrolled, the mouse over the first cell hits index 0.
-        assert_eq!(hit_test(&cells, CELL_W, CELL_H, 0, MARGIN + 5, MARGIN + 5), 0);
+        assert_eq!(
+            hit_test(&cells, CELL_W, CELL_H, 0, MARGIN + 5, MARGIN + 5),
+            0
+        );
         // Scroll the content up by one row's worth; the same screen point now
         // misses everything in a one-row grid.
-        assert_eq!(hit_test(&cells, CELL_W, CELL_H, CELL_H + GAP, MARGIN + 5, MARGIN + 5), -1);
+        assert_eq!(
+            hit_test(&cells, CELL_W, CELL_H, CELL_H + GAP, MARGIN + 5, MARGIN + 5),
+            -1
+        );
         assert_eq!(hit_test(&cells, CELL_W, CELL_H, 0, 0, 0), -1);
     }
 
     #[test]
     fn scroll_is_clamped_to_the_overflow_past_the_viewport() {
         assert_eq!(max_scroll(2000, 600), 1400);
-        assert_eq!(max_scroll(400, 600), 0, "content shorter than the viewport never scrolls");
+        assert_eq!(
+            max_scroll(400, 600),
+            0,
+            "content shorter than the viewport never scrolls"
+        );
     }
 }
 
@@ -2017,12 +2142,17 @@ mod thumb_tests {
             CELL_IMG_H,
         )
         .expect("tall scroll should still produce a cell thumb");
-        assert!(thumb.img_w <= CELL_W, "thumb width {} exceeds cell", thumb.img_w);
-        assert!(thumb.img_h <= CELL_IMG_H, "thumb height {} exceeds cell", thumb.img_h);
-        assert_eq!(
-            thumb.bgra.len(),
-            (thumb.img_w * thumb.img_h * 4) as usize
+        assert!(
+            thumb.img_w <= CELL_W,
+            "thumb width {} exceeds cell",
+            thumb.img_w
         );
+        assert!(
+            thumb.img_h <= CELL_IMG_H,
+            "thumb height {} exceeds cell",
+            thumb.img_h
+        );
+        assert_eq!(thumb.bgra.len(), (thumb.img_w * thumb.img_h * 4) as usize);
         assert_eq!(thumb.source_label, "Notepad");
     }
 
@@ -2048,7 +2178,10 @@ mod thumb_tests {
         let entry = named_entry(&path, Some("Notepad"));
         let thumbs = placeholders(std::slice::from_ref(&entry));
         assert_eq!(thumbs.len(), 1);
-        assert!(thumbs[0].bgra.is_empty(), "a placeholder must not hold pixels");
+        assert!(
+            thumbs[0].bgra.is_empty(),
+            "a placeholder must not hold pixels"
+        );
         assert_eq!(thumbs[0].img_w, 0);
         assert_eq!(thumbs[0].img_h, 0);
         assert_eq!(thumbs[0].source_label, "Notepad");
@@ -2157,7 +2290,10 @@ fn make_thumb(entry: &Entry, max_w: i32, max_h: i32) -> Option<Thumb> {
     let img = crate::thumb_decode::decode_for_thumb(&entry.path, cap)?;
     let (w, h) = (img.width().max(1) as f32, img.height().max(1) as f32);
     let scale = (max_w as f32 / w).min(max_h as f32 / h);
-    let (tw, th) = ((w * scale).round().max(1.0) as u32, (h * scale).round().max(1.0) as u32);
+    let (tw, th) = (
+        (w * scale).round().max(1.0) as u32,
+        (h * scale).round().max(1.0) as u32,
+    );
     let resized = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
     let source_label =
         normalize_source(entry.source.as_deref()).unwrap_or_else(|| "\u{2014}".to_string());
@@ -2171,7 +2307,10 @@ fn make_thumb(entry: &Entry, max_w: i32, max_h: i32) -> Option<Thumb> {
 }
 
 fn build_thumbs(entries: &[Entry], max_w: i32, max_h: i32) -> Vec<Thumb> {
-    entries.par_iter().filter_map(|e| make_thumb(e, max_w, max_h)).collect()
+    entries
+        .par_iter()
+        .filter_map(|e| make_thumb(e, max_w, max_h))
+        .collect()
 }
 
 /// What `open` / `reload` put on screen before the worker posts. Labels and
@@ -2203,11 +2342,7 @@ static THUMB_COMPLETIONS: crate::completion::CompletionMailbox<ThumbBatch> =
 /// Keep a worker result only when it belongs to this open/reload, and only
 /// for paths still in the grid. A late batch must not revive a row the user
 /// already deleted, and a stale generation must not replace a newer reload.
-fn take_ready_thumbs(
-    current: &[Thumb],
-    generation: u64,
-    batch: ThumbBatch,
-) -> Option<Vec<Thumb>> {
+fn take_ready_thumbs(current: &[Thumb], generation: u64, batch: ThumbBatch) -> Option<Vec<Thumb>> {
     if batch.generation != generation {
         return None;
     }
@@ -2215,7 +2350,11 @@ fn take_ready_thumbs(
         batch
             .thumbs
             .into_iter()
-            .filter(|ready| current.iter().any(|slot| slot.entry.path == ready.entry.path))
+            .filter(|ready| {
+                current
+                    .iter()
+                    .any(|slot| slot.entry.path == ready.entry.path)
+            })
             .collect(),
     )
 }
@@ -2327,12 +2466,24 @@ fn relayout(state: &mut State) {
     );
     state.cells = cells;
     state.content_h = content_h;
-    state.scroll_y = state.scroll_y.min(max_scroll(content_h, state.viewport_h)).max(0);
+    state.scroll_y = state
+        .scroll_y
+        .min(max_scroll(content_h, state.viewport_h))
+        .max(0);
 }
 
 unsafe fn paint(hdc: HDC, state: &State) {
     let bg = CreateSolidBrush(state.theme.bg);
-    FillRect(hdc, &RECT { left: 0, top: 0, right: state.viewport_w, bottom: state.viewport_h }, bg);
+    FillRect(
+        hdc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: state.viewport_w,
+            bottom: state.viewport_h,
+        },
+        bg,
+    );
     let _ = DeleteObject(bg);
     SetBkMode(hdc, TRANSPARENT);
 
@@ -2346,7 +2497,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
             right: state.viewport_w - state.margin,
             bottom: state.viewport_h,
         };
-        DrawTextW(hdc, &mut msg, &mut rc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        DrawTextW(
+            hdc,
+            &mut msg,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_WORDBREAK,
+        );
         return;
     }
 
@@ -2354,7 +2510,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
     // a paint, so recreating either per cell was pure repeated GDI overhead
     // on a repaint every hover-driven mouse move.
     let card = CreateSolidBrush(state.theme.chip);
-    let hover_pen = CreatePen(windows::Win32::Graphics::Gdi::PS_SOLID, 2, state.theme.accent);
+    let hover_pen = CreatePen(
+        windows::Win32::Graphics::Gdi::PS_SOLID,
+        2,
+        state.theme.accent,
+    );
     let null_brush =
         windows::Win32::Graphics::Gdi::GetStockObject(windows::Win32::Graphics::Gdi::NULL_BRUSH);
 
@@ -2365,8 +2525,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
         }
 
         let hovered = i as i32 == state.hover;
-        let card_rect =
-            RECT { left: cx, top: cy, right: cx + state.cell_w, bottom: cy + state.cell_h };
+        let card_rect = RECT {
+            left: cx,
+            top: cy,
+            right: cx + state.cell_w,
+            bottom: cy + state.cell_h,
+        };
         FillRect(hdc, &card_rect, card);
         if hovered {
             let old_pen = SelectObject(hdc, hover_pen);
@@ -2418,7 +2582,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let source_h = label_band * SOURCE_LABEL_H / (SOURCE_LABEL_H + LABEL_H);
 
         SelectObject(hdc, state.font_small);
-        SetTextColor(hdc, if hovered { state.theme.text } else { state.theme.muted });
+        SetTextColor(
+            hdc,
+            if hovered {
+                state.theme.text
+            } else {
+                state.theme.muted
+            },
+        );
         let mut source_label = wide(&thumb.source_label);
         let mut source_rect = RECT {
             left: cx + 6,
@@ -2437,7 +2608,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
             DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
 
-        SetTextColor(hdc, if hovered { state.theme.accent } else { state.theme.muted });
+        SetTextColor(
+            hdc,
+            if hovered {
+                state.theme.accent
+            } else {
+                state.theme.muted
+            },
+        );
         let mut label = wide(&format_when(thumb.entry.saved_at));
         let mut label_rect = RECT {
             left: cx + 6,
@@ -2445,7 +2623,12 @@ unsafe fn paint(hdc: HDC, state: &State) {
             right: cx + state.cell_w - 6,
             bottom: cy + state.cell_h,
         };
-        DrawTextW(hdc, &mut label, &mut label_rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        DrawTextW(
+            hdc,
+            &mut label,
+            &mut label_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
     }
 
     if let Some((text, _)) = &state.status {
@@ -2485,7 +2668,12 @@ unsafe fn require_owned_history_path(hwnd: HWND, path: &Path) -> bool {
         Ok(HistoryPathDisposition::Owned) => true,
         Ok(HistoryPathDisposition::UnownedRefused) => {
             let message = HSTRING::from("This file is not in the Matteshot save folder.");
-            let _ = MessageBoxW(hwnd, PCWSTR(message.as_ptr()), w!("Matteshot"), MB_OK | MB_ICONWARNING);
+            let _ = MessageBoxW(
+                hwnd,
+                PCWSTR(message.as_ptr()),
+                w!("Matteshot"),
+                MB_OK | MB_ICONWARNING,
+            );
             false
         }
         Err(error) => {
@@ -2544,9 +2732,7 @@ unsafe fn reveal_entry(hwnd: HWND, entry: &Entry) {
 }
 
 unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
-    if let crate::share::ShareStart::Unavailable(reason) =
-        crate::share::share_start(crate::license::can_share())
-    {
+    if let crate::share::ShareStart::Unavailable(reason) = crate::share::share_start() {
         if let Some(state) = state_of(hwnd) {
             state.status = Some((reason.to_string(), std::time::Instant::now()));
             let _ = InvalidateRect(hwnd, None, false);
@@ -2571,16 +2757,25 @@ unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
     let _ = InvalidateRect(hwnd, None, false);
 }
 
-/// History Share after license + path checks. Same idle rule recdone
+/// History Share after availability and path checks. Same idle rule recdone
 /// applies to `state.sharing` (SBS-1075).
 fn start_share_upload(pending: &mut Option<u64>, start: impl FnOnce() -> u64) -> bool {
     crate::share::begin_if_idle(pending, start)
 }
 
 unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
-    let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = entry
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let prompt = HSTRING::from(format!("Delete {name}? This cannot be undone."));
-    let confirmed = MessageBoxW(hwnd, PCWSTR(prompt.as_ptr()), w!("Matteshot"), MB_YESNO | MB_ICONWARNING) == IDYES;
+    let confirmed = MessageBoxW(
+        hwnd,
+        PCWSTR(prompt.as_ptr()),
+        w!("Matteshot"),
+        MB_YESNO | MB_ICONWARNING,
+    ) == IDYES;
     if !confirmed {
         return;
     }
@@ -2610,17 +2805,18 @@ unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
 unsafe fn warn(hwnd: HWND, prefix: &str, error: &dyn std::fmt::Display) {
     crate::diagnostics::log("history: action failed");
     let message = HSTRING::from(format!("{prefix}\n\n{error}"));
-    let _ = MessageBoxW(hwnd, PCWSTR(message.as_ptr()), w!("Matteshot"), MB_OK | MB_ICONWARNING);
+    let _ = MessageBoxW(
+        hwnd,
+        PCWSTR(message.as_ptr()),
+        w!("Matteshot"),
+        MB_OK | MB_ICONWARNING,
+    );
 }
 
-/// History context-menu rows. Share is omitted unless a paid license can
-/// actually upload (SBS-906). Command ids stay stable so Delete is always 5.
+/// History context-menu rows. Share is omitted unless this build can
+/// actually upload. Command ids stay stable so Delete is always 5.
 fn history_menu_items(can_share: bool) -> Vec<(usize, &'static str)> {
-    let mut items = vec![
-        (1, "Copy"),
-        (2, "Open in editor"),
-        (3, "Show in folder"),
-    ];
+    let mut items = vec![(1, "Copy"), (2, "Open in editor"), (3, "Show in folder")];
     if can_share {
         items.push((4, "Share link"));
     }
@@ -2634,18 +2830,30 @@ fn history_menu_items(can_share: bool) -> Vec<(usize, &'static str)> {
 unsafe fn context_menu(hwnd: HWND, entry: Entry) {
     crate::theme::enable_dark_menus();
     let Ok(menu) = CreatePopupMenu() else { return };
-    for (id, label) in history_menu_items(crate::license::can_share()) {
+    for (id, label) in history_menu_items(crate::share::available()) {
         let text = HSTRING::from(label);
         let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(text.as_ptr()));
     }
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
-    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, None);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        None,
+    );
     let _ = DestroyMenu(menu);
     match cmd.0 {
         1 => copy_entry(hwnd, &entry),
-        2 => open_in_editor(hwnd, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &entry),
+        2 => open_in_editor(
+            hwnd,
+            MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+            &entry,
+        ),
         3 => reveal_entry(hwnd, &entry),
         4 => share_entry(hwnd, &entry),
         5 => delete_entry(hwnd, &entry),
@@ -2669,7 +2877,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let bmp = CreateCompatibleBitmap(hdc, state.viewport_w, state.viewport_h);
                 let old = SelectObject(mem, bmp);
                 paint(mem, state);
-                let _ = BitBlt(hdc, 0, 0, state.viewport_w, state.viewport_h, mem, 0, 0, SRCCOPY);
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    state.viewport_w,
+                    state.viewport_h,
+                    mem,
+                    0,
+                    0,
+                    SRCCOPY,
+                );
                 SelectObject(mem, old);
                 let _ = DeleteObject(bmp);
                 let _ = DeleteDC(mem);
@@ -2679,8 +2897,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEMOVE => {
             if let Some(state) = state_of(hwnd) {
-                let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
-                let hover = hit_test(&state.cells, state.cell_w, state.cell_h, state.scroll_y, mx, my);
+                let (mx, my) = (
+                    (lparam.0 & 0xFFFF) as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                let hover = hit_test(
+                    &state.cells,
+                    state.cell_w,
+                    state.cell_h,
+                    state.scroll_y,
+                    mx,
+                    my,
+                );
                 if hover != state.hover {
                     state.hover = hover;
                     let _ = InvalidateRect(hwnd, None, false);
@@ -2700,8 +2928,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             if let Some(state) = state_of(hwnd) {
-                let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
-                let hit = hit_test(&state.cells, state.cell_w, state.cell_h, state.scroll_y, mx, my);
+                let (mx, my) = (
+                    (lparam.0 & 0xFFFF) as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                let hit = hit_test(
+                    &state.cells,
+                    state.cell_w,
+                    state.cell_h,
+                    state.scroll_y,
+                    mx,
+                    my,
+                );
                 if hit >= 0 {
                     // Deferred rather than immediate: WM_LBUTTONDBLCLK
                     // cancels this before it fires, so a double-click opens
@@ -2716,12 +2954,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let entry = state_of(hwnd).and_then(|state| {
                 let _ = KillTimer(hwnd, CLICK_TIMER_ID);
                 state.pending_click = None;
-                let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
-                let hit = hit_test(&state.cells, state.cell_w, state.cell_h, state.scroll_y, mx, my);
+                let (mx, my) = (
+                    (lparam.0 & 0xFFFF) as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                let hit = hit_test(
+                    &state.cells,
+                    state.cell_w,
+                    state.cell_h,
+                    state.scroll_y,
+                    mx,
+                    my,
+                );
                 (hit >= 0).then(|| state.thumbs[hit as usize].entry.clone())
             });
             if let Some(entry) = entry {
-                open_in_editor(hwnd, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &entry);
+                open_in_editor(
+                    hwnd,
+                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                    &entry,
+                );
             }
             LRESULT(0)
         }
@@ -2731,8 +2983,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // menu below can delete the very entry it would have copied.
                 let _ = KillTimer(hwnd, CLICK_TIMER_ID);
                 state.pending_click = None;
-                let (mx, my) = ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32);
-                let hit = hit_test(&state.cells, state.cell_w, state.cell_h, state.scroll_y, mx, my);
+                let (mx, my) = (
+                    (lparam.0 & 0xFFFF) as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                let hit = hit_test(
+                    &state.cells,
+                    state.cell_w,
+                    state.cell_h,
+                    state.scroll_y,
+                    mx,
+                    my,
+                );
                 (hit >= 0).then(|| state.thumbs[hit as usize].entry.clone())
             });
             if let Some(entry) = entry {
@@ -2771,7 +3033,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             };
             if let Some(state) = state_of(hwnd) {
-                if let Some(thumbs) = take_ready_thumbs(&state.thumbs, state.thumb_generation, batch)
+                if let Some(thumbs) =
+                    take_ready_thumbs(&state.thumbs, state.thumb_generation, batch)
                 {
                     // Indices can shift when failed decodes drop out of the
                     // grid; a pending single-click must not copy a different
@@ -2869,7 +3132,15 @@ pub fn open() -> Result<()> {
         if !existing.0.is_null() && IsWindow(existing).as_bool() {
             let _ = ShowWindow(existing, SW_RESTORE);
             let _ = SetWindowPos(existing, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            let _ = SetWindowPos(existing, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            let _ = SetWindowPos(
+                existing,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            );
             let _ = SetForegroundWindow(existing);
             reload(existing);
             return Ok(());
@@ -2895,7 +3166,10 @@ pub fn open() -> Result<()> {
         let thumbs = placeholders(&entries);
         let (cells, content_h) = grid_layout(thumbs.len(), cw, cell_w, cell_h, margin, gap);
 
-        let monitor = MonitorFromPoint(cursor, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromPoint(
+            cursor,
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
         let font = make_font(-sc(14));
         let font_small = make_font(-sc(12));
 
@@ -2935,12 +3209,20 @@ pub fn open() -> Result<()> {
 
         let leaked = Box::into_raw(state);
         let outer = crate::dpi::outer_bounds(
-            RECT { left: 0, top: 0, right: cw, bottom: ch },
+            RECT {
+                left: 0,
+                top: 0,
+                right: cw,
+                bottom: ch,
+            },
             WS_CAPTION | WS_SYSMENU,
             WS_EX_APPWINDOW,
             scale,
         );
-        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         let _ = GetMonitorInfoW(monitor, &mut mi);
         let (ww, wh) = (outer.right - outer.left, outer.bottom - outer.top);
         let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - ww) / 2;

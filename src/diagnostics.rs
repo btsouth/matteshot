@@ -56,6 +56,87 @@ pub fn log(event: &str) {
     );
 }
 
+/// Classify a failure into a fixed label. The label is all that gets logged:
+/// error text can carry a window title or a path, and the log is replayed
+/// into the support report people paste into public issues.
+pub fn failure_kind(error: &anyhow::Error) -> &'static str {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+
+    if has(&["cancel", "aborted"]) {
+        "cancelled"
+    } else if has(&[
+        "access is denied",
+        "access denied",
+        "permission",
+        "privilege",
+        "0x80070005",
+    ]) {
+        "access_denied"
+    } else if has(&["signature", "checksum", "sha-256", "sha256", "not trusted"]) {
+        "verification"
+    } else if has(&["timed out", "timeout"]) {
+        "timeout"
+    } else if has(&["winhttp", "connect", "network", "dns", "http ", "resolve"]) {
+        "network"
+    } else if has(&["clipboard"]) {
+        "clipboard"
+    } else if has(&[
+        "media foundation",
+        "encoder",
+        "aac",
+        "h.264",
+        "mfstartup",
+        "no video stream",
+    ]) {
+        "encoder"
+    } else if has(&[
+        "graphics capture",
+        "wgc",
+        "dwm",
+        "d3d",
+        "direct3d",
+        "adapter",
+        "surface",
+    ]) {
+        "capture_unavailable"
+    // Before the disk bucket: "no such file or directory" contains both "file"
+    // and "directory", so checking disk first would swallow every not-found
+    // and leave that bucket permanently empty.
+    } else if has(&[
+        "not found",
+        "not be found",
+        "does not exist",
+        "missing",
+        "no such",
+        "cannot find",
+    ]) {
+        "not_found"
+    } else if has(&[
+        "disk",
+        "space",
+        "write",
+        "create ",
+        "open ",
+        "file",
+        "directory",
+        "io error",
+    ]) {
+        "disk"
+    } else {
+        "other"
+    }
+}
+
+/// Note in the local log that `operation` failed, with a classified reason
+/// and nothing else. Nothing leaves the machine.
+pub fn log_failure(operation: &'static str, error: &anyhow::Error) {
+    log(&format!(
+        "failure operation={operation} kind={}",
+        failure_kind(error)
+    ));
+}
+
 pub fn init() {
     log(&format!("app start version={}", env!("CARGO_PKG_VERSION")));
     let previous = std::panic::take_hook();
@@ -95,16 +176,9 @@ fn recent_events() -> String {
     lines[lines.len().saturating_sub(RECENT_LINES)..].join("\r\n")
 }
 
-/// Contains no account name, machine name, license key, capture title, or
-/// save path. It is safe to paste into a support request after reviewing it.
+/// Contains no account name, machine name, capture title, or save path. It is
+/// safe to paste into a public issue after reviewing it.
 pub fn report() -> String {
-    // The coarse entitlement class, never the tray label: that one greets
-    // the licensed user by email, and this report promises to carry no
-    // account identity.
-    report_with_license(crate::license::status().diagnostics_label())
-}
-
-fn report_with_license(license_label: &str) -> String {
     let config = crate::config::Config::load();
     let save_location = if config.save_dir.is_some() {
         "custom"
@@ -121,7 +195,6 @@ fn report_with_license(license_label: &str) -> String {
         "Matteshot diagnostics\r\n\
          Version: {}\r\n\
          OS: {}\r\n\
-         License: {}\r\n\
          PrtScn preferred: {}\r\n\
          PrtScn owned: {}\r\n\
          PrtScn hook: {} down / {} up seen, {} presses saved from a lost key-up\r\n\
@@ -134,7 +207,6 @@ fn report_with_license(license_label: &str) -> String {
          Recent lifecycle events:\r\n{}",
         env!("CARGO_PKG_VERSION"),
         windows_version(),
-        license_label,
         crate::prtscn::preferred(),
         crate::prtscn::owns_key(),
         downs,
@@ -193,24 +265,74 @@ mod tests {
     }
 
     #[test]
-    fn licensed_report_carries_no_identity_markers() {
-        // The promise in report()'s doc comment, checked against the exact
-        // status that used to leak: a licensed user with a stored email.
-        let status = crate::license::Status::Licensed {
-            customer_email: Some("person@example.com".into()),
-            updates_until: None,
-        };
-        let report = report_with_license(status.diagnostics_label());
-        assert!(report.contains("License: Licensed\r\n"));
-        // The lifecycle tail replays whatever this machine logged; the
-        // license line lives in the header, so that is where identity
-        // must be absent.
+    fn report_carries_no_entitlement_line() {
+        let report = report();
         let header = report
             .split("Recent lifecycle events:")
             .next()
             .expect("report has a header");
-        assert!(!header.contains('@'), "an email address reached the report");
-        assert!(!header.contains("Licensed to"));
-        assert!(!header.contains("person"));
+        assert!(!header.contains("License:"));
+    }
+
+    #[test]
+    fn failures_classify_into_their_buckets() {
+        let cases = [
+            ("access is denied", "access_denied"),
+            ("installer signature is not valid", "verification"),
+            ("published checksum did not match", "verification"),
+            ("the operation timed out", "timeout"),
+            ("winhttp send request failed", "network"),
+            ("open the clipboard", "clipboard"),
+            ("media foundation could not start", "encoder"),
+            ("graphics capture item was 0x0", "capture_unavailable"),
+            ("user cancelled the export", "cancelled"),
+            ("no such file or directory", "not_found"),
+            ("the installer could not be found", "not_found"),
+            ("save the png: disk full", "disk"),
+            ("wobbling gizmo misaligned", "other"),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                failure_kind(&anyhow::anyhow!("{message}")),
+                expected,
+                "for {message:?}"
+            );
+        }
+    }
+
+    /// Classification reads the whole chain, so context added on the way up
+    /// still lands in the right bucket.
+    #[test]
+    fn a_wrapped_error_is_classified_by_its_cause() {
+        let wrapped = Err::<(), _>(anyhow::anyhow!("access is denied"))
+            .context("save the finished matte")
+            .unwrap_err();
+        assert_eq!(failure_kind(&wrapped), "access_denied");
+    }
+
+    #[test]
+    fn no_error_detail_ever_reaches_a_logged_kind() {
+        const ALLOWED: &[&str] = &[
+            "cancelled",
+            "access_denied",
+            "verification",
+            "timeout",
+            "network",
+            "clipboard",
+            "encoder",
+            "capture_unavailable",
+            "not_found",
+            "disk",
+            "other",
+        ];
+        for error in [
+            anyhow::anyhow!(r"create C:\Users\someone\Pictures\Matteshot: access is denied"),
+            anyhow::anyhow!("capture failed for window 'Quarterly Results - Confidential.xlsx'"),
+            anyhow::anyhow!(r"save D:\clients\acme\nda-draft.png: disk full"),
+            anyhow::anyhow!("something entirely new and unclassified"),
+        ] {
+            let kind = failure_kind(&error);
+            assert!(ALLOWED.contains(&kind), "{kind:?} is not a bounded label");
+        }
     }
 }

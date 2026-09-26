@@ -7,19 +7,19 @@ use image::RgbaImage;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, HALFTONE,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
     SetStretchBltMode, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HMONITOR, MONITORINFO, PAINTSTRUCT, SRCCOPY,
+    HALFTONE, HMONITOR, MONITORINFO, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongPtrW, LoadCursorW,
-    MessageBoxW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HTCAPTION, HWND_TOPMOST, IDC_SIZEALL, MB_ICONWARNING, MB_OK, SWP_NOMOVE, SWP_NOZORDER,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_NCLBUTTONDBLCLK, WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    MessageBoxW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, GWLP_USERDATA, HTCAPTION, HWND_TOPMOST, IDC_SIZEALL, MB_ICONWARNING, MB_OK,
+    SWP_NOMOVE, SWP_NOZORDER, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
 struct PinState {
@@ -37,8 +37,8 @@ thread_local! {
 
 unsafe fn context_menu(hwnd: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, TrackPopupMenu,
-        MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, TrackPopupMenu, MF_STRING,
+        TPM_NONOTIFY, TPM_RETURNCMD,
     };
     crate::theme::enable_dark_menus();
     let Ok(menu) = CreatePopupMenu() else { return };
@@ -48,7 +48,15 @@ unsafe fn context_menu(hwnd: HWND) {
     let mut pt = windows::Win32::Foundation::POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
-    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, None);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        None,
+    );
     let _ = DestroyMenu(menu);
     match cmd.0 {
         1 => {
@@ -57,9 +65,7 @@ unsafe fn context_menu(hwnd: HWND) {
                 for px in state.bgra.as_chunks::<4>().0.iter() {
                     rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
                 }
-                if let Some(img) =
-                    RgbaImage::from_raw(state.w as u32, state.h as u32, rgba)
-                {
+                if let Some(img) = RgbaImage::from_raw(state.w as u32, state.h as u32, rgba) {
                     let img = crate::output::resize_to_max_edge(
                         &img,
                         crate::config::Config::load().output_max_edge,
@@ -212,10 +218,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Hairline border so the pin reads as an object, not glitch.
                 let brush = CreateSolidBrush(state.border);
                 for r in [
-                    RECT { left: 0, top: 0, right: dw + 2, bottom: 1 },
-                    RECT { left: 0, top: dh + 1, right: dw + 2, bottom: dh + 2 },
-                    RECT { left: 0, top: 0, right: 1, bottom: dh + 2 },
-                    RECT { left: dw + 1, top: 0, right: dw + 2, bottom: dh + 2 },
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: dw + 2,
+                        bottom: 1,
+                    },
+                    RECT {
+                        left: 0,
+                        top: dh + 1,
+                        right: dw + 2,
+                        bottom: dh + 2,
+                    },
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: dh + 2,
+                    },
+                    RECT {
+                        left: dw + 1,
+                        top: 0,
+                        right: dw + 2,
+                        bottom: dh + 2,
+                    },
                 ] {
                     FillRect(hdc, &r, brush);
                 }
@@ -233,15 +259,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (state.w as f32 * state.zoom) as i32 + 2,
                     (state.h as f32 * state.zoom) as i32 + 2,
                 );
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    dw,
-                    dh,
-                    SWP_NOMOVE | SWP_NOZORDER,
-                );
+                let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, dw, dh, SWP_NOMOVE | SWP_NOZORDER);
                 let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
             }
             LRESULT(0)
@@ -323,9 +341,7 @@ pub fn show(img: RgbaImage, monitor: HMONITOR) -> Result<()> {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             w!("matteshot_pin"),
             w!("Matteshot pin"),
-            WS_POPUP
-                | WS_VISIBLE
-                | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME,
+            WS_POPUP | WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME,
             x,
             y,
             dw,

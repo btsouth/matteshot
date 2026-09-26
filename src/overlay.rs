@@ -15,12 +15,11 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    EnumDisplayMonitors, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, RoundRect,
-    SelectObject, SetBkColor,
-    SetBkMode, SetTextColor, TextOutW, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
-    FF_DONTCARE, HBITMAP, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, OPAQUE,
+    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, EnumDisplayMonitors,
+    FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, RoundRect, SelectObject,
+    SetBkColor, SetBkMode, SetTextColor, TextOutW, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_SINGLELINE,
+    DT_VCENTER, FF_DONTCARE, HBITMAP, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, OPAQUE,
     PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -28,14 +27,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
     GetClassNameW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LoadCursorW, PostMessageW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, LoadCursorW, PostMessageW,
     PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, HC_ACTION, HWND_TOPMOST, IDC_ARROW,
-    IDC_CROSS, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WH_KEYBOARD_LL, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HC_ACTION, HWND_TOPMOST, IDC_ARROW,
+    IDC_CROSS, KBDLLHOOKSTRUCT, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WH_KEYBOARD_LL,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 const WHITE: COLORREF = COLORREF(0x00FFFFFF);
@@ -82,12 +81,8 @@ unsafe extern "system" fn overlay_keyboard_hook(
                     let mask = 1u32 << bit;
                     if OVERLAY_KEYS_DOWN.fetch_or(mask, Ordering::SeqCst) & mask == 0 {
                         let hwnd = HWND(target as *mut _);
-                        let _ = PostMessageW(
-                            hwnd,
-                            WM_KEYDOWN,
-                            WPARAM(key.vkCode as usize),
-                            LPARAM(0),
-                        );
+                        let _ =
+                            PostMessageW(hwnd, WM_KEYDOWN, WPARAM(key.vkCode as usize), LPARAM(0));
                     }
                 }
                 return LRESULT(1);
@@ -209,13 +204,27 @@ fn delay_caret_rect(button_rect: RECT, caret_w: i32) -> RECT {
 /// `open_below`, else upward — the caller decides based on whether the
 /// monitor actually has room below the chip, so the list never runs off a
 /// short or heavily DPI-scaled monitor.
-fn delay_list_rects(anchor: RECT, item_h: i32, choices: &[u32], open_below: bool) -> Vec<(RECT, u32)> {
+fn delay_list_rects(
+    anchor: RECT,
+    item_h: i32,
+    choices: &[u32],
+    open_below: bool,
+) -> Vec<(RECT, u32)> {
     let list_h = item_h * choices.len() as i32;
-    let mut top = if open_below { anchor.bottom + 6 } else { anchor.top - 6 - list_h };
+    let mut top = if open_below {
+        anchor.bottom + 6
+    } else {
+        anchor.top - 6 - list_h
+    };
     let mut items = Vec::with_capacity(choices.len());
     for &seconds in choices {
         items.push((
-            RECT { left: anchor.left, top, right: anchor.right, bottom: top + item_h },
+            RECT {
+                left: anchor.left,
+                top,
+                right: anchor.right,
+                bottom: top + item_h,
+            },
             seconds,
         ));
         top += item_h;
@@ -361,10 +370,30 @@ unsafe fn frame_rect(hdc: HDC, r: &RECT, thickness: i32, color: COLORREF) {
     let brush = CreateSolidBrush(color);
     let t = thickness;
     for rr in [
-        RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + t },
-        RECT { left: r.left, top: r.bottom - t, right: r.right, bottom: r.bottom },
-        RECT { left: r.left, top: r.top, right: r.left + t, bottom: r.bottom },
-        RECT { left: r.right - t, top: r.top, right: r.right, bottom: r.bottom },
+        RECT {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.top + t,
+        },
+        RECT {
+            left: r.left,
+            top: r.bottom - t,
+            right: r.right,
+            bottom: r.bottom,
+        },
+        RECT {
+            left: r.left,
+            top: r.top,
+            right: r.left + t,
+            bottom: r.bottom,
+        },
+        RECT {
+            left: r.right - t,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        },
     ] {
         FillRect(hdc, &rr, brush);
     }
@@ -406,7 +435,15 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
             let nopen = CreatePen(PS_SOLID, 1, state.theme.accent);
             let ob = SelectObject(hdc, bg);
             let op = SelectObject(hdc, nopen);
-            let _ = RoundRect(hdc, b.rect.left, b.rect.top, b.rect.right, b.rect.bottom, 12, 12);
+            let _ = RoundRect(
+                hdc,
+                b.rect.left,
+                b.rect.top,
+                b.rect.right,
+                b.rect.bottom,
+                12,
+                12,
+            );
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
             let _ = DeleteObject(bg);
@@ -427,16 +464,35 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
             // zones, so they are drawn in their own sub-rects rather than as
             // one centered string.
             let mut label = b.label.clone();
-            let mut label_rc =
-                RECT { left: b.rect.left, top: b.rect.top, right: b.caret_rect.left, bottom: b.rect.bottom };
-            DrawTextW(hdc, &mut label, &mut label_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            let mut label_rc = RECT {
+                left: b.rect.left,
+                top: b.rect.top,
+                right: b.caret_rect.left,
+                bottom: b.rect.bottom,
+            };
+            DrawTextW(
+                hdc,
+                &mut label,
+                &mut label_rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
             let mut caret = wide("\u{25BE}");
             let mut caret_rc = b.caret_rect;
-            DrawTextW(hdc, &mut caret, &mut caret_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(
+                hdc,
+                &mut caret,
+                &mut caret_rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
         } else {
             let mut label = b.label.clone();
             let mut rc = b.rect;
-            DrawTextW(hdc, &mut label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(
+                hdc,
+                &mut label,
+                &mut rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
         }
     }
 }
@@ -449,12 +505,25 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
     }
     let first = state.delay_list[0].0;
     let last = state.delay_list[state.delay_list.len() - 1].0;
-    let panel = RECT { left: first.left, top: first.top, right: first.right, bottom: last.bottom };
+    let panel = RECT {
+        left: first.left,
+        top: first.top,
+        right: first.right,
+        bottom: last.bottom,
+    };
     let brush = CreateSolidBrush(state.theme.panel);
     let pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
     let old_brush = SelectObject(hdc, brush);
     let old_pen = SelectObject(hdc, pen);
-    let _ = RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 10, 10);
+    let _ = RoundRect(
+        hdc,
+        panel.left,
+        panel.top,
+        panel.right,
+        panel.bottom,
+        10,
+        10,
+    );
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(brush);
@@ -469,22 +538,45 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
         let armed = *seconds == current;
         let highlighted = armed || i as i32 == state.delay_list_hover;
         if highlighted {
-            let fill = if armed { state.theme.accent } else { state.theme.chip };
+            let fill = if armed {
+                state.theme.accent
+            } else {
+                state.theme.chip
+            };
             let bg = CreateSolidBrush(fill);
             let nopen = CreatePen(PS_SOLID, 1, fill);
             let ob = SelectObject(hdc, bg);
             let op = SelectObject(hdc, nopen);
-            let _ =
-                RoundRect(hdc, rect.left + 3, rect.top + 2, rect.right - 3, rect.bottom - 2, 8, 8);
+            let _ = RoundRect(
+                hdc,
+                rect.left + 3,
+                rect.top + 2,
+                rect.right - 3,
+                rect.bottom - 2,
+                8,
+                8,
+            );
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
             let _ = DeleteObject(bg);
             let _ = DeleteObject(nopen);
         }
-        SetTextColor(hdc, if armed { state.theme.accent_text } else { state.theme.text });
+        SetTextColor(
+            hdc,
+            if armed {
+                state.theme.accent_text
+            } else {
+                state.theme.text
+            },
+        );
         let mut label = wide(&format!("{seconds}s"));
         let mut rc = *rect;
-        DrawTextW(hdc, &mut label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(
+            hdc,
+            &mut label,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
     }
 }
 
@@ -493,7 +585,17 @@ fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
 }
 
 unsafe fn paint(hdc: HDC, state: &State) {
-    let _ = BitBlt(hdc, 0, 0, state.width, state.height, state.dim_dc, 0, 0, SRCCOPY);
+    let _ = BitBlt(
+        hdc,
+        0,
+        0,
+        state.width,
+        state.height,
+        state.dim_dc,
+        0,
+        0,
+        SRCCOPY,
+    );
 
     let bright = |hdc: HDC, r: &RECT| {
         let (x, y) = (r.left.max(0), r.top.max(0));
@@ -553,7 +655,12 @@ unsafe fn press_button(hwnd: HWND, state: &mut State, btn: Btn) {
                 .iter()
                 .find(|r| in_rect(r, x, y))
                 .copied()
-                .unwrap_or(RECT { left: 0, top: 0, right: state.width, bottom: state.height });
+                .unwrap_or(RECT {
+                    left: 0,
+                    top: 0,
+                    right: state.width,
+                    bottom: state.height,
+                });
             let crop = image::imageops::crop_imm(
                 &state.frozen,
                 r.left.max(0) as u32,
@@ -732,8 +839,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // clicks against it first and never let them fall through to
                 // a drag-select.
                 if state.delay_list_open {
-                    if let Some(&(_, seconds)) =
-                        state.delay_list.iter().find(|(r, _)| in_rect(r, pt.x, pt.y))
+                    if let Some(&(_, seconds)) = state
+                        .delay_list
+                        .iter()
+                        .find(|(r, _)| in_rect(r, pt.x, pt.y))
                     {
                         finish(hwnd, state, Some(Selection::Delay(seconds)));
                     } else {
@@ -787,7 +896,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return LRESULT(0);
                 }
                 if state.pressed.is_none() {
-                    if let Some(i) = state.buttons.iter().position(|b| in_rect(&b.rect, pt.x, pt.y))
+                    if let Some(i) = state
+                        .buttons
+                        .iter()
+                        .position(|b| in_rect(&b.rect, pt.x, pt.y))
                     {
                         let btn = state.buttons[i].btn;
                         if btn == Btn::Delay && in_rect(&state.buttons[i].caret_rect, pt.x, pt.y) {
@@ -811,7 +923,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     bottom: r.bottom + state.origin.y,
                                 };
                                 let mon = MonitorFromPoint(
-                                    POINT { x: v.left, y: v.top },
+                                    POINT {
+                                        x: v.left,
+                                        y: v.top,
+                                    },
                                     MONITOR_DEFAULTTONEAREST,
                                 );
                                 let sel = if state.scrolling {
@@ -864,7 +979,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                             bottom: r.bottom + state.origin.y,
                                         };
                                         let mon = MonitorFromPoint(
-                                            POINT { x: v.left, y: v.top },
+                                            POINT {
+                                                x: v.left,
+                                                y: v.top,
+                                            },
                                             MONITOR_DEFAULTTONEAREST,
                                         );
                                         if scrolling {
@@ -883,8 +1001,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     // preferred later for a clean window, but
                                     // hosted/layered surfaces (and anything
                                     // CreateForWindow rejects) must not error.
-                                    let frozen =
-                                        crop_frozen(&state.frozen, state.windows[i].rect);
+                                    let frozen = crop_frozen(&state.frozen, state.windows[i].rect);
                                     finish(
                                         hwnd,
                                         state,
@@ -897,8 +1014,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 None => {
                                     // Shell surface or bare desktop: crop the
                                     // frozen image — exactly what was on screen.
-                                    let crop =
-                                        crop_frozen(&state.frozen, state.windows[i].rect);
+                                    let crop = crop_frozen(&state.frozen, state.windows[i].rect);
                                     finish(hwnd, state, Some(Selection::Region(crop)));
                                 }
                             }
@@ -974,7 +1090,10 @@ unsafe extern "system" fn enum_proc(
     // target as a frozen crop — users reshoot to capture our UI itself.
     let ours = pid == state.our_pid;
     if ours
-        && !matches!(cls.as_str(), "matteshot_picker" | "matteshot_tweak" | "matteshot_settings")
+        && !matches!(
+            cls.as_str(),
+            "matteshot_picker" | "matteshot_tweak" | "matteshot_settings"
+        )
     {
         return true.into();
     }
@@ -985,8 +1104,7 @@ unsafe extern "system" fn enum_proc(
     }
     // Taskbars have no title but are legitimate targets. Shell surfaces and
     // our strip capture as frozen crops rather than WGC.
-    let is_shell_surface =
-        ours || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd";
+    let is_shell_surface = ours || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd";
     if !is_shell_surface && GetWindowTextLengthW(hwnd) == 0 {
         return true.into();
     }
@@ -1040,7 +1158,10 @@ unsafe extern "system" fn mon_enum(
         ..Default::default()
     };
     if GetMonitorInfoW(hmon, &mut mi).as_bool() {
-        list.push(MonitorEntry { hmon, rect: mi.rcMonitor });
+        list.push(MonitorEntry {
+            hmon,
+            rect: mi.rcMonitor,
+        });
     }
     true.into()
 }
@@ -1063,10 +1184,26 @@ fn monitors() -> Result<Vec<MonitorEntry>> {
 
 fn virtual_rect(monitors: &[MonitorEntry]) -> RECT {
     RECT {
-        left: monitors.iter().map(|monitor| monitor.rect.left).min().unwrap(),
-        top: monitors.iter().map(|monitor| monitor.rect.top).min().unwrap(),
-        right: monitors.iter().map(|monitor| monitor.rect.right).max().unwrap(),
-        bottom: monitors.iter().map(|monitor| monitor.rect.bottom).max().unwrap(),
+        left: monitors
+            .iter()
+            .map(|monitor| monitor.rect.left)
+            .min()
+            .unwrap(),
+        top: monitors
+            .iter()
+            .map(|monitor| monitor.rect.top)
+            .min()
+            .unwrap(),
+        right: monitors
+            .iter()
+            .map(|monitor| monitor.rect.right)
+            .max()
+            .unwrap(),
+        bottom: monitors
+            .iter()
+            .map(|monitor| monitor.rect.bottom)
+            .max()
+            .unwrap(),
     }
 }
 
@@ -1217,7 +1354,10 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
     }
     // Bottom of z-order: clicking bare desktop captures that monitor.
     for r in &local_monitors {
-        windows.push(WinEntry { hwnd: None, rect: *r });
+        windows.push(WinEntry {
+            hwnd: None,
+            rect: *r,
+        });
     }
 
     unsafe {
@@ -1277,7 +1417,11 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
         let mut sizes = Vec::new();
         let mut text_h = 0;
         for (label, btn) in &specs {
-            let mut t = if *btn == Btn::Delay { delay_measure_label.clone() } else { wide(label) };
+            let mut t = if *btn == Btn::Delay {
+                delay_measure_label.clone()
+            } else {
+                wide(label)
+            };
             let mut rc = RECT::default();
             DrawTextW(screen_dc, &mut t, &mut rc, DT_CALCRECT | DT_SINGLELINE);
             let mut w = rc.right - rc.left + BTN_PAD * 2;
@@ -1291,9 +1435,8 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
         windows::Win32::Graphics::Gdi::ReleaseDC(None, screen_dc);
 
         let btn_h = text_h + 12;
-        let total_w: i32 = sizes.iter().sum::<i32>()
-            + BTN_GAP * (specs.len() as i32 - 1)
-            + PILL_PAD * 2;
+        let total_w: i32 =
+            sizes.iter().sum::<i32>() + BTN_GAP * (specs.len() as i32 - 1) + PILL_PAD * 2;
         // Toolbar lives on the monitor the cursor is on.
         let mut cursor = POINT::default();
         let _ = GetCursorPos(&mut cursor);
@@ -1320,9 +1463,17 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
                 right: bx + w,
                 bottom: pill_top + PILL_PAD + btn_h,
             };
-            let caret_rect =
-                if *btn == Btn::Delay { delay_caret_rect(rect, DELAY_CARET_W) } else { RECT::default() };
-            buttons.push(Button { rect, btn: *btn, label: wide(label), caret_rect });
+            let caret_rect = if *btn == Btn::Delay {
+                delay_caret_rect(rect, DELAY_CARET_W)
+            } else {
+                RECT::default()
+            };
+            buttons.push(Button {
+                rect,
+                btn: *btn,
+                label: wide(label),
+                caret_rect,
+            });
             bx += w + BTN_GAP;
         }
 
@@ -1346,7 +1497,10 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
             buttons,
             toolbar_rect,
             toolbar_hover: -1,
-            origin: POINT { x: mrect.left, y: mrect.top },
+            origin: POINT {
+                x: mrect.left,
+                y: mrect.top,
+            },
             monitors: local_monitors,
             theme: crate::theme::current(),
             recording: false,
@@ -1448,34 +1602,85 @@ mod tests {
         // A virtual screen whose origin is not (0,0) — the case a left-hand
         // second monitor creates, and the one an unclamped subtraction gets
         // wrong.
-        let bounds = RECT { left: -1920, top: -200, right: 2560, bottom: 1440 };
+        let bounds = RECT {
+            left: -1920,
+            top: -200,
+            right: 2560,
+            bottom: 1440,
+        };
         let (w, h) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
 
         let inside = clamp_to_overlay(
-            RECT { left: -1000, top: 100, right: -200, bottom: 700 },
+            RECT {
+                left: -1000,
+                top: 100,
+                right: -200,
+                bottom: 700,
+            },
             bounds,
             w,
             h,
         );
-        assert_eq!(inside, RECT { left: 920, top: 300, right: 1720, bottom: 900 });
+        assert_eq!(
+            inside,
+            RECT {
+                left: 920,
+                top: 300,
+                right: 1720,
+                bottom: 900
+            }
+        );
 
         // A flyout flush against the screen edges must clip, not overflow the
         // freeze frame it will be cropped out of.
         let edge = clamp_to_overlay(
-            RECT { left: -3000, top: -500, right: 4000, bottom: 2000 },
+            RECT {
+                left: -3000,
+                top: -500,
+                right: 4000,
+                bottom: 2000,
+            },
             bounds,
             w,
             h,
         );
-        assert_eq!(edge, RECT { left: 0, top: 0, right: w, bottom: h });
+        assert_eq!(
+            edge,
+            RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h
+            }
+        );
 
         // Rects that miss the overlay entirely collapse to an empty edge
         // rather than coming back inverted, on every side.
         for outside in [
-            RECT { left: -5000, top: 100, right: -4000, bottom: 700 },
-            RECT { left: 5000, top: 100, right: 6000, bottom: 700 },
-            RECT { left: -1000, top: -3000, right: -200, bottom: -2000 },
-            RECT { left: -1000, top: 3000, right: -200, bottom: 4000 },
+            RECT {
+                left: -5000,
+                top: 100,
+                right: -4000,
+                bottom: 700,
+            },
+            RECT {
+                left: 5000,
+                top: 100,
+                right: 6000,
+                bottom: 700,
+            },
+            RECT {
+                left: -1000,
+                top: -3000,
+                right: -200,
+                bottom: -2000,
+            },
+            RECT {
+                left: -1000,
+                top: 3000,
+                right: -200,
+                bottom: 4000,
+            },
         ] {
             let clipped = clamp_to_overlay(outside, bounds, w, h);
             assert!(
@@ -1508,7 +1713,10 @@ mod tests {
         // the overlay owns the foreground; shortcut_bit is what carries it
         // through the low-level hook when it does not, which is the case the
         // hook exists for.
-        assert!(shortcut_bit(0x44).is_some(), "D missing from the keyboard hook");
+        assert!(
+            shortcut_bit(0x44).is_some(),
+            "D missing from the keyboard hook"
+        );
         assert!(matches!(shortcut_button(0x44), Some(Btn::Delay)));
         // Every shortcut_button key must also pass the hook, or it silently
         // works only some of the time.
@@ -1534,7 +1742,12 @@ mod tests {
 
     #[test]
     fn delay_caret_sits_on_the_trailing_edge_without_consuming_the_whole_chip() {
-        let button = RECT { left: 10, top: 0, right: 100, bottom: 24 };
+        let button = RECT {
+            left: 10,
+            top: 0,
+            right: 100,
+            bottom: 24,
+        };
         let caret = delay_caret_rect(button, 22);
         assert_eq!(caret.right, button.right);
         assert_eq!(caret.left, button.right - 22);
@@ -1545,16 +1758,29 @@ mod tests {
 
     #[test]
     fn delay_list_rows_stack_below_the_chip_without_overlap_or_gaps() {
-        let anchor = RECT { left: 100, top: 50, right: 160, bottom: 80 };
+        let anchor = RECT {
+            left: 100,
+            top: 50,
+            right: 160,
+            bottom: 80,
+        };
         let items = delay_list_rects(anchor, 24, &crate::delay::CHOICES, true);
 
         assert_eq!(items.len(), crate::delay::CHOICES.len());
-        assert!(items[0].0.top > anchor.bottom, "list must not overlap the chip");
+        assert!(
+            items[0].0.top > anchor.bottom,
+            "list must not overlap the chip"
+        );
         for pair in items.windows(2) {
-            assert_eq!(pair[0].0.bottom, pair[1].0.top, "rows must not overlap or leave gaps");
+            assert_eq!(
+                pair[0].0.bottom, pair[1].0.top,
+                "rows must not overlap or leave gaps"
+            );
         }
         assert!(
-            items.iter().all(|(r, _)| r.left == anchor.left && r.right == anchor.right),
+            items
+                .iter()
+                .all(|(r, _)| r.left == anchor.left && r.right == anchor.right),
             "rows must align with the chip"
         );
         let values: Vec<u32> = items.iter().map(|(_, s)| *s).collect();
@@ -1563,13 +1789,24 @@ mod tests {
 
     #[test]
     fn delay_list_rows_stack_above_the_chip_when_told_to_open_upward() {
-        let anchor = RECT { left: 100, top: 50, right: 160, bottom: 80 };
+        let anchor = RECT {
+            left: 100,
+            top: 50,
+            right: 160,
+            bottom: 80,
+        };
         let items = delay_list_rects(anchor, 24, &crate::delay::CHOICES, false);
 
         assert_eq!(items.len(), crate::delay::CHOICES.len());
-        assert!(items.last().unwrap().0.bottom < anchor.top, "list must not overlap the chip");
+        assert!(
+            items.last().unwrap().0.bottom < anchor.top,
+            "list must not overlap the chip"
+        );
         for pair in items.windows(2) {
-            assert_eq!(pair[0].0.bottom, pair[1].0.top, "rows must not overlap or leave gaps");
+            assert_eq!(
+                pair[0].0.bottom, pair[1].0.top,
+                "rows must not overlap or leave gaps"
+            );
         }
         // Same reading order regardless of direction: the first choice is
         // still the topmost row, it is just higher up the screen.
@@ -1577,4 +1814,3 @@ mod tests {
         assert_eq!(values, crate::delay::CHOICES.to_vec());
     }
 }
-

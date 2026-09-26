@@ -64,11 +64,11 @@ pub fn parse(text: &str) -> Option<Hotkey> {
 fn virtual_key(token: &str) -> Option<u32> {
     let mut chars = token.chars();
     match (chars.next(), chars.next()) {
-        (Some(c), None) if c.is_ascii_alphanumeric() => {
-            Some(c.to_ascii_uppercase() as u32)
-        }
+        (Some(c), None) if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase() as u32),
         _ => {
-            let number = token.strip_prefix('f').or_else(|| token.strip_prefix('F'))?;
+            let number = token
+                .strip_prefix('f')
+                .or_else(|| token.strip_prefix('F'))?;
             let index: u32 = number.parse().ok()?;
             // VK_F1 is 0x70 and the function keys run contiguously to F24.
             (1..=24).contains(&index).then_some(0x70 + index - 1)
@@ -146,7 +146,15 @@ mod tests {
 
     #[test]
     fn malformed_text_is_refused_rather_than_guessed() {
-        for text in ["", "Ctrl+", "+S", "Ctrl++S", "Ctrl+Alt", "Ctrl+S+A", "Ctrl+Nope"] {
+        for text in [
+            "",
+            "Ctrl+",
+            "+S",
+            "Ctrl++S",
+            "Ctrl+Alt",
+            "Ctrl+S+A",
+            "Ctrl+Nope",
+        ] {
             assert_eq!(parse(text), None, "for {text:?}");
         }
     }
@@ -162,7 +170,12 @@ mod tests {
 
     #[test]
     fn labels_round_trip_through_parsing() {
-        for text in ["Ctrl+Alt+S", "Ctrl+Shift+S", "Win+Alt+F4", "Ctrl+Alt+Shift+Win+A"] {
+        for text in [
+            "Ctrl+Alt+S",
+            "Ctrl+Shift+S",
+            "Win+Alt+F4",
+            "Ctrl+Alt+Shift+Win+A",
+        ] {
             let parsed = parse(text).expect(text);
             assert_eq!(parse(&label(Some(parsed))), Some(parsed), "for {text:?}");
         }

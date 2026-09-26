@@ -10,14 +10,14 @@ use windows::core::{w, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GlobalFree, ERROR_INVALID_PARAMETER, HANDLE, HWND, STILL_ACTIVE,
 };
-use windows::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -69,10 +69,7 @@ pub fn partial_video_path(destination: &Path, id: u64) -> PathBuf {
         .file_stem()
         .map(|value| value.to_string_lossy())
         .unwrap_or_default();
-    parent.join(format!(
-        "{stem}.partial-{}-{id}.mp4",
-        std::process::id()
-    ))
+    parent.join(format!("{stem}.partial-{}-{id}.mp4", std::process::id()))
 }
 
 fn partial_recording_owner(name: &str) -> Option<u32> {
@@ -344,8 +341,11 @@ pub fn to_clipboard(img: &RgbaImage, file: Option<&Path>) -> Result<()> {
     }
 
     let mut png_bytes: Vec<u8> = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
-        .context("encode png")?;
+    img.write_to(
+        &mut std::io::Cursor::new(&mut png_bytes),
+        image::ImageFormat::Png,
+    )
+    .context("encode png")?;
 
     let _clipboard = open_clipboard()?;
     unsafe {
@@ -378,7 +378,10 @@ pub fn to_clipboard(img: &RgbaImage, file: Option<&Path>) -> Result<()> {
 /// window's title, or a region's size — purely for the history browser to
 /// show later; it never affects the file itself.
 fn partial_png_path(destination: &Path) -> PathBuf {
-    let name = destination.file_name().and_then(|name| name.to_str()).unwrap_or("capture.png");
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("capture.png");
     destination.with_file_name(format!(
         "{name}.matteshot-partial-{}-{}",
         std::process::id(),
@@ -422,7 +425,8 @@ fn publish_png_with(
 ) -> Result<()> {
     let partial = partial_png_path(destination);
     let staged = (|| {
-        img.save_with_format(&partial, ImageFormat::Png).context("write partial png")?;
+        img.save_with_format(&partial, ImageFormat::Png)
+            .context("write partial png")?;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&partial)
@@ -444,7 +448,12 @@ fn publish_png(img: &RgbaImage, destination: &Path) -> Result<()> {
     publish_png_with(img, destination, |from, to| std::fs::rename(from, to))
 }
 
-pub fn save_png(img: &RgbaImage, style_name: &str, dir: &Path, source: Option<&str>) -> Result<PathBuf> {
+pub fn save_png(
+    img: &RgbaImage,
+    style_name: &str,
+    dir: &Path,
+    source: Option<&str>,
+) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let name = format!(
         "matteshot-{}-{}.png",
@@ -618,8 +627,14 @@ mod tests {
 
     #[test]
     fn output_size_never_upscales_or_changes_original() {
-        assert_eq!(resize_to_max_edge(&image(800, 600), 1600).dimensions(), (800, 600));
-        assert_eq!(resize_to_max_edge(&image(2400, 1200), 0).dimensions(), (2400, 1200));
+        assert_eq!(
+            resize_to_max_edge(&image(800, 600), 1600).dimensions(),
+            (800, 600)
+        );
+        assert_eq!(
+            resize_to_max_edge(&image(2400, 1200), 0).dimensions(),
+            (2400, 1200)
+        );
     }
 
     #[test]
@@ -642,9 +657,18 @@ mod tests {
 
     #[test]
     fn partial_png_names_are_narrow_and_owner_aware() {
-        assert_eq!(partial_png_owner("capture.png.matteshot-partial-123-9"), Some(123));
-        assert_eq!(partial_png_owner("capture.jpg.matteshot-partial-123-9"), None);
-        assert_eq!(partial_png_owner("capture.png.matteshot-partial-nope-9"), None);
+        assert_eq!(
+            partial_png_owner("capture.png.matteshot-partial-123-9"),
+            Some(123)
+        );
+        assert_eq!(
+            partial_png_owner("capture.jpg.matteshot-partial-123-9"),
+            None
+        );
+        assert_eq!(
+            partial_png_owner("capture.png.matteshot-partial-nope-9"),
+            None
+        );
         assert_eq!(partial_png_owner("capture.png.partial-123-9"), None);
         assert_eq!(partial_png_owner("capture.png"), None);
     }
@@ -692,9 +716,16 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!destination.exists());
-        let partial = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let partial = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         assert_eq!(
-            image::load_from_memory(&std::fs::read(&partial).unwrap()).unwrap().dimensions(),
+            image::load_from_memory(&std::fs::read(&partial).unwrap())
+                .unwrap()
+                .dimensions(),
             (17, 11)
         );
         std::fs::remove_file(partial).unwrap();
@@ -716,10 +747,7 @@ mod tests {
         let stale = dir.join(format!("clip.partial-{other_pid}-1.mp4"));
         let stale_gif = dir.join(format!("clip.partial-{other_pid}-2.gif"));
         let live = partial_video_path(&dir.join("live.mp4"), 2);
-        let live_gif = dir.join(format!(
-            "live.partial-{}-3.gif",
-            std::process::id()
-        ));
+        let live_gif = dir.join(format!("live.partial-{}-3.gif", std::process::id()));
         let normal = dir.join("normal.mp4");
         std::fs::write(&stale, b"stale").unwrap();
         std::fs::write(&stale_gif, b"stale gif").unwrap();
@@ -925,7 +953,6 @@ mod tests {
         std::fs::remove_file(garbage).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
-
 
     /// Pins SBS-764: an unqualified helper name is never the launch path.
     #[test]

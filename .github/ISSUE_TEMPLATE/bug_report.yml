@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in Matteshot does not work the way it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For a security problem, please use the private report on the Security tab instead of this form.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Press PrtScn
+        2. Drag a region across both monitors
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics report
+      description: Settings > Copy diagnostics, then paste here. It has no account name, machine name, window titles or file paths, but read it before you post.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: displays
+    attributes:
+      label: Monitors and scaling
+      placeholder: "2 monitors: 2560x1440 at 100%, 1920x1080 at 125%"
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots or recordings help, as long as they show nothing private.

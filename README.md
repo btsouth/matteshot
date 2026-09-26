@@ -8,10 +8,26 @@ The name is literal: a [matte shot](https://en.wikipedia.org/wiki/Matte_(filmmak
 
 A Windows tray app in pure Rust. No UI framework — Win32 + GDI + `Windows.Graphics.Capture` + Media Foundation. Single small release binary.
 
+Matteshot is free and open source under [MIT OR Apache-2.0](#license). There is no account, no trial, no license key, and no usage tracking. Every feature works offline.
+
+## Install
+
+- **Download:** [MatteshotSetup.exe](https://download.matteshot.app/MatteshotSetup.exe) (signed, per-user, no admin prompt), or pick a version from [GitHub Releases](https://github.com/btsouth/matteshot/releases). Each release lists the installer's SHA-256.
+- **winget:** `winget install SouthboundSoftware.Matteshot`
+- **From source:** see [Building from source](#building-from-source).
+
+Supported: Windows 10 version 2004 (build 19041) or later and Windows 11, x64. Capture uses `Windows.Graphics.Capture` and OCR uses `Windows.Media.Ocr`, both part of Windows. There is no macOS or Linux build; the code is Win32 throughout.
+
+## Privacy
+
+Matteshot sends nothing about you or your captures anywhere. It has no telemetry, no crash reporting, and no account. The only network traffic in a default build is the update check: at startup and then once a day it fetches `https://matteshot.app/version.json`, and when a newer version is listed it fetches that version's signed release record, and with automatic updates on the installer itself, from `https://download.matteshot.app`. Those requests carry your IP address and a `Matteshot/<version>` user agent, nothing else. Turning off **Install updates automatically** in Settings stops Matteshot from downloading and installing new versions on its own; it still checks and offers the update in the tray menu. Captures, History, and settings stay on your PC.
+
+Share is not in the default build. If you build with `--features share` and point it at your own server, uploads go to that server only. See [docs/self-hosting-share.md](docs/self-hosting-share.md).
+
 ## The flow
 
 1. **PrtScn** (or left-click the tray icon): freeze-frame overlay across **all monitors** — dimmed frozen screens, hover highlights whole windows (taskbar included), drag selects a region (cross-monitor works), clicking bare desktop grabs that monitor. Toolbar: **Window / Region / Screen / ● Record / ↓ Scroll / ✕** (keys W/R/F/V/S). Esc cancels. **Shell flyouts are capturable**: the notification center, Quick Settings, Task View, Start and Search all land in the freeze and are offered as one-click targets, which nothing else on Windows manages — see the landmine note on z-bands for why.
-2. **Pick a matte**: contact strip of auto-styled variants. Click / 1–7 / arrows+Enter chooses, **T** opens the tweak editor, **S** shares a link when a paid license can actually share (hidden on trial), **P** pins the raw capture, **C** copies its text via OCR, **PrtScn re-snips** (the strip itself is snippable), Esc cancels. Last-used matte preselected.
+2. **Pick a matte**: contact strip of auto-styled variants. Click / 1–7 / arrows+Enter chooses, **T** opens the tweak editor, **S** shares a link when Share is built in and a server is configured (hidden otherwise), **P** pins the raw capture, **C** copies its text via OCR, **PrtScn re-snips** (the strip itself is snippable), Esc cancels. Last-used matte preselected.
 3. **Done**: PNG on the clipboard (as bitmap + PNG + file, so paste works everywhere) and in your captures folder. Output-size presets can preserve the original pixels or cap the finished matte to Email (1600 px), Compact (1200 px), or a custom final width or height without ever upscaling. The screenshot editor updates the preset name and exact final dimensions live while keeping the working preview large and readable; custom sizing uses a focused inline number field with Done/Cancel instead of blocking capture.
 
 **Ctrl+Alt+S** skips the overlay: instant capture of the active window.
@@ -33,7 +49,7 @@ Opens at 85% of the monitor, resizable — nearly all of a small one, and the co
 - Optional share-sized **GIF** alongside (settings toggle).
 - **Scrubbing decodes live.** A decoder thread holds one reader open for the life of the editor and chases the playhead, so dragging shows the real frame rather than the nearest of a couple of dozen cached ones. Requests coalesce: whatever you scrub past is dropped and only the newest position is served, so it never falls behind the cursor. The cached frame still paints immediately, so the picture always tracks the drag. Keyboard seeking goes the same way instead of blocking the message loop per keypress.
 - **On stop**, the editor opens on one decoded frame and fills its filmstrip and scrub cache on a worker thread. Building them up front meant dozens of seeks before the window existed, at roughly 100ms each, so opening got slower the longer the recording was. It is now a fixed cost regardless of length.
-- A focused video editor opens at 85% of the active monitor with a large frame preview, native Play/Pause, Spacebar control, synchronized playhead, the same seven matte choices as screenshots, adjustable padding, Auto / 1:1 / 4:3 / 16:9 / Social aspect presets, keyboard seeking, and two trim handles. Playback keeps running through visual changes and resumes after timeline or trim seeks; its bounded preview decoder, cached matte, and coalesced frame delivery keep background switches responsive. A compact **+ Add** drawer has the same nine annotation tools as the photo editor: arrow, line, box, oval, mark, text, blur, auto-numbered steps, and freehand Pen. Every tool stays armed until you put it away, so four boxes take one trip to the drawer; consecutive Step clicks drop 1, 2, 3, 4, and clicking the tool again, picking another, or pressing Escape disarms. Every annotation can cover the whole video or three seconds from the playhead, stays attached to the recorded content across matte and aspect changes, and remains freely movable and editable. **Crop** sits beside padding and aspect and works exactly as it does for screenshots: arming it brings the whole recording back with the current frame over it, drag to sweep, pull a corner, drag inside to move, Del uncrops, Enter applies, Esc cancels. It is non-destructive — the recording is untouched, annotations stay normalized to it, so cropping moves the picture under them and the frame can be reopened, cleared or undone. The preview, the filmstrip and the export all follow it, and the export sizes the encoder from the kept region rather than the recording. **Export edit** renders the chosen layout and annotations at full resolution through a responsive background re-encode with progress and audio preserved. Export is cancelable, finalizes through a same-folder temporary file, never overwrites an earlier edit, and keeps the untouched original in place. If the export check cannot run or the final rename fails, the `.partial` stays for recovery on the next start; proven-undecodable export bytes are still deleted. Closing during export offers a safe cancel-and-cleanup path. A finished export lands on the clipboard by itself and Explorer opens on it, selected, once the editor closes. Show in folder / Copy / Share / Delete act on the recorded original and say so ("Show original" / "Copy original" / "Share original") as soon as an edit exists, so neither one silently replaces the export you just made. Share is hidden unless a paid license can actually upload. Resizable, double-buffered, no flicker.
+- A focused video editor opens at 85% of the active monitor with a large frame preview, native Play/Pause, Spacebar control, synchronized playhead, the same seven matte choices as screenshots, adjustable padding, Auto / 1:1 / 4:3 / 16:9 / Social aspect presets, keyboard seeking, and two trim handles. Playback keeps running through visual changes and resumes after timeline or trim seeks; its bounded preview decoder, cached matte, and coalesced frame delivery keep background switches responsive. A compact **+ Add** drawer has the same nine annotation tools as the photo editor: arrow, line, box, oval, mark, text, blur, auto-numbered steps, and freehand Pen. Every tool stays armed until you put it away, so four boxes take one trip to the drawer; consecutive Step clicks drop 1, 2, 3, 4, and clicking the tool again, picking another, or pressing Escape disarms. Every annotation can cover the whole video or three seconds from the playhead, stays attached to the recorded content across matte and aspect changes, and remains freely movable and editable. **Crop** sits beside padding and aspect and works exactly as it does for screenshots: arming it brings the whole recording back with the current frame over it, drag to sweep, pull a corner, drag inside to move, Del uncrops, Enter applies, Esc cancels. It is non-destructive — the recording is untouched, annotations stay normalized to it, so cropping moves the picture under them and the frame can be reopened, cleared or undone. The preview, the filmstrip and the export all follow it, and the export sizes the encoder from the kept region rather than the recording. **Export edit** renders the chosen layout and annotations at full resolution through a responsive background re-encode with progress and audio preserved. Export is cancelable, finalizes through a same-folder temporary file, never overwrites an earlier edit, and keeps the untouched original in place. If the export check cannot run or the final rename fails, the `.partial` stays for recovery on the next start; proven-undecodable export bytes are still deleted. Closing during export offers a safe cancel-and-cleanup path. A finished export lands on the clipboard by itself and Explorer opens on it, selected, once the editor closes. Show in folder / Copy / Share / Delete act on the recorded original and say so ("Show original" / "Copy original" / "Share original") as soon as an edit exists, so neither one silently replaces the export you just made. Share is hidden unless this build can actually upload. Resizable, double-buffered, no flicker.
 - Recordings and edited exports remain private `.partial` files until they finalize and pass a real Media Foundation decode check. A crash cannot surface a truncated MP4 as finished work. A check that cannot run (Defender or OneDrive locking the file), or a rename that fails after a successful check, keeps the `.partial` for recovery on the next start instead of deleting it; proven-undecodable bytes are still deleted. Stale proven-undecodable partials are removed on the next clean start.
 
 ## Scrolling capture
@@ -76,17 +92,17 @@ Any failure leaves the running app untouched and the tray menu still offers the 
 
 ## Settings (tray menu)
 
-Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows (a denied or missing Startup folder on enable, or a locked or read-only shortcut on disable, shows an error and leaves the checkbox matching the shortcut on disk), PrtScn capture toggle, GIF toggle, automatic updates toggle, keep the editor open after Copy, recording audio Off/System/Mic, plus **Copy diagnostics** (a bounded privacy-safe support report with no license key, account name, machine name, window title, or filesystem path), **Clear History titles** (strips stored window titles from the History index and leaves capture files alone), and **Deactivate this PC** for licensed installs.
+Save folder + video folder (`IFileDialog` pickers, open buttons), render quality 1x/2x/3x, screenshot size Original/Email/Compact/Custom, start with Windows (a denied or missing Startup folder on enable, or a locked or read-only shortcut on disable, shows an error and leaves the checkbox matching the shortcut on disk), PrtScn capture toggle, GIF toggle, automatic updates toggle, keep the editor open after Copy, recording audio Off/System/Mic, plus **Copy diagnostics** (a bounded privacy-safe support report with no account name, machine name, window title, or filesystem path) and **Clear History titles** (strips stored window titles from the History index and leaves capture files alone).
 
-The Settings window clamps to the active monitor work area and scrolls, so Update, privacy, diagnostics, and license controls stay reachable at 100-200% even on 1366x768. Tab/arrows move focus and scroll the focused control into view; mouse wheel and Page Up/Down scroll the rest of the way.
+The Settings window clamps to the active monitor work area and scrolls, so the update, diagnostics, and History controls stay reachable at 100-200% even on 1366x768. Tab/arrows move focus and scroll the focused control into view; mouse wheel and Page Up/Down scroll the rest of the way.
 
-Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. The tray menu is capture (and the active-window and delayed-capture variants), open captures/videos folders, History, license, and Settings — Deactivate, Copy diagnostics, and Clear History titles live in the Settings window.
+Only one resident can run at a time. Launching Matteshot again opens Settings on the existing resident instead of competing for hotkeys. The tray menu is capture (and the active-window and delayed-capture variants), open captures/videos folders, History, and Settings — Copy diagnostics and Clear History titles live in the Settings window.
 
-On first run, a compact native welcome surface explains the PrtScn-to-paste loop, the no-card 14-day trial, and opens the real capture flow in one click. It follows Windows light and dark app mode, stays non-modal so capture hotkeys remain responsive, and never appears again after it has been shown. If that window fails to open, a tray balloon explains PrtScn and the tray menu, and first-run is marked done so it does not retry.
+On first run, a compact native welcome surface explains the PrtScn-to-paste loop and opens the real capture flow in one click. It follows Windows light and dark app mode, stays non-modal so capture hotkeys remain responsive, and never appears again after it has been shown. If that window fails to open, a tray balloon explains PrtScn and the tray menu, and first-run is marked done so it does not retry.
 
 ## History privacy
 
-History is a local index at `%APPDATA%\matteshot\history.json`. Each entry stores the save path, time, size, matte name, and — by default — the captured window's title (or a region-size label), sanitized and capped at 200 characters. Titles stay on this PC; diagnostics and telemetry do not send them.
+History is a local index at `%APPDATA%\matteshot\history.json`. Each entry stores the save path, time, size, matte name, and — by default — the captured window's title (or a region-size label), sanitized and capped at 200 characters. Titles stay on this PC; nothing sends them anywhere, and the diagnostics report leaves them out.
 
 Opening History drops entries whose files are confirmed gone — a deleted file whose folder is still reachable — and writes that pruned list back to disk, so a capture deleted in Explorer does not leave its title behind. An ejected USB or offline share stays in the index until the volume is back and the file is actually missing. Per-item Delete of that same offline path fails and leaves the row; it does not persist-prune the index. **Clear History titles…** in Settings removes stored titles without deleting screenshots or videos. Per-item Delete is what removes a file. Uninstall asks before deleting `history.json` (plus leftover `history.json.tmp` and quarantined copies); it does not delete captures. The default is still the full window title, not the app name only.
 
@@ -117,7 +133,7 @@ matteshot --once --tweak     # capture the foreground window and open the tweak 
 matteshot --tweak-tabs-test <title>... # open several captures as tabs in one editor
 ```
 
-Capture-producing diagnostic commands honor the same trial and license gate as the resident app.
+None of these need a network connection except the `--update-*` probes.
 
 Run every headless probe at once and fail loudly if one breaks:
 
@@ -140,53 +156,71 @@ Run the same static code gate used by CI, signed candidates, and releases:
 That gate now includes a locked RustSec `cargo audit` (pinned `cargo-audit` 0.22.2 from crates.io). A missing or wrong-version tool, an expired or undocumented ignore, or an actionable advisory fails the run. Exceptions live in `.cargo/rustsec-exceptions.json` and must match `.cargo/audit.toml`.
 
 Release acceptance runs in Windows Sandbox with clipboard redirection disabled.
-The host waits for the guest `result.json` and exits 0 only when `passed` is
-true. It exits non-zero on guest FAIL, timeout, or an unreadable/missing
-result. `-TimeoutSeconds` (default 1200) bounds the wait.
+The guest seeds the state a paid-era install left behind (an ended trial in
+`license.json` and the registry, a config with the retired telemetry keys),
+installs the signed build, blocks `matteshot.exe` from the network with a
+firewall rule, captures a window, runs the resident, uninstalls, and checks
+that the old files and settings are still there. The host waits for the guest
+`result.json` and exits 0 only when `passed` is true. It exits non-zero on
+guest FAIL, timeout, or an unreadable/missing result. `-TimeoutSeconds`
+(default 1200) bounds the wait.
 
 ```powershell
 .\scripts\run-sandbox-smoke.ps1 `
   -InstallerPath <signed-installer> `
-  -LicenseKeyPath <test-key-file> `
   -WorkDirectory <temporary-directory>
 ```
 
 Config: `%APPDATA%\matteshot\config.json`. Default dirs: `Pictures\Matteshot`, `Videos\Matteshot` (note: often OneDrive-redirected).
 
+## Building from source
+
+You need Windows 10 or 11 (x64) with:
+
+- Rust stable (`rustup default stable`), with the `x86_64-pc-windows-msvc` toolchain
+- Visual Studio 2022 Build Tools with the "Desktop development with C++" workload (MSVC linker, `rc.exe`, Windows SDK)
+- PowerShell 7 (`pwsh`) for the scripts
+- [Inno Setup 6](https://jrsoftware.org/isinfo.php) only if you want to build the installer
+
+```powershell
+cargo build --release                 # target\release\matteshot.exe
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+.\scripts\verify-code.ps1            # the full gate CI runs
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\matteshot.iss   # unsigned local installer
+```
+
+`cargo build --release --features share` adds Share, which then needs a server of your own (see [docs/self-hosting-share.md](docs/self-hosting-share.md)).
+
+The resident app locks its own exe, so quit it from the tray (or `matteshot --quit`) before rebuilding over an installed or running copy. It is a GUI-subsystem program and prints nothing to a console; run the diagnostic flags with `Start-Process -RedirectStandardError <log> -Wait` and read the log.
+
+From Linux or macOS you can type-check and lint the Windows target with [cargo-xwin](https://github.com/rust-cross/cargo-xwin) and `llvm-rc` on the `PATH`, which is how much of this code is reviewed:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+```
+
+Running it still needs Windows.
+
 ## Architecture
 
-~20 modules, all Win32-direct:
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module map and the Windows behaviour that shaped it.
 
-- `capture.rs` — WGC single-frame grabs (window/monitor). Thread-local cached D3D device → ~20ms warm captures; prefers the second frame within 80ms (first can be stale). `device_pair()` for worker threads.
-- `overlay.rs` — multi-monitor freeze-frame selector: combined virtual-screen image, dim/bright DIB layers, z-order hit-testing on `DWMWA_EXTENDED_FRAME_BOUNDS`, toolbar with record/scroll arming.
-- `style.rs` / `compose.rs` — hue-histogram matte families; pure-Rust compositing (gradient, blurred shadow, SDF corner mask, proportional padding, aspect extension). Export short-circuits the None matte and skips upscales ≥1600px.
-- `picker.rs` — contact strip; `tweak.rs` — the editor; `annotate.rs` — shape model + capsule-band AA rasterizer + GDI text with halo.
-- `record.rs` — MF sink writer (H.264+AAC), WGC frame loop, audio-cursor muxing with silence fill; `audio.rs` — WASAPI loopback/mic + stateful linear resampler; `recui.rs` — stop pill; `recdone.rs` — matte-aware video editor; `video_edit.rs` — normalized time-ranged annotation model shared by preview and export; `trim.rs` — source reader (`ENABLE_ADVANCED_VIDEO_PROCESSING`, streams resolved via `GetNativeMediaType`, never assume stream 0) → frame-accurate edit export; PCM packets are clipped to the selected `[start, end)` so ordinary trims share the speed-section boundary math.
-- `scroll.rs` — scrolling capture (see above).
-- `theme.rs` — theme plumbing; `settings.rs` — settings window; `pin.rs` — floating pinned captures; `ocr.rs` — Windows.Media.Ocr, whole-capture text plus per-word boxes mapped back out of the engine's input downscale; `prtscn.rs` — PrtScn acquisition; `tray.rs` — tray icon/menu; `output.rs` — clipboard (manual CF_DIB + PNG + CF_HDROP), save, reveal.
-- `update.rs` — silent WinHTTP version check on startup and daily, then the background install; `installer.rs` — download, verification, and silent execution.
+## Contributing
 
-## Windows landmines (hard-won)
+Bug reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first; it covers the checks a change needs and what can only be verified by hand on Windows. Security problems go through [SECURITY.md](SECURITY.md), not public issues.
 
-- **DPI**: `PerMonitorV2` at startup or captures come out soft on mixed-DPI setups.
-- **PrtScn**: Win11 routes it to Snipping Tool. On 23H2/24H2 that's `PrintScreenKeyForSnippingEnabled` (HKCU\Control Panel\Keyboard, missing = enabled), but Insider 26220+ can ignore that value and consume the key even after `RegisterHotKey(VK_SNAPSHOT)` reports success. The resident therefore owns PrtScn with a `WH_KEYBOARD_LL` hook and posts the same `WM_HOTKEY` used by every nested picker/editor loop. The hook is removed on toggle, license expiry, or process exit, so Matteshot stops consuming the key. Registry routing remains only as a compatibility fallback: `release` puts `PrintScreenKeyForSnippingEnabled` back only if we flipped it this run. A prior-off value stays off; missing stays missing. `--restore-printscreen` is the explicit force-on write.
-- **Synthetic PrtScn is untestable** while Snipping routing is on — injected VK_SNAPSHOT never reaches hotkey dispatch.
-- **WGC corner alpha varies by build** — Matteshot applies its own SDF corner mask unconditionally.
-- **`FindWindowW` doesn't match** Matteshot's toolwindow popups even though `EnumWindows` sees them — don't use it in tests.
-- **Z-bands outrank `WS_EX_TOPMOST` absolutely.** Every top-level window sits in a band, and nothing an ordinary process creates is ever placed above a window in a higher one. Measured on 26220: the notification center and Quick Settings are band 4, Task View 5, Start and Search 6, against band 1 for anything Matteshot can make. So a capture overlay is drawn *under* an open flyout and never receives the hit test — the crosshair reverts to an arrow and drags land on a panel that is still scrolling and dismissing under the cursor. They are also invisible to `EnumWindows`, so they cannot be listed as targets either. The freeze itself is fine, so the overlay notes the flyout before freezing, dismisses the live one afterwards (Esc; the foreground drops back ~190-200ms later and it stops answering `WindowFromPoint` in the same frame), and injects its rect as a target by hand. `GetWindowBand` is an undocumented user32 export, resolved at runtime. `uiAccess` + `CreateWindowInBand` is the usual advice and is a dead end: `ZBID_UIACCESS` is band 2, still below the notification center, and it would force a Program Files install.
-- **MF AAC** rejects float PCM (`0xC00D36B4`) and non-44.1/48k rates — convert to 16-bit PCM and resample first.
-- **MF source reader**: stream 0 is not necessarily video — resolve via `GetNativeMediaType` or you'll mux garbage.
-- **AdjustWindowRectEx everywhere** — never guess non-client frame sizes.
-- **H.264 caps a frame** near 9.4M luma samples. A matte with a forced aspect can compose a large recording past that (a 2560x1392 source at 1:1 lands on 3088x3088), and Media Foundation reports only an invalid-media-type error. Exports shrink the content until the framed result fits rather than failing.
-- **OCR input is capped** at `MaxImageDimension` (2600). Oversized captures are downscaled before recognition and word boxes are scaled back out, so select-text stays aligned — but a tall scrolling stitch loses enough detail that recognition itself suffers. Tiled recognition is the fix if that matters.
-- **GDI has no alpha on `Rectangle`** — translucent overlays (select-text highlights) stretch a 1x1 solid through `AlphaBlend`.
+## License
 
-## Ship status
+Matteshot is licensed under either of
 
-- [x] Feature-complete core: capture, mattes, picker, tweak editor, annotations, OCR, pin, recording + audio + trim, scrolling capture, themes, settings, multi-monitor
-- [x] Inno Setup installer + Azure Trusted Signing release pipeline
-- [ ] winget manifest
-- [x] Silent verified auto-update
-- [x] 14-day trial + Lemon Squeezy license activation
-- [ ] Lemon Squeezy merchant approval + live checkout
-- [x] matteshot.app site + assets
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Matteshot by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+The Matteshot name and icon identify the official builds signed by Southbound Software. Forks are welcome under the license; please give them a different name and icon so people can tell them apart.

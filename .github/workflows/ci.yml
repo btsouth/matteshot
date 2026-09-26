@@ -22,30 +22,29 @@ jobs:
   validate:
     name: Test, lint and build
     runs-on: windows-latest
-    # A ceiling, not a target: observed cold-cache runs are around 20 minutes.
-    # Without one, a hung job bills against GitHub's six-hour default.
-    timeout-minutes: 25
-    # The original reason for this gate is gone: runners are hosted and
-    # ephemeral now, so PR code no longer executes on the machine that signs
-    # releases. What it still does is keep a branch nobody vetted from
-    # spending billed minutes, which is why it stays.
-    if: >-
-      (github.event_name == 'push' && github.actor == github.repository_owner) ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.user.login == github.repository_owner &&
-       github.actor == github.repository_owner)
+    # A ceiling, not a target: cold-cache runs build and test both the default
+    # and the share build. Without one, a hung job runs to GitHub's six-hour
+    # default.
+    timeout-minutes: 40
+    # Runs for every pull request, forks included. That is safe because
+    # nothing here holds anything worth taking: the token is read-only, the
+    # job uses no secrets or environment, and the GitHub-hosted runner is
+    # discarded afterwards. Signing and publishing live only in release.yml
+    # and release-candidate.yml, behind the `release` environment, which pull
+    # requests cannot reach. A first-time outside contributor's run waits for
+    # a maintainer's approval (repository setting).
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # This job executes branch code on a persistent host; leave no
-          # GITHUB_TOKEN behind in .git/config for that code to read.
+          # Branch code runs in this job; leave no GITHUB_TOKEN behind in
+          # .git/config for it to read.
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # `cargo install cargo-audit --locked` builds the auditor from source,
       # which measured at 12.5 of this job's 19.3 minutes - two thirds of the
@@ -67,7 +66,7 @@ jobs:
           }
           "version=$pin" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-audit.exe
           key: cargo-audit-${{ runner.os }}-${{ steps.audit-pin.outputs.version }}
@@ -89,3 +88,57 @@ jobs:
       - name: Verify code
         shell: pwsh
         run: .\scripts\verify-code.ps1
+
+  policy:
+    name: Format and dependency policy
+    # Platform independent, so it runs on Linux: formatting, and cargo-deny's
+    # license, source and advisory rules from deny.toml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check licenses, sources and advisories
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  share-server:
+    name: Share server
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: share-server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: share-server/package-lock.json
+
+      - name: Install
+        run: npm ci --no-fund
+
+      - name: Check syntax
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=moderate

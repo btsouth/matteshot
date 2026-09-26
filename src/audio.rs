@@ -116,7 +116,10 @@ pub fn encode_format(dev: &Format) -> Format {
     } else {
         48000
     };
-    Format { rate, channels: dev.channels.clamp(1, 2) }
+    Format {
+        rate,
+        channels: dev.channels.clamp(1, 2),
+    }
 }
 
 /// Open the device on the calling thread just long enough to learn the mix
@@ -125,11 +128,18 @@ pub fn probe_format(source: Source) -> Result<Format> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let flow = if source == Source::System { eRender } else { eCapture };
+        let flow = if source == Source::System {
+            eRender
+        } else {
+            eCapture
+        };
         let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let fmt = client.GetMixFormat()?;
-        let format = Format { rate: (*fmt).nSamplesPerSec, channels: (*fmt).nChannels };
+        let format = Format {
+            rate: (*fmt).nSamplesPerSec,
+            channels: (*fmt).nChannels,
+        };
         CoTaskMemFree(Some(fmt as *const _));
         Ok(format)
     }
@@ -142,7 +152,11 @@ pub fn capture_thread(source: Source, tx: Sender<Chunk>, stop: Arc<AtomicBool>) 
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let flow = if source == Source::System { eRender } else { eCapture };
+        let flow = if source == Source::System {
+            eRender
+        } else {
+            eCapture
+        };
         let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let fmt = client.GetMixFormat()?;
@@ -150,7 +164,11 @@ pub fn capture_thread(source: Source, tx: Sender<Chunk>, stop: Arc<AtomicBool>) 
         let bits = (*fmt).wBitsPerSample;
         let block = (*fmt).nBlockAlign as usize;
 
-        let flags = if source == Source::System { AUDCLNT_STREAMFLAGS_LOOPBACK } else { 0 };
+        let flags = if source == Source::System {
+            AUDCLNT_STREAMFLAGS_LOOPBACK
+        } else {
+            0
+        };
         client
             .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2_000_000, 0, fmt, None)
             .context("audio init")?;
@@ -167,7 +185,10 @@ pub fn capture_thread(source: Source, tx: Sender<Chunk>, stop: Arc<AtomicBool>) 
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut frames = 0u32;
                 let mut fl = 0u32;
-                if capture.GetBuffer(&mut data, &mut frames, &mut fl, None, None).is_err() {
+                if capture
+                    .GetBuffer(&mut data, &mut frames, &mut fl, None, None)
+                    .is_err()
+                {
                     break;
                 }
                 let n = frames as usize * channels;
@@ -243,7 +264,10 @@ mod tests {
             piecewise.extend(chunked.process(chunk));
         }
 
-        assert_eq!(piecewise, one_shot, "a chunk boundary must not disturb the resampled stream");
+        assert_eq!(
+            piecewise, one_shot,
+            "a chunk boundary must not disturb the resampled stream"
+        );
     }
 
     #[test]
@@ -264,7 +288,10 @@ mod tests {
             piecewise.extend(chunked.process(chunk));
         }
 
-        assert_eq!(piecewise, one_shot, "a chunk boundary must not disturb the resampled stream");
+        assert_eq!(
+            piecewise, one_shot,
+            "a chunk boundary must not disturb the resampled stream"
+        );
     }
 
     #[test]
@@ -288,7 +315,11 @@ mod tests {
         // must never reach the output.
         let input = vec![1.0, 2.0, 9.0, 9.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 9.0, 9.0];
         let out = r.process(&input);
-        assert_eq!(out, vec![1.0, 2.0], "only the front L/R channels should survive");
+        assert_eq!(
+            out,
+            vec![1.0, 2.0],
+            "only the front L/R channels should survive"
+        );
     }
 
     #[test]
@@ -314,8 +345,16 @@ mod tests {
         // recording depends on flush() to not be silently dropped.
         let mut r = Resampler::new(48_000, 48_000, 1, 1);
         let out = r.process(&[1.0, 2.0, 3.0]);
-        assert_eq!(out, vec![1.0, 2.0], "3.0 is held as interpolation context, not emitted yet");
-        assert_eq!(r.flush(), vec![3.0], "flush recovers it instead of losing it");
+        assert_eq!(
+            out,
+            vec![1.0, 2.0],
+            "3.0 is held as interpolation context, not emitted yet"
+        );
+        assert_eq!(
+            r.flush(),
+            vec![3.0],
+            "flush recovers it instead of losing it"
+        );
     }
 
     #[test]
@@ -332,7 +371,11 @@ mod tests {
         // what's left in the tail for flush() to recover.
         let input = vec![1.0, 2.0, 9.0, 9.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 9.0, 9.0];
         let _ = r.process(&input);
-        assert_eq!(r.flush(), vec![3.0, 4.0], "only the front L/R channels should survive");
+        assert_eq!(
+            r.flush(),
+            vec![3.0, 4.0],
+            "only the front L/R channels should survive"
+        );
     }
 
     #[test]
@@ -344,7 +387,10 @@ mod tests {
             (96_000, 48_000),  // 2x48k
             (192_000, 48_000), // common high-rate interface; not a 44.1k multiple
         ] {
-            let out = encode_format(&Format { rate: device_rate, channels: 2 });
+            let out = encode_format(&Format {
+                rate: device_rate,
+                channels: 2,
+            });
             assert_eq!(out.rate, expected, "for device rate {device_rate}");
         }
     }
@@ -352,8 +398,14 @@ mod tests {
     #[test]
     fn encode_format_clamps_channels_into_what_aac_accepts() {
         for (device_channels, expected) in [(0u16, 1u16), (1, 1), (2, 2), (6, 2), (8, 2)] {
-            let out = encode_format(&Format { rate: 48_000, channels: device_channels });
-            assert_eq!(out.channels, expected, "for device channels {device_channels}");
+            let out = encode_format(&Format {
+                rate: 48_000,
+                channels: device_channels,
+            });
+            assert_eq!(
+                out.channels, expected,
+                "for device channels {device_channels}"
+            );
         }
     }
 }

@@ -14,7 +14,11 @@ fn card(w: u32, h: u32) -> RgbaImage {
         for x in 0..w {
             let t = (x as f32 / w as f32 + y as f32 / h as f32) / 2.0;
             let v = 251.0 - t * 14.0;
-            img.put_pixel(x, y, image::Rgba([v as u8, (v + 1.0) as u8, 255.0_f32.min(v + 4.0) as u8, 255]));
+            img.put_pixel(
+                x,
+                y,
+                image::Rgba([v as u8, (v + 1.0) as u8, 255.0_f32.min(v + 4.0) as u8, 255]),
+            );
         }
     }
     img
@@ -29,7 +33,8 @@ fn round_outer(img: &mut RgbaImage, radius: f32) {
             let py = y as f32 + 0.5;
             let qx = (px - w / 2.0).abs() - (w / 2.0 - radius);
             let qy = (py - h / 2.0).abs() - (h / 2.0 - radius);
-            let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - radius;
+            let d =
+                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - radius;
             let a = (0.5 - d).clamp(0.0, 1.0);
             let p = img.get_pixel_mut(x, y);
             p[3] = (p[3] as f32 * a) as u8;
@@ -49,9 +54,24 @@ pub fn generate(outdir: &std::path::Path) -> Result<()> {
         backdrop: Backdrop::Aurora {
             base: Rgb(0.10, 0.08, 0.24),
             blobs: vec![
-                Blob { cx: 0.10, cy: 0.12, r: 0.62, color: Rgb(0.44, 0.32, 0.92) },
-                Blob { cx: 0.90, cy: 0.18, r: 0.55, color: Rgb(0.10, 0.62, 0.58) },
-                Blob { cx: 0.55, cy: 1.00, r: 0.60, color: Rgb(0.66, 0.22, 0.48) },
+                Blob {
+                    cx: 0.10,
+                    cy: 0.12,
+                    r: 0.62,
+                    color: Rgb(0.44, 0.32, 0.92),
+                },
+                Blob {
+                    cx: 0.90,
+                    cy: 0.18,
+                    r: 0.55,
+                    color: Rgb(0.10, 0.62, 0.58),
+                },
+                Blob {
+                    cx: 0.55,
+                    cy: 1.00,
+                    r: 0.60,
+                    color: Rgb(0.66, 0.22, 0.48),
+                },
             ],
         },
     };
@@ -89,6 +109,10 @@ pub fn generate(outdir: &std::path::Path) -> Result<()> {
     }
     let ico_path = outdir.join("matteshot.ico");
     std::fs::write(&ico_path, ico)?;
-    eprintln!("icon: {} + icon-256.png ({} sizes)", ico_path.display(), sizes.len());
+    eprintln!(
+        "icon: {} + icon-256.png ({} sizes)",
+        ico_path.display(),
+        sizes.len()
+    );
     Ok(())
 }

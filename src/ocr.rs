@@ -63,8 +63,7 @@ fn to_bitmap(img: &RgbaImage) -> Result<(SoftwareBitmap, f32)> {
 /// Every recognized word with its box, for selecting text straight off the
 /// preview. Empty result means the engine ran and found nothing.
 pub fn recognize_words(img: &RgbaImage) -> Result<Vec<Word>> {
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .context("create OCR engine")?;
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages().context("create OCR engine")?;
     let (bitmap, scale) = to_bitmap(img)?;
     let result = engine.RecognizeAsync(&bitmap)?.get().context("recognize")?;
     let inverse = 1.0 / scale;
@@ -93,8 +92,7 @@ pub fn recognize_words(img: &RgbaImage) -> Result<Vec<Word>> {
 }
 
 pub fn recognize(img: &RgbaImage) -> Result<String> {
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .context("create OCR engine")?;
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages().context("create OCR engine")?;
     let (bitmap, _) = to_bitmap(img)?;
     let result = engine.RecognizeAsync(&bitmap)?.get().context("recognize")?;
     let lines = result.Lines()?;

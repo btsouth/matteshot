@@ -37,7 +37,7 @@ mod tests {
             "README tray-menu sentence must mention delayed capture"
         );
         assert!(
-            README.contains("open captures/videos folders, History, license, and Settings"),
+            README.contains("open captures/videos folders, History, and Settings"),
             "README tray-menu sentence must list History"
         );
     }
@@ -48,7 +48,7 @@ mod tests {
     fn interactive_regression_tray_menu_includes_delayed_capture_and_history() {
         assert!(
             REGRESSION.contains(
-                "Tray menu lists capture, active window, delayed capture, open captures/videos folders, History, license, and Settings"
+                "Tray menu lists capture, active window, delayed capture, open captures/videos folders, History, and Settings"
             ),
             "interactive regression tray check must list delayed capture and History in order"
         );

@@ -6,10 +6,9 @@
 use image::{Rgba, RgbaImage};
 use windows::core::w;
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
-    GdiFlush, SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT,
-    FF_DONTCARE, TRANSPARENT,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
+    SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT, FF_DONTCARE, TRANSPARENT,
 };
 
 /// Annotation palette: red, amber, blue, white.
@@ -22,17 +21,43 @@ pub const COLORS: [[u8; 3]; 4] = [
 
 #[derive(Clone)]
 pub enum Shape {
-    Arrow { from: (f32, f32), to: (f32, f32) },
-    Line { from: (f32, f32), to: (f32, f32) },
-    Freehand { points: Vec<(f32, f32)> },
-    Rect { a: (f32, f32), b: (f32, f32) },
-    Ellipse { a: (f32, f32), b: (f32, f32) },
+    Arrow {
+        from: (f32, f32),
+        to: (f32, f32),
+    },
+    Line {
+        from: (f32, f32),
+        to: (f32, f32),
+    },
+    Freehand {
+        points: Vec<(f32, f32)>,
+    },
+    Rect {
+        a: (f32, f32),
+        b: (f32, f32),
+    },
+    Ellipse {
+        a: (f32, f32),
+        b: (f32, f32),
+    },
     /// Translucent marker fill.
-    Highlight { a: (f32, f32), b: (f32, f32) },
-    Text { pos: (f32, f32), text: String },
-    Blur { a: (f32, f32), b: (f32, f32) },
+    Highlight {
+        a: (f32, f32),
+        b: (f32, f32),
+    },
+    Text {
+        pos: (f32, f32),
+        text: String,
+    },
+    Blur {
+        a: (f32, f32),
+        b: (f32, f32),
+    },
     /// Numbered step badge.
-    Counter { pos: (f32, f32), n: u32 },
+    Counter {
+        pos: (f32, f32),
+        n: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,7 +231,10 @@ fn raster_text(text: &str, px_height: i32) -> Option<(Vec<u8>, i32, i32)> {
         let mut wtext: Vec<u16> = text.encode_utf16().collect();
         let mut rc = windows::Win32::Foundation::RECT::default();
         DrawTextW(hdc, &mut wtext, &mut rc, DT_CALCRECT | DT_LEFT);
-        let (w, h) = ((rc.right - rc.left).max(1) + 4, (rc.bottom - rc.top).max(1) + 2);
+        let (w, h) = (
+            (rc.right - rc.left).max(1) + 4,
+            (rc.bottom - rc.top).max(1) + 2,
+        );
 
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -231,7 +259,12 @@ fn raster_text(text: &str, px_height: i32) -> Option<(Vec<u8>, i32, i32)> {
         // Black background is already zeroed; draw white text.
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x00FFFFFF));
-        let mut draw_rc = windows::Win32::Foundation::RECT { left: 2, top: 1, right: w, bottom: h };
+        let mut draw_rc = windows::Win32::Foundation::RECT {
+            left: 2,
+            top: 1,
+            right: w,
+            bottom: h,
+        };
         DrawTextW(hdc, &mut wtext, &mut draw_rc, DT_LEFT);
         let _ = GdiFlush();
 
@@ -264,11 +297,7 @@ pub fn render(
 /// Return the exact pixel box produced by the caption rasterizer. Selection,
 /// hit testing, and rendering all use this measurement so the editor outline
 /// cannot drift away from the text it represents.
-pub(crate) fn caption_text_size(
-    text: &str,
-    size: f32,
-    metric_scale: f32,
-) -> Option<(i32, i32)> {
+pub(crate) fn caption_text_size(text: &str, size: f32, metric_scale: f32) -> Option<(i32, i32)> {
     if text.is_empty() {
         return None;
     }
@@ -294,17 +323,10 @@ fn rounded_plate(
             let py = y as f32 + 0.5 - top as f32;
             let qx = (px - width / 2.0).abs() - (width / 2.0 - radius);
             let qy = (py - height / 2.0).abs() - (height / 2.0 - radius);
-            let distance = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt()
-                + qx.max(qy).min(0.0)
-                - radius;
+            let distance =
+                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - radius;
             let coverage = (0.5 - distance).clamp(0.0, 1.0);
-            blend(
-                img,
-                x,
-                y,
-                [12, 14, 20],
-                coverage * opacity.clamp(0.0, 1.0),
-            );
+            blend(img, x, y, [12, 14, 20], coverage * opacity.clamp(0.0, 1.0));
         }
     }
 }
@@ -321,12 +343,7 @@ pub struct CaptionOptions {
     pub box_opacity: f32,
 }
 
-pub fn render_caption(
-    img: &mut RgbaImage,
-    pos: (f32, f32),
-    text: &str,
-    options: CaptionOptions,
-) {
+pub fn render_caption(img: &mut RgbaImage, pos: (f32, f32), text: &str, options: CaptionOptions) {
     if text.is_empty() {
         return;
     }
@@ -434,8 +451,14 @@ pub fn render_with_metric(
                     img,
                     [
                         t,
-                        (t.0 - ux * head + px * head * 0.5, t.1 - uy * head + py * head * 0.5),
-                        (t.0 - ux * head - px * head * 0.5, t.1 - uy * head - py * head * 0.5),
+                        (
+                            t.0 - ux * head + px * head * 0.5,
+                            t.1 - uy * head + py * head * 0.5,
+                        ),
+                        (
+                            t.0 - ux * head - px * head * 0.5,
+                            t.1 - uy * head - py * head * 0.5,
+                        ),
                     ],
                     color,
                 );
@@ -490,19 +513,24 @@ pub fn render_with_metric(
                 let (min_y, max_y) = ((c.1 - r - 1.0) as i32, (c.1 + r + 1.0) as i32);
                 for y in min_y..=max_y {
                     for x in min_x..=max_x {
-                        let d = ((x as f32 + 0.5 - c.0).powi(2)
-                            + (y as f32 + 0.5 - c.1).powi(2))
-                        .sqrt();
+                        let d = ((x as f32 + 0.5 - c.0).powi(2) + (y as f32 + 0.5 - c.1).powi(2))
+                            .sqrt();
                         blend(img, x, y, color, (r - d + 0.5).clamp(0.0, 1.0));
                     }
                 }
                 let num = n.to_string();
                 let px_h = (r * 1.15) as i32;
                 if let Some((alpha, tw, th)) = raster_text(&num, px_h) {
-                    let (ox, oy) = ((c.0 - tw as f32 / 2.0) as i32, (c.1 - th as f32 / 2.0) as i32);
+                    let (ox, oy) = (
+                        (c.0 - tw as f32 / 2.0) as i32,
+                        (c.1 - th as f32 / 2.0) as i32,
+                    );
                     // White on colored badge (dark text on the white swatch).
-                    let text_color =
-                        if ann.color == 3 { [30u8, 28, 26] } else { [255u8, 255, 255] };
+                    let text_color = if ann.color == 3 {
+                        [30u8, 28, 26]
+                    } else {
+                        [255u8, 255, 255]
+                    };
                     for y in 0..th {
                         for x in 0..tw {
                             let a = alpha[(y * tw + x) as usize] as f32 / 255.0;
@@ -548,7 +576,12 @@ mod tests {
 
     fn patterned_image() -> RgbaImage {
         RgbaImage::from_fn(12, 12, |x, y| {
-            Rgba([(x * 17 + y * 3) as u8, (y * 19 + x * 5) as u8, (x * 11 + y * 7) as u8, 255])
+            Rgba([
+                (x * 17 + y * 3) as u8,
+                (y * 19 + x * 5) as u8,
+                (x * 11 + y * 7) as u8,
+                255,
+            ])
         })
     }
 
@@ -581,7 +614,10 @@ mod tests {
         pixelate(&mut forward, (2.0, 2.0), (10.0, 10.0), 1);
         pixelate(&mut reversed, (10.0, 10.0), (2.0, 2.0), 1);
 
-        assert_eq!(forward, reversed, "reversing the box corners changed the redaction");
+        assert_eq!(
+            forward, reversed,
+            "reversing the box corners changed the redaction"
+        );
         assert_eq!(forward.get_pixel(0, 0), original.get_pixel(0, 0));
         assert_eq!(forward.get_pixel(11, 11), original.get_pixel(11, 11));
         assert_ne!(forward.get_pixel(2, 2), original.get_pixel(2, 2));
@@ -591,7 +627,11 @@ mod tests {
                 let expected = *forward.get_pixel(block_x, block_y);
                 for y in block_y..block_y + 4 {
                     for x in block_x..block_x + 4 {
-                        assert_eq!(*forward.get_pixel(x, y), expected, "detail survived at ({x}, {y})");
+                        assert_eq!(
+                            *forward.get_pixel(x, y),
+                            expected,
+                            "detail survived at ({x}, {y})"
+                        );
                     }
                 }
             }

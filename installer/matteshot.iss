@@ -30,7 +30,8 @@ AppName=Matteshot
 AppVersion={#AppVersion}
 AppPublisher=Southbound Software
 AppPublisherURL=https://matteshot.app
-AppSupportURL=https://matteshot.app
+AppSupportURL=https://github.com/btsouth/matteshot/issues
+AppUpdatesURL=https://github.com/btsouth/matteshot/releases
 DefaultDirName={localappdata}\Programs\Matteshot
 DisableProgramGroupPage=yes
 DisableDirPage=yes
@@ -54,7 +55,7 @@ VersionInfoProductVersion={#NumericVersion}
 VersionInfoCompany=Southbound Software
 VersionInfoProductName=Matteshot
 VersionInfoDescription=Matteshot Setup
-VersionInfoCopyright=Copyright (C) 2026 Southbound Software
+VersionInfoCopyright=Copyright (C) 2026 Southbound Software. MIT OR Apache-2.0.
 ; Built as MatteshotSetup-<version>.exe, but published and downloaded under the
 ; stable name, which is the one worth claiming here.
 VersionInfoOriginalFileName=MatteshotSetup.exe
@@ -92,12 +93,16 @@ Filename: "{app}\matteshot.exe"; Flags: nowait runhidden; Check: WizardSilent
 Type: files; Name: "{userstartup}\Matteshot.lnk"
 
 [UninstallRun]
-; Stop through Matteshot's own cleanup path. --quit is enough: the resident
-; hands PrtScn back via release(), which restores the prior HKCU binding
-; (SBS-1050) or leaves it alone when we never wrote it. Do not follow with
-; --restore-printscreen: that flag force-writes
-; PrintScreenKeyForSnippingEnabled=1 in a new process and turns Snipping
-; on for anyone who had it off (SBS-1072). Explicit undo stays a CLI command.
+; Stop through Matteshot's own cleanup path. On the graceful path --quit is
+; enough: the resident hands PrtScn back via release(), which restores the
+; prior HKCU binding (SBS-1050) or leaves it alone when we never wrote it. Do
+; not follow with --restore-printscreen: that flag force-writes
+; PrintScreenKeyForSnippingEnabled=1 in a new process and turns Snipping on for
+; anyone who had it off (SBS-1072). The trade is deliberate: when --quit fails
+; and StopResident falls back to taskkill, a resident that had written the
+; value (the RegisterHotKey fallback or the Settings takeover) exits without
+; release() and leaves PrtScn off for Snipping. `matteshot --restore-printscreen`
+; is the explicit undo for that case.
 Filename: "{app}\matteshot.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "StopApp"
 
 [Code]
