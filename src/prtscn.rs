@@ -197,7 +197,8 @@ fn install_hook(id: i32) -> bool {
             let module = GetModuleHandleW(None)
                 .map(|module| HINSTANCE(module.0))
                 .unwrap_or_default();
-            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) else {
+            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), Some(module), 0)
+            else {
                 let _ = ready_tx.send(None);
                 return;
             };
@@ -353,7 +354,7 @@ fn restore_snipping_binding() {
 fn broadcast_setting_change() {
     unsafe {
         let _ = PostMessageW(
-            HWND_BROADCAST,
+            Some(HWND_BROADCAST),
             WM_SETTINGCHANGE,
             WPARAM(0),
             LPARAM(w!("Control Panel\\Keyboard").0 as isize),

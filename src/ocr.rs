@@ -65,7 +65,10 @@ fn to_bitmap(img: &RgbaImage) -> Result<(SoftwareBitmap, f32)> {
 pub fn recognize_words(img: &RgbaImage) -> Result<Vec<Word>> {
     let engine = OcrEngine::TryCreateFromUserProfileLanguages().context("create OCR engine")?;
     let (bitmap, scale) = to_bitmap(img)?;
-    let result = engine.RecognizeAsync(&bitmap)?.get().context("recognize")?;
+    let result = engine
+        .RecognizeAsync(&bitmap)?
+        .join()
+        .context("recognize")?;
     let inverse = 1.0 / scale;
     let lines = result.Lines()?;
     let mut words = Vec::new();
@@ -94,7 +97,10 @@ pub fn recognize_words(img: &RgbaImage) -> Result<Vec<Word>> {
 pub fn recognize(img: &RgbaImage) -> Result<String> {
     let engine = OcrEngine::TryCreateFromUserProfileLanguages().context("create OCR engine")?;
     let (bitmap, _) = to_bitmap(img)?;
-    let result = engine.RecognizeAsync(&bitmap)?.get().context("recognize")?;
+    let result = engine
+        .RecognizeAsync(&bitmap)?
+        .join()
+        .context("recognize")?;
     let lines = result.Lines()?;
     let mut text = String::new();
     for line in &lines {

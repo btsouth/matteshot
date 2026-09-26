@@ -81,8 +81,12 @@ unsafe extern "system" fn overlay_keyboard_hook(
                     let mask = 1u32 << bit;
                     if OVERLAY_KEYS_DOWN.fetch_or(mask, Ordering::SeqCst) & mask == 0 {
                         let hwnd = HWND(target as *mut _);
-                        let _ =
-                            PostMessageW(hwnd, WM_KEYDOWN, WPARAM(key.vkCode as usize), LPARAM(0));
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_KEYDOWN,
+                            WPARAM(key.vkCode as usize),
+                            LPARAM(0),
+                        );
                     }
                 }
                 return LRESULT(1);
@@ -312,10 +316,10 @@ unsafe fn make_layer_storage(reference: HDC, w: i32, h: i32) -> (HDC, HBITMAP, *
         ..Default::default()
     };
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let bmp = CreateDIBSection(reference, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+    let bmp = CreateDIBSection(Some(reference), &info, DIB_RGB_COLORS, &mut bits, None, 0)
         .expect("CreateDIBSection");
-    let dc = CreateCompatibleDC(reference);
-    SelectObject(dc, bmp);
+    let dc = CreateCompatibleDC(Some(reference));
+    SelectObject(dc, bmp.into());
     (dc, bmp, bits.cast())
 }
 
@@ -397,7 +401,7 @@ unsafe fn frame_rect(hdc: HDC, r: &RECT, thickness: i32, color: COLORREF) {
     ] {
         FillRect(hdc, &rr, brush);
     }
-    let _ = DeleteObject(brush);
+    let _ = DeleteObject(brush.into());
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -410,15 +414,15 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
     let pill = state.toolbar_rect;
     let brush = CreateSolidBrush(state.theme.panel);
     let pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
-    let old_brush = SelectObject(hdc, brush);
-    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, brush.into());
+    let old_pen = SelectObject(hdc, pen.into());
     let _ = RoundRect(hdc, pill.left, pill.top, pill.right, pill.bottom, 20, 20);
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
-    let _ = DeleteObject(brush);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(brush.into());
+    let _ = DeleteObject(pen.into());
 
-    SelectObject(hdc, state.font);
+    SelectObject(hdc, state.font.into());
     SetBkMode(hdc, TRANSPARENT);
     for (i, b) in state.buttons.iter().enumerate() {
         let selected = matches!(
@@ -433,8 +437,8 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
         if selected {
             let bg = CreateSolidBrush(state.theme.accent);
             let nopen = CreatePen(PS_SOLID, 1, state.theme.accent);
-            let ob = SelectObject(hdc, bg);
-            let op = SelectObject(hdc, nopen);
+            let ob = SelectObject(hdc, bg.into());
+            let op = SelectObject(hdc, nopen.into());
             let _ = RoundRect(
                 hdc,
                 b.rect.left,
@@ -446,8 +450,8 @@ unsafe fn draw_toolbar(hdc: HDC, state: &State) {
             );
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
-            let _ = DeleteObject(bg);
-            let _ = DeleteObject(nopen);
+            let _ = DeleteObject(bg.into());
+            let _ = DeleteObject(nopen.into());
         }
         SetTextColor(
             hdc,
@@ -513,8 +517,8 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
     };
     let brush = CreateSolidBrush(state.theme.panel);
     let pen = CreatePen(PS_SOLID, 1, state.theme.chip_line);
-    let old_brush = SelectObject(hdc, brush);
-    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, brush.into());
+    let old_pen = SelectObject(hdc, pen.into());
     let _ = RoundRect(
         hdc,
         panel.left,
@@ -526,10 +530,10 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
     );
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
-    let _ = DeleteObject(brush);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(brush.into());
+    let _ = DeleteObject(pen.into());
 
-    SelectObject(hdc, state.font);
+    SelectObject(hdc, state.font.into());
     SetBkMode(hdc, TRANSPARENT);
     let current = crate::delay::sanitize(state.delay_secs);
     for (i, (rect, seconds)) in state.delay_list.iter().enumerate() {
@@ -545,8 +549,8 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
             };
             let bg = CreateSolidBrush(fill);
             let nopen = CreatePen(PS_SOLID, 1, fill);
-            let ob = SelectObject(hdc, bg);
-            let op = SelectObject(hdc, nopen);
+            let ob = SelectObject(hdc, bg.into());
+            let op = SelectObject(hdc, nopen.into());
             let _ = RoundRect(
                 hdc,
                 rect.left + 3,
@@ -558,8 +562,8 @@ unsafe fn draw_delay_list(hdc: HDC, state: &State) {
             );
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
-            let _ = DeleteObject(bg);
-            let _ = DeleteObject(nopen);
+            let _ = DeleteObject(bg.into());
+            let _ = DeleteObject(nopen.into());
         }
         SetTextColor(
             hdc,
@@ -591,7 +595,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         0,
         state.width,
         state.height,
-        state.dim_dc,
+        Some(state.dim_dc),
         0,
         0,
         SRCCOPY,
@@ -601,7 +605,17 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let (x, y) = (r.left.max(0), r.top.max(0));
         let (x1, y1) = (r.right.min(state.width), r.bottom.min(state.height));
         if x1 > x && y1 > y {
-            let _ = BitBlt(hdc, x, y, x1 - x, y1 - y, state.bright_dc, x, y, SRCCOPY);
+            let _ = BitBlt(
+                hdc,
+                x,
+                y,
+                x1 - x,
+                y1 - y,
+                Some(state.bright_dc),
+                x,
+                y,
+                SRCCOPY,
+            );
         }
     };
 
@@ -638,12 +652,12 @@ unsafe fn press_button(hwnd: HWND, state: &mut State, btn: Btn) {
     match btn {
         Btn::Window => {
             state.mode = Mode::Window;
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Btn::Region => {
             state.mode = Mode::Region;
             state.hover = None;
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Btn::Screen => {
             // The monitor under the cursor.
@@ -676,12 +690,12 @@ unsafe fn press_button(hwnd: HWND, state: &mut State, btn: Btn) {
             // instead of capturing.
             state.recording = !state.recording;
             state.scrolling = false;
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Btn::Scroll => {
             state.scrolling = !state.scrolling;
             state.recording = false;
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         // Not a mode: the overlay has to leave the screen for the delay to be
         // worth anything, so this ends the overlay and lets the caller reopen.
@@ -716,7 +730,7 @@ unsafe fn open_delay_list(hwnd: HWND, state: &mut State) {
     state.delay_list = delay_list_rects(anchor, state.btn_h, &crate::delay::CHOICES, open_below);
     state.delay_list_open = true;
     state.delay_list_hover = -1;
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 unsafe fn close_delay_list(hwnd: HWND, state: &mut State) {
@@ -724,7 +738,7 @@ unsafe fn close_delay_list(hwnd: HWND, state: &mut State) {
         state.delay_list_open = false;
         state.delay_list.clear();
         state.delay_list_hover = -1;
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -741,14 +755,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 if state.back.is_none() {
-                    let mem = CreateCompatibleDC(hdc);
+                    let mem = CreateCompatibleDC(Some(hdc));
                     let bmp = CreateCompatibleBitmap(hdc, state.width, state.height);
-                    SelectObject(mem, bmp);
+                    SelectObject(mem, bmp.into());
                     state.back = Some((mem, bmp));
                 }
                 let (mem, _) = state.back.unwrap();
                 paint(mem, state);
-                let _ = BitBlt(hdc, 0, 0, state.width, state.height, mem, 0, 0, SRCCOPY);
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    state.width,
+                    state.height,
+                    Some(mem),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
                 let _ = EndPaint(hwnd, &ps);
             }
             LRESULT(0)
@@ -768,7 +792,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .unwrap_or(-1);
                     if h != state.delay_list_hover {
                         state.delay_list_hover = h;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     return LRESULT(0);
                 }
@@ -778,7 +802,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         || (pt.y - start.y).abs() > DRAG_THRESHOLD
                     {
                         state.drag_to = Some(pt);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 } else if in_rect(&state.toolbar_rect, pt.x, pt.y) {
                     let th = state
@@ -790,7 +814,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if th != state.toolbar_hover || state.hover.is_some() {
                         state.toolbar_hover = th;
                         state.hover = None;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 } else {
                     let hover = if state.mode == Mode::Window {
@@ -806,7 +830,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if hover != state.hover || state.toolbar_hover != -1 {
                         state.hover = hover;
                         state.toolbar_hover = -1;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
             }
@@ -823,7 +847,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     LoadCursorW(None, IDC_CROSS)
                 };
                 if let Ok(c) = cursor {
-                    SetCursor(c);
+                    SetCursor(Some(c));
                 }
                 return LRESULT(1);
             }
@@ -956,7 +980,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         } else {
                             state.pressed = None;
                             state.drag_to = None;
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     _ => {
@@ -1063,10 +1087,7 @@ struct EnumState {
     list: Vec<(HWND, RECT, bool)>,
 }
 
-unsafe extern "system" fn enum_proc(
-    hwnd: HWND,
-    lparam: LPARAM,
-) -> windows::Win32::Foundation::BOOL {
+unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
     let state = &mut *(lparam.0 as *mut EnumState);
 
     if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
@@ -1151,7 +1172,7 @@ unsafe extern "system" fn mon_enum(
     _hdc: HDC,
     _rc: *mut RECT,
     lparam: LPARAM,
-) -> windows::Win32::Foundation::BOOL {
+) -> windows::core::BOOL {
     let list = &mut *(lparam.0 as *mut Vec<MonitorEntry>);
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -1250,8 +1271,8 @@ pub fn benchmark_freeze(batched: bool) -> Result<()> {
         let layer_elapsed = started.elapsed() - freeze_elapsed;
         let _ = DeleteDC(dim_dc);
         let _ = DeleteDC(bright_dc);
-        let _ = DeleteObject(dim_bmp);
-        let _ = DeleteObject(bright_bmp);
+        let _ = DeleteObject(dim_bmp.into());
+        let _ = DeleteObject(bright_bmp.into());
         eprintln!(
             "overlay bench {}: {} monitor(s), {}x{}, freeze {:?}, layers {:?}, total {:?}",
             if batched { "batched" } else { "sequential" },
@@ -1385,16 +1406,16 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
             0,
             0,
             0,
-            DEFAULT_CHARSET.0 as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY.0 as u32,
+            DEFAULT_CHARSET,
+            windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+            windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+            CLEARTYPE_QUALITY,
             FF_DONTCARE.0 as u32,
             w!("Segoe UI"),
         );
 
         // Toolbar layout, measured with the real font.
-        let old_font = SelectObject(screen_dc, font);
+        let old_font = SelectObject(screen_dc, font.into());
         // The row is actions, not only modes: Close already lives here, and
         // "capture after Ns" belongs beside it.
         let delay_label = format!("\u{23F1} {}s", crate::delay::sanitize(delay_secs));
@@ -1523,7 +1544,7 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
             mh,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(&mut *state as *mut State as *const _),
         )?;
         OVERLAY_KEY_TARGET.store(hwnd.0 as isize, Ordering::SeqCst);
@@ -1531,7 +1552,7 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
         let keyboard_hook = SetWindowsHookExW(
             WH_KEYBOARD_LL,
             Some(overlay_keyboard_hook),
-            HINSTANCE(hinstance.0),
+            Some(HINSTANCE(hinstance.0)),
             0,
         )
         .ok();
@@ -1543,7 +1564,7 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
         // The keyboard guard above remains the reliable fallback.
         let _ = SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
@@ -1551,7 +1572,7 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
         );
         let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(hwnd);
+        let _ = SetFocus(Some(hwnd));
         let visible_elapsed = t0.elapsed();
         eprintln!("timing: overlay visible — freeze {t_freeze:?}, total {visible_elapsed:?}");
         crate::diagnostics::log(&format!(
@@ -1573,13 +1594,13 @@ pub fn select(delayed: bool, delay_secs: u32) -> Result<Option<(Selection, HMONI
 
         let _ = DeleteDC(state.dim_dc);
         let _ = DeleteDC(state.bright_dc);
-        let _ = DeleteObject(state.dim_bmp);
-        let _ = DeleteObject(state.bright_bmp);
+        let _ = DeleteObject(state.dim_bmp.into());
+        let _ = DeleteObject(state.bright_bmp.into());
         if let Some((mem, bmp)) = state.back.take() {
             let _ = DeleteDC(mem);
-            let _ = DeleteObject(bmp);
+            let _ = DeleteObject(bmp.into());
         }
-        let _ = DeleteObject(state.font);
+        let _ = DeleteObject(state.font.into());
 
         // Anchor follow-up UI (the picker) on the monitor the cursor ended on.
         let mut pt = POINT::default();

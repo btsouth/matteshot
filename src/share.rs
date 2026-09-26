@@ -188,7 +188,7 @@ pub fn share_in_background(hwnd: HWND, path: PathBuf) -> u64 {
             },
             |token| unsafe {
                 PostMessageW(
-                    HWND(hwnd_value as *mut c_void),
+                    Some(HWND(hwnd_value as *mut c_void)),
                     WM_SHARE_COMPLETE,
                     WPARAM(0),
                     LPARAM(token as isize),

@@ -121,7 +121,7 @@ impl State {
             }
             let previous = std::mem::replace(&mut *slot, replacement);
             if !previous.is_invalid() {
-                let _ = DeleteObject(previous);
+                let _ = DeleteObject(previous.into());
             }
         }
     }
@@ -130,11 +130,11 @@ impl State {
 impl Drop for State {
     fn drop(&mut self) {
         unsafe {
-            let _ = DeleteObject(self.font_brand);
-            let _ = DeleteObject(self.font_title);
-            let _ = DeleteObject(self.font_body);
-            let _ = DeleteObject(self.font_step);
-            let _ = DeleteObject(self.font_small);
+            let _ = DeleteObject(self.font_brand.into());
+            let _ = DeleteObject(self.font_title.into());
+            let _ = DeleteObject(self.font_body.into());
+            let _ = DeleteObject(self.font_step.into());
+            let _ = DeleteObject(self.font_small.into());
         }
     }
 }
@@ -149,10 +149,10 @@ unsafe fn make_font(height: i32, weight: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -178,7 +178,7 @@ unsafe fn text(
     value: &str,
     flags: DRAW_TEXT_FORMAT,
 ) {
-    SelectObject(hdc, font);
+    SelectObject(hdc, font.into());
     SetTextColor(hdc, color);
     let mut value: Vec<u16> = value.encode_utf16().collect();
     let mut rect = rect;
@@ -188,8 +188,8 @@ unsafe fn text(
 unsafe fn rounded_panel(hdc: HDC, rect: RECT, fill: COLORREF, line: COLORREF, radius: i32) {
     let brush = CreateSolidBrush(fill);
     let pen = CreatePen(PS_SOLID, 1, line);
-    let old_brush = SelectObject(hdc, brush);
-    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, brush.into());
+    let old_pen = SelectObject(hdc, pen.into());
     let _ = RoundRect(
         hdc,
         rect.left,
@@ -201,8 +201,8 @@ unsafe fn rounded_panel(hdc: HDC, rect: RECT, fill: COLORREF, line: COLORREF, ra
     );
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
-    let _ = DeleteObject(brush);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(brush.into());
+    let _ = DeleteObject(pen.into());
 }
 
 unsafe fn button(hdc: HDC, state: &State, rect: RECT, label: &str, primary: bool, hot: bool) {
@@ -302,7 +302,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         },
         background,
     );
-    let _ = DeleteObject(background);
+    let _ = DeleteObject(background.into());
     SetBkMode(hdc, TRANSPARENT);
 
     // Small brand mark: the white card on Matteshot's accent field.
@@ -517,13 +517,23 @@ unsafe extern "system" fn wndproc(
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
             if let Some(state) = state(hwnd) {
-                let memory = CreateCompatibleDC(hdc);
+                let memory = CreateCompatibleDC(Some(hdc));
                 let bitmap = CreateCompatibleBitmap(hdc, state.width, state.height);
-                let old_bitmap = SelectObject(memory, bitmap);
+                let old_bitmap = SelectObject(memory, bitmap.into());
                 paint(memory, state);
-                let _ = BitBlt(hdc, 0, 0, state.width, state.height, memory, 0, 0, SRCCOPY);
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    state.width,
+                    state.height,
+                    Some(memory),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
                 SelectObject(memory, old_bitmap);
-                let _ = DeleteObject(bitmap);
+                let _ = DeleteObject(bitmap.into());
                 let _ = DeleteDC(memory);
             }
             let _ = EndPaint(hwnd, &ps);
@@ -538,7 +548,7 @@ unsafe extern "system" fn wndproc(
                 let sc = |value: i32| (value as f32 * scale) as i32;
                 state.apply_scale(scale, sc(640), sc(424));
                 crate::dpi::apply_suggested_bounds(hwnd, lparam);
-                let _ = InvalidateRect(hwnd, None, true);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -566,7 +576,7 @@ unsafe extern "system" fn wndproc(
                 };
                 if state.hover != hover {
                     state.hover = hover;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -575,7 +585,7 @@ unsafe extern "system" fn wndproc(
             if let Some(state) = state(hwnd) {
                 state.tracking_mouse = false;
                 state.hover = 0;
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -603,7 +613,7 @@ unsafe extern "system" fn wndproc(
             if let Some(state) = state(hwnd) {
                 state.theme = crate::theme::current();
                 crate::theme::apply_titlebar(hwnd, &state.theme);
-                let _ = InvalidateRect(hwnd, None, true);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -626,7 +636,7 @@ unsafe extern "system" fn wndproc(
 fn open(mark_seen: bool) -> Result<()> {
     unsafe {
         let existing = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        if !existing.0.is_null() && IsWindow(existing).as_bool() {
+        if !existing.0.is_null() && IsWindow(Some(existing)).as_bool() {
             let _ = ShowWindow(existing, SW_RESTORE);
             let _ = SetForegroundWindow(existing);
             return Ok(());
@@ -694,7 +704,7 @@ fn open(mark_seen: bool) -> Result<()> {
             height,
             None,
             None,
-            instance,
+            Some(instance.into()),
             Some(leaked as *const c_void),
         ) {
             Ok(hwnd) => hwnd,
@@ -711,7 +721,7 @@ fn open(mark_seen: bool) -> Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
@@ -720,7 +730,7 @@ fn open(mark_seen: bool) -> Result<()> {
         );
         let _ = SetWindowPos(
             hwnd,
-            HWND_NOTOPMOST,
+            Some(HWND_NOTOPMOST),
             0,
             0,
             0,
@@ -748,7 +758,7 @@ pub fn open_preview() -> Result<()> {
 pub fn is_open() -> bool {
     unsafe {
         let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        !hwnd.0.is_null() && IsWindow(hwnd).as_bool()
+        !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool()
     }
 }
 

@@ -80,9 +80,9 @@ unsafe extern "system" fn pill_proc(
                     },
                     bg,
                 );
-                let _ = DeleteObject(bg);
+                let _ = DeleteObject(bg.into());
                 SetBkMode(hdc, TRANSPARENT);
-                SelectObject(hdc, p.font);
+                SelectObject(hdc, p.font.into());
                 SetTextColor(hdc, p.theme.text);
                 let mut t = p.text.clone();
                 let mut r = RECT {
@@ -144,10 +144,10 @@ pub fn countdown(seconds: u32) -> Result<bool> {
                 0,
                 0,
                 0,
-                DEFAULT_CHARSET.0 as u32,
-                0,
-                0,
-                CLEARTYPE_QUALITY.0 as u32,
+                DEFAULT_CHARSET,
+                windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+                windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+                CLEARTYPE_QUALITY,
                 FF_DONTCARE.0 as u32,
                 w!("Segoe UI"),
             ),
@@ -189,12 +189,12 @@ pub fn countdown(seconds: u32) -> Result<bool> {
             h,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(&mut *pill as *mut Pill as *const _),
         ) {
             Ok(hwnd) => hwnd,
             Err(error) => {
-                let _ = DeleteObject(pill.font);
+                let _ = DeleteObject(pill.font.into());
                 return Err(error.into());
             }
         };
@@ -226,14 +226,14 @@ pub fn countdown(seconds: u32) -> Result<bool> {
             if left != shown {
                 shown = left;
                 pill.text = label(left).encode_utf16().collect();
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             pump();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         let _ = DestroyWindow(hwnd);
-        let _ = DeleteObject(pill.font);
+        let _ = DeleteObject(pill.font.into());
         // Let the pill actually leave the screen before anything freezes it.
         pump();
         Ok(!cancelled)

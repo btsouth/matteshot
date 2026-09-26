@@ -4,7 +4,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows::core::s;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -51,7 +52,7 @@ pub fn external_foreground() -> Option<HWND> {
 }
 
 pub fn is_external(hwnd: HWND) -> bool {
-    if hwnd.is_invalid() || !unsafe { IsWindow(hwnd).as_bool() } {
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return false;
     }
     let mut pid = 0u32;
@@ -334,7 +335,7 @@ pub fn any_surface_open() -> bool {
 }
 
 pub fn has_class(hwnd: HWND, class_name: &str) -> bool {
-    if hwnd.is_invalid() || !unsafe { IsWindow(hwnd).as_bool() } {
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return false;
     }
     let mut class = [0u16; 128];

@@ -62,7 +62,7 @@ unsafe fn paint(hdc: HDC, state: &UiState) {
         },
         bg,
     );
-    let _ = DeleteObject(bg);
+    let _ = DeleteObject(bg.into());
     SetBkMode(hdc, windows::Win32::Graphics::Gdi::TRANSPARENT);
 
     // Red dot.
@@ -78,11 +78,11 @@ unsafe fn paint(hdc: HDC, state: &UiState) {
         },
         dot,
     );
-    let _ = DeleteObject(dot);
+    let _ = DeleteObject(dot.into());
 
     let secs = state.progress.started.elapsed().as_secs();
     let label = format!("{:02}:{:02}", secs / 60, secs % 60);
-    SelectObject(hdc, state.font);
+    SelectObject(hdc, state.font.into());
     SetTextColor(hdc, state.theme.text);
     let mut t = wide(&label);
     let mut rc = RECT {
@@ -100,8 +100,8 @@ unsafe fn paint(hdc: HDC, state: &UiState) {
         state.theme.chip
     });
     FillRect(hdc, &state.stop_rect, fill);
-    let _ = DeleteObject(fill);
-    SelectObject(hdc, state.font_small);
+    let _ = DeleteObject(fill.into());
+    SelectObject(hdc, state.font_small.into());
     SetTextColor(
         hdc,
         if state.hover {
@@ -114,7 +114,7 @@ unsafe fn paint(hdc: HDC, state: &UiState) {
     let mut sr = state.stop_rect;
     DrawTextW(hdc, &mut s, &mut sr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
-    SelectObject(hdc, state.font_small);
+    SelectObject(hdc, state.font_small.into());
     SetTextColor(hdc, state.theme.faint);
     let mut h = wide("Ctrl+Shift+R");
     let mut hr = RECT {
@@ -168,7 +168,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // The worker died (encoder error) — close the pill.
                     let _ = DestroyWindow(hwnd);
                 } else {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -183,7 +183,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let hot = x >= r.left && x < r.right && y >= r.top && y < r.bottom;
                 if hot != state.hover {
                     state.hover = hot;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -197,8 +197,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
-            let _ = KillTimer(hwnd, 1);
-            let _ = UnregisterHotKey(hwnd, 1);
+            let _ = KillTimer(Some(hwnd), 1);
+            let _ = UnregisterHotKey(Some(hwnd), 1);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -216,10 +216,10 @@ unsafe fn make_font(h: i32, weight: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -281,7 +281,7 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
             ch,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(&mut *state as *mut UiState as *const _),
         )?;
         // Never let the controls appear in their own recording.
@@ -289,7 +289,7 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
         // A chord remains available even though the pill deliberately never
         // activates, without stealing a normal application key from games.
         let _ = RegisterHotKey(
-            hwnd,
+            Some(hwnd),
             1,
             MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
             0x52, // R
@@ -299,15 +299,15 @@ pub fn run(progress: Arc<Progress>, target: Target) -> Result<()> {
         if let Target::Window(h) = target {
             let _ = SetForegroundWindow(HWND(h as *mut _));
         }
-        SetTimer(hwnd, 1, 250, None);
+        SetTimer(Some(hwnd), 1, 250, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        let _ = DeleteObject(state.font);
-        let _ = DeleteObject(state.font_small);
+        let _ = DeleteObject(state.font.into());
+        let _ = DeleteObject(state.font_small.into());
     }
     Ok(())
 }

@@ -278,7 +278,7 @@ impl Drop for ClipboardGuard {
 fn open_clipboard() -> Result<ClipboardGuard> {
     let mut last_error = None;
     for attempt in 0..8u64 {
-        match unsafe { OpenClipboard(HWND::default()) } {
+        match unsafe { OpenClipboard(Some(HWND::default())) } {
             Ok(()) => return Ok(ClipboardGuard),
             Err(error) => last_error = Some(error),
         }
@@ -286,7 +286,7 @@ fn open_clipboard() -> Result<ClipboardGuard> {
             std::thread::sleep(std::time::Duration::from_millis(8 * (attempt + 1)));
         }
     }
-    Err(last_error.unwrap_or_else(windows::core::Error::from_win32))
+    Err(last_error.unwrap_or_else(windows::core::Error::from_thread))
         .context("open clipboard after retries")
 }
 
@@ -294,14 +294,14 @@ unsafe fn put_bytes(format: u32, bytes: &[u8]) -> Result<()> {
     let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
     let ptr = GlobalLock(hmem) as *mut u8;
     if ptr.is_null() {
-        let _ = GlobalFree(hmem);
+        let _ = GlobalFree(Some(hmem));
         bail!("lock clipboard memory");
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
     let _ = GlobalUnlock(hmem);
-    if let Err(error) = SetClipboardData(format, HANDLE(hmem.0)) {
+    if let Err(error) = SetClipboardData(format, Some(HANDLE(hmem.0))) {
         // Ownership transfers to Windows only after SetClipboardData succeeds.
-        let _ = GlobalFree(hmem);
+        let _ = GlobalFree(Some(hmem));
         return Err(error).context("SetClipboardData");
     }
     Ok(())

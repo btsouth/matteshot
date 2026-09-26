@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 use image::RgbaImage;
 use rayon::prelude::*;
-use windows::core::{HSTRING, PROPVARIANT};
+use windows::core::HSTRING;
 use windows::Win32::Media::MediaFoundation::{
     IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio,
     MFMediaType_Video, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_FULL,
@@ -18,6 +18,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READER_MEDIASOURCE, MF_VERSION,
 };
+use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 
 pub struct Probe {
     pub duration_100ns: i64,

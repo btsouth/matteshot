@@ -2377,8 +2377,13 @@ fn start_thumb_build(hwnd: HWND, generation: u64, entries: Vec<Entry>, max_w: i3
             |token| {
                 crate::window::has_class(hwnd, "matteshot_history")
                     && unsafe {
-                        PostMessageW(hwnd, WM_THUMBS_READY, WPARAM(0), LPARAM(token as isize))
-                            .is_ok()
+                        PostMessageW(
+                            Some(hwnd),
+                            WM_THUMBS_READY,
+                            WPARAM(0),
+                            LPARAM(token as isize),
+                        )
+                        .is_ok()
                     }
             },
         );
@@ -2399,10 +2404,10 @@ unsafe fn make_font(height: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -2484,11 +2489,11 @@ unsafe fn paint(hdc: HDC, state: &State) {
         },
         bg,
     );
-    let _ = DeleteObject(bg);
+    let _ = DeleteObject(bg.into());
     SetBkMode(hdc, TRANSPARENT);
 
     if state.thumbs.is_empty() {
-        SelectObject(hdc, state.font);
+        SelectObject(hdc, state.font.into());
         SetTextColor(hdc, state.theme.muted);
         let mut msg = wide("No captures yet \u{2014} press PrtScn to make your first one.");
         let mut rc = RECT {
@@ -2533,7 +2538,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         };
         FillRect(hdc, &card_rect, card);
         if hovered {
-            let old_pen = SelectObject(hdc, hover_pen);
+            let old_pen = SelectObject(hdc, hover_pen.into());
             let old_brush = SelectObject(hdc, null_brush);
             let _ = RoundRect(hdc, cx, cy, cx + state.cell_w, cy + state.cell_h, 8, 8);
             SelectObject(hdc, old_pen);
@@ -2581,7 +2586,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let label_band = state.cell_h - state.cell_img_h;
         let source_h = label_band * SOURCE_LABEL_H / (SOURCE_LABEL_H + LABEL_H);
 
-        SelectObject(hdc, state.font_small);
+        SelectObject(hdc, state.font_small.into());
         SetTextColor(
             hdc,
             if hovered {
@@ -2632,7 +2637,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     }
 
     if let Some((text, _)) = &state.status {
-        SelectObject(hdc, state.font_small);
+        SelectObject(hdc, state.font_small.into());
         SetTextColor(hdc, state.theme.accent);
         let mut t = wide(text);
         let mut rc = RECT {
@@ -2645,8 +2650,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
     }
 
     // null_brush is a stock object owned by GDI and must not be deleted.
-    let _ = DeleteObject(card);
-    let _ = DeleteObject(hover_pen);
+    let _ = DeleteObject(card.into());
+    let _ = DeleteObject(hover_pen.into());
 }
 
 // The four actions below deliberately take plain data (an already-cloned
@@ -2669,7 +2674,7 @@ unsafe fn require_owned_history_path(hwnd: HWND, path: &Path) -> bool {
         Ok(HistoryPathDisposition::UnownedRefused) => {
             let message = HSTRING::from("This file is not in the Matteshot save folder.");
             let _ = MessageBoxW(
-                hwnd,
+                Some(hwnd),
                 PCWSTR(message.as_ptr()),
                 w!("Matteshot"),
                 MB_OK | MB_ICONWARNING,
@@ -2696,7 +2701,7 @@ unsafe fn copy_entry(hwnd: HWND, entry: &Entry) {
     }
     if let Some(state) = state_of(hwnd) {
         state.status = Some(("Copied to clipboard".to_string(), std::time::Instant::now()));
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -2735,7 +2740,7 @@ unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
     if let crate::share::ShareStart::Unavailable(reason) = crate::share::share_start() {
         if let Some(state) = state_of(hwnd) {
             state.status = Some((reason.to_string(), std::time::Instant::now()));
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         return;
     }
@@ -2754,7 +2759,7 @@ unsafe fn share_entry(hwnd: HWND, entry: &Entry) {
         return;
     }
     state.status = Some(("Sharing\u{2026}".to_string(), std::time::Instant::now()));
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 /// History Share after availability and path checks. Same idle rule recdone
@@ -2771,7 +2776,7 @@ unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
         .unwrap_or_default();
     let prompt = HSTRING::from(format!("Delete {name}? This cannot be undone."));
     let confirmed = MessageBoxW(
-        hwnd,
+        Some(hwnd),
         PCWSTR(prompt.as_ptr()),
         w!("Matteshot"),
         MB_YESNO | MB_ICONWARNING,
@@ -2799,14 +2804,14 @@ unsafe fn delete_entry(hwnd: HWND, entry: &Entry) {
         }
         Err(error) => warn(hwnd, "This capture could not be deleted.", &error),
     }
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 unsafe fn warn(hwnd: HWND, prefix: &str, error: &dyn std::fmt::Display) {
     crate::diagnostics::log("history: action failed");
     let message = HSTRING::from(format!("{prefix}\n\n{error}"));
     let _ = MessageBoxW(
-        hwnd,
+        Some(hwnd),
         PCWSTR(message.as_ptr()),
         w!("Matteshot"),
         MB_OK | MB_ICONWARNING,
@@ -2842,7 +2847,7 @@ unsafe fn context_menu(hwnd: HWND, entry: Entry) {
         TPM_RETURNCMD | TPM_NONOTIFY,
         pt.x,
         pt.y,
-        0,
+        None,
         hwnd,
         None,
     );
@@ -2873,9 +2878,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                let mem = CreateCompatibleDC(hdc);
+                let mem = CreateCompatibleDC(Some(hdc));
                 let bmp = CreateCompatibleBitmap(hdc, state.viewport_w, state.viewport_h);
-                let old = SelectObject(mem, bmp);
+                let old = SelectObject(mem, bmp.into());
                 paint(mem, state);
                 let _ = BitBlt(
                     hdc,
@@ -2883,13 +2888,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     0,
                     state.viewport_w,
                     state.viewport_h,
-                    mem,
+                    Some(mem),
                     0,
                     0,
                     SRCCOPY,
                 );
                 SelectObject(mem, old);
-                let _ = DeleteObject(bmp);
+                let _ = DeleteObject(bmp.into());
                 let _ = DeleteDC(mem);
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -2911,7 +2916,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 if hover != state.hover {
                     state.hover = hover;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -2922,7 +2927,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let step = if delta > 0 { -WHEEL_STEP } else { WHEEL_STEP };
                 state.scroll_y =
                     (state.scroll_y + step).clamp(0, max_scroll(state.content_h, state.viewport_h));
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -2945,14 +2950,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // cancels this before it fires, so a double-click opens
                     // the editor instead of also copying to the clipboard.
                     state.pending_click = Some(hit as usize);
-                    let _ = SetTimer(hwnd, CLICK_TIMER_ID, GetDoubleClickTime(), None);
+                    let _ = SetTimer(Some(hwnd), CLICK_TIMER_ID, GetDoubleClickTime(), None);
                 }
             }
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
             let entry = state_of(hwnd).and_then(|state| {
-                let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
                 state.pending_click = None;
                 let (mx, my) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
@@ -2981,7 +2986,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let entry = state_of(hwnd).and_then(|state| {
                 // A right-click cancels any pending single-click too: the
                 // menu below can delete the very entry it would have copied.
-                let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
                 state.pending_click = None;
                 let (mx, my) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
@@ -3010,7 +3015,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TIMER => {
             if wparam.0 == CLICK_TIMER_ID {
-                let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
                 let pending = state_of(hwnd).and_then(|state| {
                     let index = state.pending_click.take()?;
                     Some(state.thumbs[index].entry.clone())
@@ -3022,7 +3027,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some((_, shown_at)) = &state.status {
                     if shown_at.elapsed().as_millis() > STATUS_MS {
                         state.status = None;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
             }
@@ -3039,12 +3044,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Indices can shift when failed decodes drop out of the
                     // grid; a pending single-click must not copy a different
                     // file than the one that was under the cursor.
-                    let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+                    let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
                     state.pending_click = None;
                     state.hover = -1;
                     state.thumbs = thumbs;
                     relayout(state);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -3073,7 +3078,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     "Link copied to clipboard".to_string(),
                                     std::time::Instant::now(),
                                 ));
-                                let _ = InvalidateRect(hwnd, None, false);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
                         Err(error) => warn(hwnd, "The share link could not be copied.", &error),
@@ -3090,13 +3095,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_NCDESTROY => {
             crate::share::discard_window(hwnd.0 as isize);
             THUMB_COMPLETIONS.unbind(hwnd.0 as isize);
-            let _ = KillTimer(hwnd, STATUS_TIMER_ID);
-            let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+            let _ = KillTimer(Some(hwnd), STATUS_TIMER_ID);
+            let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
-                let _ = DeleteObject(state.font);
-                let _ = DeleteObject(state.font_small);
+                let _ = DeleteObject(state.font.into());
+                let _ = DeleteObject(state.font_small.into());
             }
             WINDOW.store(0, Ordering::SeqCst);
             LRESULT(0)
@@ -3109,7 +3114,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// screen immediately; PNG decode stays on the worker (SBS-1054).
 unsafe fn reload(hwnd: HWND) {
     let Some(state) = state_of(hwnd) else { return };
-    let _ = KillTimer(hwnd, CLICK_TIMER_ID);
+    let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
     state.pending_click = None;
     let entries = list();
     let cell_w = state.cell_w;
@@ -3120,7 +3125,7 @@ unsafe fn reload(hwnd: HWND) {
     state.scroll_y = 0;
     state.hover = -1;
     relayout(state);
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
     start_thumb_build(hwnd, generation, entries, cell_w, cell_img_h);
 }
 
@@ -3129,12 +3134,20 @@ unsafe fn reload(hwnd: HWND) {
 pub fn open() -> Result<()> {
     unsafe {
         let existing = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        if !existing.0.is_null() && IsWindow(existing).as_bool() {
+        if !existing.0.is_null() && IsWindow(Some(existing)).as_bool() {
             let _ = ShowWindow(existing, SW_RESTORE);
-            let _ = SetWindowPos(existing, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = SetWindowPos(
                 existing,
-                HWND_NOTOPMOST,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            );
+            let _ = SetWindowPos(
+                existing,
+                Some(HWND_NOTOPMOST),
                 0,
                 0,
                 0,
@@ -3239,7 +3252,7 @@ pub fn open() -> Result<()> {
             wh,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(leaked as *const _),
         ) {
             Ok(h) => h,
@@ -3251,13 +3264,29 @@ pub fn open() -> Result<()> {
 
         crate::theme::apply_titlebar(hwnd, &crate::theme::current());
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
-        let _ = SetTimer(hwnd, STATUS_TIMER_ID, 500, None);
+        let _ = SetTimer(Some(hwnd), STATUS_TIMER_ID, 500, None);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         // Mirrors settings::open: a tray menu just closed, so this process may
         // have lost foreground permission; the topmost toggle forces z-order
         // without needing activation rights.
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
         let _ = SetForegroundWindow(hwnd);
         eprintln!("history: opened with {} entries", entries.len());
         start_thumb_build(hwnd, 0, entries, cell_w, cell_img_h);
@@ -3269,7 +3298,7 @@ pub fn open() -> Result<()> {
 pub fn is_open() -> bool {
     unsafe {
         let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        !hwnd.0.is_null() && IsWindow(hwnd).as_bool()
+        !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool()
     }
 }
 
@@ -3278,7 +3307,7 @@ pub fn is_open() -> bool {
 pub fn reload_if_open() {
     unsafe {
         let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        if !hwnd.0.is_null() && IsWindow(hwnd).as_bool() {
+        if !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool() {
             reload(hwnd);
         }
     }

@@ -86,11 +86,11 @@ fn request_graceful_shutdown() -> Result<()> {
                 None => return Ok(()),
             };
             unsafe {
-                PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0))
+                PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0))
                     .with_context(|| format!("ask {label} to close"))?;
             }
             let deadline = std::time::Instant::now() + timeout;
-            while unsafe { IsWindow(hwnd) }.as_bool() {
+            while unsafe { IsWindow(Some(hwnd)) }.as_bool() {
                 if std::time::Instant::now() >= deadline {
                     bail!("{label} is still busy; finish or cancel the current operation and try again");
                 }
@@ -926,7 +926,7 @@ fn run_resident() -> Result<()> {
                             // open behind the foreground app, which reads as
                             // a hang with no visible prompt.
                             MessageBoxW(
-                                tray.hwnd,
+                                Some(tray.hwnd),
                                 w!("A recording is still finishing. Matteshot will quit when it is done."),
                                 w!("Matteshot"),
                                 MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
@@ -1177,7 +1177,7 @@ fn schedule_recording_stop(secs: u64) {
         if let Some(pill) = crate::window::find_own_by_class("matteshot_recui") {
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    pill,
+                    Some(pill),
                     windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
                     windows::Win32::Foundation::WPARAM(0),
                     windows::Win32::Foundation::LPARAM(0),
