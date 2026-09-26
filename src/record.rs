@@ -175,7 +175,9 @@ impl ProtectedRegionWatch {
             self.frames = 0;
         }
         for (i, pixel) in bgra
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .step_by(Self::STRIDE)
             .enumerate()
             .take(samples)
