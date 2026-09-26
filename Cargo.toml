@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 ed25519-dalek = "2"
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 png = "0.18"
