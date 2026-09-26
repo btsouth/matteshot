@@ -1,14 +1,21 @@
-"""Build the Matteshot Product Hunt gallery and demo video.
+"""Build the Microsoft Store screenshots in microsoft-store/screenshots/.
 
-The source screenshots in captures/ come from Matteshot's own headless capture
-and editor test paths. This script only composes those real captures into the
-1270x760 artwork Product Hunt expects.
+The source screenshots in captures/ are Matteshot capturing studio/index.html,
+a made-up demo workspace, through its own capture and editor paths. This
+script only composes those real captures into 1366x818 store artwork.
+
+    pip install pillow
+    python marketing/build_store_screenshots.py
+
+It needs the Segoe UI regular, semibold and bold fonts. On Windows they are
+found in C:\\Windows\\Fonts; elsewhere, point MATTESHOT_FONT_DIR at a folder
+holding segoeui.ttf, seguisb.ttf and segoeuib.ttf.
 """
 
 from __future__ import annotations
 
 import math
-import subprocess
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,13 +24,16 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 ROOT = Path(__file__).resolve().parent
 CAPTURES = ROOT / "captures"
-OUT = ROOT / "output"
+OUT = ROOT / "microsoft-store" / "screenshots"
 OUT.mkdir(parents=True, exist_ok=True)
 
+# Slides are laid out at 1270x760 and scaled up to the store size on save.
 W, H = 1270, 760
-FONT_REGULAR = Path(r"C:\Windows\Fonts\segoeui.ttf")
-FONT_SEMIBOLD = Path(r"C:\Windows\Fonts\seguisb.ttf")
-FONT_BOLD = Path(r"C:\Windows\Fonts\segoeuib.ttf")
+STORE_SIZE = (1366, 818)
+FONT_DIR = Path(os.environ.get("MATTESHOT_FONT_DIR", r"C:\Windows\Fonts"))
+FONT_REGULAR = FONT_DIR / "segoeui.ttf"
+FONT_SEMIBOLD = FONT_DIR / "seguisb.ttf"
+FONT_BOLD = FONT_DIR / "segoeuib.ttf"
 
 
 def font(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
@@ -32,8 +42,8 @@ def font(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
         return ImageFont.truetype(str(path), size)
     except OSError as error:
         raise RuntimeError(
-            "Matteshot launch assets require the Windows Segoe UI regular, "
-            "semibold, and bold font files under C:\\Windows\\Fonts."
+            "The store screenshots need the Segoe UI regular, semibold, and bold "
+            "font files. Set MATTESHOT_FONT_DIR to the folder that holds them."
         ) from error
 
 
@@ -134,7 +144,7 @@ def pill(draw: ImageDraw.ImageDraw, xy, label: str, accent=(108, 209, 198), font
 
 
 def brand(xy=(64, 44), dark=False):
-    icon_path = ROOT.parents[1] / "assets" / "icon-256.png"
+    icon_path = ROOT.parent / "assets" / "icon-256.png"
     icon = cached_image(str(icon_path)).resize((44, 44), Image.Resampling.LANCZOS)
     return icon, (xy[0] + 58, xy[1] + 7), (20, 27, 43) if dark else (255, 255, 255)
 
@@ -147,7 +157,8 @@ def add_brand(canvas: Image.Image, xy=(64, 40), label="MATTESHOT"):
 
 
 def save(canvas: Image.Image, name: str):
-    canvas.convert("RGB").save(OUT / name, quality=94, subsampling=0)
+    store = canvas.convert("RGB").resize(STORE_SIZE, Image.Resampling.LANCZOS)
+    store.save(OUT / name.replace(".jpg", ".png"), optimize=True)
 
 
 def slide_hero():
@@ -157,7 +168,7 @@ def slide_hero():
     text(draw, (66, 150), "Press PrtScn.\nPick a look.\nPaste.", 55, weight="bold", spacing=0)
     text(draw, (69, 355), "Six polished results before\nan editor ever opens.", 24, fill=(197, 206, 231), spacing=7)
     x = 67
-    for label in ("Native Windows", "Local processing", "$19 once"):
+    for label in ("Native Windows", "Local processing", "Free"):
         x += pill(draw, (x, 486), label, font_size=14) + 8
     if x - 8 >= 505:
         raise RuntimeError("Hero feature chips overlap the product screenshot")
@@ -333,7 +344,7 @@ def slide_trust():
     cards = [
         ("LOCAL", "Capture, OCR and editing\nhappen on your PC."),
         ("SIGNED", "Verified installer and\ntrusted automatic updates."),
-        ("ONE TIME", "$19 once. No account\nrequired for the trial."),
+        ("OPEN SOURCE", "Free, with no account.\nMIT or Apache-2.0."),
     ]
     for i, (head, body) in enumerate(cards):
         x = 83 + i * 393
@@ -343,205 +354,8 @@ def slide_trust():
         text(draw, (x + 172, 436), head, 17, fill=(112, 215, 201), weight="bold", anchor="mm")
         text(draw, (x + 172, 477), body, 16, fill=(220, 227, 244), anchor="mm", spacing=4)
     draw.rounded_rectangle((455, 581, 815, 647), radius=33, fill=(92, 113, 228))
-    text(draw, (635, 614), "Try everything free for 14 days", 20, weight="semibold", anchor="mm")
+    text(draw, (635, 614), "Free for Windows 10 and 11", 20, weight="semibold", anchor="mm")
     save(canvas, "07-private-native.jpg")
-
-
-def thumbnail():
-    image = gradient((240, 240), left=(52, 60, 145), right=(114, 68, 164))
-    icon = cached_image(str(ROOT.parents[1] / "assets" / "icon-256.png")).resize((142, 142), Image.Resampling.LANCZOS)
-    shadow = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).ellipse((50, 66, 190, 206), fill=(0, 0, 0, 100))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(22))
-    image.alpha_composite(shadow)
-    image.alpha_composite(icon, (49, 39))
-    draw = ImageDraw.Draw(image)
-    text(draw, (120, 207), "MATTESHOT", 17, weight="bold", anchor="mm")
-    image.convert("RGB").save(OUT / "thumbnail-240.png")
-
-
-def video_canvas(title: str, subtitle: str):
-    canvas = cached_gradient(left=(18, 25, 57), right=(42, 37, 96)).copy()
-    add_brand(canvas, (52, 35))
-    draw = ImageDraw.Draw(canvas)
-    text(draw, (635, 93), title, 43, weight="bold", anchor="mm")
-    text(draw, (635, 143), subtitle, 19, fill=(198, 208, 232), anchor="mm")
-    del draw
-    return canvas
-
-
-@lru_cache(maxsize=1)
-def phase_capture() -> Image.Image:
-    canvas = video_canvas("Press PrtScn", "Click a window or drag a region.")
-    raw = cached_image(str(CAPTURES / "demo" / "raw.png"))
-    pasted = paste_card(canvas, raw, (150, 183), (970, 535), radius=17, shadow=20)
-    draw = ImageDraw.Draw(canvas)
-    x, y, width, _ = pasted
-    draw.rounded_rectangle((x + width - 196, y + 20, x + width - 20, y + 58), radius=19, fill=(31, 42, 76, 235))
-    text(draw, (x + width - 108, y + 39), "WINDOW CAPTURE", 13, fill=(111, 214, 199), weight="bold", anchor="mm")
-    return canvas.convert("RGB")
-
-
-@lru_cache(maxsize=1)
-def phase_picker() -> Image.Image:
-    canvas = video_canvas("Pick a finished look", "The first result is already copied.")
-    picker_img = cached_image(str(CAPTURES / "picker" / "raw.png"))
-    picker = fit(picker_img, (1170, 250), contain=True)
-    paste_card(canvas, picker, (50, 238), (1170, 250), radius=16, shadow=18)
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((455, 580, 815, 635), radius=27, fill=(67, 178, 151))
-    text(draw, (635, 607), "Six styles. One click.", 20, weight="semibold", anchor="mm")
-    return canvas.convert("RGB")
-
-
-@lru_cache(maxsize=1)
-def phase_ocr() -> Image.Image:
-    canvas = video_canvas("Select text from the screenshot", "Offline OCR. Copy only what you need.")
-    editor = cached_image(str(CAPTURES / "editor" / "raw.png"))
-    pasted = paste_card(canvas, editor, (105, 165), (1060, 460), radius=16, shadow=22)
-    draw = ImageDraw.Draw(canvas)
-    button = map_source_rect(SELECT_TEXT_BUTTON, editor, pasted)
-    draw.rounded_rectangle(button, radius=6, outline=(104, 220, 201), width=3)
-    draw.line((button[0] + 8, button[1], 850, 645), fill=(104, 220, 201), width=3)
-    draw.rounded_rectangle((842, 628, 1138, 714), radius=18, fill=(31, 42, 76), outline=(104, 205, 190), width=2)
-    text(draw, (862, 642), "COPIED TEXT", 12, fill=(111, 214, 199), weight="bold")
-    text(draw, (862, 667), "Dashboard totals do not\nmatch export", 15, fill=(232, 237, 249), spacing=2)
-    return canvas.convert("RGB")
-
-
-@lru_cache(maxsize=1)
-def phase_video() -> Image.Image:
-    canvas = video_canvas("Annotate video, too", "Nine tools, precise timing and audio-preserving export.")
-    paste_card(canvas, video_annotation_preview(), (100, 172), (1070, 530), radius=16, shadow=22)
-    return canvas.convert("RGB")
-
-
-@lru_cache(maxsize=1)
-def phase_paste() -> Image.Image:
-    canvas = video_canvas("Paste anywhere.", "Email, chat, docs or your next launch.")
-    aurora = cached_image(str(CAPTURES / "demo" / "matte-aurora.png"))
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((145, 183, 1125, 702), radius=22, fill=(244, 246, 250), outline=(255, 255, 255, 40), width=1)
-    draw.rectangle((145, 183, 1125, 243), fill=(35, 39, 50))
-    text(draw, (178, 213), "New message", 18, weight="semibold", anchor="lm")
-    text(draw, (181, 273), "To:  Product team", 16, fill=(60, 68, 84))
-    draw.line((180, 305, 1090, 305), fill=(210, 216, 227), width=1)
-    text(draw, (181, 331), "The support dashboard is ready for review.", 17, fill=(47, 54, 70))
-    del draw
-    image = fit(aurora, (660, 305), contain=True)
-    canvas.alpha_composite(image, ((W - image.width) // 2, 370))
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((902, 648, 1080, 686), radius=19, fill=(92, 113, 228))
-    text(draw, (991, 667), "Send", 16, weight="semibold", anchor="mm")
-    return canvas.convert("RGB")
-
-
-PHASES = (
-    (2.6, phase_capture),
-    (2.6, phase_picker),
-    (3.0, phase_ocr),
-    (3.0, phase_video),
-    (2.8, phase_paste),
-)
-
-
-@lru_cache(maxsize=1)
-def phase_bridge() -> Image.Image:
-    canvas = cached_gradient(left=(18, 25, 57), right=(42, 37, 96)).copy()
-    add_brand(canvas, (52, 35))
-    return canvas.convert("RGB")
-
-
-def smoothstep(value: float) -> float:
-    value = max(0.0, min(1.0, value))
-    return value * value * (3 - 2 * value)
-
-
-def demo_frame(time_s: float, fps: int = 30) -> Image.Image:
-    elapsed = 0.0
-    transition = 0.32
-    for index, (duration, renderer) in enumerate(PHASES):
-        local = time_s - elapsed
-        if local < duration or index == len(PHASES) - 1:
-            frame = renderer()
-            if index < len(PHASES) - 1 and local > duration - transition:
-                sampled_span = max(transition - 1 / fps, 1e-6)
-                progress = min(1.0, (local - (duration - transition)) / sampled_span)
-                if progress < 0.5:
-                    frame = Image.blend(frame, phase_bridge(), smoothstep(progress * 2))
-                else:
-                    frame = Image.blend(
-                        phase_bridge(),
-                        PHASES[index + 1][1](),
-                        smoothstep((progress - 0.5) * 2),
-                    )
-            return frame
-        elapsed += duration
-    return PHASES[-1][1]()
-
-
-def demo_video():
-    fps = 30
-    duration = sum(duration for duration, _ in PHASES)
-    mp4 = OUT / "matteshot-product-hunt-demo.mp4"
-    # High-quality standard-profile H.264 preserves small UI text while staying
-    # compatible with browser and hardware decoders.
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
-        "-r", str(fps), "-i", "-", "-an", "-c:v", "libx264", "-preset", "medium",
-        "-tune", "stillimage", "-crf", "8", "-profile:v", "high", "-level", "4.1",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
-    ]
-    proc = subprocess.Popen(command, stdin=subprocess.PIPE, bufsize=0)
-    if proc.stdin is None:
-        raise RuntimeError("ffmpeg did not expose a frame input stream")
-    pipe_error = None
-    try:
-        for i in range(round(duration * fps)):
-            frame = demo_frame(i / fps, fps)
-            payload = frame.tobytes()
-            expected_bytes = W * H * 3
-            if frame.mode != "RGB" or frame.size != (W, H) or len(payload) != expected_bytes:
-                raise RuntimeError(
-                    f"Invalid raw frame {i}: mode={frame.mode}, size={frame.size}, bytes={len(payload)}"
-                )
-            remaining = memoryview(payload)
-            while remaining:
-                written = proc.stdin.write(remaining)
-                if written is None or written <= 0:
-                    raise BrokenPipeError("ffmpeg stopped accepting raw frame data")
-                remaining = remaining[written:]
-    except BrokenPipeError as error:
-        pipe_error = error
-    finally:
-        try:
-            if not proc.stdin.closed:
-                proc.stdin.close()
-        except BrokenPipeError:
-            pass
-        code = proc.wait()
-    if pipe_error is not None:
-        raise RuntimeError(
-            f"ffmpeg stopped while encoding frames (exit code {code})"
-        ) from pipe_error
-    if code != 0:
-        raise RuntimeError(f"ffmpeg failed to encode the demo (exit code {code})")
-
-    palette = OUT / "demo-palette.png"
-    gif = OUT / "matteshot-product-hunt-demo.gif"
-    subprocess.run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4),
-        "-vf", "fps=10,scale=760:-1:flags=lanczos,palettegen=max_colors=128", str(palette)
-    ], check=True)
-    subprocess.run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(mp4), "-i", str(palette), "-lavfi",
-        "fps=10,scale=760:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=4", str(gif)
-    ], check=True)
-    palette.unlink(missing_ok=True)
-    if gif.stat().st_size > 3_000_000:
-        raise RuntimeError(f"Product Hunt GIF is too large: {gif.stat().st_size:,} bytes")
 
 
 def main():
@@ -552,8 +366,6 @@ def main():
     slide_video()
     slide_capture_more()
     slide_trust()
-    thumbnail()
-    demo_video()
     for file in sorted(OUT.iterdir()):
         print(f"{file.name}: {file.stat().st_size:,} bytes")
 
