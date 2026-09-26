@@ -616,7 +616,7 @@ fn capture_loop(
             blank_frames += 1;
             if blank_frames >= fps * 3 {
                 bail!(
-                    "The selected window returned only blank frames for three seconds. Windows does not hand protected video (Netflix and other DRM players) to any screen recorder, and some apps draw video through a hardware overlay that capture cannot read either. Recording a region of the monitor will not help, because it reads the same surface."
+                    "The selected window returned only blank frames for three seconds. Windows does not hand protected video (Netflix and other DRM players) to any screen recorder, whether you record the window or a region. For other apps that draw through a hardware overlay, recording a region of the monitor may work."
                 );
             }
         } else {
