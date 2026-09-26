@@ -219,14 +219,14 @@ fn raster_text(text: &str, px_height: i32) -> Option<(Vec<u8>, i32, i32)> {
             0,
             0,
             0,
-            DEFAULT_CHARSET.0 as u32,
-            0,
-            0,
-            ANTIALIASED_QUALITY.0 as u32,
+            DEFAULT_CHARSET,
+            windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+            windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+            ANTIALIASED_QUALITY,
             FF_DONTCARE.0 as u32,
             w!("Segoe UI"),
         );
-        let old_font = SelectObject(hdc, font);
+        let old_font = SelectObject(hdc, font.into());
 
         let mut wtext: Vec<u16> = text.encode_utf16().collect();
         let mut rc = windows::Win32::Foundation::RECT::default();
@@ -249,13 +249,13 @@ fn raster_text(text: &str, px_height: i32) -> Option<(Vec<u8>, i32, i32)> {
             ..Default::default()
         };
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let Ok(bmp) = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
+        let Ok(bmp) = CreateDIBSection(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
             SelectObject(hdc, old_font);
-            let _ = DeleteObject(font);
+            let _ = DeleteObject(font.into());
             let _ = DeleteDC(hdc);
             return None;
         };
-        let old_bmp = SelectObject(hdc, bmp);
+        let old_bmp = SelectObject(hdc, bmp.into());
         // Black background is already zeroed; draw white text.
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x00FFFFFF));
@@ -274,8 +274,8 @@ fn raster_text(text: &str, px_height: i32) -> Option<(Vec<u8>, i32, i32)> {
 
         SelectObject(hdc, old_bmp);
         SelectObject(hdc, old_font);
-        let _ = DeleteObject(bmp);
-        let _ = DeleteObject(font);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteObject(font.into());
         let _ = DeleteDC(hdc);
         Some((alpha, w, h))
     }

@@ -130,7 +130,7 @@ struct InternetHandle(*mut c_void);
 impl InternetHandle {
     fn new(raw: *mut c_void, what: &str) -> Result<Self> {
         if raw.is_null() {
-            Err(windows::core::Error::from_win32()).with_context(|| what.to_owned())
+            Err(windows::core::Error::from_thread()).with_context(|| what.to_owned())
         } else {
             Ok(Self(raw))
         }

@@ -56,10 +56,10 @@ unsafe fn font(height: i32, weight: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -78,7 +78,14 @@ unsafe fn draw_text(
     color: COLORREF,
     flags: u32,
 ) {
-    SelectObject(hdc, if small { state.font_small } else { state.font });
+    SelectObject(
+        hdc,
+        if small {
+            state.font_small.into()
+        } else {
+            state.font.into()
+        },
+    );
     SetTextColor(hdc, color);
     let mut value = wide(text);
     let mut rect = rect;
@@ -104,9 +111,9 @@ unsafe fn commit(hwnd: HWND, state: &mut State) {
         let _ = DestroyWindow(hwnd);
     } else {
         state.invalid = true;
-        let _ = InvalidateRect(hwnd, None, false);
-        let _ = SetFocus(state.edit);
-        SendMessageW(state.edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        let _ = SetFocus(Some(state.edit));
+        SendMessageW(state.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
     }
 }
 
@@ -137,7 +144,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     let previous = std::mem::replace(&mut *slot, replacement);
                     if !previous.is_invalid() {
-                        let _ = DeleteObject(previous);
+                        let _ = DeleteObject(previous.into());
                     }
                 }
                 let _ = MoveWindow(
@@ -151,10 +158,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 SendMessageW(
                     state.edit,
                     windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
-                    WPARAM(state.font.0 as usize),
-                    LPARAM(1),
+                    Some(WPARAM(state.font.0 as usize)),
+                    Some(LPARAM(1)),
                 );
-                let _ = InvalidateRect(hwnd, None, true);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -176,7 +183,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = GetClientRect(hwnd, &mut client);
                 let bg = CreateSolidBrush(state.theme.bg);
                 FillRect(hdc, &client, bg);
-                let _ = DeleteObject(bg);
+                let _ = DeleteObject(bg.into());
                 SetBkMode(hdc, TRANSPARENT);
                 let margin = sc(state, 22);
                 draw_text(
@@ -249,7 +256,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.theme.chip
                     });
                     FillRect(hdc, &rect, brush);
-                    let _ = DeleteObject(brush);
+                    let _ = DeleteObject(brush.into());
                     draw_text(
                         hdc,
                         state,
@@ -376,9 +383,9 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
             y,
             bounds.right - bounds.left,
             bounds.bottom - bounds.top,
-            owner,
+            Some(owner),
             None,
-            instance,
+            Some(instance.into()),
             Some((&mut *state as *mut State).cast()),
         )?;
         let initial = if (OUTPUT_CUSTOM_MIN..=OUTPUT_CUSTOM_MAX).contains(&current) {
@@ -396,9 +403,9 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
             px(72),
             px(316),
             px(34),
-            hwnd,
+            Some(hwnd),
             None,
-            instance,
+            Some(instance.into()),
             None,
         )?;
         if !owner.0.is_null() {
@@ -407,18 +414,34 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
         SendMessageW(
             state.edit,
             windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
-            WPARAM(state.font.0 as usize),
-            LPARAM(1),
+            Some(WPARAM(state.font.0 as usize)),
+            Some(LPARAM(1)),
         );
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
         let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(state.edit);
-        SendMessageW(state.edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+        let _ = SetFocus(Some(state.edit));
+        SendMessageW(state.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
 
         let mut message = MSG::default();
-        while IsWindow(hwnd).as_bool() && GetMessageW(&mut message, None, 0, 0).as_bool() {
+        while IsWindow(Some(hwnd)).as_bool() && GetMessageW(&mut message, None, 0, 0).as_bool() {
             if message.message == WM_KEYDOWN {
                 match message.wParam.0 as u16 {
                     key if key == VK_RETURN.0 => {
@@ -440,9 +463,9 @@ pub fn ask(owner: HWND, current: u32) -> Result<Option<u32>> {
             let _ = SetForegroundWindow(owner);
         }
         let result = state.result;
-        let _ = DeleteObject(state.font);
-        let _ = DeleteObject(state.font_small);
-        let _ = DeleteObject(state.edit_brush);
+        let _ = DeleteObject(state.font.into());
+        let _ = DeleteObject(state.font_small.into());
+        let _ = DeleteObject(state.edit_brush.into());
         Ok(result)
     }
 }

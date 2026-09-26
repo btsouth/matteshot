@@ -180,7 +180,7 @@ pub(crate) unsafe fn app_icon() -> HICON {
     };
     if let Ok(hinstance) = GetModuleHandleW(None) {
         if let Ok(h) = LoadImageW(
-            hinstance,
+            Some(hinstance.into()),
             windows::core::PCWSTR(1 as *const u16),
             IMAGE_ICON,
             0,
@@ -211,8 +211,8 @@ unsafe fn make_icon() -> HICON {
     };
     let screen = GetDC(None);
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let color =
-        CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0).expect("icon dib");
+    let color = CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+        .expect("icon dib");
     ReleaseDC(None, screen);
     let px = std::slice::from_raw_parts_mut(bits as *mut u8, (S * S * 4) as usize);
 
@@ -263,8 +263,8 @@ unsafe fn make_icon() -> HICON {
         ..Default::default()
     };
     let icon = CreateIconIndirect(&icon_info).expect("icon");
-    let _ = DeleteObject(color);
-    let _ = DeleteObject(mask);
+    let _ = DeleteObject(color.into());
+    let _ = DeleteObject(mask.into());
     icon
 }
 
@@ -339,7 +339,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
         TPM_RETURNCMD | TPM_NONOTIFY | TPM_BOTTOMALIGN,
         pt.x,
         pt.y,
-        0,
+        None,
         hwnd,
         None,
     );
@@ -348,7 +348,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     // Documented TrackPopupMenu quirk: without this, the next click on the
     // tray icon can be swallowed by leftover menu state.
     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-        hwnd,
+        Some(hwnd),
         windows::Win32::UI::WindowsAndMessaging::WM_NULL,
         WPARAM(0),
         LPARAM(0),
@@ -368,7 +368,7 @@ unsafe fn show_menu(hwnd: HWND, state: &mut TrayState) {
     };
     if let Some(action) = action {
         let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-            hwnd,
+            Some(hwnd),
             WM_TRAY_ACTION,
             WPARAM(action as usize),
             LPARAM(0),
@@ -386,7 +386,7 @@ fn post_action(action: Action) -> bool {
     };
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-            hwnd,
+            Some(hwnd),
             WM_TRAY_ACTION,
             WPARAM(action as usize),
             LPARAM(0),
@@ -542,7 +542,7 @@ impl Tray {
                 0,
                 None,
                 None,
-                hinstance,
+                Some(hinstance.into()),
                 Some(&mut *state as *mut TrayState as *const _),
             )
             .context("create tray window")?;
@@ -562,7 +562,7 @@ impl Tray {
                 .collect();
             data.szTip[..tip.len()].copy_from_slice(&tip);
             let _ = Shell_NotifyIconW(NIM_ADD, &data);
-            let _ = SetTimer(hwnd, 1, 250, None);
+            let _ = SetTimer(Some(hwnd), 1, 250, None);
 
             Ok(Tray {
                 hwnd,
@@ -601,7 +601,7 @@ impl Tray {
 
     pub fn remove(&self) {
         unsafe {
-            let _ = KillTimer(self.hwnd, 1);
+            let _ = KillTimer(Some(self.hwnd), 1);
             let data = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: self.hwnd,

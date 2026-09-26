@@ -563,10 +563,10 @@ unsafe fn make_font(height: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -708,7 +708,7 @@ fn build_layout(scale: f32, cw: i32) -> LaidOut {
 }
 
 unsafe fn draw_text_in(hdc: HDC, font: HFONT, color: COLORREF, r: RECT, text: &str, flags: u32) {
-    SelectObject(hdc, font);
+    SelectObject(hdc, font.into());
     SetTextColor(hdc, color);
     let mut t = wide(text);
     let mut rc = r;
@@ -748,8 +748,8 @@ unsafe fn draw_chip_button(hdc: HDC, r: RECT, label: &str, state: &State, active
             state.theme.chip_line
         },
     );
-    let ob = SelectObject(hdc, fill);
-    let op = SelectObject(hdc, pen);
+    let ob = SelectObject(hdc, fill.into());
+    let op = SelectObject(hdc, pen.into());
     let _ = RoundRect(
         hdc,
         r.left,
@@ -761,8 +761,8 @@ unsafe fn draw_chip_button(hdc: HDC, r: RECT, label: &str, state: &State, active
     );
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
-    let _ = DeleteObject(fill);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(fill.into());
+    let _ = DeleteObject(pen.into());
     let color = if active {
         state.theme.accent_text
     } else if hot {
@@ -770,7 +770,7 @@ unsafe fn draw_chip_button(hdc: HDC, r: RECT, label: &str, state: &State, active
     } else {
         state.theme.muted
     };
-    SelectObject(hdc, state.font);
+    SelectObject(hdc, state.font.into());
     SetTextColor(hdc, color);
     let mut t = wide(label);
     let mut rc = r;
@@ -803,8 +803,8 @@ unsafe fn draw_checkbox(hdc: HDC, r: RECT, label: &str, state: &State, checked: 
             state.theme.chip_line
         },
     );
-    let ob = SelectObject(hdc, fill);
-    let op = SelectObject(hdc, pen);
+    let ob = SelectObject(hdc, fill.into());
+    let op = SelectObject(hdc, pen.into());
     let _ = RoundRect(
         hdc,
         box_r.left,
@@ -816,8 +816,8 @@ unsafe fn draw_checkbox(hdc: HDC, r: RECT, label: &str, state: &State, checked: 
     );
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
-    let _ = DeleteObject(fill);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(fill.into());
+    let _ = DeleteObject(pen.into());
     if checked {
         draw_text_in(
             hdc,
@@ -858,7 +858,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         },
         bg,
     );
-    let _ = DeleteObject(bg);
+    let _ = DeleteObject(bg.into());
     SetBkMode(hdc, TRANSPARENT);
 
     // Furniture first, from the same layout pass that placed the controls.
@@ -925,7 +925,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 } else {
                     state.cfg.video_dir().display().to_string()
                 };
-                SelectObject(hdc, state.font);
+                SelectObject(hdc, state.font.into());
                 SetTextColor(hdc, state.theme.text);
                 let mut wide_text = wide(&text);
                 let mut rc = RECT {
@@ -1148,7 +1148,7 @@ unsafe fn pick_folder(hwnd: HWND) -> Option<String> {
     dialog
         .SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
         .ok()?;
-    dialog.Show(hwnd).ok()?;
+    dialog.Show(Some(hwnd)).ok()?;
     let item = dialog.GetResult().ok()?;
     let pw = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
     let path = pw.to_string().ok();
@@ -1169,7 +1169,7 @@ unsafe fn update_config(hwnd: HWND, state: &mut State, change: impl FnOnce(&mut 
             let title: Vec<u16> = "Matteshot\0".encode_utf16().collect();
             let message: Vec<u16> = format!("{message}\0").encode_utf16().collect();
             let _ = MessageBoxW(
-                hwnd,
+                Some(hwnd),
                 windows::core::PCWSTR(message.as_ptr()),
                 windows::core::PCWSTR(title.as_ptr()),
                 MB_OK | MB_ICONERROR,
@@ -1224,7 +1224,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
                 let title: Vec<u16> = "Matteshot\0".encode_utf16().collect();
                 let message: Vec<u16> = format!("{error}\0").encode_utf16().collect();
                 let _ = MessageBoxW(
-                    hwnd,
+                    Some(hwnd),
                     windows::core::PCWSTR(message.as_ptr()),
                     windows::core::PCWSTR(title.as_ptr()),
                     MB_OK | MB_ICONERROR,
@@ -1290,7 +1290,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             // Confirmation is the explicit request. Yes clears titles only;
             // capture files stay unless the user uses History Delete.
             let confirmed = MessageBoxW(
-                hwnd,
+                Some(hwnd),
                 w!("Remove stored window titles from History?\r\n\r\nScreenshot and video files stay on disk."),
                 w!("Matteshot"),
                 MB_YESNO | MB_ICONWARNING,
@@ -1308,7 +1308,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
                             )
                         };
                         let _ = MessageBoxW(
-                            hwnd,
+                            Some(hwnd),
                             PCWSTR(HSTRING::from(text).as_ptr()),
                             w!("Matteshot"),
                             MB_OK | MB_ICONINFORMATION,
@@ -1317,7 +1317,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
                     Err(error) => {
                         let text = format!("History titles could not be cleared.\n\n{error:#}");
                         let _ = MessageBoxW(
-                            hwnd,
+                            Some(hwnd),
                             PCWSTR(HSTRING::from(text).as_ptr()),
                             w!("Matteshot"),
                             MB_OK | MB_ICONERROR,
@@ -1327,7 +1327,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctrl: Ctrl) {
             }
         }
     }
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 unsafe fn sync_viewport(hwnd: HWND, state: &mut State) {
@@ -1454,13 +1454,13 @@ unsafe fn handle_settings_key(
     if vk == VK_TAB.0 as u32 {
         let next = next_reachable(&state.controls, state.focus, shift);
         move_focus(state, next);
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         return LRESULT(0);
     }
     if vk == VK_DOWN.0 as u32 || vk == VK_UP.0 as u32 {
         let next = next_reachable(&state.controls, state.focus, vk == VK_UP.0 as u32);
         move_focus(state, next);
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         return LRESULT(0);
     }
     let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
@@ -1474,23 +1474,23 @@ unsafe fn handle_settings_key(
     if vk == VK_PRIOR.0 as u32 {
         state.scroll_y = (state.scroll_y - state.viewport_h.max(1))
             .clamp(0, max_scroll(state.height, state.viewport_h));
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         return LRESULT(0);
     }
     if vk == VK_NEXT.0 as u32 {
         state.scroll_y = (state.scroll_y + state.viewport_h.max(1))
             .clamp(0, max_scroll(state.height, state.viewport_h));
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         return LRESULT(0);
     }
     if vk == VK_HOME.0 as u32 {
         state.scroll_y = 0;
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         return LRESULT(0);
     }
     if vk == VK_END.0 as u32 {
         state.scroll_y = max_scroll(state.height, state.viewport_h);
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1524,7 +1524,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     let previous = std::mem::replace(&mut *slot, replacement);
                     if !previous.is_invalid() {
-                        let _ = DeleteObject(previous);
+                        let _ = DeleteObject(previous.into());
                     }
                 }
                 // Hover is an index into the controls just replaced.
@@ -1538,7 +1538,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if state.focus >= 0 {
                     move_focus(state, state.focus);
                 }
-                let _ = InvalidateRect(hwnd, None, true);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -1546,7 +1546,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DISPLAYCHANGE => {
             if let Some(state) = state_of(hwnd) {
                 reclamp_to_monitor(hwnd, state);
-                let _ = InvalidateRect(hwnd, None, true);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -1573,13 +1573,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else {
                     (state.width, state.viewport_h.max(1))
                 };
-                let mem = CreateCompatibleDC(hdc);
+                let mem = CreateCompatibleDC(Some(hdc));
                 let bmp = CreateCompatibleBitmap(hdc, state.width.max(1), state.height.max(1));
-                let old = SelectObject(mem, bmp);
+                let old = SelectObject(mem, bmp.into());
                 paint(mem, state);
-                let _ = BitBlt(hdc, 0, 0, vw, vh, mem, 0, state.scroll_y, SRCCOPY);
+                let _ = BitBlt(hdc, 0, 0, vw, vh, Some(mem), 0, state.scroll_y, SRCCOPY);
                 SelectObject(mem, old);
-                let _ = DeleteObject(bmp);
+                let _ = DeleteObject(bmp.into());
                 let _ = DeleteDC(mem);
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -1602,7 +1602,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let down = |key: VIRTUAL_KEY| (GetKeyState(key.0 as i32) as u16 & 0x8000) != 0;
                 if vk == VK_ESCAPE.0 as u32 {
                     state.capturing = false;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
                 // Holding a modifier is not yet a choice; keep waiting for the
@@ -1645,7 +1645,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.capturing = false;
                     crate::rebind_capture_hotkey();
                 }
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -1655,7 +1655,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 if state.capturing {
                     state.capturing = false;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -1669,7 +1669,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let hover = hit_test_control(&state.controls, x, y, state.scroll_y);
                 if hover != state.hover {
                     state.hover = hover;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -1680,14 +1680,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let step = if delta > 0 { -WHEEL_STEP } else { WHEEL_STEP };
                 state.scroll_y =
                     (state.scroll_y + step).clamp(0, max_scroll(state.height, state.viewport_h));
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
         WM_SIZE => {
             if let Some(state) = state_of(hwnd) {
                 sync_viewport(hwnd, state);
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -1711,7 +1711,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 state.theme = crate::theme::current();
                 crate::theme::apply_titlebar(hwnd, &state.theme);
-                let _ = InvalidateRect(hwnd, None, true);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -1723,8 +1723,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
-                let _ = DeleteObject(state.font);
-                let _ = DeleteObject(state.font_small);
+                let _ = DeleteObject(state.font.into());
+                let _ = DeleteObject(state.font_small.into());
             }
             WINDOW.store(0, Ordering::SeqCst);
             LRESULT(0)
@@ -1737,12 +1737,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 pub fn open() -> Result<()> {
     unsafe {
         let existing = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        if !existing.0.is_null() && IsWindow(existing).as_bool() {
+        if !existing.0.is_null() && IsWindow(Some(existing)).as_bool() {
             let _ = ShowWindow(existing, SW_RESTORE);
-            let _ = SetWindowPos(existing, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             let _ = SetWindowPos(
                 existing,
-                HWND_NOTOPMOST,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            );
+            let _ = SetWindowPos(
+                existing,
+                Some(HWND_NOTOPMOST),
                 0,
                 0,
                 0,
@@ -1754,7 +1762,7 @@ pub fn open() -> Result<()> {
             // monitor, or the taskbar may have grown, since it last fitted.
             if let Some(state) = state_of(existing) {
                 reclamp_to_monitor(existing, state);
-                let _ = InvalidateRect(existing, None, false);
+                let _ = InvalidateRect(Some(existing), None, false);
             }
             eprintln!("settings: focused existing window");
             return Ok(());
@@ -1829,7 +1837,7 @@ pub fn open() -> Result<()> {
             fitted.outer_h,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(leaked as *const _),
         ) {
             Ok(h) => h,
@@ -1849,8 +1857,24 @@ pub fn open() -> Result<()> {
         // permission, so SetForegroundWindow alone silently fails and the new
         // window is born BEHIND the active app. The topmost toggle forces
         // z-order without needing activation rights.
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
         let _ = SetForegroundWindow(hwnd);
         eprintln!("settings: opened");
         Ok(())
@@ -1860,13 +1884,13 @@ pub fn open() -> Result<()> {
 pub fn refresh() {
     unsafe {
         let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        if !hwnd.0.is_null() && IsWindow(hwnd).as_bool() {
+        if !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool() {
             if let Some(state) = state_of(hwnd) {
                 state.cfg = Config::load();
                 state.hover = -1;
                 reclamp_to_monitor(hwnd, state);
             }
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
 }
@@ -1879,7 +1903,7 @@ pub fn refresh() {
 pub fn is_open() -> bool {
     unsafe {
         let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        !hwnd.0.is_null() && IsWindow(hwnd).as_bool()
+        !hwnd.0.is_null() && IsWindow(Some(hwnd)).as_bool()
     }
 }
 

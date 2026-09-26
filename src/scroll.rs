@@ -280,10 +280,10 @@ unsafe extern "system" fn pill_proc(
                     },
                     bg,
                 );
-                let _ = DeleteObject(bg);
+                let _ = DeleteObject(bg.into());
                 SetBkMode(hdc, TRANSPARENT);
 
-                SelectObject(hdc, p.font);
+                SelectObject(hdc, p.font.into());
                 SetTextColor(hdc, p.theme.text);
                 let mut t = p.text.clone();
                 let mut r = RECT {
@@ -297,7 +297,7 @@ unsafe extern "system" fn pill_proc(
                 let hot = hovering_stop(hwnd, p);
                 let fill = CreateSolidBrush(if hot { p.theme.accent } else { p.theme.chip });
                 FillRect(hdc, &p.stop_rect, fill);
-                let _ = DeleteObject(fill);
+                let _ = DeleteObject(fill.into());
                 SetTextColor(
                     hdc,
                     if hot {
@@ -315,7 +315,7 @@ unsafe extern "system" fn pill_proc(
                     DT_CENTER | DT_SINGLELINE | DT_VCENTER,
                 );
 
-                SelectObject(hdc, p.font_small);
+                SelectObject(hdc, p.font_small.into());
                 SetTextColor(hdc, p.theme.faint);
                 let mut hint = p.hint.clone();
                 let mut hr = RECT {
@@ -338,7 +338,7 @@ unsafe extern "system" fn pill_proc(
         // Repaint so the Stop button lights up under the pointer; the hover
         // test itself happens in WM_PAINT.
         WM_MOUSEMOVE => {
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         // Down, not up: the capture teleports the cursor back to the scroll
@@ -378,10 +378,10 @@ unsafe fn make_font(height: i32, weight: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -439,13 +439,13 @@ unsafe fn show_pill(
         h,
         None,
         None,
-        hinstance,
+        Some(hinstance.into()),
         Some(&mut *pill as *mut Pill as *const _),
     ) {
         Ok(hwnd) => hwnd,
         Err(error) => {
-            let _ = DeleteObject(pill.font);
-            let _ = DeleteObject(pill.font_small);
+            let _ = DeleteObject(pill.font.into());
+            let _ = DeleteObject(pill.font_small.into());
             return Err(error.into());
         }
     };
@@ -465,7 +465,7 @@ unsafe fn show_pill(
     // worse than one that was never offered. Esc and the button are unaffected,
     // so this degrades rather than fails.
     if RegisterHotKey(
-        hwnd,
+        Some(hwnd),
         STOP_HOTKEY,
         MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
         0x53, // S
@@ -812,12 +812,12 @@ impl Drop for CaptureCleanup {
     fn drop(&mut self) {
         unsafe {
             if let Some((hwnd, pill)) = self.pill.take() {
-                let _ = UnregisterHotKey(hwnd, STOP_HOTKEY);
+                let _ = UnregisterHotKey(Some(hwnd), STOP_HOTKEY);
                 // Before the fonts, and before `pill` falls out of scope: the
                 // window procedure can still run during destruction.
                 let _ = DestroyWindow(hwnd);
-                let _ = DeleteObject(pill.font);
-                let _ = DeleteObject(pill.font_small);
+                let _ = DeleteObject(pill.font.into());
+                let _ = DeleteObject(pill.font_small.into());
             }
             let _ = SetCursorPos(self.saved.x, self.saved.y);
         }
@@ -1220,7 +1220,7 @@ pub fn capture(target: Target) -> Result<RgbaImage> {
             pill_state.text = wide(&format!("Scrolling\u{2026}  {} px", canvas.height()));
         }
         unsafe {
-            let _ = InvalidateRect(pill, None, false);
+            let _ = InvalidateRect(Some(pill), None, false);
         }
         pump();
     }

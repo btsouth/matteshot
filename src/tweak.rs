@@ -648,10 +648,10 @@ unsafe fn make_font(height: i32, weight: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -1297,7 +1297,8 @@ fn enter_text_select(hwnd: HWND, state: &mut State) {
             let hwnd = HWND(target as *mut _);
             OCR_COMPLETIONS.post_with_at(target, mailbox_generation, completion, |token| {
                 crate::window::has_class(hwnd, "matteshot_tweak")
-                    && PostMessageW(hwnd, WM_OCR_READY, WPARAM(0), LPARAM(token as isize)).is_ok()
+                    && PostMessageW(Some(hwnd), WM_OCR_READY, WPARAM(0), LPARAM(token as isize))
+                        .is_ok()
             });
         }
     });
@@ -1310,9 +1311,9 @@ unsafe fn wash_all(hdc: HDC, color: COLORREF, rects: &[(RECT, u8)]) {
     if rects.is_empty() {
         return;
     }
-    let mem = CreateCompatibleDC(hdc);
+    let mem = CreateCompatibleDC(Some(hdc));
     let bmp = CreateCompatibleBitmap(hdc, 1, 1);
-    let old = SelectObject(mem, bmp);
+    let old = SelectObject(mem, bmp.into());
     let brush = CreateSolidBrush(color);
     FillRect(
         mem,
@@ -1349,8 +1350,8 @@ unsafe fn wash_all(hdc: HDC, color: COLORREF, rects: &[(RECT, u8)]) {
         );
     }
     SelectObject(mem, old);
-    let _ = DeleteObject(bmp);
-    let _ = DeleteObject(brush);
+    let _ = DeleteObject(bmp.into());
+    let _ = DeleteObject(brush.into());
     let _ = DeleteDC(mem);
 }
 
@@ -1634,14 +1635,14 @@ unsafe fn chip(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot:
             state.theme.chip_line
         },
     );
-    let ob = SelectObject(hdc, fill);
-    let op = SelectObject(hdc, pen);
+    let ob = SelectObject(hdc, fill.into());
+    let op = SelectObject(hdc, pen.into());
     let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, 10, 10);
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
-    let _ = DeleteObject(fill);
-    let _ = DeleteObject(pen);
-    SelectObject(hdc, state.font);
+    let _ = DeleteObject(fill.into());
+    let _ = DeleteObject(pen.into());
+    SelectObject(hdc, state.font.into());
     SetTextColor(
         hdc,
         if active {
@@ -1658,7 +1659,7 @@ unsafe fn chip(hdc: HDC, r: RECT, label: &str, state: &State, active: bool, hot:
 }
 
 unsafe fn label(hdc: HDC, state: &State, x: i32, y: i32, text: &str) {
-    SelectObject(hdc, state.font_small);
+    SelectObject(hdc, state.font_small.into());
     SetTextColor(hdc, state.theme.muted);
     let mut t = wide(text);
     let mut rc = RECT {
@@ -1671,7 +1672,7 @@ unsafe fn label(hdc: HDC, state: &State, x: i32, y: i32, text: &str) {
 }
 
 unsafe fn clipped_label(hdc: HDC, state: &State, mut r: RECT, text: &str) {
-    SelectObject(hdc, state.font_small);
+    SelectObject(hdc, state.font_small.into());
     SetTextColor(hdc, state.theme.muted);
     let mut t = wide(text);
     DrawTextW(
@@ -1685,13 +1686,13 @@ unsafe fn clipped_label(hdc: HDC, state: &State, mut r: RECT, text: &str) {
 unsafe fn custom_size_field(hdc: HDC, r: RECT, state: &State, _hot: bool) {
     let fill = CreateSolidBrush(state.theme.bg);
     let pen = CreatePen(PS_SOLID, 2, state.theme.accent);
-    let old_brush = SelectObject(hdc, fill);
-    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, fill.into());
+    let old_pen = SelectObject(hdc, pen.into());
     let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, 10, 10);
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
-    let _ = DeleteObject(fill);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(fill.into());
+    let _ = DeleteObject(pen.into());
 
     let edit = state.custom_size_edit.as_ref().unwrap();
     let axis = custom_size_axis(composed_dimensions(state)).to_uppercase();
@@ -1705,7 +1706,7 @@ unsafe fn custom_size_field(hdc: HDC, r: RECT, state: &State, _hot: bool) {
     };
     clipped_label(hdc, state, label_rect, &format!("{axis} (PX)"));
 
-    SelectObject(hdc, state.font);
+    SelectObject(hdc, state.font.into());
     SetTextColor(hdc, state.theme.text);
     let caret = if state.caret_on { "\u{2502}" } else { " " };
     let mut value = wide(&format!("{}{caret}", edit.input));
@@ -1736,7 +1737,7 @@ unsafe fn paint_slider(hdc: HDC, state: &State, rect: RECT, t: f32, active: bool
         },
         track,
     );
-    let _ = DeleteObject(track);
+    let _ = DeleteObject(track.into());
     let tx = rect.left + ((rect.right - rect.left) as f32 * t.clamp(0.0, 1.0)) as i32;
     let color = if active {
         state.theme.accent
@@ -1755,8 +1756,8 @@ unsafe fn paint_slider(hdc: HDC, state: &State, rect: RECT, t: f32, active: bool
         fill,
     );
     let pen = CreatePen(PS_SOLID, 1, color);
-    let old_brush = SelectObject(hdc, fill);
-    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, fill.into());
+    let old_pen = SelectObject(hdc, pen.into());
     let radius = (6.0 * state.scale).round() as i32;
     let _ = RoundRect(
         hdc,
@@ -1769,8 +1770,8 @@ unsafe fn paint_slider(hdc: HDC, state: &State, rect: RECT, t: f32, active: bool
     );
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
-    let _ = DeleteObject(fill);
-    let _ = DeleteObject(pen);
+    let _ = DeleteObject(fill.into());
+    let _ = DeleteObject(pen.into());
 }
 
 /// Tab strip across the top: one per open capture, active one lit.
@@ -1792,8 +1793,8 @@ unsafe fn paint_tabs(hdc: HDC, state: &State) {
                 state.theme.chip_line
             },
         );
-        let ob = SelectObject(hdc, fill);
-        let op = SelectObject(hdc, pen);
+        let ob = SelectObject(hdc, fill.into());
+        let op = SelectObject(hdc, pen.into());
         let _ = RoundRect(
             hdc,
             tab.rect.left,
@@ -1805,10 +1806,10 @@ unsafe fn paint_tabs(hdc: HDC, state: &State) {
         );
         SelectObject(hdc, ob);
         SelectObject(hdc, op);
-        let _ = DeleteObject(fill);
-        let _ = DeleteObject(pen);
+        let _ = DeleteObject(fill.into());
+        let _ = DeleteObject(pen.into());
 
-        SelectObject(hdc, state.font_small);
+        SelectObject(hdc, state.font_small.into());
         SetTextColor(
             hdc,
             if active {
@@ -1864,7 +1865,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         },
         bg,
     );
-    let _ = DeleteObject(bg);
+    let _ = DeleteObject(bg.into());
     SetBkMode(hdc, TRANSPARENT);
     paint_tabs(hdc, state);
 
@@ -1962,7 +1963,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
             ],
         );
         let pen = CreatePen(PS_SOLID, 1, state.theme.accent);
-        let op = SelectObject(hdc, pen);
+        let op = SelectObject(hdc, pen.into());
         let ob = SelectObject(
             hdc,
             windows::Win32::Graphics::Gdi::GetStockObject(
@@ -1972,20 +1973,20 @@ unsafe fn paint(hdc: HDC, state: &State) {
         let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, kx0, ky0, kx1, ky1);
         SelectObject(hdc, ob);
         SelectObject(hdc, op);
-        let _ = DeleteObject(pen);
+        let _ = DeleteObject(pen.into());
 
         let fill = CreateSolidBrush(state.theme.accent);
         let edge = CreatePen(PS_SOLID, 1, state.theme.bg);
-        let ob = SelectObject(hdc, fill);
-        let op = SelectObject(hdc, edge);
+        let ob = SelectObject(hdc, fill.into());
+        let op = SelectObject(hdc, edge.into());
         for corner in pending.corners() {
             let (sx, sy) = raw_to_screen(state, corner);
             let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, sx - 5, sy - 5, sx + 6, sy + 6);
         }
         SelectObject(hdc, ob);
         SelectObject(hdc, op);
-        let _ = DeleteObject(fill);
-        let _ = DeleteObject(edge);
+        let _ = DeleteObject(fill.into());
+        let _ = DeleteObject(edge.into());
 
         // The readout sits just inside the top-left corner, and flips below the
         // rectangle when the crop is pushed against the top of the pane.
@@ -2029,7 +2030,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     state.theme.muted
                 },
             );
-            let op = SelectObject(hdc, pen);
+            let op = SelectObject(hdc, pen.into());
             let ob = SelectObject(
                 hdc,
                 windows::Win32::Graphics::Gdi::GetStockObject(
@@ -2040,7 +2041,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 windows::Win32::Graphics::Gdi::Rectangle(hdc, sx0 - 6, sy0 - 6, sx1 + 6, sy1 + 6);
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
-            let _ = DeleteObject(pen);
+            let _ = DeleteObject(pen.into());
         }
 
         // Grab handles on the selected annotation: arrow tips and box
@@ -2064,8 +2065,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
                 if !pts.is_empty() {
                     let fill = CreateSolidBrush(state.theme.accent);
                     let pen = CreatePen(PS_SOLID, 1, state.theme.bg);
-                    let ob = SelectObject(hdc, fill);
-                    let op = SelectObject(hdc, pen);
+                    let ob = SelectObject(hdc, fill.into());
+                    let op = SelectObject(hdc, pen.into());
                     for p in pts {
                         let (sx, sy) = raw_to_screen(state, p);
                         let _ = windows::Win32::Graphics::Gdi::Rectangle(
@@ -2078,8 +2079,8 @@ unsafe fn paint(hdc: HDC, state: &State) {
                     }
                     SelectObject(hdc, ob);
                     SelectObject(hdc, op);
-                    let _ = DeleteObject(fill);
-                    let _ = DeleteObject(pen);
+                    let _ = DeleteObject(fill.into());
+                    let _ = DeleteObject(pen.into());
                 }
             }
         }
@@ -2417,13 +2418,13 @@ unsafe fn paint(hdc: HDC, state: &State) {
                         state.theme.chip_line
                     },
                 );
-                let ob = SelectObject(hdc, fill);
-                let op = SelectObject(hdc, ring);
+                let ob = SelectObject(hdc, fill.into());
+                let op = SelectObject(hdc, ring.into());
                 let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, 8, 8);
                 SelectObject(hdc, ob);
                 SelectObject(hdc, op);
-                let _ = DeleteObject(fill);
-                let _ = DeleteObject(ring);
+                let _ = DeleteObject(fill.into());
+                let _ = DeleteObject(ring.into());
             }
             Ctl::Slider => {}
         }
@@ -2492,7 +2493,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         },
         track,
     );
-    let _ = DeleteObject(track);
+    let _ = DeleteObject(track.into());
     let t = (state.doc().pad_factor - compose::PAD_SLIDER_MIN)
         / (compose::PAD_SLIDER_MAX - compose::PAD_SLIDER_MIN);
     let tx = sr.left + ((sr.right - sr.left) as f32 * t) as i32;
@@ -2508,14 +2509,14 @@ unsafe fn paint(hdc: HDC, state: &State) {
         filled,
     );
     let thumb_pen = CreatePen(PS_SOLID, 1, state.theme.accent);
-    let ob = SelectObject(hdc, filled);
-    let op = SelectObject(hdc, thumb_pen);
+    let ob = SelectObject(hdc, filled.into());
+    let op = SelectObject(hdc, thumb_pen.into());
     let th = 7;
     let _ = RoundRect(hdc, tx - th, cy - th, tx + th, cy + th, th * 2, th * 2);
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
-    let _ = DeleteObject(filled);
-    let _ = DeleteObject(thumb_pen);
+    let _ = DeleteObject(filled.into());
+    let _ = DeleteObject(thumb_pen.into());
 }
 
 unsafe fn slider_update(hwnd: HWND, state: &mut State, x: i32) {
@@ -2527,7 +2528,7 @@ unsafe fn slider_update(hwnd: HWND, state: &mut State, x: i32) {
     }
     state.doc_mut().pad_factor = padding;
     rebuild_preview(state);
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 #[derive(Debug)]
@@ -2551,7 +2552,7 @@ fn persist_and_copy_with(
 unsafe fn show_output_error(hwnd: HWND, summary: &str, error: &Error, save_failed: bool) {
     let message = HSTRING::from(format!("{summary}\n\n{error:#}"));
     let _ = MessageBoxW(
-        hwnd,
+        Some(hwnd),
         PCWSTR(message.as_ptr()),
         w!("Matteshot"),
         MB_OK
@@ -2581,7 +2582,7 @@ unsafe fn copy_image(hwnd: HWND, state: &mut State) {
             let _ = Config::update(|cfg| cfg.last_style = state.doc_mut().sel);
             if cfg.keep_editor_open {
                 state.copy_hint = Some(("copied".into(), std::time::Instant::now()));
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             } else {
                 let active = state.active;
                 close_tab(hwnd, state, active);
@@ -2610,7 +2611,7 @@ unsafe fn end_fast_preview(hwnd: HWND, state: &mut State) {
     if state.doc_mut().fast_preview {
         state.doc_mut().fast_preview = false;
         rebuild_preview(state);
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -2627,7 +2628,7 @@ unsafe fn caption_size_update(hwnd: HWND, state: &mut State, x: i32) {
         }
     }
     rebuild_preview(state);
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 unsafe fn caption_opacity_update(hwnd: HWND, state: &mut State, x: i32) {
@@ -2643,7 +2644,7 @@ unsafe fn caption_opacity_update(hwnd: HWND, state: &mut State, x: i32) {
         }
     }
     rebuild_preview(state);
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3065,7 +3066,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 }
             }
             rebuild_preview(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             return;
         }
         Ctl::Tool(n) => {
@@ -3079,7 +3080,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 }
             }
             rebuild_preview(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             return;
         }
         Ctl::Color(n) => {
@@ -3097,7 +3098,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 }
                 rebuild_preview(state);
             }
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             return;
         }
         Ctl::Size(n) => {
@@ -3112,14 +3113,14 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 }
                 rebuild_preview(state);
             }
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             return;
         }
         Ctl::Undo => {
             commit_editing(state);
             if state.doc_mut().undo() {
                 rebuild_preview(state);
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             return;
         }
@@ -3134,7 +3135,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             state.doc_mut().hover_ann = None;
             state.doc_mut().counter_next = 1;
             rebuild_preview(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             return;
         }
         _ => {}
@@ -3143,20 +3144,20 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
         Ctl::Matte(n) => {
             state.doc_mut().sel = n;
             rebuild_preview(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::Aspect(n) => {
             state.doc_mut().aspect_idx = n;
             rebuild_preview(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::OutputSize(max_edge) => {
             state.doc_mut().output_max_edge = max_edge;
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::CustomSize => {
             begin_custom_size(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::CustomSizeField => {
             if let Some(edit) = state.custom_size_edit.as_mut() {
@@ -3164,15 +3165,15 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
                 edit.invalid = false;
             }
             state.caret_on = true;
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::CustomSizeDone => {
             commit_custom_size(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::CustomSizeCancel => {
             cancel_custom_size(state);
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::Slider => {}
         Ctl::Ocr => {
@@ -3181,7 +3182,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
             } else {
                 enter_text_select(hwnd, state);
             }
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Ctl::Copy => copy_image(hwnd, state),
         Ctl::Save => {
@@ -3218,7 +3219,7 @@ unsafe fn activate(hwnd: HWND, state: &mut State, ctl: Ctl) {
 unsafe fn share_current(hwnd: HWND, state: &mut State) {
     if let crate::share::ShareStart::Unavailable(reason) = crate::share::share_start() {
         state.copy_hint = Some((reason.into(), std::time::Instant::now()));
-        let _ = InvalidateRect(hwnd, None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         return;
     }
     // Recdone already refuses a second Share with `if !state.sharing`.
@@ -3239,7 +3240,7 @@ unsafe fn share_current(hwnd: HWND, state: &mut State) {
                 return;
             }
             state.copy_hint = Some(("Sharing\u{2026}".into(), std::time::Instant::now()));
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Err(error) => show_output_error(
             hwnd,
@@ -3272,13 +3273,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                let mem = CreateCompatibleDC(hdc);
+                let mem = CreateCompatibleDC(Some(hdc));
                 let bmp = CreateCompatibleBitmap(hdc, state.width, state.height);
-                let old = SelectObject(mem, bmp);
+                let old = SelectObject(mem, bmp.into());
                 paint(mem, state);
-                let _ = BitBlt(hdc, 0, 0, state.width, state.height, mem, 0, 0, SRCCOPY);
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    state.width,
+                    state.height,
+                    Some(mem),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
                 SelectObject(mem, old);
-                let _ = DeleteObject(bmp);
+                let _ = DeleteObject(bmp.into());
                 let _ = DeleteDC(mem);
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -3302,7 +3313,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(select) = state.doc_mut().text_select.as_mut() {
                         if focus.is_some() && select.focus != focus {
                             select.focus = focus;
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     return LRESULT(0);
@@ -3333,7 +3344,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.crop_drag = Some(drag);
                     if state.doc().crop_edit != Some(next) {
                         state.doc_mut().crop_edit = Some(next);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     return LRESULT(0);
                 }
@@ -3354,7 +3365,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.doc_mut().moving = Some((i, p, grab));
                         if state.doc_mut().last_rebuild.elapsed().as_millis() > 15 {
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                 } else if state.doc_mut().drawing {
@@ -3383,7 +3394,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Annotation stamping is cheap now; near-frame-rate.
                         if state.doc_mut().last_rebuild.elapsed().as_millis() > 15 {
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                 } else {
@@ -3404,7 +3415,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if hover != state.hover || hover_ann != state.doc_mut().hover_ann {
                         state.hover = hover;
                         state.doc_mut().hover_ann = hover_ann;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
             }
@@ -3412,7 +3423,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK => {
             if let Some(state) = state_of(hwnd) {
-                let _ = SetFocus(hwnd);
+                let _ = SetFocus(Some(hwnd));
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -3427,7 +3438,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             select.message = None;
                         }
                     }
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
                 if state.tool.is_none() {
@@ -3450,7 +3461,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 sync_annotation_controls(state, i);
                                 state.caret_on = true;
                                 rebuild_preview(state);
-                                let _ = InvalidateRect(hwnd, None, false);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
                     }
@@ -3460,7 +3471,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN => {
             if let Some(state) = state_of(hwnd) {
-                let _ = SetFocus(hwnd);
+                let _ = SetFocus(Some(hwnd));
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -3495,7 +3506,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     });
                     if !inside_inline_editor {
                         cancel_custom_size(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 if state.doc_mut().text_select.is_some() && in_rect(&state.preview_box, x, y) {
@@ -3509,7 +3520,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if hit.is_some() {
                         SetCapture(hwnd);
                     }
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
                 let grab = RECT {
@@ -3559,7 +3570,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                         }
                         rebuild_preview(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                         return LRESULT(0);
                     }
                 }
@@ -3579,7 +3590,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.crop_drag =
                                 Some(crop_drag_for(pending, p, tolerance, width, height));
                             SetCapture(hwnd);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                         return LRESULT(0);
                     }
@@ -3647,7 +3658,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Armed tool, so no selection — see the drag release.
                         state.doc_mut().selected = None;
                         rebuild_preview(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     } else {
                         // Text: click places, then type.
                         state.doc_mut().push_history();
@@ -3666,13 +3677,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.doc_mut().selected = Some(state.doc_mut().anns.len() - 1);
                         state.caret_on = true;
                         rebuild_preview(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 } else {
                     if state.doc_mut().editing.is_some() {
                         commit_editing(state);
                         rebuild_preview(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     // Selector mode: grab an existing annotation (whole,
                     // endpoint, or corner) to manipulate it.
@@ -3689,9 +3700,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.doc_mut().moving = Some((i, p, grab));
                             state.doc_mut().moved = false;
                             SetCapture(hwnd);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         } else if state.doc_mut().selected.take().is_some() {
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                 }
@@ -3710,13 +3721,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         select.dragging = false;
                     }
                     let _ = ReleaseCapture();
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
                 // The up belongs to the crop drag whether the drag ended here
                 // or was already ended by a key; either way it goes no further.
                 if take_crop_click(state) {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
                 if state.dragging.take().is_some() {
@@ -3731,7 +3742,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.doc_mut().discard_history();
                     }
                     rebuild_preview(state);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
                 if state.doc_mut().drawing {
@@ -3771,7 +3782,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.doc_mut().selected = None;
                     }
                     rebuild_preview(state);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     return LRESULT(0);
                 }
                 let (x, y) = (
@@ -3791,7 +3802,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_RBUTTONDOWN => {
             if let Some(state) = state_of(hwnd) {
-                let _ = SetFocus(hwnd);
+                let _ = SetFocus(Some(hwnd));
                 let (x, y) = (
                     (lparam.0 & 0xFFFF) as i16 as i32,
                     ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -3812,7 +3823,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.doc_mut().selected = Some(index);
                         sync_annotation_controls(state, index);
                         rebuild_preview(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
             }
@@ -3839,11 +3850,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 if state.custom_size_edit.is_some() {
                     state.caret_on = !state.caret_on;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 } else if state.doc_mut().editing.is_some() {
                     state.caret_on = !state.caret_on;
                     rebuild_preview(state);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 } else if !state.caret_on {
                     // Next edit starts with a visible caret.
                     state.caret_on = true;
@@ -3868,7 +3879,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         preview_custom_size(state);
                     }
                     if action != CustomInput::Ignored {
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     return LRESULT(0);
                 }
@@ -3891,7 +3902,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if action != TextInput::Ignored {
                         rebuild_preview(state);
                     }
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -3905,17 +3916,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let key = wparam.0 as u16;
                     if key == VK_ESCAPE.0 {
                         cancel_custom_size(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     } else if key == VK_RETURN.0 {
                         commit_custom_size(state);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     } else if ctrl_down && key == b'A' as u16 {
                         if let Some(edit) = state.custom_size_edit.as_mut() {
                             edit.replace_on_type = true;
                             edit.invalid = false;
                         }
                         state.caret_on = true;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     return LRESULT(0);
                 }
@@ -3925,7 +3936,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let key = wparam.0 as u16;
                     if key == VK_ESCAPE.0 {
                         state.doc_mut().text_select = None;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                         return LRESULT(0);
                     }
                     if ctrl_down && key == b'A' as u16 {
@@ -3942,7 +3953,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 select.message = None;
                             }
                         }
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                         return LRESULT(0);
                     }
                     if ctrl_down && key == b'C' as u16 {
@@ -3962,7 +3973,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if let Some(select) = state.doc_mut().text_select.as_mut() {
                             select.message = Some(message);
                         }
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                         return LRESULT(0);
                     }
                 }
@@ -3978,14 +3989,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             cancel_crop(state);
                             state.tool = None;
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
                         v if v == VK_RETURN.0 => {
                             commit_crop(state);
                             state.tool = None;
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
                         // Delete / Backspace: back to the whole capture, ready
@@ -3997,7 +4008,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             end_crop_drag(state);
                             let (width, height) = state.doc().raw.dimensions();
                             state.doc_mut().crop_edit = Some(Crop::full(width, height));
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
                         v if ctrl_down && v == b'C' as u16 => {
@@ -4061,15 +4072,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // is not a reason to leave caption mode. The next
                             // Esc puts the tool away.
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         } else if state.tool.take().is_some() {
                             // Esc peels one layer at a time — caption, then the
                             // armed tool, then the selection, and only then the
                             // tab. Tools stay armed across uses, so without this
                             // ladder a single Esc would throw away the capture.
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         } else if state.doc_mut().selected.take().is_some() {
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         } else {
                             let active = state.active;
                             close_tab(hwnd, state, active);
@@ -4079,7 +4090,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if state.doc_mut().editing.is_some() {
                             commit_editing(state);
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         } else {
                             activate(hwnd, state, Ctl::Copy);
                         }
@@ -4090,7 +4101,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         commit_editing(state);
                         if state.doc_mut().undo() {
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     // Delete removes the selected annotation.
@@ -4102,7 +4113,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                             state.doc_mut().hover_ann = None;
                             rebuild_preview(state);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     // Tool shortcuts (A/R/T/B/P) and colors (1-4).
@@ -4172,7 +4183,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         None
                     }
                 };
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -4193,7 +4204,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .iter_mut()
                     .map(|doc| (doc.id, &mut doc.text_select));
                 if deliver_ocr(docs, payload) {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -4232,7 +4243,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         ARROW
                     };
                     if let Ok(c) = LC(None, id) {
-                        SetCursor(c);
+                        SetCursor(Some(c));
                     }
                     return LRESULT(1);
                 }
@@ -4243,7 +4254,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 state.theme = crate::theme::current();
                 crate::theme::apply_titlebar(hwnd, &state.theme);
-                let _ = InvalidateRect(hwnd, None, true);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -4272,7 +4283,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if !state.sizing && ensure_preview_source(state) {
                         rebuild_preview(state);
                     }
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -4288,7 +4299,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.sizing = false;
                 if ensure_preview_source(state) {
                     rebuild_preview(state);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -4309,7 +4320,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 if state.crop_drag.take().is_some() {
                     state.crop_click_owed = false;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -4327,8 +4338,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
             if !ptr.is_null() {
                 let state = Box::from_raw(ptr);
-                let _ = DeleteObject(state.font);
-                let _ = DeleteObject(state.font_small);
+                let _ = DeleteObject(state.font.into());
+                let _ = DeleteObject(state.font_small.into());
             }
             WINDOW.store(0, Ordering::SeqCst);
             LRESULT(0)
@@ -4812,7 +4823,7 @@ unsafe fn activate_tab(hwnd: HWND, state: &mut State, index: usize) {
     state.active = index;
     state.tool = None;
     rebuild_preview(state);
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 /// Which tab to show after closing one. `remaining` is the count *after* the
@@ -4860,7 +4871,7 @@ unsafe fn close_tab(hwnd: HWND, state: &mut State, index: usize) {
     state.active = active_after_close(state.active, index, state.docs.len());
     state.tool = None;
     rebuild_preview(state);
-    let _ = InvalidateRect(hwnd, None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 /// Bring an existing editor to the front. After a tray menu the process has
@@ -4870,15 +4881,31 @@ unsafe fn surface(hwnd: HWND) {
         SetWindowPos, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
     };
     let _ = ShowWindow(hwnd, SW_RESTORE);
-    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    let _ = SetWindowPos(
+        hwnd,
+        Some(HWND_TOPMOST),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE,
+    );
+    let _ = SetWindowPos(
+        hwnd,
+        Some(HWND_NOTOPMOST),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE,
+    );
     let _ = SetForegroundWindow(hwnd);
 }
 
 /// Whether an editor window is currently open.
 pub fn is_open() -> bool {
     let hwnd = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-    !hwnd.0.is_null() && unsafe { IsWindow(hwnd) }.as_bool()
+    !hwnd.0.is_null() && unsafe { IsWindow(Some(hwnd)) }.as_bool()
 }
 
 /// Open the editor on a capture. Non-modal: this returns immediately and the
@@ -4893,7 +4920,7 @@ pub fn open(
     let document = build_document(raw, styles, initial, title);
     unsafe {
         let existing = HWND(WINDOW.load(Ordering::SeqCst) as *mut _);
-        if !existing.0.is_null() && IsWindow(existing).as_bool() {
+        if !existing.0.is_null() && IsWindow(Some(existing)).as_bool() {
             if let Some(state) = state_of(existing) {
                 // A further capture joins the window as its own tab rather
                 // than replacing what is already being edited.
@@ -4908,7 +4935,7 @@ pub fn open(
                 state.active = state.docs.len() - 1;
                 state.tool = None;
                 rebuild_preview(state);
-                let _ = InvalidateRect(existing, None, false);
+                let _ = InvalidateRect(Some(existing), None, false);
             }
             surface(existing);
             return Ok(());
@@ -5022,7 +5049,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
             outer.bottom - outer.top,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             // The window owns the state from here; WM_NCDESTROY reclaims it.
             Some(Box::into_raw(state) as *const _),
         )?;
@@ -5032,7 +5059,7 @@ fn create_window(document: Document, monitor: HMONITOR) -> Result<()> {
         let blink = windows::Win32::UI::WindowsAndMessaging::GetCaretBlinkTime();
         if blink != u32::MAX {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
-                hwnd,
+                Some(hwnd),
                 1,
                 blink.clamp(200, 1200),
                 None,

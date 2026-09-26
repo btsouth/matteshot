@@ -20,7 +20,7 @@ use std::ptr;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
@@ -45,7 +45,7 @@ struct InternetHandle(*mut c_void);
 impl InternetHandle {
     fn new(raw: *mut c_void, what: &str) -> Result<Self> {
         if raw.is_null() {
-            Err(windows::core::Error::from_win32()).with_context(|| what.to_owned())
+            Err(windows::core::Error::from_thread()).with_context(|| what.to_owned())
         } else {
             Ok(Self(raw))
         }
@@ -230,7 +230,14 @@ fn download(url: &str, dest: &Path, mut progress: impl FnMut(u32)) -> Result<()>
 fn sha256_of(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).context("open installer for hashing")?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("hash installer")?;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut chunk).context("hash installer")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
     Ok(hasher
         .finalize()
         .iter()
@@ -288,9 +295,17 @@ pub fn verify_signature(path: &Path) -> Result<()> {
             ..Default::default()
         };
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-        let status = WinVerifyTrust(None, &mut action, &mut data as *mut _ as *mut c_void);
+        let status = WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            &mut data as *mut _ as *mut c_void,
+        );
         data.dwStateAction = WTD_STATEACTION_CLOSE;
-        let _ = WinVerifyTrust(None, &mut action, &mut data as *mut _ as *mut c_void);
+        let _ = WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            &mut data as *mut _ as *mut c_void,
+        );
         if status != 0 {
             bail!("installer signature is not valid (0x{status:08X})");
         }
@@ -377,7 +392,7 @@ pub fn verify_signature(path: &Path) -> Result<()> {
 
     unsafe {
         let _ = CryptMsgClose(Some(message));
-        let _ = CertCloseStore(store, 0);
+        let _ = CertCloseStore(Some(store), 0);
     }
     result
 }
@@ -644,7 +659,7 @@ pub fn launch(path: &Path) -> Result<()> {
     unsafe {
         CreateProcessW(
             &application,
-            PWSTR(command_line.as_mut_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
             None,
             None,
             false,

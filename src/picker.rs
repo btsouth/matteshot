@@ -335,10 +335,10 @@ unsafe fn make_font(height: i32) -> HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        0,
-        0,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        windows::Win32::Graphics::Gdi::FONT_OUTPUT_PRECISION(0),
+        windows::Win32::Graphics::Gdi::FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI"),
     )
@@ -370,7 +370,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
         },
         bg,
     );
-    let _ = DeleteObject(bg);
+    let _ = DeleteObject(bg.into());
     SetBkMode(hdc, TRANSPARENT);
 
     for (i, t) in state.thumbs.iter().enumerate() {
@@ -434,10 +434,10 @@ unsafe fn paint(hdc: HDC, state: &State) {
             ] {
                 FillRect(hdc, &r, accent);
             }
-            let _ = DeleteObject(accent);
+            let _ = DeleteObject(accent.into());
         }
 
-        SelectObject(hdc, state.font);
+        SelectObject(hdc, state.font.into());
         SetTextColor(
             hdc,
             if hovered {
@@ -462,7 +462,7 @@ unsafe fn paint(hdc: HDC, state: &State) {
     }
 
     // Hint line along the bottom.
-    SelectObject(hdc, state.font_small);
+    SelectObject(hdc, state.font_small.into());
     SetTextColor(hdc, state.theme.faint);
     let mut hint = wide(&picker_hint(state.auto_copy.get(), state.can_share));
     let mut hint_rect = RECT {
@@ -516,13 +516,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(state) = state_of(hwnd) {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                let mem = CreateCompatibleDC(hdc);
+                let mem = CreateCompatibleDC(Some(hdc));
                 let bmp = CreateCompatibleBitmap(hdc, state.width, state.height);
-                let old = SelectObject(mem, bmp);
+                let old = SelectObject(mem, bmp.into());
                 paint(mem, state);
-                let _ = BitBlt(hdc, 0, 0, state.width, state.height, mem, 0, 0, SRCCOPY);
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    state.width,
+                    state.height,
+                    Some(mem),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
                 SelectObject(mem, old);
-                let _ = DeleteObject(bmp);
+                let _ = DeleteObject(bmp.into());
                 let _ = DeleteDC(mem);
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -537,7 +547,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let hover = hit_test(state, mx, my);
                 if hover != state.hover && hover >= 0 {
                     state.hover = hover;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
@@ -584,7 +594,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     Some(KeyAction::CopyText) => finish(hwnd, state, PickAction::CopyText),
                     Some(KeyAction::Hover(index)) => {
                         state.hover = index;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     None => {}
                 }
@@ -611,16 +621,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let status = state.auto_copy.get();
                 if status != state.painted_hint {
                     state.painted_hint = status;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 if status != AutoCopyHint::Pending {
-                    let _ = KillTimer(hwnd, AUTO_COPY_TIMER);
+                    let _ = KillTimer(Some(hwnd), AUTO_COPY_TIMER);
                 }
             }
             LRESULT(0)
         }
         WM_DESTROY => {
-            let _ = KillTimer(hwnd, AUTO_COPY_TIMER);
+            let _ = KillTimer(Some(hwnd), AUTO_COPY_TIMER);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -722,7 +732,7 @@ pub fn pick(
             total_h,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(&mut *state as *mut State as *const _),
         )?;
 
@@ -731,13 +741,13 @@ pub fn pick(
         // write landed in that gap, repaint now; otherwise poll until it does.
         let status = state.auto_copy.get();
         if status == AutoCopyHint::Pending {
-            let _ = SetTimer(hwnd, AUTO_COPY_TIMER, AUTO_COPY_TIMER_MS, None);
+            let _ = SetTimer(Some(hwnd), AUTO_COPY_TIMER, AUTO_COPY_TIMER_MS, None);
         } else {
             state.painted_hint = status;
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         let region = CreateRoundRectRgn(0, 0, total_w, total_h, 16, 16);
-        SetWindowRgn(hwnd, region, true);
+        SetWindowRgn(hwnd, Some(region), true);
         let _ = SetForegroundWindow(hwnd);
 
         let mut msg = MSG::default();
@@ -746,14 +756,14 @@ pub fn pick(
             // otherwise be swallowed by this modal loop; PrtScn mid-pick
             // means "shoot the strip itself".
             if msg.hwnd.0.is_null() && msg.message == WM_HOTKEY {
-                let _ = PostMessageW(hwnd, WM_RETAKE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(hwnd), WM_RETAKE, WPARAM(0), LPARAM(0));
                 continue;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        let _ = DeleteObject(state.font);
-        let _ = DeleteObject(state.font_small);
+        let _ = DeleteObject(state.font.into());
+        let _ = DeleteObject(state.font_small.into());
     }
 
     Ok(state.action.unwrap_or(PickAction::Cancel))

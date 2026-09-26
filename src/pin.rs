@@ -53,7 +53,7 @@ unsafe fn context_menu(hwnd: HWND) {
         TPM_RETURNCMD | TPM_NONOTIFY,
         pt.x,
         pt.y,
-        0,
+        None,
         hwnd,
         None,
     );
@@ -76,7 +76,7 @@ unsafe fn context_menu(hwnd: HWND) {
                             "The pinned image could not be copied. The pin is still open so you can try again.\n\n{error:#}"
                         ));
                         let _ = MessageBoxW(
-                            hwnd,
+                            Some(hwnd),
                             PCWSTR(message.as_ptr()),
                             w!("Matteshot"),
                             MB_OK | MB_ICONWARNING,
@@ -166,7 +166,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let cw = (lparam.0 & 0xFFFF) as i32;
                 if cw > 2 {
                     state.zoom = (cw - 2) as f32 / state.w as f32;
-                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
                 }
             }
             LRESULT(0)
@@ -245,7 +245,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 ] {
                     FillRect(hdc, &r, brush);
                 }
-                let _ = DeleteObject(brush);
+                let _ = DeleteObject(brush.into());
                 let _ = EndPaint(hwnd, &ps);
             }
             LRESULT(0)
@@ -259,8 +259,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (state.w as f32 * state.zoom) as i32 + 2,
                     (state.h as f32 * state.zoom) as i32 + 2,
                 );
-                let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, dw, dh, SWP_NOMOVE | SWP_NOZORDER);
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    dw,
+                    dh,
+                    SWP_NOMOVE | SWP_NOZORDER,
+                );
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -348,7 +356,7 @@ pub fn show(img: RgbaImage, monitor: HMONITOR) -> Result<()> {
             dh,
             None,
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(state as *const _),
         ) {
             Ok(hwnd) => {

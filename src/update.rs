@@ -62,7 +62,7 @@ struct InternetHandle(*mut c_void);
 impl InternetHandle {
     fn new(raw: *mut c_void, what: &str) -> Result<Self> {
         if raw.is_null() {
-            Err(windows::core::Error::from_win32()).with_context(|| what.to_owned())
+            Err(windows::core::Error::from_thread()).with_context(|| what.to_owned())
         } else {
             Ok(Self(raw))
         }
@@ -226,7 +226,7 @@ static INSTALLING_VERSIONS: crate::completion::CompletionMailbox<String> =
 fn post_token(hwnd_value: isize, message: u32, token: u64) -> bool {
     unsafe {
         PostMessageW(
-            HWND(hwnd_value as *mut c_void),
+            Some(HWND(hwnd_value as *mut c_void)),
             message,
             WPARAM(0),
             LPARAM(token as isize),
