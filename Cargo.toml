@@ -3,6 +3,12 @@ name = "matteshot"
 version = "0.20.0"
 edition = "2021"
 description = "Every screenshot, a matte shot. PrtScn -> six styled mattes -> pick one -> premium PNG on your clipboard."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/btsouth/matteshot"
+homepage = "https://matteshot.app"
+readme = "README.md"
+# A Windows application, not a library for crates.io.
+publish = false
 
 [dependencies]
 anyhow = "1"
@@ -64,15 +70,14 @@ features = [
 
 [features]
 default = []
-# Honour MATTESHOT_LICENSE_OVERRIDE so the trial and purchase flow can be
-# exercised without waiting 14 days. Never enabled for a shipped binary:
-# verify-code.ps1 lints and tests with --all-features so the code stays
-# correct, and builds the release binary with none of them.
-debug-license = []
+# Share uploads to a self-hosted server (share-server/). Off by default:
+# Matteshot does not run a public upload service, so the default build has no
+# Share button and no upload code. See docs/self-hosting-share.md.
+share = []
 
 [profile.release]
 lto = true
 strip = true
 
 [build-dependencies]
-winres = "0.1"
+embed-resource = "3"
