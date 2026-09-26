@@ -1,0 +1,50 @@
+# Matteshot share server. Copy this directory, change the three marked values,
+# then follow docs/self-hosting-share.md.
+
+# 1. The Worker's name. It becomes <name>.<your-subdomain>.workers.dev.
+name = "matteshot-share"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+preview_urls = false
+
+# 2. Your R2 bucket. Create it first: wrangler r2 bucket create <bucket>
+[[r2_buckets]]
+binding = "SHARES"
+bucket_name = "matteshot-shares"
+
+# 3. Optional custom domain. Uncomment and set it, then put the same
+#    https://<host> in Matteshot's share_server setting.
+# [[routes]]
+# pattern = "share.example.com"
+# custom_domain = true
+
+[vars]
+# Uploads are deleted after this many days. Set the R2 lifecycle rule to the
+# same number (see the docs); this value is also enforced when serving.
+SHARE_TTL_DAYS = "30"
+# Largest accepted upload in bytes. Cloudflare's Free plan stops at 100 MB.
+MAX_UPLOAD_BYTES = "104857600"
+
+# Upload tokens are a secret, never a var:
+#   wrangler secret put UPLOAD_TOKENS
+# One or more tokens of at least 24 characters, separated by commas.
+
+# Best-effort, per-location limits. Uploads per client address, and per token.
+[[ratelimits]]
+name = "SHARE_LIMITER"
+namespace_id = "3001"
+simple = { limit = 20, period = 60 }
+
+[[ratelimits]]
+name = "TOKEN_LIMITER"
+namespace_id = "3002"
+simple = { limit = 30, period = 60 }
+
+# Keep error logs, but do not persist request logs: their URLs contain the
+# unlisted share ids.
+[observability]
+enabled = true
+
+[observability.logs]
+invocation_logs = false

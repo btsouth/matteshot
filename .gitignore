@@ -6,3 +6,6 @@
 # which is an email address.
 /.claude
 /.wrangler
+
+# Local working handoff. Keep operational notes out of the repository.
+/LOCAL-HANDOFF.md
