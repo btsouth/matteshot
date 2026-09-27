@@ -2,6 +2,10 @@
 
 Notable changes to Matteshot. Releases before 0.21.0 are listed on [GitHub Releases](https://github.com/btsouth/matteshot/releases).
 
+## 0.21.1 (2026-09-27)
+
+- Settings saved as UTF-8 with a byte-order mark, including files written by Windows PowerShell 5.1, now load correctly. Previously, Matteshot fell back to defaults, turning off PrtScn capture and clearing the capture shortcut in the app.
+
 ## 0.21.0 (2026-09-26)
 
 ### Free and open source
