@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Build, test and sign. The desktop probes are split into the job below so
   # they run against the signed artifact this one uploads, rather than against

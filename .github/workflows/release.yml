@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Build and sign first, but do not publish yet: nothing may reach R2 until
   # the exact artifact has passed the same signer-identity gate every
