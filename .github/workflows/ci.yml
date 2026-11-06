@@ -44,7 +44,7 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # `cargo install cargo-audit --locked` builds the auditor from source,
       # which measured at 12.5 of this job's 19.3 minutes - two thirds of the
