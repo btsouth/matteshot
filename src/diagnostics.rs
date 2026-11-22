@@ -51,7 +51,7 @@ pub fn log(event: &str) {
     let _ = writeln!(
         file,
         "{} {}",
-        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
+        jiff::Zoned::now().strftime("%Y-%m-%dT%H:%M:%S%:z"),
         clean_event(event)
     );
 }

@@ -457,7 +457,7 @@ pub fn save_png(
     std::fs::create_dir_all(dir)?;
     let name = format!(
         "matteshot-{}-{}.png",
-        chrono::Local::now().format("%Y%m%d-%H%M%S%3f"),
+        jiff::Zoned::now().strftime("%Y%m%d-%H%M%S%3f"),
         style_name.to_lowercase()
     );
     let path = dir.join(name);
