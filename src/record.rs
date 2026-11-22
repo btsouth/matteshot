@@ -1102,7 +1102,7 @@ pub fn session(target: Target, want_gif: bool) -> Result<()> {
     ));
     let dir = cfg.video_dir();
     std::fs::create_dir_all(&dir)?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
+    let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S%3f");
     let mp4 = dir.join(format!("matteshot-{stamp}.mp4"));
     let record_id = NEXT_RECORD_ID.fetch_add(1, Ordering::Relaxed);
     let partial_mp4 = crate::output::partial_video_path(&mp4, record_id);

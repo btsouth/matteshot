@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use anyhow::{Context, Result};
-use chrono::{Local, TimeZone};
 use image::RgbaImage;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -232,7 +231,7 @@ fn normalize_source(source: Option<&str>) -> Option<String> {
 pub fn record(path: &Path, width: u32, height: u32, style: &str, source: Option<&str>) {
     let entry = Entry {
         path: path.to_path_buf(),
-        saved_at: Local::now().timestamp(),
+        saved_at: jiff::Timestamp::now().as_second(),
         width,
         height,
         style: style.to_string(),
@@ -606,9 +605,12 @@ fn remove_history_metadata_in(dir: &Path) -> Result<()> {
 }
 
 fn format_when(saved_at: i64) -> String {
-    match Local.timestamp_opt(saved_at, 0).single() {
-        Some(dt) => dt.format("%b %-d, %-I:%M %p").to_string(),
-        None => String::new(),
+    match jiff::Timestamp::from_second(saved_at) {
+        Ok(ts) => ts
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%b %-d, %-I:%M %p")
+            .to_string(),
+        Err(_) => String::new(),
     }
 }
 
